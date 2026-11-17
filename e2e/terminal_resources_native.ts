@@ -1,5 +1,7 @@
 /** Repeatable native PTY memory/throughput workload, with optional heap evidence.
  * RPC latencies include automation; diagnostic tools run outside frame samples. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,realpath,mkdir,open,writeFile,readFile,rm,stat} from 'node:fs/promises';
@@ -23,7 +25,7 @@ const shown=(n:any)=>!n.hidden&&n.visible!==false&&(n.effective_opacity??1)>0&&n
 const text=(n:any):string=>n.hidden||n.visible===false?'':(n.text??'')+(n.children??[]).map(text).join('');
 async function tail(){const rows=await query('terminal.surface');return Array.isArray(rows)?rows.filter(shown).map(text).join(''):'';}
 async function command(value:string,token:string){await type_(value);await key('enter');await waitFor(async()=>(await tail()).includes(token)||null,45000,20);}
-function resource(){const raw=execFileSync('/bin/ps',['-p',String(child.pid),'-o','rss=,time='],{encoding:'utf8'}).trim().split(/\s+/);return {rss_kib:Number(raw[0]),cpu_seconds:raw[1].split(':').map(Number).reduce((a,b)=>a*60+b,0)};}
+function resource(){const raw=psCompat(['-p',String(child.pid),'-o','rss=,time=']).trim().split(/\s+/);return {rss_kib:Number(raw[0]),cpu_seconds:raw[1].split(':').map(Number).reduce((a,b)=>a*60+b,0)};}
 async function metrics(){return await request('POST','/zerowork/terminal',{action:'metrics'}).catch(()=>null);}
 async function phase(name:string){await sleep(500);const start=resource();await sleep(2500);const end=resource();report.phases[name]={...end,idle_cpu_percent:(end.cpu_seconds-start.cpu_seconds)*40,terminal:await metrics(),frame:await stats()};}
 async function diagnostic(name:string){for(const [tool,args] of [['vmmap',['-summary',String(child.pid)]],['heap',['-s',String(child.pid)]],...(process.env.ZEROWORK_RESOURCE_STACKS==='1'?[['malloc_history',[String(child.pid),'-callTree','malloc[48k-]']]]:[])]){try{await writeFile(join(out,`${name}-${tool}.txt`),execFileSync('/usr/bin/'+tool,args,{encoding:'utf8',timeout:30000,maxBuffer:8*1024*1024}));}catch(e){report[`${name}_${tool}_error`]=String(e);}}}

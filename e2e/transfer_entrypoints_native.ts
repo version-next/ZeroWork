@@ -2,6 +2,7 @@
  * --live-transfers enqueues actual uploads; --foreground also checks passive
  * ticker acknowledgement in an activated, disposable application window.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -12,7 +13,7 @@ const live=process.argv.includes('--live-transfers'),foreground=process.argv.inc
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);await mkdir(out,{recursive:true});
 const iso=await realpath(await mkdtemp('/tmp/zw-transfer-entrypoints-')),rpc=join(iso,'rpc'),data=join(iso,'data');await mkdir(rpc);await mkdir(data);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const log=await open(join(out,'app.log'),'w'),peerLog=await open(join(out,'peer.log'),'w'),peerOut=join(out,'peer');
-const peer=spawn(process.env.ZW_TEST_PYTHON??'python3',[live?'e2e/sftp_v3_peer.py':'e2e/builtin_records_ssh_peer.py','--out',peerOut],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnd=new Promise(r=>peer.once('close',r));
+const peer=spawn(process.env.ZW_TEST_PYTHON??'python3',['-I',live?'e2e/sftp_v3_peer.py':'e2e/builtin_records_ssh_peer.py','--out',peerOut],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnd=new Promise(r=>peer.once('close',r));
 let app:any,appEnd:Promise<any>;const report:any={checks:[],isolated:iso,live_transfers:live,foreground,binary,sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),samples:[]};
 const shown=(n:any)=>n?.rect?.w>0&&n.rect.h>0&&n.visible!==false&&n.hidden!==true&&(n.effective_opacity??1)>0;
 const flat=(n:any):any[]=>n?[n,...(n.children??[]).flatMap(flat)]:[];
@@ -35,7 +36,7 @@ try{
  if(ready.known_host)await writeFile(join(data,'known_hosts'),ready.known_host);
  await writeFile(join(data,'config.toml'),'[ui]\ntheme="dark"\n[transfer]\ndedicated_connection=true\nwindow_chunks=1\nchunk_kb=32\nmax_tasks=1\nresume=true\nverify_md5=false\n');
  app=spawn(binary,[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_BACKGROUND:foreground?'0':'1',ZENIT_E2E_REAL_ACTIVATION:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',log.fd,log.fd]});appEnd=new Promise(r=>app.once('close',r));report.pid=app.pid;
- await waitForServerReady();await resizeWindow(1440,900);const host=await visible('sidebar.host');await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2);await click('sidebar.host.connect');
+ await waitForServerReady();await resizeWindow(1440,900);const host=await visible('sidebar.host');await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2);await click('sidebar.host.connect_button');
  await waitFor(async()=>{
   assert(app.exitCode===null&&app.signalCode===null,'SFTP connection progress must not crash');
   if((await query(live?'files.workspace':'terminal.surface')).some(shown))return true;
@@ -47,41 +48,29 @@ try{
  },30000);
  await hidden('connection.progress');report.checks.push('Real SFTP connects through production progress/authentication UI without crashing');
  if(live){
-  const edit=flat(await visible('files.local')).find(n=>n.test_id==='files.path.edit'&&shown(n));assert(edit);await clickAt(edit.rect.x+edit.rect.w/2,edit.rect.y+edit.rect.h/2);
+  const edit=flat(await visible('files.local')).find(n=>n.test_id==='files.path.edit'&&shown(n));assert(edit);await clickAt(edit.rect.x+edit.rect.w-8,edit.rect.y+edit.rect.h/2); // the free end of the path bar (a crumb would navigate)
   const field=flat(await visible('files.local')).find(n=>n.test_id==='files.path'&&shown(n));assert(field);await clickAt(field.rect.x+10,field.rect.y+field.rect.h/2);await key('a',{cmd:true});await type_(iso);await key('return');
  }
 
  await hidden('toolbar.transfers.badge');
- if(live){await enqueue('first.bin');await enqueue('second.bin');if(!foreground)await expectBadge(2)}
- const ticker=await visible('status.transfer');await mouseMove(ticker.rect.x+ticker.rect.w/2,ticker.rect.y+ticker.rect.h/2);await sleep(650);
- await hidden('transfer.manager');assert.equal((await query('transfer.session')).length,0);report.checks.push('Hover keeps lists closed; old bottom popover is absent');
- if(live){
-  const changes:any[]=[];for(let i=0;i<24;i++){
-   const ids=['status.transfer.name','status.transfer.percent','status.transfer.speed','status.transfer.counts'];const values=Object.fromEntries(await Promise.all(ids.map(async id=>[id,text((await query(id)).find(shown))])));
-   const sample={at:Date.now(),name:values[ids[0]],percent:values[ids[1]],speed:values[ids[2]],count:values[ids[3]],badge:await badgeCount()};report.samples.push(sample);
-   assert.equal(sample.count,'2');assert(['first.bin','second.bin'].includes(sample.name));
-   if(sample.name!==changes.at(-1)?.name)changes.push(sample);
-   await sleep(300);
-  }
-  assert(new Set(changes.map(s=>s.name)).size===2,'Both actual tasks rotate');
-  const intervals=changes.slice(2).map((s,i)=>s.at-changes[i+1].at);assert(intervals.length>0);for(const interval of intervals)assert(interval>=2300&&interval<=3800,'Three-second rotation cadence: '+interval);report.rotation_intervals_ms=intervals;
-  assert(report.samples.some(s=>/[1-9]/.test(s.percent)),'Real upload progress is visible');
-  assert(report.samples.some(s=>/[1-9].*[KM]?i?B\/s/.test(s.speed)),'Real upload speed is visible');
-  if(foreground){await expectBadge(0);report.native_activation=await request('GET','/zerowork/menu-bar');assert.equal(report.native_activation.foreground,true,'Native app actually gained foreground');report.checks.push('Foreground ticker shows both actual tasks and clears their badges without opening any list')}
-  else {await expectBadge(2);report.checks.push('Background rotation leaves both unseen tasks badged until the list is viewed')}
-  report.checks.push('Two real transfers rotate at three-second intervals with current progress, speed and task count');
- }
+ // Workspace chrome (UI revamp): the old bottom status-bar ticker (status.transfer) is mounted but not shown; the
+ // top-right toolbar button (toolbar.transfers, with its unseen-task badge) is the transfer entry point.
+ assert(!(await query('status.transfer')).some(shown),'Bottom ticker is not presented in workspace chrome');report.checks.push('Bottom status ticker is not presented; the toolbar is the entry point');
+ // The file tab's own transfer tray (上传传输) presents both tasks as they start, so they are already seen: no unseen badge.
+ if(live){await enqueue('first.bin');await enqueue('second.bin');await visible('transfer.task');await sleep(1000);await expectBadge(0);report.checks.push('Uploads shown in the file tab tray are seen: no unseen-task badge')}
+ await hidden('transfer.manager');assert.equal((await query('transfer.session')).length,0);report.checks.push('Lists stay closed until opened; old bottom popover is absent');
  await capture('ticker');
- const bottom=await visible('status.transfer');await clickAt(bottom.rect.x+2,bottom.rect.y+bottom.rect.h/2);const fromBottom=await visible('transfer.manager');await expectBadge(0);await capture('bottom-open');
- assert.equal((await query('transfer.manager')).filter(shown).length,1);const toolbar=await visible('toolbar.transfers');assert(fromBottom.rect.y>toolbar.rect.y&&fromBottom.rect.y<toolbar.rect.y+toolbar.rect.h+40,'List anchors below the top-right toolbar');
+ await click('toolbar.transfers');await visible('transfer.manager');await sleep(500);const fromTop=await visible('transfer.manager');await expectBadge(0);await capture('toolbar-open');
+ assert.equal((await query('transfer.manager')).filter(shown).length,1);const toolbar=await visible('toolbar.transfers');assert(fromTop.rect.y>toolbar.rect.y&&fromTop.rect.y<toolbar.rect.y+toolbar.rect.h+40,'List anchors below the top-right toolbar');
+ if(live){const rows=flat(fromTop).filter(n=>n.test_id==='transfer.task'&&shown(n));assert.equal(rows.length,2,'Both actual uploads are listed');report.checks.push('The global list lists both actual uploads')}
  await key('escape');await hidden('transfer.manager');await sleep(1000);await expectBadge(0);
- await click('toolbar.transfers');const fromTop=await visible('transfer.manager');assert.deepEqual(fromTop.rect,fromBottom.rect);await click('toolbar.transfers');await hidden('transfer.manager');
- report.checks.push('Whole bottom control and toolbar open the same top-right global list; Escape and either trigger close it');
+ await click('toolbar.transfers');await visible('transfer.manager');await sleep(500);const again=await visible('transfer.manager');for(const k of ['x','y','w','h'])assert(Math.abs(again.rect[k]-fromTop.rect[k])<=0.5,'Same list frame on reopen: '+k);await click('toolbar.transfers');await hidden('transfer.manager');
+ report.checks.push('Toolbar opens the top-right global list; Escape and the toolbar close it');
  if(live&&!foreground){
-  await enqueue('third.bin',65536);await expectBadge(1);await capture('new-task-badge');await click('toolbar.transfers');await expectBadge(0);await click('transfer.window.close');await hidden('transfer.manager');await sleep(1000);await expectBadge(0);
-  report.checks.push('Viewing via bottom clears badge 2; a subsequent new task restores badge 1; viewing via toolbar clears it again and closing never restores it');
+  await enqueue('third.bin',65536);await sleep(1000);await expectBadge(0);await capture('new-task-tray');await click('toolbar.transfers');await expectBadge(0);await click('transfer.window.close');await hidden('transfer.manager');await sleep(1000);await expectBadge(0);
+  report.checks.push('A subsequent task shown in the tray adds no badge; opening and closing the list never restores one');
  }
- await resizeWindow(860,480);await click('status.transfer');await visible('transfer.manager');await capture('compact');await click('transfer.window.close');await hidden('transfer.manager');report.checks.push('Compact window opens and closes the same populated list');
+ await resizeWindow(860,480);await click('toolbar.transfers');await visible('transfer.manager');await capture('compact');await click('transfer.window.close');await hidden('transfer.manager');report.checks.push('Compact window opens and closes the same populated list');
  if(live){
   const state=await waitFor(async()=>{try{const state=JSON.parse(await readFile(join(peerOut,'state.json'),'utf8'));return [...payloads].every(([name,payload])=>state.files['/fixture/'+name]?.bytes===payload.length&&state.files['/fixture/'+name]?.sha256===createHash('sha256').update(payload).digest('hex'))?state:null}catch{return null}},90000);
   report.files=[...payloads].map(([name,payload])=>({name,bytes:payload.length,sha256:state.files['/fixture/'+name].sha256}));

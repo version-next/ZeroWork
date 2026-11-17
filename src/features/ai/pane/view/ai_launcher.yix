@@ -1,0 +1,44 @@
+//! 每个 tab 的浮动 AI 图标（Pencil XqqLV：tfmv1 / cVXd5 状态矩阵、Db7OS 规则、wqZ1s 位置与拖放）。
+//!
+//! - 原生 `W.GlassButton` 纯图标默认尺寸（48 圆形、图标 24、liquid glass），不覆盖尺寸与材质；状态只经它的
+//!   `glassTint`（待审批的 warning_subtle 着色）、`ink`（warning / accent 图标）、`symbolEffect`（运行中呼吸）、
+//!   `lifted`（拖动中的加深阴影）与 `label`（a11y）表达。悬停提示是原生 `W.Tooltip`。
+//! - 角标是原生 `W.Badge` 的 8 pt 圆点（warning / danger / accent），贴在圆形右上缘（tfmv1：x 36、y 4）；
+//!   待审批脉冲是同色的第二颗圆点（`Ring`，单独一个根，叠在角标正下方），由宿主用 zenit `presets.ping`
+//!   外扩淡出（8 → 16、60% → 0）。
+//! - 位置、显隐、状态全部是宿主经 `ai_launcher_view.zig` 写的信号；拖动经 GlassButton 的 `onDrag`。
+//! - `ai.launcher.state` 是给 e2e 读的状态名（零尺寸、不可见、不参与命中）。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("ai_launcher.yss");
+
+pub const ids = struct {
+    pub const anchor = "ai.launcher.anchor";
+    pub const button = "ai.launcher";
+    pub const dot = "ai.launcher.dot";
+    pub const ring = "ai.launcher.ring";
+    pub const state = "ai.launcher.state";
+};
+
+pub fn Launcher(shown: bool, x: f32, y: f32, label: []const u8, stateName: []const u8, glassTint: ?ui.Color, ink: ?ui.Color, effect: W.glass_bars.SymbolEffect, lifted: bool, dotShown: bool, dotStatus: W.badge.BadgeStatus, onOpen: ?Handler(void) = null, onDrag: ?Handler(W.glass_bars.ButtonDrag) = null) View {
+    return (
+        <box testId={ids.anchor} style={S.anchor.of(.{ .x = x, .y = y })} visible={shown}>
+            <W.Tooltip text={label} position={.top}>
+                <W.GlassButton testId={ids.button} icon={ui.icons.sparkles} label={label} glassTint={glassTint} ink={ink} symbolEffect={effect} lifted={lifted} onClick={onOpen} onDrag={onDrag} />
+            </W.Tooltip>
+            <box style={S.dot} visible={dotShown}>
+                <W.Badge testId={ids.dot} dot={true} status={dotStatus} />
+            </box>
+            <text testId={ids.state} style={S.state}>{stateName}</text>
+        </box>
+    );
+}
+
+/// 待审批脉冲的圆点：与角标同位置、同颜色，静止时透明（宿主把整个根放大淡出）。挂在图标之前，画在它下面。
+pub fn Ring(shown: bool, x: f32, y: f32, dotStatus: W.badge.BadgeStatus) View {
+    return (
+        <box testId={ids.ring} style={S.ring.of(.{ .x = x, .y = y })} visible={shown}>
+            <W.Badge dot={true} status={dotStatus} />
+        </box>
+    );
+}

@@ -76,6 +76,13 @@ pub const Measurements = struct {
     /// breaks.
     sizes: std.AutoHashMapUnmanaged(ItemKey, f32) = .{},
 
+    /// key -> per-row estimate: a height the row is believed to have without being measured in
+    /// this state (`hint`: known from an earlier mount; `demoteAll`: its last measurement before
+    /// the content was known to have changed). Takes precedence over `estimate` / `estimate_fn`
+    /// for that row and is dropped by its next measurement, which is a **first** measurement
+    /// (anchored by the row's top), not a re-measurement.
+    hints: std.AutoHashMapUnmanaged(ItemKey, f32) = .{},
+
     /// index -> prefix sum. length always equals opts.count (realigned on rebuild).
     layout: []Measurement = &.{},
 
@@ -93,6 +100,7 @@ pub const Measurements = struct {
 
     pub fn deinit(self: *Measurements) void {
         self.sizes.deinit(self.allocator);
+        self.hints.deinit(self.allocator);
         if (self.layout.len > 0) self.allocator.free(self.layout);
         self.layout = &.{};
     }
@@ -109,6 +117,7 @@ pub const Measurements = struct {
     }
 
     pub fn estimateOf(self: *const Measurements, index: usize) f32 {
+        if (self.hints.count() != 0) if (self.hints.get(self.keyOf(index))) |hinted| return hinted;
         const raw = if (self.opts.estimate_fn) |f|
             f(index, self.opts.estimate_ctx)
         else
@@ -133,7 +142,40 @@ pub const Measurements = struct {
     /// discard all measurements, revert to pure estimates (use when data source entirely swapped).
     pub fn resetMeasurements(self: *Measurements) void {
         self.sizes.clearRetainingCapacity();
+        self.hints.clearRetainingCapacity();
         self.pending_min = 0;
+    }
+
+    /// Give the unmeasured row at `index` its own estimate (see `hints`). Ignored for a row that
+    /// has a measurement, an out-of-range index, or a height that is not positive and finite.
+    /// Returns whether the row's effective height changed.
+    pub fn hint(self: *Measurements, index: usize, height: f32) bool {
+        if (index >= self.opts.count) return false;
+        if (!std.math.isFinite(height) or height <= 0) return false;
+        const key = self.keyOf(index);
+        if (self.sizes.contains(key)) return false;
+        const old = self.estimateOf(index);
+        self.hints.put(self.allocator, key, height) catch return false;
+        if (@abs(old - height) < 0.01) return false;
+        self.markDirty(index);
+        return true;
+    }
+
+    /// Every measurement becomes that row's estimate (see `hints`): the geometry stays exactly
+    /// as it is, but no row counts as measured any more, so each is measured again -- as a
+    /// first measurement -- the next time it is laid out. For when all rows may have changed
+    /// height at once (the list got a new width, a font setting changed) and the old heights are
+    /// still the best guess.
+    pub fn demoteAll(self: *Measurements) void {
+        var it = self.sizes.iterator();
+        while (it.next()) |entry| {
+            // A row whose estimate cannot be kept falls back to the common estimate: its
+            // height (and every prefix after it) changes, so rebuild.
+            self.hints.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {
+                self.pending_min = 0;
+            };
+        }
+        self.sizes.clearRetainingCapacity();
     }
 
     /// Invalidate the entire prefix sum but **keep measured values**.
@@ -198,6 +240,7 @@ pub const Measurements = struct {
             // re-measure criteria never reached.
             if (is_first_measure) {
                 self.sizes.put(self.allocator, key, measured) catch return .{};
+                _ = self.hints.remove(key);
             }
             return .{};
         }
@@ -212,6 +255,7 @@ pub const Measurements = struct {
             (item_start + old_size <= anchor) and direction != .backward;
 
         self.sizes.put(self.allocator, key, measured) catch return .{};
+        _ = self.hints.remove(key);
         self.markDirty(index);
 
         if (should_adjust) {
@@ -648,4 +692,54 @@ test "measurements: unchanged first measurement is still recorded as measured" {
     m.ensureBuilt();
     _ = m.applyMeasurement(0, 10, 0, .idle);
     try testing.expect(m.hasMeasurement(0));
+}
+
+test "hint: a row's own estimate drives the geometry until it is measured, as a first measurement" {
+    var m = Measurements.init(testing.allocator, .{ .count = 10, .estimate = 30 });
+    defer m.deinit();
+    try testing.expect(m.hint(2, 50));
+    try testing.expect(!m.hint(2, 50));
+    try testing.expect(!m.hint(10, 50));
+    try testing.expect(!m.hint(3, 0));
+    try testing.expectEqual(@as(f32, 50), m.sizeOf(2));
+    try testing.expect(!m.hasMeasurement(2));
+    try testing.expectEqual(@as(f32, 320), m.totalHeight());
+    try testing.expectEqual(@as(f32, 110), m.offsetOf(3));
+    // Measured 70 with the viewport line below the row's top: first-measure rule, compensated by
+    // the difference from the hint (not from the common estimate).
+    const out = m.applyMeasurement(2, 70, 100, .backward);
+    try testing.expect(out.changed);
+    try testing.expectEqual(@as(f32, 20), out.scroll_adjustment);
+    try testing.expect(m.hasMeasurement(2));
+    try testing.expectEqual(@as(usize, 0), m.hints.count());
+    // A measured row takes no hint.
+    try testing.expect(!m.hint(2, 10));
+    try testing.expectEqual(@as(f32, 70), m.sizeOf(2));
+}
+
+test "demoteAll: geometry unchanged, every row measured again as a first measurement" {
+    var m = Measurements.init(testing.allocator, .{ .count = 6, .estimate = 30 });
+    defer m.deinit();
+    _ = m.applyMeasurement(0, 40, 0, .idle);
+    _ = m.applyMeasurement(1, 60, 0, .idle);
+    _ = m.applyMeasurement(2, 80, 0, .idle);
+    m.consumeAdjustment();
+    const total = m.totalHeight();
+    const third = m.offsetOf(3);
+    m.demoteAll();
+    try testing.expectEqual(total, m.totalHeight());
+    try testing.expectEqual(third, m.offsetOf(3));
+    try testing.expect(!m.hasMeasurement(1));
+    try testing.expectEqual(@as(f32, 60), m.sizeOf(1));
+    // Row 1 (40..100) now measures 90 while the reader is at 70, scrolling up: a re-measurement
+    // would not compensate (the row spans the line, direction backward); a first one does.
+    const out = m.applyMeasurement(1, 90, 70, .backward);
+    try testing.expectEqual(@as(f32, 30), out.scroll_adjustment);
+    // Unchanged height: recorded again, nothing moves.
+    m.consumeAdjustment();
+    const same = m.applyMeasurement(2, 80, 0, .idle);
+    try testing.expect(!same.changed);
+    try testing.expect(m.hasMeasurement(2));
+    m.resetMeasurements();
+    try testing.expectEqual(@as(f32, 180), m.totalHeight());
 }

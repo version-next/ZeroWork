@@ -1,0 +1,14 @@
+//! 测试夹具：外观与主题的面板正文（settings_appearance_tests.zig 使用；P3 3e 外观包）。
+//! 不经内容页外壳：夹具的 Controller 不开 drill-down，六个面板全部显示。
+const ui = @import("ui");
+const m = @import("../model/view_model.zig");
+const Frame = @import("../view/window_frame.zig").Frame;
+const Appearance = @import("../view/panes/appearance.yix");
+
+pub fn AppearanceFixture(vm: *m.ViewModel, frame: *Frame) View {
+    return (
+        <col>
+            <Appearance.AppearancePanes vm={vm} frame={frame} />
+        </col>
+    );
+}

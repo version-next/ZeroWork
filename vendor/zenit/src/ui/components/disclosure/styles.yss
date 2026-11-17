@@ -1,0 +1,55 @@
+//! Disclosure styles: a 28-high trigger row (hover / open fill), status inks by tone, and the
+//! content rail (1px border at the left, no card). View in disclosure.yix.
+const ui = @import("../../ui.zig");
+
+style root { width: fill; min-width: 0; height: fit; direction: column; gap: space50; }
+
+/// Trigger: 28 high, 0 6, radius control, 6 apart; hover and open fill with bg-hover.
+recipe Trigger {
+  base {
+    width: fill; min-width: 0; height: 28; direction: row; align-items: center; gap: space150;
+    padding: 0 space150; corner-radius: control; background: transparent; cursor: pointer;
+    transition: background 120ms ease-out;
+    :hover { background: bg-hover; }
+  }
+  flag open { background: bg-hover; }
+  flag disabled { cursor: default; :hover { background: transparent; } }
+}
+
+style chevron { width: 12; height: 12; flex-shrink: 0; icon-color: fg-tertiary; }
+/// A caller's status view (a spinner, a custom glyph) in the 14 status box.
+style status_slot { width: 14; height: 14; flex-shrink: 0; justify: center; align-items: center; }
+
+recipe Status {
+  base { width: 14; height: 14; flex-shrink: 0; }
+  variant tone = neutral {
+    neutral { icon-color: fg-tertiary; }
+    accent { icon-color: accent; }
+    success { icon-color: success; }
+    warning { icon-color: warning; }
+    danger { icon-color: danger; }
+  }
+}
+
+style title { font-size: sm; font-weight: 500; line-height: 1.5; color: fg-secondary; wrap: none; selectable: false; }
+/// Title and trailing keep their width; the detail gives way first.
+style fixed_box { flex-shrink: 0; }
+style detail_box { min-width: 0; flex-shrink: 1; }
+
+/// Count / status after the title; it gives way first when the row is narrow.
+recipe Detail {
+  base { font-size: sm; line-height: 1.5; wrap: none; text-overflow: ellipsis; selectable: false; }
+  variant tone = neutral {
+    neutral { color: fg-tertiary; }
+    accent { color: accent; }
+    success { color: success; }
+    warning { color: warning; }
+    danger { color: danger; }
+  }
+}
+
+style spacer { width: fill; min-width: 0; height: 1; }
+style trailing { font-size: xs; line-height: 1.5; color: fg-tertiary; wrap: none; selectable: false; }
+
+/// Content: hangs on a 1px border-colour rail at the left (2 0 2 12), items 2 apart.
+style rail { width: fill; min-width: 0; height: fit; direction: column; gap: space50; padding: space50 0 space50 space300; border-left-width: 1; border-left-color: border; }

@@ -4,7 +4,7 @@ async function controls() {
   const tree = await request("POST", "/windows/native-input", { action: "uia-tree" });
   assert(tree.ok && Array.isArray(tree.nodes), "external UIA tree query failed");
   for (const node of tree.nodes) assert(node.text_available === node.text_property, "TextPattern/property disagree");
-  return tree.nodes.filter((node: any) => node.framework === "Zenit");
+  return tree.nodes.filter((node: any) => node.framework === "Zenit" && node.role === 50004);
 }
 async function write(name: string, value: string) {
   assert((await request("POST", "/windows/native-input", { action: "uia-set-value", name, value })).ok, "UIA Value write failed");

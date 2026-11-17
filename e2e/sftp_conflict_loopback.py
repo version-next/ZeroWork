@@ -19,11 +19,16 @@ import threading
 import time
 
 import paramiko
+import sys as _sys; from pathlib import Path as _Path; _sys.path.insert(0, str(_Path(__file__).resolve().parent))  # run under `python -I`: siblings in e2e/ only, never the cwd
 from sftp_readonly import Files as ReadOnlyFiles, Handle as ReadOnlyHandle, Server as ReadOnlyServer, State as ReadOnlyState
 
 PAYLOAD = b"ZEROWORK_LOOPBACK_CONFLICT_SOURCE_V1\n" + bytes(range(256)) * 257
 REMOTE = "/fixture/release.txt"
 USER, PASSWORD = "fixture", "conflict-fixture"
+# Served read-only so the app's SFTP-only OS identification has something to read: /etc/os-release is absent
+# (NO_SUCH_FILE), the /usr/lib fallback answers. Never reached by exec: this peer refuses every exec.
+OS_RELEASE_PATH = "/usr/lib/os-release"
+OS_RELEASE = b'NAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\nID_LIKE=debian\n'
 
 
 class State(ReadOnlyState):
@@ -63,11 +68,11 @@ def normalized(path):
 
 def attributes(path):
     path = normalized(path)
-    if path not in ("/", "/fixture", REMOTE):
+    if path not in ("/", "/fixture", REMOTE, OS_RELEASE_PATH):
         return paramiko.SFTP_NO_SUCH_FILE
     value = paramiko.SFTPAttributes()
-    value.st_mode = (stat.S_IFREG | 0o644) if path == REMOTE else (stat.S_IFDIR | 0o755)
-    value.st_size = len(PAYLOAD) if path == REMOTE else 0
+    value.st_mode = (stat.S_IFREG | 0o644) if path in (REMOTE, OS_RELEASE_PATH) else (stat.S_IFDIR | 0o755)
+    value.st_size = len(PAYLOAD) if path == REMOTE else len(OS_RELEASE) if path == OS_RELEASE_PATH else 0
     value.st_mtime = value.st_atime = 1700000000
     return value
 
@@ -78,7 +83,7 @@ class Handle(ReadOnlyHandle):
         self.connection, self.handle = connection, handle
 
     def read(self, offset, length):
-        result = PAYLOAD[offset:offset + length]
+        result = (OS_RELEASE if self.path == OS_RELEASE_PATH else PAYLOAD)[offset:offset + length]
         self.state.record(self.connection, "READ", path=self.path, handle=self.handle, offset=offset, requested=length, returned=len(result))
         return result
 
@@ -125,12 +130,12 @@ class Files(ReadOnlyFiles):
         self.state.record(self.connection, "OPEN", path=path, flags=flags)
         if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_EXCL):
             return self.state.deny(self.connection, "WRITE_OPEN", path=path, flags=flags)
-        if normalized(path) != REMOTE:
+        if normalized(path) not in (REMOTE, OS_RELEASE_PATH):
             return paramiko.SFTP_NO_SUCH_FILE
         with self.state.lock:
             handle = f"{self.connection}:{len(self.state.opens) + 1}"
             self.state.opens.append(handle)
-        return Handle(REMOTE, self.state, self.connection, handle)
+        return Handle(normalized(path), self.state, self.connection, handle)
 
     def remove(self, path):
         return self.state.deny(self.connection, "REMOVE", path=path)
@@ -177,7 +182,8 @@ class Server(ReadOnlyServer):
         return False
 
     def check_channel_exec_request(self, channel, command):
-        self.state.deny(self.connection, "EXEC")
+        # An SFTP-only host never receives exec (OS identification uses SFTP itself); every request is forbidden.
+        self.state.deny(self.connection, "EXEC", command=bytes(command).decode("utf-8", "replace"))
         return False
 
 

@@ -1,0 +1,151 @@
+old_path	new_path	layer	mixed	note
+src/ai_attached_service_tests.zig	src/features/ai/tools/tests/ai_attached_service_tests.zig	tests	no	
+src/ai_attachments_view_tests.zig	src/features/ai/attachments/tests/ai_attachments_view_tests.zig	tests	no	
+src/ai_children_view_tests.zig	src/features/ai/sessions/tests/ai_children_view_tests.zig	tests	no	
+src/ai_close_confirmation_preview_runner.zig	src/features/ai/pane/preview/ai_close_confirmation_preview_runner.zig	preview	no	
+src/ai_close_confirmation_view_tests.zig	src/features/ai/pane/tests/ai_close_confirmation_view_tests.zig	tests	no	
+src/ai_composer_controls_view_tests.zig	src/features/ai/composer/tests/ai_composer_controls_view_tests.zig	tests	no	
+src/ai_composer_input_tests.zig	src/features/ai/composer/tests/ai_composer_input_tests.zig	tests	no	
+src/ai_composer_interaction_view_tests.zig	src/features/ai/composer/tests/ai_composer_interaction_view_tests.zig	tests	no	
+src/ai_conversation_input_view_tests.zig	src/features/ai/pane/tests/ai_conversation_input_view_tests.zig	tests	no	import ai_pending_view(approvals)+ai_sessions_view(sessions)，按会话输入区整体归 pane
+src/ai_conversation_tests.zig	src/features/ai/pane/tests/ai_conversation_tests.zig	tests	no	
+src/ai_empty_recent_preview_runner.zig	src/features/ai/sessions/preview/ai_empty_recent_preview_runner.zig	preview	no	
+src/ai_empty_recent_view_tests.zig	src/features/ai/sessions/tests/ai_empty_recent_view_tests.zig	tests	no	
+src/ai_feedback_view_tests.zig	src/features/ai/pane/tests/ai_feedback_view_tests.zig	tests	no	
+src/ai_file_tool_result_tests.zig	src/features/ai/cards/tests/ai_file_tool_result_tests.zig	tests	no	
+src/ai_float_gestures_tests.zig	src/features/ai/pane/tests/ai_float_gestures_tests.zig	tests	no	
+src/ai_image_attachment_view_tests.zig	src/features/ai/attachments/tests/ai_image_attachment_view_tests.zig	tests	no	
+src/ai_inventory_grant_view_tests.zig	src/features/ai/approvals/tests/ai_inventory_grant_view_tests.zig	tests	no	
+src/ai_local_tools_tests.zig	src/features/ai/tools/tests/ai_local_tools_tests.zig	tests	no	
+src/ai_message_alignment_tests.zig	src/features/ai/pane/tests/ai_message_alignment_tests.zig	tests	no	
+src/ai_panel_visibility_tests.zig	src/features/ai/pane/tests/ai_panel_visibility_tests.zig	tests	no	
+src/ai_recovery_preview_runner.zig	src/features/ai/cards/preview/ai_recovery_preview_runner.zig	preview	no	
+src/ai_recovery_view_tests.zig	src/features/ai/cards/tests/ai_recovery_view_tests.zig	tests	no	
+src/ai_remote_file_snapshot_runner.zig	src/features/ai/attachments/preview/ai_remote_file_snapshot_runner.zig	preview	no	非 UI 的 loopback 验收 runner，仅 import ui/ai_file_tool_result；P6 可能转 acceptance
+src/ai_remote_file_snapshot_tests.zig	src/features/ai/attachments/tests/ai_remote_file_snapshot_tests.zig	tests	no	
+src/ai_remote_picker_view_tests.zig	src/features/ai/attachments/tests/ai_remote_picker_view_tests.zig	tests	no	同时 import challenge_window_host、host_key_confirmation（connections）
+src/ai_ssh_tools_tests.zig	src/features/ai/tools/tests/ai_ssh_tools_tests.zig	tests	no	
+src/ai_tail_follow_tests.zig	src/features/ai/pane/tests/ai_tail_follow_tests.zig	tests	no	
+src/ai_tool_approval_view_tests.zig	src/features/ai/approvals/tests/ai_tool_approval_view_tests.zig	tests	no	
+src/ai_tool_results_view_tests.zig	src/features/ai/cards/tests/ai_tool_results_view_tests.zig	tests	no	
+src/ai_vt_attachment_view_tests.zig	src/features/ai/attachments/tests/ai_vt_attachment_view_tests.zig	tests	no	
+src/composer_interaction_preview_runner.zig	src/features/ai/composer/preview/composer_interaction_preview_runner.zig	preview	no	
+src/execution_result_preview_runner.zig	src/features/ai/cards/preview/execution_result_preview_runner.zig	preview	no	
+src/host_approval_preview_runner.zig	src/features/ai/approvals/preview/host_approval_preview_runner.zig	preview	no	
+src/host_recording_queries_tests.zig	src/features/ai/tools/tests/host_recording_queries_tests.zig	tests	no	import ui/ai_host_recording_queries
+src/host_secret_store_tests.zig	src/features/ai/approvals/tests/host_secret_store_tests.zig	tests	no	import ui/ai_host_secret_controller
+src/host_terminal_queries_tests.zig	src/features/ai/tools/tests/host_terminal_queries_tests.zig	tests	no	import ui/ai_host_terminal_queries
+src/inventory_grant_preview_runner.zig	src/features/ai/approvals/preview/inventory_grant_preview_runner.zig	preview	no	
+src/recording_access_tests.zig	src/features/ai/tools/tests/recording_access_tests.zig	tests	no	import ui/ai_recording_query_access
+src/remaining_ui_tests.zig	src/features/ai/pane/tests/remaining_ui_tests.zig	tests	no	仅测 ai_history_view（虚拟历史行），文件名泛化但内容全属 ai
+src/task_finish_preview_runner.zig	src/features/ai/cards/preview/task_finish_preview_runner.zig	preview	no	
+src/ui/ai_assistant_header.zig	src/features/ai/pane/view/ai_assistant_header.zig	view	no	
+src/ui/ai_assistant_styles.zig	src/features/ai/pane/view/ai_assistant_styles.zig	view	no	
+src/ui/ai_attachments_styles.zig	src/features/ai/attachments/view/ai_attachments_styles.zig	view	no	
+src/ui/ai_attachments_view.zig	src/features/ai/attachments/view/ai_attachments_view.zig	view	no	
+src/ui/ai_brand.zig	src/features/ai/shared/view/ai_brand.zig	view	no	被 core import: src/config/ai_provider_settings.zig（后者归 settings）；ai 与 settings 共用的品牌标记，建议主 agent 评估放 shared/ui
+src/ui/ai_brand_assets.zig	src/features/ai/shared/model/ai_brand_assets.zig	model	no	ai_brand/ai_composer_controls_view 共用；引用 src/ui/assets/ai-brands/*.svg（资源不归本包）
+src/ui/ai_card_scroll.zig	src/features/ai/cards/view/ai_card_scroll.zig	view	no	
+src/ui/ai_child_logo.zig	src/features/ai/sessions/view/ai_child_logo.zig	view	no	
+src/ui/ai_children_styles.zig	src/features/ai/sessions/view/ai_children_styles.zig	view	no	
+src/ui/ai_children_view.zig	src/features/ai/sessions/view/ai_children_view.zig	view	no	
+src/ui/ai_close_confirmation_styles.zig	src/features/ai/pane/view/ai_close_confirmation_styles.zig	view	no	
+src/ui/ai_close_confirmation_view.zig	src/features/ai/pane/view/ai_close_confirmation_view.zig	view	no	
+src/ui/ai_composer_controls_styles.zig	src/features/ai/composer/view/ai_composer_controls_styles.zig	view	no	
+src/ui/ai_composer_controls_view.zig	src/features/ai/composer/view/ai_composer_controls_view.zig	view	no	
+src/ui/ai_composer_interaction_styles.zig	src/features/ai/composer/view/ai_composer_interaction_styles.zig	view	no	
+src/ui/ai_composer_interaction_view.zig	src/features/ai/composer/view/ai_composer_interaction_view.zig	view	no	
+src/ui/ai_composer_keys.zig	src/features/ai/composer/view/ai_composer_keys.zig	view	no	
+src/ui/ai_composer_sizing.zig	src/features/ai/composer/view/ai_composer_sizing.zig	view	no	
+src/ui/ai_disconnect_backend.zig	src/features/ai/tools/host/ai_disconnect_backend.zig	host	no	
+src/ui/ai_empty_styles.zig	src/features/ai/sessions/view/ai_empty_styles.zig	view	no	
+src/ui/ai_empty_view.zig	src/features/ai/sessions/view/ai_empty_view.zig	view	no	
+src/ui/ai_execution_backend.zig	src/features/ai/tools/host/ai_execution_backend.zig	host	no	
+src/ui/ai_execution_backend_tests.zig	src/features/ai/tools/tests/ai_execution_backend_tests.zig	tests	no	src/ui 下的 Zig 测试；import ui
+src/ui/ai_execution_result_styles.zig	src/features/ai/cards/view/ai_execution_result_styles.zig	view	no	
+src/ui/ai_execution_result_view.zig	src/features/ai/cards/view/ai_execution_result_view.zig	view	no	
+src/ui/ai_feedback_view.zig	src/features/ai/pane/view/ai_feedback_view.zig	view	no	
+src/ui/ai_file_tool_result.zig	src/features/ai/cards/model/ai_file_tool_result.zig	model	no	
+src/ui/ai_file_tools.zig	src/features/ai/tools/host/ai_file_tools.zig	host	no	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_float_gesture_styles.zig	src/features/ai/pane/view/ai_float_gesture_styles.zig	view	no	
+src/ui/ai_float_gestures.zig	src/features/ai/pane/view/ai_float_gestures.zig	view	no	
+src/ui/ai_group_context.zig	src/features/ai/tools/host/ai_group_context.zig	host	no	
+src/ui/ai_group_tools.zig	src/features/ai/tools/host/ai_group_tools.zig	host	no	
+src/ui/ai_history_view.zig	src/features/ai/pane/view/ai_history_view.zig	view	no	
+src/ui/ai_host_approval_route_styles.zig	src/features/ai/approvals/view/ai_host_approval_route_styles.zig	view	no	
+src/ui/ai_host_approval_view.zig	src/features/ai/approvals/view/ai_host_approval_view.zig	view	no	
+src/ui/ai_host_catalog_controller.zig	src/features/ai/tools/host/ai_host_catalog_controller.zig	host	no	
+src/ui/ai_host_notice_view.zig	src/features/ai/cards/view/ai_host_notice_view.zig	view	no	
+src/ui/ai_host_queries.zig	src/features/ai/tools/host/ai_host_queries.zig	host	no	含线程/I/O 相关代码
+src/ui/ai_host_recording_queries.zig	src/features/ai/tools/model/ai_host_recording_queries.zig	model	no	
+src/ui/ai_host_secret_controller.zig	src/features/ai/approvals/host/ai_host_secret_controller.zig	host	no	含线程/I/O 相关代码
+src/ui/ai_host_secret_view.zig	src/features/ai/approvals/view/ai_host_secret_view.zig	view	no	
+src/ui/ai_host_terminal_queries.zig	src/features/ai/tools/host/ai_host_terminal_queries.zig	host	no	
+src/ui/ai_image_attachments_styles.zig	src/features/ai/attachments/view/ai_image_attachments_styles.zig	view	no	
+src/ui/ai_image_attachments_view.zig	src/features/ai/attachments/view/ai_image_attachments_view.zig	view	no	
+src/ui/ai_inventory_context.zig	src/features/ai/tools/host/ai_inventory_context.zig	host	no	
+src/ui/ai_inventory_grant_styles.zig	src/features/ai/approvals/view/ai_inventory_grant_styles.zig	view	no	
+src/ui/ai_inventory_grant_view.zig	src/features/ai/approvals/view/ai_inventory_grant_view.zig	view	no	
+src/ui/ai_lifecycle_controller.zig	src/features/ai/tools/host/ai_lifecycle_controller.zig	host	yes	import ui + application_host + 线程；生命周期控制器
+src/ui/ai_local_tools.zig	src/features/ai/tools/host/ai_local_tools.zig	host	no	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_message_view.zig	src/features/ai/pane/view/ai_message_view.zig	view	no	
+src/ui/ai_pane_layout.zig	src/features/ai/pane/view/ai_pane_layout.zig	view	no	
+src/ui/ai_pending_styles.zig	src/features/ai/approvals/view/ai_pending_styles.zig	view	no	
+src/ui/ai_pending_view.zig	src/features/ai/approvals/view/ai_pending_view.zig	view	no	
+src/ui/ai_preview_geometry.zig	src/features/ai/attachments/view/ai_preview_geometry.zig	view	no	
+src/ui/ai_recording_query_access.zig	src/features/ai/tools/host/ai_recording_query_access.zig	host	no	含线程/I/O 相关代码
+src/ui/ai_recovery_styles.zig	src/features/ai/cards/view/ai_recovery_styles.zig	view	no	
+src/ui/ai_recovery_view.zig	src/features/ai/cards/view/ai_recovery_view.zig	view	no	
+src/ui/ai_remote_picker.zig	src/features/ai/attachments/view/ai_remote_picker.zig	view	no	
+src/ui/ai_remote_picker_styles.zig	src/features/ai/attachments/view/ai_remote_picker_styles.zig	view	no	
+src/ui/ai_return_focus.zig	src/features/ai/pane/view/ai_return_focus.zig	view	no	
+src/ui/ai_session_context.zig	src/features/ai/tools/host/ai_session_context.zig	host	no	
+src/ui/ai_session_row.zig	src/features/ai/sessions/view/ai_session_row.zig	view	no	
+src/ui/ai_sessions_styles.zig	src/features/ai/sessions/view/ai_sessions_styles.zig	view	no	
+src/ui/ai_sessions_view.zig	src/features/ai/sessions/view/ai_sessions_view.zig	view	no	
+src/ui/ai_ssh_tools.zig	src/features/ai/tools/host/ai_ssh_tools.zig	host	no	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_step_disclosure.zig	src/features/ai/cards/view/ai_step_disclosure.zig	view	no	
+src/ui/ai_step_group_styles.zig	src/features/ai/cards/view/ai_step_group_styles.zig	view	no	
+src/ui/ai_step_group_view.zig	src/features/ai/cards/view/ai_step_group_view.zig	view	no	
+src/ui/ai_step_view.zig	src/features/ai/cards/view/ai_step_view.zig	view	no	
+src/ui/ai_strip_styles.zig	src/features/ai/cards/view/ai_strip_styles.zig	view	no	
+src/ui/ai_strip_view.zig	src/features/ai/cards/view/ai_strip_view.zig	view	no	
+src/ui/ai_tail_follow.zig	src/features/ai/pane/view/ai_tail_follow.zig	view	no	
+src/ui/ai_task_finish.zig	src/features/ai/cards/view/ai_task_finish.zig	view	yes	view 同时依赖 application_host/lifecycle_supervisor/terminal_execution
+src/ui/ai_task_finish_styles.zig	src/features/ai/cards/view/ai_task_finish_styles.zig	view	no	
+src/ui/ai_text_selection.zig	src/features/ai/pane/view/ai_text_selection.zig	view	no	
+src/ui/ai_timeline_view.zig	src/features/ai/pane/view/ai_timeline_view.zig	view	no	
+src/ui/ai_token_count.zig	src/features/ai/shared/model/ai_token_count.zig	model	no	助手用量与模型上下文标签共用的纯函数
+src/ui/ai_tool_approval_styles.zig	src/features/ai/approvals/view/ai_tool_approval_styles.zig	view	no	
+src/ui/ai_tool_approval_view.zig	src/features/ai/approvals/view/ai_tool_approval_view.zig	view	no	
+src/ui/ai_tool_header_projection.zig	src/features/ai/cards/model/ai_tool_header_projection.zig	model	no	
+src/ui/ai_tool_results_styles.zig	src/features/ai/cards/view/ai_tool_results_styles.zig	view	no	
+src/ui/ai_tool_results_view.zig	src/features/ai/cards/view/ai_tool_results_view.zig	view	no	
+src/ui/ai_tool_titles.zig	src/features/ai/cards/model/ai_tool_titles.zig	model	no	
+src/ui/ai_tools.zig	src/ai/ai_tools.zig	core	yes	被 core import: src/ai/turn_manager.zig（Bridge 类型，§5.2 下沉 ai/）；整文件依赖 ui/application_host、group_model，P1 整体搬，需 P2 拆出 Bridge 类型；另被 main.zig/root.zig/transfer_panel_tests.zig 引用
+src/ui/ai_transcript_images.zig	src/features/ai/attachments/view/ai_transcript_images.zig	view	no	
+src/ui/ai_transcript_images_styles.zig	src/features/ai/attachments/view/ai_transcript_images_styles.zig	view	no	
+src/ui/ai_turn_status_view.zig	src/features/ai/pane/view/ai_turn_status_view.zig	view	no	
+src/ui/ai_verification_view.zig	src/features/ai/cards/view/ai_verification_view.zig	view	no	
+# CONTESTED src/ai_provider_settings_tests.zig settings 测 config/ai_provider_settings（§5.2 归 settings），只 import ui/app_theme，不 import ui/ai_*
+# CONTESTED src/button_policy_tests.zig shared/ui 跨 feature 按钮策略测试，仅 import ui/ai_execution_result_styles（ai 的 action/actionInk）以及 transfer/notification 等多个 styles，建议留给通用包；若按钮样式迁移需同步改 ai 路径
+# CONTESTED src/button_policy_preview_runner.zig shared/ui 同上，import 两个 ai_* 样式 + 多 feature 样式
+# CONTESTED src/ui/assets/ai-brands/ shared/ui 或 ai/shared 13 个品牌 svg + LICENSE + README，仅被 ai_brand_assets 使用，随 ai_brand_assets 去向决定
+# CONTESTED src/ui/ai_brand.zig settings 被 config/ai_provider_settings.zig import；本包暂认领到 features/ai/shared/view（见 note）
+# CONTESTED src/ai_gateway_runner.zig root-core 不 import 任何 ui，属 core 验收 runner，未认领
+# NOTE 未认领：src/ai_*_tests.zig 中不 import src/ui/* 的（ai_child_agent/conversation_commands/extensions/host_catalog/image_attachment/inventory_grant/lifecycle_backend/limits/local_text_attachment/request_budget/session_patch/task_gateway/terminal_selection/terminal_text_attachment/wire_history 等）归 root-core
+# NOTE ai 下 .yss/.yix 与生成孪生：src/ui/ai_* 无此类文件
+# NOTE 被 core import 的文件：ai_tools.zig(src/ai/turn_manager.zig)、ai_brand.zig(src/config/ai_provider_settings.zig)、ai_local_tools/ai_ssh_tools/ai_file_tools.zig(src/plugins/linked_plugins.zig)；command_catalog.zig 不在 ai 认领范围（terminal 包，被 src/ai/session_prompt.zig import）
+# E2E build.zig 引用了 src/ai_close_confirmation_preview_runner.zig
+# E2E build.zig 引用了 src/ai_empty_recent_preview_runner.zig
+# E2E build.zig 引用了 src/ai_recovery_preview_runner.zig
+# E2E build.zig 引用了 src/composer_interaction_preview_runner.zig
+# E2E build.zig 引用了 src/execution_result_preview_runner.zig
+# E2E build.zig 引用了 src/host_approval_preview_runner.zig
+# E2E build.zig 引用了 src/inventory_grant_preview_runner.zig
+# E2E build.zig 引用了 src/task_finish_preview_runner.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/ui/ai_composer_controls_view.zig
+# E2E docs/DESIGN/V0.4_AI_AGENT_CLUSTER.md 引用了 src/ui/ai_lifecycle_controller.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/ui/ai_tools.zig
+# E2E docs/DESIGN/V0.4_AI_AGENT_CLUSTER.md 引用了 src/ui/ai_tools.zig
+# TESTID ai

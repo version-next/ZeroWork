@@ -2,12 +2,16 @@
  * Uses isolated Local PTY, data and loopback provider; executes no commands.
  * ZW_AI_TEST_PREFIX=/tmp/zw-v04-task-build node e2e/ai_task_gateway_native.ts <out>
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {createHash} from 'node:crypto';
 import {mkdir,mkdtemp,writeFile,readFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-v04-task-build'),binary=join(prefix,'bin/zerowork');
 const out=resolve(process.argv[2]??'/tmp/zw-v04-task-gateway-native');await mkdir(out,{recursive:true});
 const iso=await realpath(await mkdtemp('/tmp/zw-task-gateway-')),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');
@@ -16,7 +20,7 @@ const steer=process.argv[3]==='steer';const requests:any[]=[];let childHeld:any=
 const frame=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\n\n';
 const finish=(res:any,text:string)=>res.end(frame({content:text})+'data: '+JSON.stringify({choices:[],usage:{prompt_tokens:17,completion_tokens:3}})+'\n\ndata: [DONE]\n\n');
 const tool=(res:any,id:string,args:any)=>res.end(frame({tool_calls:[{index:0,id,type:'function',function:{name:'host__agent_utasks',arguments:JSON.stringify(args)}}]})+'data: [DONE]\n\n');
-const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"task-gateway"}]}');return}let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});
+const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"task-gateway"}]}');return}const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length){finish(res,'任务协作测试');return}
  requests.push(body);
  const child=JSON.stringify(body.messages).includes('CHILD_MATERIAL_TASK')&&!body.tools.some((t:any)=>t.function?.name==='host__agent_utasks');
@@ -42,9 +46,9 @@ const visible=(id:string)=>h.waitFor(async()=>{assert(alive());return(await h.qu
 const report:any={status:'running',isolation:iso,binary,binary_sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),checks:[],screenshots:[]};
 const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
 const capture=async(name:string)=>{await h.mouseMove(1,1);await h.sleep(200);assert((await h.screenshot(join(out,name+'.png'))).ok);report.screenshots.push(join(out,name+'.png'))};
-const journal=async()=>String(await readFile(join(data,'ai-sessions.jsonl'),'utf8')).trim().split('\n').map(row=>JSON.parse(row));
+const journal=async()=>String(await readFile(join(data,'ai-sessions.v4.jsonl'),'utf8')).trim().split('\n').map(row=>JSON.parse(row));
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await click('ai.prompt');await h.type_('ROOT_FIRST_TASK 委派材料检查并汇总');await click('ai.send');
  await h.waitFor(()=>childHeld||null,20000);
  await h.waitFor(async()=>(await journal()).some(row=>row.event?.task_fact?.status==='waiting_children')||null,20000);

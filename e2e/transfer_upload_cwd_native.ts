@@ -3,6 +3,7 @@
  * Pass --complete-transfers as the fourth argument to verify a writable SFTP round trip.
  * Without it, the fixture checks picker -> queue handoff only.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,readdir,rm} from 'node:fs/promises';
@@ -11,6 +12,7 @@ import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep,scrollAt,mouseDown,mouseMove,mouseUp} from '../zig-out/share/zenit/harness/client.ts';
 const {cleanupOwnedBridgeDirectories}=await import('./native_owned_cleanup.ts');
+const python=process.env.ZW_TEST_PYTHON;assert(python,'ZW_TEST_PYTHON (audited Python with paramiko, run with -I) is required');
 const complete=process.argv[4]==='--complete-transfers';
 const out=resolve(process.argv[2]),source=resolve(process.argv[3]);await mkdir(out,{recursive:false});
 const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-builtin-records-'))),rpc=join(iso,'rpc'),data=join(iso,'data'),shell=join(iso,'shell');await Promise.all([mkdir(rpc),mkdir(data),mkdir(shell)]);
@@ -23,7 +25,7 @@ const fixture=join(out,'upload-fixture');await mkdir(fixture);await writeFile(jo
 await mkdir(join(out,'download-target'));
 const remoteRoot=join(out,'remote-root');
 if(complete){await writeFile(join(fixture,'first.txt'),Buffer.from(Array.from({length:300123},(_,i)=>i%251)));await writeFile(join(fixture,'second.txt'),'第二个上传文件\n'.repeat(8192))}
-const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');const peer=spawn('python3',['e2e/builtin_records_ssh_peer.py','--out',peerOut,...(complete?['--sftp-root',remoteRoot]:[])],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
+const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');const peer=spawn(python,['-I','e2e/builtin_records_ssh_peer.py','--out',peerOut,...(complete?['--sftp-root',remoteRoot]:[])],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
 const ready=await waitFor(async()=>{try{return JSON.parse(await readFile(join(peerOut,'ready.json'),'utf8'))}catch{return null}},15000);
 await writeFile(join(data,'known_hosts'),ready.known_host);
 await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Owned records SSH"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`);
@@ -43,7 +45,9 @@ async function outputs(){return (await query('terminal.command.output')).filter(
 async function records(){return (await query('terminal.command.record')).filter(shown).map(content)}
 try{
  await waitForServerReady();await resizeWindow(1200,800);
- const host=await vis('sidebar.host');assert((await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2,2)).ok);
+ // design-r3 A2: a row click only selects (double-click no longer connects, sidebar_view.zig onEvent); the selected row's
+ // native “连接” (sidebar.host.connect_button) connects.
+ const host=await vis('sidebar.host');assert((await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2)).ok);await click('sidebar.host.connect_button');
  await waitFor(async()=>content(await vis('workspace.pane')).includes('sshrecords')||null,30000);
  await sleep(600);await type('cd '+(complete?remoteRoot:'/tmp'));await press('return');await sleep(400);
  async function drive(stage:string,cmd:string){

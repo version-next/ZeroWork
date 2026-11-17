@@ -15,6 +15,7 @@
 const animation_mod = @import("animation/mod.zig");
 const physics_mod = @import("physics.zig");
 const snapshot_transition_mod = @import("snapshot_transition.zig");
+const anchor_transition_mod = @import("anchor_transition.zig");
 const timeline_profiler_mod = @import("timeline_profiler.zig");
 
 // Tests in const-referenced files aren't collected (orphan test scanner caught
@@ -22,6 +23,7 @@ const timeline_profiler_mod = @import("timeline_profiler.zig");
 test {
     _ = router_mod;
     _ = snapshot_transition_mod;
+    _ = anchor_transition_mod;
     _ = timeline_profiler_mod;
 }
 const router_mod = @import("router.zig");
@@ -30,6 +32,7 @@ const router_mod = @import("router.zig");
 pub const animation = animation_mod;
 pub const physics = physics_mod;
 pub const snapshot_transition = snapshot_transition_mod;
+pub const anchor_transition = anchor_transition_mod;
 pub const timeline_profiler = timeline_profiler_mod;
 pub const router = router_mod;
 
@@ -52,6 +55,10 @@ pub const FadeIndicator = physics_mod.FadeIndicator;
 // -- View transitions (snapshot-based view transitions) --
 pub const Transition = snapshot_transition_mod.Transition;
 pub const SnapshotTransition = snapshot_transition_mod.SnapshotTransition;
+
+// -- Anchor transitions (collapse into / expand from an anchor; docs/ANCHOR_TRANSITION.md) --
+pub const AnchorTransition = anchor_transition_mod.AnchorTransition;
+pub const AnchorMotionTokens = anchor_transition_mod.Tokens;
 
 // -- Timeline analysis --
 pub const TimelineProfiler = timeline_profiler_mod.TimelineProfiler;

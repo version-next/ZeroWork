@@ -1,11 +1,15 @@
 /** Live read-only Feishu acceptance through ZeroWork MCP -> CLI adapter.
  * Requires existing lark-cli user login. Does not export credentials or change
  * cloud documents. ZW_LARK_TEST_DOC_FILE selects an existing authorized doc. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,writeFile,readFile,open,realpath} from 'node:fs/promises';
+import {homedir} from 'node:os';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-standard-mcp-build');
 const out=resolve(process.argv[2]??'/tmp/zw-live-lark-mcp');await mkdir(out,{recursive:true,mode:0o700});
 const doc=(await readFile(process.env.ZW_LARK_TEST_DOC_FILE??'/tmp/zw-lark-mcp-doc.txt','utf8')).trim();
@@ -16,7 +20,7 @@ let round=0,serverId='',identityRef='',outlineRef='',searchRef='',error:string|n
 const report:any={status:'running',identity:null,document_read:false,search_missing_scope:false,approvals:0,screenshots:[],isolation:iso};
 const deep=(value:any,test:(o:any)=>boolean):any=>{if(value&&typeof value==='object'){if(test(value))return value;for(const v of Object.values(value)){const found=deep(v,test);if(found)return found}}else if(typeof value==='string'&&value.trimStart().startsWith('{')){try{return deep(JSON.parse(value),test)}catch{}}return null};
 const frame=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\n\n';
-const provider=createServer(async(req,res)=>{try{if(req.method!=='POST'){res.end('{"data":[{"id":"live-lark"}]}');return}let raw='';for await(const p of req)raw+=p;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});if(!body.tools?.length){res.end(frame({content:'Live Lark'})+'data: [DONE]\n\n');return}round++;
+const provider=createServer(async(req,res)=>{try{if(req.method!=='POST'){res.end('{"data":[{"id":"live-lark"}]}');return}const body=await readRequestJson(req);res.writeHead(200,{'content-type':'text/event-stream'});if(!body.tools?.length){res.end(frame({content:'Live Lark'})+'data: [DONE]\n\n');return}round++;
  const tool=(name:string,args:any)=>res.end(frame({tool_calls:[{index:0,id:'live-lark-'+round,type:'function',function:{name,arguments:JSON.stringify(args)}}]})+'data: [DONE]\n\n');
  const finish=(message:string)=>res.end(frame({content:message})+'data: [DONE]\n\n');
  const last=()=>{const item=body.messages.filter((m:any)=>m.role==='tool').at(-1);assert(item);return JSON.parse(item.content)};
@@ -39,8 +43,8 @@ const fill=async(id:string,value:string)=>{await click(id,true);await h.key('a',
 const capture=async(name:string)=>{await h.mouseMove(1,1);await h.sleep(120);assert((await h.screenshot(join(out,name+'.png'))).ok);report.screenshots.push(join(out,name+'.png'))};
 try{
  await h.waitForServerReady(60000);await h.resizeWindow(1280,900);await click('toolbar.settings');await click('settings.nav.ai');await click('settings.ai.mcp.header',true);await h.sleep(180);await click('settings.mcp.add',true);
- await fill('settings.mcp.field.name','飞书 CLI · 只读验收');await fill('settings.mcp.field.program','/usr/bin/python3');await fill('settings.mcp.field.arguments',resolve('e2e/fixtures/lark_cli_mcp.py'));await fill('settings.mcp.field.environment',`LARK_CLI=${process.env.LARK_CLI??'/Users/iskylite/.local/bin/lark-cli'}\nHOME=${process.env.HOME}\nPATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\nZW_MCP_TRACE=${trace}`);await fill('settings.mcp.field.bindings','lark_identity\nlark_document_outline\nlark_drive_search');await click('settings.mcp.apply',true);await click('settings.mcp.0.test',true);await h.waitFor(async()=>text(await h.query('settings.extensions.detail')).includes('lark_document_outline')||null,20000);await capture('01-live-lark-catalog');
- await click('settings.mcp.0.toggle',true);await click('settings.save');await h.waitFor(async()=>{const content=await readFile(join(data,'config.toml'),'utf8');return content.includes('extensions =')?content:null},15000);const saved=await readFile(join(data,'config.toml'),'utf8');const ext=JSON.parse(JSON.parse(/^extensions = (.+)$/m.exec(saved)![1]));serverId=ext.servers[0].id;await click('settings.close');await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.prompt');await h.type_('验证飞书用户身份、读取现有文档目录，并检查搜索权限错误。');await click('ai.send');
+ await fill('settings.mcp.field.name','飞书 CLI · 只读验收');await fill('settings.mcp.field.program','/usr/bin/python3');await fill('settings.mcp.field.arguments',resolve('e2e/fixtures/lark_cli_mcp.py'));await fill('settings.mcp.field.environment',`LARK_CLI=${process.env.LARK_CLI??join(homedir(),'.local/bin/lark-cli')}\nHOME=${process.env.HOME}\nPATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\nZW_MCP_TRACE=${trace}`);await fill('settings.mcp.field.bindings','lark_identity\nlark_document_outline\nlark_drive_search');await click('settings.mcp.apply',true);await click('settings.mcp.0.test',true);await h.waitFor(async()=>text(await h.query('settings.extensions.detail')).includes('lark_document_outline')||null,20000);await capture('01-live-lark-catalog');
+ await click('settings.mcp.0.toggle',true);await click('settings.save');await h.waitFor(async()=>{const content=await readFile(join(data,'config.toml'),'utf8');return content.includes('extensions =')?content:null},15000);const saved=await readFile(join(data,'config.toml'),'utf8');const ext=JSON.parse(JSON.parse(/^extensions = (.+)$/m.exec(saved)![1]));serverId=ext.servers[0].id;await click('settings.close');await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.prompt');await h.type_('验证飞书用户身份、读取现有文档目录，并检查搜索权限错误。');await click('ai.send');
  await h.waitFor(async()=>{if(error)throw Error(error);if(text(await h.query('ai.panel')).includes('LIVE_LARK_MCP_PASSED'))return true;for(const id of ['ai.interaction.approve','ai.host_approval.accept'])if((await h.query(id)).some(shown)){report.approvals++;assert((await h.clickTestId(id)).ok)}return null},90000);
  await capture('02-live-lark-completed');const lines=(await readFile(trace,'utf8')).trim().split('\n').map(s=>JSON.parse(s));report.tool_calls=lines.filter(x=>x.method==='tools/call').map(x=>x.tool);assert.deepEqual(report.tool_calls,['lark_identity','lark_document_outline','lark_drive_search']);assert(report.approvals>=4);report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);process.exitCode=1;await capture('failure').catch(()=>{})}

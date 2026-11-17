@@ -65,15 +65,18 @@ try:
  if raw['dch1']:
   clear();at(2);emit('ABCDE');at(2,2);emit(cap('dch1'));emit(cap('ich',1));emit('X');at(3);emit('123456');at(3,2);emit(cap('ech',2));at(4);emit(cap('smir'));emit('INSERT');emit(cap('rmir'))
   at(6);emit('LINE_A');at(7);emit('LINE_B');at(6);emit(cap('il1'));emit('NEW');at(7);emit(cap('dl1'))
-  at(9);emit('A');emit(cap('hpa',8));emit('HPA');emit(cap('vpa',10));emit('VPA');at(11);emit('T');emit(cap('ht'));emit('TAB');emit(cap('cbt'));emit('X');at(12);emit('R');emit(cap('rep',ord('Z'),4))
+  at(9);emit('A');emit(cap('hpa',8));emit('HPA');emit(cap('vpa',10));emit('VPA');at(11);emit('T');emit(cap('ht'));emit('TAB');emit(cap('cbt'));emit('X');at(12);emit('R')
+  if raw['rep']:emit(cap('rep',ord('Z'),4))
   at(14);emit('ABCDE');at(14,2);emit(cap('dch',2));at(16);emit('OLD');at(17);emit('NEXT');at(16);emit(cap('il',1));emit('NEW');at(17);emit(cap('dl',1))
   at(19);emit('SCROLL_UP');at(20);emit('SCROLL_DOWN');emit(cap('csr',19,21));at(21);emit(cap('indn',1));emit(cap('rin',1));emit(cap('csr',0,os.get_terminal_size().lines-1))
-  at(23);emit('EDIT_DONE');editing('extended',{'2':'ABXDE','3':'12  56','4':'INSERT','6':'NEW','7':'LINE_B','9':'A       HPA','10':'           VPA','11':'T       XAB','12':'RZZZZ','14':'ABE','16':'NEW','17':'NEXT','19':'','20':'SCROLL_DOWN'})
+  at(23);emit('EDIT_DONE');editing('extended',{'2':'ABXDE','3':'12  56','4':'INSERT','6':'NEW','7':'LINE_B','9':'A       HPA','10':'           VPA','11':'T       XAB','12':'RZZZZ' if raw['rep'] else 'R','14':'ABE','16':'NEW','17':'NEXT','19':'','20':'SCROLL_DOWN'})
   clear();emit('PRIMARY_RESTORED');emit(cap('smcup'));emit(cap('clear'));emit('ALTERNATE_ACTIVE');stage('alternate');wait('alternate');emit(cap('rmcup'));stage('primary');wait('primary');report['checks'].append('advertised-alternate-screen')
  clear();emit(cap('home'));at(4,9);emit('\x1b[6n');v=read_until(lambda b:b.endswith(b'R'));assert v==b'\x1b[5;10R',v
  emit('\x1b[c');v=read_until(lambda b:b.endswith(b'c'));assert v.startswith(b'\x1b[?'),v;report['checks'].append('DSR-primary-DA')
  if raw['initc']:
-  emit(cap('initc',20,1000,0,0));emit('\x1b]4;20;?\x07');v=read_until(lambda b:b.endswith(b'\x1b\\') or b.endswith(b'\x07'));assert b'rgb:ffff/0000/0000'in v.lower(),v;emit(cap('oc'));report['checks'].append('advertised-palette-change-query-reset')
+  emit(cap('initc',20,1000,0,0));emit('\x1b]4;20;?\x07');v=read_until(lambda b:b.endswith(b'\x1b\\') or b.endswith(b'\x07'));assert b'rgb:ffff/0000/0000'in v.lower(),v
+  report['checks'].append('advertised-palette-change-query')
+ if raw['oc']:emit(cap('oc'));report['checks'].append('advertised-palette-reset')
  if raw['op']:emit(cap('op'))
  for n in ['civis','cnorm','cvvis']:
   if raw[n]:emit(cap(n));stage('cursor-'+n);wait('cursor-'+n)
@@ -81,8 +84,18 @@ try:
  for name,n in [('up','kcuu1'),('down','kcud1'),('left','kcub1'),('right','kcuf1')]:exact('key-'+name+'-application',cap('smkx'),cap(n))
  for name,n in [('home','khome'),('end','kend'),('delete','kdch1'),('insert','kich1'),('pageup','kpp'),('pagedown','knp'),('backtab','kcbt')]:
   if raw[n]:exact('key-'+name,b'',cap(n))
+ # A fullscreen program receives F2. At an ordinary shell prompt ZeroWork
+ # assigns it to tab rename. VT100 has no terminfo alternate-screen entry;
+ # explicitly exercise the emulator's private extension in that profile.
+ if raw['smcup']:
+  emit(cap('smcup'))
+ else:
+  report['extensions'].append('alternate-screen application routing')
+  emit('\x1b[?1049h')
+ emit('FUNCTION_KEYS_READY');stage('function-keys');wait('function-keys')
  for i in range(1,64):
   if raw['kf'+str(i)]:exact('key-f'+str(i),b'',cap('kf'+str(i)))
+ emit(cap('rmcup') if raw['rmcup'] else '\x1b[?1049l')
  for name,n in [('delete','kDC'),('end','kEND'),('home','kHOM'),('insert','kIC'),('left','kLFT'),('pagedown','kNXT'),('pageup','kPRV'),('right','kRIT'),('down','kind'),('up','kri')]:
   if raw[n]:exact('key-shift-'+name,b'',cap(n))
  exact('key-backspace-bs','\x1b[?67h',cap('kbs'));exact('key-backspace-del','\x1b[?67l',b'\x7f')

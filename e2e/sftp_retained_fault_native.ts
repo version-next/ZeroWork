@@ -2,13 +2,14 @@
  * (paused by default, during READ with --active-fin 1) -> attempt 3 MD5.
  * Invoke only through sftp_retained_fault_loopback.py; no VM or remote mutation.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, cp, mkdir, mkdtemp, open, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep, mouseMove } from "../zig-out/share/zenit/harness/client.ts";
 
 const options: Record<string, string> = {}, args = process.argv.slice(2);
 for (let i = 0; i < args.length; i += 2) {
@@ -105,7 +106,7 @@ async function traces(): Promise<any[]> {
   });
 }
 async function capture(name: string): Promise<void> {
-  const ids = ["tabs.strip", "files.presentation", "transfer.confirmation.overlay", "transfer.confirmation", "transfer.manager", "auth.challenge.modal", "connection.progress", "workspace.pane"];
+  const ids = ["tabs.strip", "plugin.challenge.modal", "session.close.confirm", "files.presentation", "transfer.confirmation.overlay", "transfer.confirmation", "transfer.manager", "auth.challenge.modal", "connection.progress", "workspace.pane"];
   const current = Object.fromEntries(await Promise.all(ids.map(async id => {
     const value = await query(id);
     assert(Array.isArray(value), `Scoped ${id} query failed: ${JSON.stringify(value)}`);
@@ -120,6 +121,51 @@ async function authenticateUntil(phase: "original" | "retained_before_fault" | "
   const deadline = Date.now() + timeout;
   let decisions = 0;
   while (Date.now() < deadline) {
+    // Host-key trust and password now come from the plugin challenge presenter (plugin.challenge.*); the legacy
+    // auth.challenge.* branches below stay for builds that still show that modal.
+    const pluginModal = (await query("plugin.challenge.modal")).find(n => shown(n) && (n.effective_opacity ?? 1) >= 0.999);
+    const pluginTitle = pluginModal && byId(pluginModal, "plugin.challenge.title")[0];
+    if (pluginModal && pluginTitle) {
+      const part = (id: string) => byId(pluginModal, id)[0];
+      const endpoint = text(part("plugin.challenge.source")), title = text(pluginTitle);
+      assert(endpoint.includes(peer.host) && endpoint.includes(peer.user), `Only this run's own peer: ${endpoint}`);
+      assert(++decisions <= 10, "Bound all original-identity authentication decisions");
+      if (title === "核对主机密钥") {
+        const fingerprint = text(part("plugin.challenge.material"));
+        assert(fingerprint.includes(peer.fingerprint), "Trust only this run's actual ephemeral peer key");
+        await capture(`${phase}-trust-${decisions}`);
+        const button = await stableNode(async () => {
+          const fresh = (await query("plugin.challenge.modal")).find(n => n.id === pluginModal.id && shown(n));
+          const choice = fresh && byId(fresh, "plugin.challenge.choice.0").find(n => n.focusable);
+          return choice && text(choice).includes("仅本次信任") ? choice : undefined;
+        });
+        if (button) {
+          await clickNode(button, `${phase}: trust this exact loopback challenge once`);
+          report.authentication.push({ phase, kind: "trust_once", endpoint, fingerprint, modal_id: pluginModal.id, at: new Date().toISOString() });
+        }
+      } else if (title === "SSH 密码认证") {
+        assert(!/替换已保存|输入小写 yes/.test(text(pluginModal)), "Changed-key replacement is never authorized");
+        await capture(`${phase}-password-${decisions}`);
+        const answer = await stableNode(async () => {
+          const fresh = (await query("plugin.challenge.modal")).find(n => n.id === pluginModal.id && shown(n));
+          return fresh && (byId(fresh, "plugin.challenge.answer.0")[0] ?? byId(fresh, "plugin.challenge.secret")[0]);
+        });
+        if (answer) {
+          await clickNode(answer, `${phase}: answer original password request`);
+          assert((await key("a", { cmd: true })).ok);
+          assert((await type_(peer.password)).ok);
+          const submit = await stableNode(async () => {
+            const current = (await query("plugin.challenge.modal")).find(n => n.id === pluginModal.id && shown(n));
+            return current && byId(current, "plugin.challenge.submit").find(n => n.focusable);
+          });
+          assert(submit, "The same visible challenge owns its submit");
+          await clickNode(submit, `${phase}: submit exact challenge`);
+          report.authentication.push({ phase, kind: "password", modal_id: pluginModal.id, at: new Date().toISOString() });
+        }
+      } else throw new Error(`Unexpected owned-peer authentication challenge: ${title}`);
+      await sleep(80);
+      continue;
+    }
     const modal = (await query("auth.challenge.modal")).find(n => shown(n) && (n.effective_opacity ?? 1) >= 0.999);
     const inside = (id: string) => modal ? byId(modal, id)[0] : undefined;
     if (modal && inside("auth.challenge.trust_once")?.focusable) {
@@ -186,20 +232,19 @@ async function taskGroup(): Promise<any> {
   assert(group, "The real Manager tree contains the original row's direct parent");
   return group;
 }
-async function expandTask(attempt = 1): Promise<any> {
-  const original = report.original_job, expected = `任务 #${original.enqueue.job} · 尝试 ${attempt} · 会话 #${original.attached.owner.session_id}`;
-  const current = await taskGroup(); assert(current);
-  const detailAlreadyOpen = nodes(current).some(value => typeof value.text === "string" && value.text.startsWith(`任务 #${original.enqueue.job} · 尝试 `));
-  if (!detailAlreadyOpen) {
-    await clickNode(await stableNode(async () => {
-      const group = await taskGroup();
-      return group && byId(group, "transfer.task.expand")[0];
-    }), "Inspect the original task identity");
-  }
-  return waitFor(async () => {
-    const current = await taskGroup();
-    return current && nodes(current).some(value => value.text === expected) ? current : null;
+/** The Manager row has no expand: the job identity (任务 #N · 会话 #M) and its attempts live in the row's 事件
+ * dialog. Opens it, waits for `· 尝试 <attempt>`, closes it again and returns the row plus the journal text. */
+async function expandTask(attempt = 1): Promise<{ row: any; events: string }> {
+  const original = report.original_job, identity = `任务 #${original.enqueue.job} · 会话 #${original.attached.owner.session_id}`;
+  await clickNode(await stableNode(async () => { const row = await task(); return row && byId(row, "transfer.task.events")[0]; }), "Inspect the original task identity in its event journal");
+  const events = await waitFor(async () => {
+    const entries = (await query("transfer.events.entries")).find(shown), value = entries ? text(entries) : "";
+    return value.includes(identity) && value.includes(`· 尝试 ${attempt}`) ? value : null;
   }, 10000);
+  await click("transfer.events.dismiss");
+  await waitFor(async () => !(await query("transfer.events.dialog")).some(shown) || null, 10000);
+  await sleep(350);
+  return { row: await task(), events };
 }
 async function originalLocalOnly(localTab: string): Promise<boolean> {
   const current = await tabs();
@@ -222,43 +267,38 @@ try {
   const originalTabs = await tabs(); assert.equal(originalTabs.length, 1);
   const localTab = originalTabs[0].test_id;
   report.original_local_tab = localTab;
-  await click("sidebar.host"); await authenticateUntil("original", async () => (await query("files.workspace")).some(shown));
+  // design-r3 A2: a row click only selects; the selected row's native “连接” button connects.
+  await click("sidebar.host"); await click("sidebar.host.connect_button"); await authenticateUntil("original", async () => (await query("files.workspace")).some(shown));
   const openedTabs = await tabs(); assert.equal(openedTabs.length, 2);
   const fileTab = openedTabs.find(value => value.test_id !== localTab).test_id;
   report.original_file_tab = fileTab;
   const attached = await waitFor(async () => (await traces()).find(value => value.trace_prefix === "SFTP_WORKSPACE_TRACE" && value.event === "attached" && Number(value.tab_id) === Number(fileTab.split(".").at(-1))) ?? null, 10000);
   assert.equal(attached.plugin, "sftp"); assert.equal(attached.terminal_present, false); assert.equal(attached.runtime_present, false);
   const originalOwner = attached.owner;
-  const local = await visible("files.local"), path = byId(local, "files.path")[0];
-  await clickNode(path, "Navigate only the local file-service pane to the owned download directory");
+  // The local card shows a breadcrumb; files.path.edit swaps in the native path Input (files.path).
+  // Click the free end of the path bar: a crumb itself navigates instead of starting the edit.
+  { const edit = byId(await visible("files.local"), "files.path.edit")[0]; assert(edit, "files.path.edit"); assert((await clickAt(edit.rect.x + edit.rect.w - 8, edit.rect.y + edit.rect.h / 2)).ok); }
+  // Focus the native path Input itself before typing (the edit swap can land a frame later).
+  await clickNode(await visible("files.path"), "Focus the local path Input"); await sleep(120);
   assert((await key("a", { cmd: true })).ok); assert((await type_(localDirectory)).ok); assert((await key("return")).ok);
   const canonicalLocal = await realpath(localDirectory);
-  await waitFor(async () => text(byId(await visible("files.local"), "files.path")[0]) === canonicalLocal || null, 20000);
+  await waitFor(async () => byId(await visible("files.local"), "files.breadcrumb").map(n => nodes(n).map(v => v.text ?? "").filter(Boolean).join("/")).some(v => "/" + v === canonicalLocal) || null, 20000);
   const row = await waitFor(async () => byId(await visible("files.remote"), "files.row").find(value => byId(value, "files.row.name").some(name => name.text === basename(peer.source))) ?? null, 20000);
   assert(row);
   await capture("00-original-real-file-workspace");
   await clickNode(await stableNode(async () => byId(await visible("files.remote"), "files.row").find(value => byId(value, "files.row.name").some(name => name.text === basename(peer.source)))), "Select the immutable remote source");
   await waitFor(async () => /已选 1 项/.test(text(await visible("files.remote"))) || null, 10000);
   await clickNode(byId(await visible("files.remote"), "files.transfer")[0], "Download with the frozen original owner");
-  let confirm = await visible("transfer.confirmation");
-  assert(text(confirm).includes(fixtureName) && text(confirm).includes(`#${originalOwner.session_id}`));
-  assert(text(confirm).includes(peer.source) && text(confirm).includes(peer.host));
-  assert(text(byId(confirm, "transfer.local_directory")[0]).includes(canonicalLocal));
-  assert(text(confirm).includes("断点续传 · 开"), "Enable checkpoint retention through the actual default option");
-  // Preserve the full original modal subtree before interacting: a positive
-  // node rect alone does not prove its clipping ancestors expose the button.
+  // Native “下载文件” Modal (files.copy.*): 断点续传 on by default, MD5 through its Checkbox (or the saved
+  // default); the enqueue trace below proves both options reached the job.
+  const confirm = await visible("files.copy.confirmation");
+  assert(text(confirm).includes("下载文件") && text(confirm).includes(`#${originalOwner.session_id}`));
+  assert(text(byId(confirm, "files.copy.target")[0]).includes(canonicalLocal));
   await capture("00b-before-md5-confirmation-click");
-  confirm = await visible("transfer.confirmation");
-  if (savedMd5) {
-    assert(text(confirm).includes("MD5 校验 · 开"), "Saved MD5 default must reach the actual main confirmation without a toggle");
-    report.saved_md5_default_verified = true;
-  } else {
-    const md5 = nodes(confirm).find(value => value.component === "Button" && text(value) === "MD5 校验 · 关");
-    assert(md5); await clickNode(md5, "Enable actual MD5 verification");
-  }
-  confirm = await waitFor(async () => { const current = await visible("transfer.confirmation"); return text(current).includes("MD5 校验 · 开") ? current : null; }, 10000);
+  if (savedMd5) report.saved_md5_default_verified = true;
+  else await clickNode(byId(confirm, "files.copy.md5")[0], "Enable actual MD5 verification");
   await capture("01-original-owner-md5-confirmation");
-  await click("transfer.confirmation.submit");
+  await click("files.copy.submit");
   const enqueue = await waitFor(async () => (await traces()).find(value => value.trace_prefix === "FILE_TRANSFER_ENQUEUED") ?? null, 15000);
   assert.equal(enqueue.owner_id, originalOwner.session_id); assert.equal(enqueue.owner_generation, originalOwner.generation);
   assert.equal(enqueue.md5_check, true); assert.equal(enqueue.resume_transfer, true);
@@ -267,8 +307,11 @@ try {
   await click("toolbar.transfers");
   const progressed = await waitFor(async () => {
     const current = await task(), partial = await ownPart();
-    const visibleBytes = current && Number(text(current).match(/([\d.]+) MiB \/ [\d.]+ MiB/)?.[1] ?? 0);
-    return current && visibleBytes > 0 && partial.bytes >= 32768 && partial.bytes < peer.source_size ? { current, partial, visible_mib: visibleBytes } : null;
+    const visibleBytes = current && Number(text(current).match(/([\d.]+) (?:B|KiB|MiB|GiB) \/ [\d.]+ (?:B|KiB|MiB|GiB)/)?.[1] ?? 0);
+    // With MD5 on and no remote checksum (the peer refuses exec) a download first streams the source once into a
+    // private, unlinked staging cache while hashing it (“读取源文件”, sftp_engine sourceScan); the gated READ is that
+    // pass, so no named .part exists yet. Visible nonzero bytes of that real network read are the progress.
+    return current && visibleBytes > 0 && text(current).includes("读取源文件") ? { current, partial, visible_mib: visibleBytes } : null;
   }, 15000);
   await capture("02-original-nonzero-bytes-read-gated");
   await marker("pause-requested");
@@ -277,21 +320,23 @@ try {
   await marker("read-release");
   await taskState("已暂停");
   const paused = await expandTask(), partial = await ownPart();
-  assert(text(paused).includes(`任务 #${enqueue.job} · 尝试 1`));
-  assert(text(paused).includes(`会话 #${originalOwner.session_id}`));
-  assert(partial.bytes > 0 && partial.bytes < peer.source_size);
+  // The paused source pass leaves no adoptable named partial (its staging cache is unlinked and closed on exit).
+  assert(partial.name === "" || (partial.bytes > 0 && partial.bytes <= peer.source_size), `Own partial state: ${JSON.stringify(partial)}`);
   report.paused = { task: paused, partial, original_visible_mib: progressed.visible_mib, peer_gate: (await peerState()).gate };
   await capture("03-original-paused-released-keeps-own-part");
   await key("escape");
   await waitFor(async () => !(await query("transfer.manager")).some(shown) || null, 10000);
+  // The tab close button shows on hover: point at the tab first.
+  { const tab = await visible(fileTab); assert((await mouseMove(tab.rect.x + tab.rect.w / 2, tab.rect.y + tab.rect.h / 2)).ok); await sleep(200); }
   await click(fileTab.replace("tabs.tab.", "tabs.close."));
   const closeTree = await waitFor(async () => {
-    const current = await visible("workspace.pane");
-    return nodes(current).some(value => value.component === "Button" && text(value) === "仍然关闭") ? current : null;
+    // The session close confirmation is a native Modal (session.close.confirm) portaled above the pane.
+    const current = await visible("session.close.confirm");
+    return byId(current, "session.close.accept").some(value => text(value) === "关闭页签") ? current : null;
   }, 10000);
   assert(text(closeTree).includes("尚有未完成任务，关闭将暂停并保留续传数据"), "Actual session-close risk names the real retained transfer");
   await capture("04-original-session-real-close-confirmation");
-  await clickNode(await stableNode(async () => nodes(await visible("workspace.pane")).find(value => value.component === "Button" && text(value) === "仍然关闭")), "Confirm closing only the original SFTP tab");
+  await clickNode(await stableNode(async () => byId(await visible("session.close.confirm"), "session.close.accept").find(value => value.focusable)), "Confirm closing only the original SFTP tab");
   await waitFor(async () => await originalLocalOnly(localTab) || null, 30000);
   await visible("terminal.surface");
   const released = await waitFor(async () => (await traces()).find(value => value.trace_prefix === "SFTP_WORKSPACE_TRACE" && value.event === "closed" && value.tab_id === attached.tab_id && JSON.stringify(value.owner) === JSON.stringify(originalOwner)) ?? null, 10000);
@@ -300,13 +345,14 @@ try {
     return current.connections.length >= 2 && current.connections.every(value => value.client_closed_before_peer_cleanup === true) ? current : null;
   }, 20000);
   const closedPart = await ownPart(); assert.equal(closedPart.name, partial.name); assert.equal(closedPart.bytes, partial.bytes);
+  const staged = closedPart.name === "";
+  report.staged_download = staged;
   report.closed_original = { receipt: released, peer_connection_ids: oldPeer.connections.map(value => value.id), peer: oldPeer, remaining_tabs: (await tabs()).map(value => value.test_id), partial: closedPart };
   await marker("original-tab-closed");
   await capture("05-original-released-local-tab-and-retained-part");
   await click("toolbar.transfers");
-  const retained = await expandTask(); assert(text(retained).includes("已暂停"));
-  assert(text(retained).includes(`任务 #${enqueue.job} · 尝试 1`) && text(retained).includes(`会话 #${originalOwner.session_id}`));
-  const resume = byId(retained, "transfer.task.primary")[0]; assert(resume?.focusable, "Original retained job can resume after its session is actually closed");
+  const retained = await expandTask(); assert(text(retained.row).includes("已暂停"));
+  const resume = byId(retained.row, "transfer.task.primary")[0]; assert(resume?.focusable, "Original retained job can resume after its session is actually closed");
   await capture("06-retained-original-job-resume-on-local-tab");
   await writeFile(join(peer.controls, "retained-gate.json"), JSON.stringify({ min_offset: closedPart.bytes + 6 * 32768 }) + "\n");
   await marker("resume-requested");
@@ -319,12 +365,14 @@ try {
   const retainedAuthentication = report.authentication.filter(value => value.phase === "retained_before_fault");
   assert(retainedAuthentication.some(value => value.kind === "trust_once") && retainedAuthentication.some(value => value.kind === "password"), "Retained attempt 2 uses the actual trust/password UI");
   const resumedBeforeFault = await waitFor(async () => {
-    const current = await expandTask(2), currentPart = await ownPart(), state = await peerState();
-    return text(current).includes("传输中") && currentPart.bytes > closedPart.bytes && currentPart.bytes < peer.source_size && state.gates?.retained
+    const current = await task(), currentPart = await ownPart(), state = await peerState();
+    // Staged download (no named partial was kept): attempt 2 streams the source again (“读取源文件”) and the gate
+    // holds that real read. Direct-write path: the same named partial grows past its retained prefix.
+    const running = text(current ?? {}).includes(staged ? "读取源文件" : "传输中");
+    return current && running && (staged || (currentPart.bytes > closedPart.bytes && currentPart.bytes < peer.source_size)) && state.gates?.retained
       ? { current, partial: currentPart, gate: state.gates.retained } : null;
   }, 20000);
-  assert.equal(resumedBeforeFault.partial.name, closedPart.name);
-  assert.equal(resumedBeforeFault.partial.inode, closedPart.inode);
+  if (!staged) { assert.equal(resumedBeforeFault.partial.name, closedPart.name); assert.equal(resumedBeforeFault.partial.inode, closedPart.inode); }
   await capture("07-retained-attempt-two-nonzero-read-gated");
   if (!activeFin) {
     await marker("retained-pause-requested");
@@ -340,11 +388,14 @@ try {
     await marker("retained-read-release");
     await taskState("已暂停");
   }
-  const beforeFaultTask = await expandTask(2), beforeFaultPart = await ownPart();
-  assert(beforeFaultPart.bytes > closedPart.bytes && beforeFaultPart.bytes < peer.source_size);
-  assert.equal(beforeFaultPart.name, closedPart.name); assert.equal(beforeFaultPart.inode, closedPart.inode);
+  const beforeFaultTask = (await expandTask(2)).row, beforeFaultPart = await ownPart();
+  if (staged) assert.equal(beforeFaultPart.name, "", "The staged source pass still owns no named partial");
+  else {
+    assert(beforeFaultPart.bytes > closedPart.bytes && beforeFaultPart.bytes < peer.source_size);
+    assert.equal(beforeFaultPart.name, closedPart.name); assert.equal(beforeFaultPart.inode, closedPart.inode);
+  }
   if (activeFin) {
-    assert(text(beforeFaultTask).includes("传输中"), "Send active FIN while the real task is still running");
+    assert(text(beforeFaultTask).includes(staged ? "读取源文件" : "传输中"), "Send active FIN while the real task is still running");
     assert(!(await peerState()).gates.retained.released, "Real retained READ remains in flight; no UI pause was requested");
   }
   const preFaultDiagnostics = await traces(), originalBinding = `${enqueue.binding_id}:${enqueue.binding_generation}`;
@@ -368,9 +419,10 @@ try {
     if (!current || !text(current).includes("已暂停")) return null;
     return byId(current, "transfer.task.primary").find(value => value.focusable);
   });
-  const faultTask = await expandTask(2), faultPart = await ownPart();
+  const faultTask = (await expandTask(2)).row, faultPart = await ownPart();
   assert.equal(faultPart.name, beforeFaultPart.name); assert.equal(faultPart.inode, beforeFaultPart.inode);
-  if (activeFin) assert(faultPart.bytes >= beforeFaultPart.bytes && faultPart.bytes < peer.source_size, "Actual FIN keeps the confirmed prefix without completing the file");
+  if (staged) assert.equal(faultPart.bytes, 0, "FIN during the staged source pass leaves no named partial");
+  else if (activeFin) assert(faultPart.bytes >= beforeFaultPart.bytes && faultPart.bytes < peer.source_size, "Actual FIN keeps the confirmed prefix without completing the file");
   else assert.equal(faultPart.bytes, beforeFaultPart.bytes);
   if (activeFin) await marker("retained-read-release");
   assert(await originalLocalOnly(localTab), "FIN handling never recreates the original file tab");
@@ -409,7 +461,6 @@ try {
   if (!(await query("transfer.manager")).some(shown)) await click("toolbar.transfers");
   await taskState("已完成");
   const finalTask = await expandTask(3);
-  assert(text(finalTask).includes(`任务 #${enqueue.job} · 尝试 3`) && text(finalTask).includes(`会话 #${originalOwner.session_id}`));
   const finalPeer = await waitFor(async () => {
     const current = await peerState(), excluded = new Set([...report.closed_original.peer_connection_ids, report.fault_retained.peer_connection_id]);
     const fresh = current.connections.filter(value => !excluded.has(value.id));
@@ -420,7 +471,9 @@ try {
     source_sha256: peer.source_sha256, actual_sha256: actualSha, actual_md5: actualMd5,
     bytes: downloaded.byteLength, destination, partials: [], remaining_tabs: (await tabs()).map(value => value.test_id) };
   await capture("10-fault-retained-same-job-attempt-three-md5-completed");
-  assert.equal(await readFile(join(data, "hosts.toml"), "utf8"), fixture);
+  // The fixture carries no credentials: the registry keeps the same host (normalised on write); trust-once adds no
+  // known_hosts entry.
+  { const savedHosts = await readFile(join(data, "hosts.toml"), "utf8"); assert(savedHosts.includes(`port = ${peer.port}`) && savedHosts.includes(`name = "${fixtureName}"`) && !savedHosts.includes(peer.password)); }
   assert.equal(await readFile(join(data, "known_hosts"), "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; }), "");
   report.checks = ["Original task has actual nonzero bytes and pauses through the real Manager UI",
     "Actual close confirmation releases both original connections and closes the original SFTP tab",

@@ -7,3 +7,9 @@
 /// Triggers:
 ///   ZENIT_TEXT_FLICKER_TRACE=1  -> text_flicker.log
 pub const text_flicker = @import("text_flicker.zig");
+/// Deterministic work counters (docs/design/streaming-content.md §5.8). Always on.
+pub const work_counters = @import("work_counters.zig");
+
+test {
+    _ = work_counters;
+}

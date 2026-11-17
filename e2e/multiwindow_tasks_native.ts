@@ -22,7 +22,7 @@ async function approveClose(){
  for(const id of ['groups.close.accept','local.close.accept','session.close.accept']){const values=await query(id);const node=Array.isArray(values)?values.find(shown):null;if(node){await clickNode(node);return}}
  // The existing ordinary-session card predates test IDs. Read its real
  // workspace subtree and activate the actual displayed confirmation label.
- for(const pane of (await query('workspace.pane') instanceof Array ? await query('workspace.pane') : [])){const force=flat(pane).find(n=>n.text==='仍然关闭');if(force){await clickNode(force);return}}
+ for(const pane of (await query('workspace.pane') instanceof Array ? await query('workspace.pane') : [])){const force=flat(pane).find(n=>n.text==='关闭页签');if(force){await clickNode(force);return}}
 }
 export type RetainedOptions = {
  firstWindow:number; secondWindow:number; sourceName:string; targetDirectory:string;

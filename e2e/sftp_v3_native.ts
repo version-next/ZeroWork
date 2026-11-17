@@ -1,6 +1,7 @@
 /** Real main-app local selection -> upload confirmation -> Manager -> remote refresh.
  * Own loopback peer only; public synthetic Harness input, no injected success.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -21,7 +22,9 @@ await mkdir(dirname(binary),{recursive:true});await writeFile(join(dirname(dirna
 const sha=createHash("sha256").update(await readFile(binary)).digest("hex"); assert.equal(sha,options["--expected-sha"]); Object.assign(report,{binary,source_binary:sourceBinary,binary_sha256:sha});
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const appLog=await open(join(output,"app.log"),"w"), peerLog=await open(join(output,"peer.log"),"w"), peerOut=join(output,"peer");
-const peer=spawn(options["--python"]??"python3",[resolve("e2e/sftp_v3_peer.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
+// Audited interpreter only (runner passes it for `python: true` entries); -I keeps cwd / user site out of sys.path.
+const python=options["--python"]??process.env.ZW_TEST_PYTHON;assert(python,"--python / ZW_TEST_PYTHON (audited Python with paramiko) is required");
+const peer=spawn(python,["-I",resolve("e2e/sftp_v3_peer.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
 const peerEnded=new Promise<void>(done=>peer.once("close",()=>done())); let peerError:Error|undefined; peer.once("error",e=>{peerError=e;});
 let app:ReturnType<typeof spawn>|undefined, appEnded:Promise<void>|undefined, appError:Error|undefined, ready:any, failure:unknown;
 const payload=Buffer.concat([Buffer.from("ZEROWORK_MAIN_APP_UPLOAD_V1\n"),Buffer.from(Array.from({length:70001},(_,i)=>i%251))]);
@@ -37,20 +40,35 @@ async function clickNode(n: any, reason: string): Promise<void> {
   assert((await clickAt(n.rect.x + n.rect.w / 2, n.rect.y + n.rect.h / 2)).ok, reason);
 }
 async function click(id: string): Promise<void> { await clickNode(await visible(id), id); }
+/** A negative condition has to hold for the whole dwell window, not a single sample. */
+async function stays(what: string, cond: () => Promise<boolean>, ms: number): Promise<void> { const t = Date.now(); do { assert(await cond(), what); await sleep(50); } while (Date.now() - t < ms); }
 async function fileTray(side: "local" | "remote"): Promise<any> {
   return waitFor(async()=>nodes(await visible("files.column."+side)).find(n=>n.test_id==="transfer.session.tray")??null,10000);
 }
+/** Waits (time bounded) until the file workspace has been laid out for a window `width` wide: it is the session pane's island
+ * (src/features/shell/view/shell/styles.yss `island`: margin right / bottom 6) and its two cards split it. */
+async function filePanes(width: number): Promise<{workspace:any,panes:any[]}> {
+  return waitFor(async()=>{
+    // workspace.shell is the whole UI subtree (too large for one harness query): the title bar ends at the window's right edge.
+    const titlebar=(await query("workspace.titlebar")).find(shown),workspace=(await query("files.workspace")).find(shown),pane=(await query("workspace.pane")).find(shown);
+    const panes=[(await query("files.local")).find(shown),(await query("files.remote")).find(shown)];
+    if(!titlebar||!workspace||!pane||panes.some(p=>!p)||Math.abs(titlebar.rect.x+titlebar.rect.w-width)>.5)return null;
+    if(Math.abs(workspace.rect.x+workspace.rect.w-(width-6))>.5||Math.abs(panes[1].rect.x+panes[1].rect.w-(workspace.rect.x+workspace.rect.w-4))>.5)return null;
+    for(const axis of ["x","y","w","h"])assert(Math.abs(workspace.rect[axis]-pane.rect[axis])<.5,"The file workspace is the session pane's content: "+axis);
+    return {workspace,panes};
+  },10000);
+}
+/** A native zenit Menu item once its open transition is over: the menu is fully opaque, the item lies inside it, is enabled
+ * (MenuItem nodes are not focusable themselves; the Menu owns keyboard focus) and the menu has not moved for 200 ms (time bounded). */
 async function stableMenuItem(menuId: string, itemId: string): Promise<any> {
-  let previous = "", stable = 0;
+  let previous = "", since = 0;
   return waitFor(async () => {
     const menu = (await query(menuId)).find(n => shown(n) && (n.effective_opacity ?? n.opacity ?? 1) >= 0.999);
     const item = menu && inside(menu, itemId);
-    if (!menu || !shown(item) || !item.focusable || item.rect.x < menu.rect.x || item.rect.y < menu.rect.y || item.rect.x + item.rect.w > menu.rect.x + menu.rect.w + 1 || item.rect.y + item.rect.h > menu.rect.y + menu.rect.h + 1) { stable = 0; return null; }
+    if (!menu || !shown(item) || item.disabled === true || item.rect.x < menu.rect.x || item.rect.y < menu.rect.y || item.rect.x + item.rect.w > menu.rect.x + menu.rect.w + 1 || item.rect.y + item.rect.h > menu.rect.y + menu.rect.h + 1) { previous = ""; return null; }
     const current = JSON.stringify([menu.id, menu.rect, item.id, item.rect]);
-    stable = current === previous ? stable + 1 : 0;
-    previous = current;
-    await sleep(80);
-    return stable >= 2 ? item : null;
+    if (current !== previous) { previous = current; since = Date.now(); return null; }
+    return Date.now() - since >= 200 ? item : null;
   }, 15000);
 }
 async function tabs(): Promise<any[]> { return nodes(await visible("tabs.strip")).filter(n => /^tabs\.tab\.\d+$/.test(n.test_id ?? "")); }
@@ -132,29 +150,35 @@ async function settleSftp(): Promise<void> {
 try {
   ready=await waitFor(async()=>{if(peerError||peer.exitCode!==null)throw peerError??new Error("Peer exited");try{return JSON.parse(await readFile(join(peerOut,"ready.json"),"utf8"));}catch(e){if(e.code==="ENOENT")return null;throw e;}},15000);
   const fixture=`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="sftp"\nauth_mode="password"\noptions={strict_host_key=true}\nname="SFTP V3 Owned Peer"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`;
-  await writeFile(join(data,"hosts.toml"),fixture);await writeFile(join(data,"config.toml"),'[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\n');
+  await writeFile(join(data,"hosts.toml"),fixture);await writeFile(join(data,"config.toml"),`[meta]\nconfig_revision=1\n[ui]\ntheme="${theme}"\n`);/* the --theme variant is the app theme (was always "dark") */
   const secondName="second.yaml",second=Buffer.from("multi: source-two\n");await writeFile(join(local,secondName),second);
   const internalName="internal-drag.txt",internalPayload=Buffer.from("actual internal drag upload\n");await writeFile(join(local,internalName),internalPayload);
   report.peer={...ready,password:undefined,output:peerOut};
   app=spawn(binary,[],{cwd:process.cwd(),env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:options["--hold"]?"0":"1",ZENIT_E2E_ISOLATE_POINTER:options["--hold"]?"0":"1",ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:"0",ZEROWORK_FILE_TRACE:"1",OPENAI_API_KEY:"",ANTHROPIC_API_KEY:""},stdio:["ignore",appLog.fd,appLog.fd]});
   appEnded=new Promise<void>(done=>app!.once("close",()=>done()));report.pid=app.pid;
   await waitForServerReady();await resizeWindow(1440,900);
-  await click("sidebar.host");await settleSftp();
+  await click("sidebar.host");await click("sidebar.host.connect_button");/* design-r3 A2 (fe28ab5b): row click selects, the selected row's native “连接” connects */await settleSftp();
   const attached=await waitFor(async()=>(await traces()).find(t=>t.trace_prefix==="SFTP_WORKSPACE_TRACE"&&t.event==="attached")??null,10000);report.attachment=attached;
-  await clickNode(inside(await visible("files.local"),"files.path.edit"),"Activate local path editor");const path=await waitFor(async()=>inside(await visible("files.local"),"files.path")??null,10000);await clickNode(path,"Navigate only local owned fixture");await key("a",{cmd:true});await type_(local);await key("return");
+  // The local card shows a breadcrumb; its blank end (files.path.edit) swaps in the native path Input (files.path). The centre may
+  // be a breadcrumb part, which navigates instead (same entry as sftp_upload_native / sftp_conflict_native, 4811ee5a).
+  {const edit=inside(await visible("files.local"),"files.path.edit");assert(edit,"files.path.edit");assert((await clickAt(edit.rect.x+edit.rect.w-8,edit.rect.y+edit.rect.h/2)).ok,"Activate local path editor");}const path=await waitFor(async()=>inside(await visible("files.local"),"files.path")??null,10000);await clickNode(path,"Navigate only local owned fixture");await key("a",{cmd:true});await type_(local);await key("return");
   await waitFor(async()=>nodes(await visible("files.local")).find(n=>n.test_id==="files.row.name"&&n.text===filename)??null,10000);
   if(!(await query("sidebar.header")).some(shown)){await key("b",{cmd:true});await visible("sidebar.header");}
   for(const [width,height]of [[1440,900],[860,480]]){
-    await resizeWindow(width,height);await sleep(200);const panes=[await visible("files.local"),await visible("files.remote")];
-    assert(Math.abs(panes[1].rect.x-panes[0].rect.x-panes[0].rect.w-6)<.5);for(const pane of panes){assert.equal(inside(pane,"files.footer").rect.h,36);for(const r of nodes(pane).filter(n=>n.test_id==="files.row"))assert.equal(r.rect.h,40);}
+    await resizeWindow(width,height);const {workspace,panes}=await filePanes(width);
+    // src/features/files/view/styles.yss: root padding 4 / gap 4, column_stack flex-basis 0 ⇒ two equal cards of (W − 2×4 − 4)/2;
+    // path_bar (files.footer) 28; file_workspace_styles.zig row_height 26.
+    const half=(workspace.rect.w-2*4-4)/2;
+    for(const pane of panes){assert(Math.abs(pane.rect.w-half)<.5,`File cards are equal halves of the workspace: ${pane.rect.w} vs ${half}`);assert(Math.abs(pane.rect.y-workspace.rect.y-4)<.5&&Math.abs(pane.rect.y+pane.rect.h-(workspace.rect.y+workspace.rect.h-4))<.5,"Cards fill the workspace height inside its 4pt padding");}
+    assert(Math.abs(panes[0].rect.x-workspace.rect.x-4)<.5&&Math.abs(panes[1].rect.x-panes[0].rect.x-panes[0].rect.w-4)<.5&&Math.abs(panes[1].rect.x+panes[1].rect.w-(workspace.rect.x+workspace.rect.w-4))<.5,"4pt padding / 4pt gap between the cards");
+    for(const pane of panes){assert.equal(inside(pane,"files.footer").rect.h,28);const rows=nodes(pane).filter(n=>n.test_id==="files.row");assert(rows.length>0);for(const r of rows)assert.equal(r.rect.h,26);}
     for(const side of ["local","remote"]){const column=await visible("files.column."+side);assert(!nodes(column).some(n=>n.test_id==="transfer.session.tray"),"empty direction tray occupies no visible card space");}
-    const body=await visible("workspace.body");for(const pane of panes)assert(Math.abs(pane.rect.y-body.rect.y)<.5,"SFTP cards align with the sidebar body top");
-    assert(!(await query("ai.strip")).some(shown),"SFTP has no separate assistant strip splitting the page");
+    assert(!(await query("ai.panel")).some(shown)&&(await query("ai.launcher")).some(n=>shown(n)&&n.rect.w===48),"SFTP keeps one floating 48 × 48 ai.launcher and no assistant column splitting the page (PL4c)");
     await click("toolbar.transfers");await visible("transfer.manager");await clickNode(inside(await visible("transfer.manager"),"transfer.window.close"),"Close toolbar transfer panel");await waitFor(async()=>!(await query("transfer.manager")).some(shown)||null,10000);
     await click("toolbar.transfers");await visible("transfer.manager");await clickNode(inside(await visible("transfer.manager"),"transfer.window.close"),"Close reopened toolbar transfer panel");await waitFor(async()=>!(await query("transfer.manager")).some(shown)||null,10000);
     await capture("v3-empty-"+width);
   }
-  await resizeWindow(1440,900);await sleep(200);
+  await resizeWindow(1440,900);await filePanes(1440);
   // Actual mouse gesture, not the external OS-drop adapter. Drop on a file
   // row to transfer into its containing directory.
   const internalRow=nodes(await visible("files.local")).find(n=>n.test_id==="files.row"&&text(n).includes(internalName));assert(internalRow);
@@ -177,7 +201,8 @@ try {
   await capture("v3-multi-drop-confirm");await click("files.copy.submit");
   await waitFor(async()=>text(await fileTray("local")).includes("传输中")||null,10000);const uploadCard=await visible("files.local"),uploadTray=await fileTray("local");
   assert(uploadTray.rect.x>=uploadCard.rect.x&&uploadTray.rect.x+uploadTray.rect.w<=uploadCard.rect.x+uploadCard.rect.w+.5);
-  assert(Math.abs(uploadTray.rect.y-uploadCard.rect.y-uploadCard.rect.h-6)<.5,"Transfer card is a separate sibling below the file card with a 6px gap");
+  // files/view/styles.yss column_stack: file card over the transfer card, gap 4.
+  assert(Math.abs(uploadTray.rect.y-uploadCard.rect.y-uploadCard.rect.h-4)<.5,"Transfer card is a separate sibling below the file card with a 4pt gap");
   assert(!nodes(uploadCard).some(n=>n.test_id==="transfer.session.tray"),"Transfer card is outside the file card");
   const column=await visible("files.column.local");assert(uploadTray.rect.y+uploadTray.rect.h<=column.rect.y+column.rect.h+.5);
   assert(text(uploadTray).includes("上传传输"));
@@ -188,15 +213,18 @@ try {
   report.checks.push("Native external two-file URI drop froze original owner/remote directory, opened confirmation, and actual SFTP WRITE produced both exact source hashes");
   await waitFor(async()=>{const p=await visible("files.remote");return nodes(p).some(n=>n.test_id==="files.row.name"&&n.text===filename)&&nodes(p).some(n=>n.test_id==="files.row.name"&&n.text===secondName)?true:null;},15000);
   assert(text(await fileTray("local")).includes("等2个文件"));
-  await sleep(300);for(const presenter of (await query("notifications.presenter")).filter(shown))assert(!text(presenter).includes("文件传输已完成"),"Visible session tray suppresses duplicate completion toast");
+  // Negative check: it has to hold for a dwell window, not a single sample.
+  await stays("Visible session tray suppresses duplicate completion toast",async()=>!(await query("notifications.presenter")).filter(shown).some(p=>text(p).includes("文件传输已完成")),1500);
   report.checks.push("Completed multi-file upload refreshes original remote pane, reports true file count, and visible tray suppresses duplicate completion toast");
   for(const [width,height]of [[1440,900],[860,480]]){
-    await resizeWindow(width,height);await sleep(200);const current=await fileTray("local");for(const row of nodes(current).filter(n=>n.test_id==="transfer.task")){
-      assert.equal(row.rect.h,76);
+    await resizeWindow(width,height);await filePanes(width);const current=await fileTray("local");const taskRows=nodes(current).filter(n=>n.test_id==="transfer.task");assert(taskRows.length>0);for(const row of taskRows){
+      // The session tray shares the popover renderer: transfer_styles.zig popover_row_height = 54 (Pencil Gq5xg).
+      assert.equal(row.rect.h,54);
       const actions=inside(row,"transfer.task.actions");assert(actions&&actions.rect.x>=row.rect.x&&actions.rect.x+actions.rect.w<=row.rect.x+row.rect.w+.5,"All task action slots stay visible inside the actual SFTP column");
       for(const id of ["transfer.task.copy_path","transfer.task.events"]){const control=inside(row,id);assert(control&&control.rect.w>=24&&control.rect.x+control.rect.w<=row.rect.x+row.rect.w+.5,"Task action remains fully reachable: "+id);}
     }assert(!nodes(await visible("files.column.remote")).some(n=>n.test_id==="transfer.session.tray"),"upload never creates a download tray");
-    assert(!inside(current,"transfer.task.more")&&!inside(current,"transfer.task.expand"),"Direct actions replace collapsed menus and details");
+    // Rows have no expand control any more (4811ee5a: 任务行无展开); details are the file-name Popover.
+    assert(!inside(current,"transfer.task.more"),"Direct actions replace the collapsed menu");
     await capture("v3-tray-completed-"+width);
   }
   let receiptFailure:unknown;
@@ -206,21 +234,26 @@ try {
   await clickNode(inside(await visible("files.local"),"files.row.name"),"Select source for actual path copy");
   await clickNode(inside(await visible("files.local"),"files.context"),"Open original local context menu");
   const copyItem=await stableMenuItem("files.context.menu","files.context.copy");
+  // “复制完整路径” writes the system clipboard (src/plugins/sftp/provider_host.zig clipboardSetText; zenit has no test
+  // clipboard): with a selection it must be offered and enabled, but it is not clicked.
+  assert(text(copyItem).includes("复制完整路径")&&copyItem.disabled!==true,"Copy full path is offered for the selection");
   await capture("v3-file-context-menu");
-  await clickNode(copyItem,"Copy real selected path");
-  await waitFor(async()=> (await query("notifications.local")).find(n=>shown(n)&&text(n).includes("路径已复制"))??null,10000);await capture("v3-copy-receipt");
-  report.checks.push("Refresh receipt follows the accepted request generation and path-copy receipt follows the real clipboard callback, anchored to original clicked controls");
+  assert((await key("escape")).ok);await waitFor(async()=>!(await query("files.context.menu")).some(shown)||null,10000);
+  report.checks.push("Refresh receipt follows the accepted request generation and is anchored to the clicked control; the context menu offers copy-full-path for the selection (not clicked: system clipboard)");
   } catch(error) { receiptFailure=error;report.receipts={status:"failed",error:String(error)};await capture("v3-receipts-failed"); }
-  await resizeWindow(1440,900);await sleep(160);
+  await resizeWindow(1440,900);await filePanes(1440);
   await click("toolbar.transfers");await visible("transfer.manager");assert(text(await visible("transfer.manager")).includes("等2个文件"));await capture("v3-global-shared-row");
   const taskRow=nodes(await visible("transfer.manager")).find(n=>n.test_id==="transfer.task"&&text(n).includes("等2个文件"));
-  assert(taskRow&&!inside(taskRow,"transfer.task.expand")&&!inside(taskRow,"transfer.task.more"));
+  assert(taskRow&&!inside(taskRow,"transfer.task.more"));
   assert(inside(taskRow,"transfer.task.copy_path"),"Completed upload retains copy remote path");
-  await mouseMove(taskRow.rect.x+100,taskRow.rect.y+12);await sleep(650);
-  const detail=await visible("transfer.task.hover_detail");
-  assert(text(detail).includes(destination),"Hover details preserve actual remote target path");
-  await capture("v3-global-hover-detail");
-  await mouseMove(10,10);
+  // Details are a click Popover on the file name (transfer_manager_view.zig: Popover trigger = .click, transfer.task.detail_popup).
+  await clickNode(inside(taskRow,"transfer.task.name"),"Open the task details from its file name");
+  const detail=await visible("transfer.task.detail_popup");
+  assert(text(detail).includes(destination),"Task details preserve actual remote target path");
+  await capture("v3-global-task-detail");
+  // A second click on the trigger closes the click Popover (Escape would also be routed to the transfer panel).
+  await clickNode(inside(nodes(await visible("transfer.manager")).find(n=>n.test_id==="transfer.task"&&text(n).includes("等2个文件")),"transfer.task.name"),"Close the task details from its file name");
+  await waitFor(async()=>!(await query("transfer.task.detail_popup")).some(shown)||null,10000);assert((await query("transfer.manager")).some(shown),"Closing the details keeps the transfer panel open");
   assert(!inside(await visible("transfer.manager"),"transfer.task.select"),"Browsing does not expose multiselect by default");
   await clickNode(inside(await visible("transfer.manager"),"transfer.batch"),"Enter management explicitly");
   await clickNode(inside(await visible("transfer.manager"),"transfer.task.select"),"Select original upload task");
@@ -229,8 +262,7 @@ try {
   report.checks.push("Shallow cards keep direct actions and structured hover details; opt-in management updates original task selection");
   await clickNode(inside(await visible("transfer.manager"),"transfer.window.close"),"Close own global manager");
   await waitFor(async()=> (await query("transfer.manager")).every(n=>!shown(n))||null,10000);
-  await sleep(160);
-  await resizeWindow(860,480);await sleep(180);
+  await resizeWindow(860,480);await filePanes(860);
   const downloadRow=nodes(await visible("files.remote")).find(n=>n.test_id==="files.row"&&text(n).includes("README.md"));assert(downloadRow);
   const downloadHandle=inside(downloadRow,"files.row.drag");assert(downloadHandle);
   const dx=downloadHandle.rect.x+50,dy=downloadHandle.rect.y+downloadHandle.rect.h/2;

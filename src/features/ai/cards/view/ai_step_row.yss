@@ -1,0 +1,9 @@
+//! 步骤行（Pencil Kaf7E A6）：工具卡 / 执行结果卡 / 步骤的表头行与工具卡的目标行都是原生 `W.Pressable`（按钮语义、
+//! 子元素即内容），这里是它们的 `look`——随主题由 zenit 按根自身状态解析（悬停 / 按下的底色用 zenit 交互 token），
+//! 不再把原生 Button 当容器、隐藏它的子节点，也不在主题变化时由卡片重算外观。
+const ui = @import("ui");
+
+/// 表头行：24 高，左右 6，间距 6，圆角 6；整行展开 / 收起详情。
+style step_row { width: fill; height: 24; flex-shrink: 0; direction: row; align-items: center; justify: start; padding: 0 6; gap: 6; corner-radius: 6; background: transparent; :hover { background: bg-hover; } :active { background: button-pressed-bg; } }
+/// 工具卡的目标行（Figma 16 / 186 / 6 / fill 的槽位在内容里）：26 高，圆角 4。
+style target_row { width: fill; height: 26; flex-shrink: 0; direction: row; align-items: center; justify: start; gap: 6; corner-radius: 4; background: transparent; :hover { background: bg-hover; } :active { background: button-pressed-bg; } }

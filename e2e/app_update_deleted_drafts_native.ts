@@ -3,6 +3,8 @@
  * cache are observed separately; no force install, installer or real user data.
  * Run: node e2e/app_update_deleted_drafts_native.ts <test-prefix> <out>
  * EXPECT_STALE=1 verifies the unfixed build as a negative control. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {isolatedHome} from './regression/home_guard.mjs';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {spawn,execFileSync} from 'node:child_process';
@@ -10,6 +12,8 @@ import {mkdtemp,mkdir,copyFile,writeFile,readFile,open,rm,realpath} from 'node:f
 import {join,resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createHash} from 'node:crypto';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const build=resolve(process.argv[2]??'zig-out');
 const out=resolve(process.argv[3]??'/tmp/zw-update-feedback');await mkdir(out,{recursive:true});
 const h=await import(pathToFileURL(join(build,'share/zenit/harness/client.ts')).href);
@@ -18,13 +22,13 @@ await Promise.all([rpc,data,mac].map(p=>mkdir(p,{recursive:true})));
 for(const name of ['zerowork','zw_ipc.so','zw_execution.so','zw_secret_consume.so','zw_execution_guard'])await copyFile(join(build,'bin',name),join(mac,name==='zerowork'?'ZeroWork':name));
 const frame=(content:string)=>'data: '+JSON.stringify({choices:[{index:0,delta:{content}}]})+'\n\n';
 let held:any=null;
-const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"deletion-fixture"}]}');return}let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});const last=String(body.messages.filter((m:any)=>m.role==='user').at(-1)?.content??'');if(body.tools?.length&&last.includes('HOLD')){held=res;res.write(frame('ISOLATED_HOLD'));return}res.end(frame(body.tools?.length?'ISOLATED_ANSWER':'删除验证')+'data: [DONE]\n\n');});
+const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"deletion-fixture"}]}');return}const body=await readRequestJson(req);res.writeHead(200,{'content-type':'text/event-stream'});const last=String(body.messages.filter((m:any)=>m.role==='user').at(-1)?.content??'');if(body.tools?.length&&last.includes('HOLD')){held=res;res.write(frame('ISOLATED_HOLD'));return}res.end(frame(body.tools?.length?'ISOLATED_ANSWER':'删除验证')+'data: [DONE]\n\n');});
 await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));
 await writeFile(join(data,'config.toml'),`[updates]\nauto_check=false\n[ai]\ndefault_provider="deletion-fixture"\n[[ai.providers]]\nid="deletion-fixture"\nkind="openai_compat"\nendpoint="http://127.0.0.1:${(server.address()as any).port}/v1/chat/completions"\nenabled=true\n[[ai.providers.models]]\nname="deletion-fixture"\ncontext_window=200000\ndefault=true\n`);
 await writeFile(join(bundle,'Contents/Info.plist'),'<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.zerowork.app</string><key>CFBundleExecutable</key><string>ZeroWork</string><key>CFBundlePackageType</key><string>APPL</string><key>ZeroWorkReleaseVersion</key><string>0.3.0-rc1</string></dict></plist>');
 const identity=execFileSync('python3',['scripts/macos_signing.py','identity'],{encoding:'utf8'}).trim();execFileSync('codesign',['--force','--deep','--sign',identity,'--identifier','com.zerowork.app',bundle]);
-const root=join(process.env.HOME!,'Library/Application Support/com.zerowork.updater',createHash('sha256').update(bundle+'\n'+data).digest('hex').slice(0,32));
-if(process.argv[4]==='restore'){assert(process.env.ZW_UPDATE_HISTORY_FIXTURE,'restore requires an explicitly supplied synthetic history');await copyFile(process.env.ZW_UPDATE_HISTORY_FIXTURE!,join(data,'ai-sessions.jsonl'));}
+const root=join(isolatedHome(),'Library/Application Support/com.zerowork.updater',createHash('sha256').update(bundle+'\n'+data).digest('hex').slice(0,32));
+if(process.argv[4]==='restore'){assert(process.env.ZW_UPDATE_HISTORY_FIXTURE,'restore requires an explicitly supplied synthetic history');await copyFile(process.env.ZW_UPDATE_HISTORY_FIXTURE!,join(data,'ai-sessions.v4.jsonl'));}
 const log=await open(join(out,'app.log'),'w');process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const app=spawn(join(mac,'ZeroWork'),[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_AUTOCONNECT:'0',OPENAI_API_KEY:'',ANTHROPIC_API_KEY:''},stdio:['ignore',log.fd,log.fd]});
 const ended=new Promise(r=>app.once('close',(code,signal)=>r({code,signal})));
@@ -40,7 +44,7 @@ const mode=process.argv[4]??'stale';
 const snapshots:any[]=[];
 const snap=async(label:string)=>{const state=await route('drafts');snapshots.push({label,...state});await writeFile(join(out,'states.json'),JSON.stringify(snapshots,null,2));return state;};
 const input=async(value:string)=>{await click('ai.prompt');await h.key('a',{cmd:true});await h.type_(value);};
-const panel=async()=>{if(!(await h.query('ai.panel')).some(shown))await click('toolbar.ai');await visible('ai.prompt');};
+const panel=async()=>{if(!(await h.query('ai.panel')).some(shown))await click(await aiToggleId());await visible('ai.prompt');};
 const end=async()=>{await click('ai.close');await h.waitFor(async()=>{if((await h.query('ai.close.confirmation.confirm')).some(shown))await click('ai.close.confirmation.confirm');return !(await h.query('ai.panel')).some(shown)||null;},15000);};
 try{
  await h.waitForServerReady();await h.resizeWindow(1100,800);await route('legacy_preflight',{legacy:true});
@@ -80,6 +84,6 @@ finally{
  try{await h.request('POST','/zerowork/windows',{action:'quit'});await h.waitFor(async()=>app.exitCode!==null||null,12000);}catch{if(app.exitCode===null)app.kill('SIGTERM');}
  await ended;await log.close();server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));
  // Preserve only synthetic journal and diagnostic evidence before cleanup.
- await readFile(join(data,'ai-sessions.jsonl'),'utf8').then(j=>writeFile(join(out,'journal.jsonl'),j)).catch(()=>{});
+ await readFile(join(data,'ai-sessions.v4.jsonl'),'utf8').then(j=>writeFile(join(out,'journal.jsonl'),j)).catch(()=>{});
  await rm(base,{recursive:true,force:true});await rm(root,{recursive:true,force:true});
 }

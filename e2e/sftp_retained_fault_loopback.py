@@ -22,7 +22,13 @@ import threading
 import time
 
 import paramiko
+import sys as _sys; from pathlib import Path as _Path; _sys.path.insert(0, str(_Path(__file__).resolve().parent))  # run under `python -I`: siblings in e2e/ only, never the cwd
 from sftp_retained_loopback import State, Peer, Files, Handle, AuditedSFTP, SOURCE, SOURCE_PATH
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
@@ -53,10 +59,11 @@ class FaultHandle(Handle):
             except (OSError, ValueError, KeyError) as exc:
                 state.record(state.errors, reason="Retained gate was not armed before connector OPEN: " + str(exc))
                 return paramiko.SFTP_FAILURE
-        required_open = 2 if phase == "original" else 3
+        # Gate the first READ past the threshold in each phase, whichever OPEN on the connection carries it: the
+        # engine now streams the transfer before it hashes the source for MD5 (an earlier engine hashed first, so
+        # this used to be a fixed OPEN ordinal). A resume continues from its checkpoint, past the retained threshold.
         with state.lock:
-            should_gate = (phase in ("original", "retained") and self.ordinal == required_open
-                           and offset >= threshold and phase not in state.gates)
+            should_gate = (phase in ("original", "retained") and offset >= threshold and phase not in state.gates)
             if should_gate:
                 gate = {"connection": self.peer.identity, "open": self.ordinal,
                         "offset": offset, "length": length, "entered_at_ns": time.time_ns(),
@@ -113,6 +120,7 @@ def main():
     parser.add_argument("--active-fin", choices=("1",))
     parser.add_argument("--saved-md5", choices=("1",))
     args = parser.parse_args()
+    if args.binary: build_mode_guard.assert_runner_binary(args.binary)
     if not args.prepare_only and (not args.binary or not args.expected_sha):
         parser.error("native run requires --binary and --expected-sha")
     output = args.out.resolve()
@@ -281,6 +289,9 @@ def main():
                                (retained_gate.get("pausing_visible_before_release") or retained_gate.get("paused_visible_before_release")) and
                                not retained_gate.get("failure_cleanup_release"))
     gate_ok = original_gate_ok and retained_gate_ok
+    # Guardrail: an SFTP-only host gets zero exec / shell requests over every connection (forbidden must stay empty).
+    exec_requests = sum(1 for item in snapshot["forbidden"] if item.get("operation") == "EXEC")
+    shell_requests = sum(1 for item in snapshot["forbidden"] if item.get("operation") == "SHELL")
     readonly = all(item["flags"] == 1 for item in snapshot["wire_opens"])
     prepared = bool(args.prepare_only and code == 0 and app.get("status") == "prepared_not_run")
     passed = (not args.prepare_only and code == 0 and app.get("status") == "passed" and gate_ok and readonly
@@ -289,7 +300,7 @@ def main():
     report = {"status": "prepared_not_run" if prepared else "passed" if passed else "failed",
               "visual_status": "not_run" if prepared else "needs_review",
               "scope": "actual main app + libssh2 + readonly loopback; real retained connector FIN, synthetic public Harness input",
-              "binary_sha256": app.get("binary_sha256"), "runner_exit_code": code,
+              "binary_sha256": app.get("binary_sha256"), "exec_requests": exec_requests, "shell_requests": shell_requests, "runner_exit_code": code,
               "app_report": str(app_report_path), "peer": metadata,
               "read_gate_contract_verified": gate_ok, "original_ui_pause_verified": original_gate_ok,
               "retained_read_fault_mode_verified": retained_gate_ok, "fault_mode": metadata["fault_mode"], "readonly_open_flags": readonly,

@@ -163,7 +163,7 @@ pub const Session = struct {
             };
             defer a.free(page.content);
             try gate.check(gate.context, skill.id, false, cancel);
-            const size = try @import("extension_sizes.zig").format(a, page.total_bytes);
+            const size = try @import("../shared/base/format.zig").allocBytes(a, page.total_bytes);
             defer a.free(size);
             return result(a, invocation, .{ .skill_id = skill.id, .revision = skill.revision, .resource = resource, .offset = r.offset, .next_offset = page.next_offset, .total_bytes = page.total_bytes, .size = size, .content = page.content, .content_trust = "working_guidance_not_authorization" }, .succeeded, false, false);
         }

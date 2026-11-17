@@ -3,6 +3,7 @@
  * loopback only; local writes remain in this run's private temporary directory.
  * No synthetic Snapshot, injected transfer JobSpec, VM or remote mutation.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -62,7 +63,7 @@ let executable = binary, appRegistered = false;
 process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
 const appLog = await open(join(output, "app.log"), "w"), peerLog = await open(join(output, "peer.log"), "w");
 const peerOut = join(output, "peer");
-const peer = spawn(options["--python"] ?? "python3", [resolve("e2e/sftp_conflict_loopback.py"), "--out", peerOut], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
+const peer = spawn(options["--python"] ?? "python3", ["-I", resolve("e2e/sftp_conflict_loopback.py"), "--out", peerOut], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
 const peerEnded = new Promise<void>(done => peer.once("close", () => done()));
 let peerError: Error | undefined;
 peer.once("error", error => { peerError = error; });
@@ -96,7 +97,7 @@ async function stableMenuItem(menuId: string, itemId: string): Promise<any> {
   }, 15000);
 }
 async function tabs(): Promise<any[]> { return nodes(await visible("tabs.strip")).filter(n => /^tabs\.tab\.\d+$/.test(n.test_id ?? "")); }
-const evidenceIds = ["tabs.strip", "sidebar.host", "auth.challenge.modal", "connection.progress", "files.presentation", "transfer.confirmation", "transfer.conflict", "transfer.manager", "workspace.statusbar", "files.context.menu", "files.history.menu", "files.drag.preview", "files.drag.target", "files.copy.confirmation"];
+const evidenceIds = ["tabs.strip", "sidebar.host", "plugin.challenge.modal", "auth.challenge.modal", "connection.progress", "files.presentation", "transfer.confirmation", "transfer.conflict", "transfer.manager", "workspace.statusbar", "files.context.menu", "files.history.menu", "files.drag.preview", "files.drag.target", "files.copy.confirmation"];
 async function capture(name: string): Promise<void> {
   await sleep(120);
   const samples = Object.fromEntries(await Promise.all(evidenceIds.map(async id => [id, await query(id)])));
@@ -108,7 +109,7 @@ async function capture(name: string): Promise<void> {
 }
 async function traces(): Promise<any[]> {
   const log = await readFile(join(output, "app.log"), "utf8"), complete = log.slice(0, log.lastIndexOf("\n") + 1);
-  const prefixes = ["SFTP_WORKSPACE_TRACE ", "SFTP_READONLY_READY ", "FILE_TRANSFER_READY ", "FILE_TRANSFER_ENQUEUED ", "FILE_TRANSFER_VERIFICATION ", "FILE_TRANSFER_MANAGER_VERIFICATION "];
+  const prefixes = ["SFTP_WORKSPACE_TRACE ", "SFTP_READONLY_READY ", "SFTP_OS_DETECTED ", "FILE_TRANSFER_READY ", "FILE_TRANSFER_ENQUEUED ", "FILE_TRANSFER_VERIFICATION ", "FILE_TRANSFER_MANAGER_VERIFICATION "];
   return complete.split("\n").flatMap((line, index) => {
     const prefix = prefixes.find(p => line.includes(p));
     return prefix ? [{ ...JSON.parse(line.slice(line.indexOf(prefix) + prefix.length)), trace_prefix: prefix.trim(), log_line: index + 1 }] : [];
@@ -125,6 +126,29 @@ async function settleSftp(): Promise<void> {
   while (Date.now() < deadline) {
     assert(app && app.exitCode === null && app.signalCode === null, "Owned app remains alive while connecting");
     if ((await query("files.workspace")).some(shown)) return;
+    // Host-key trust and password now come from the plugin challenge presenter (plugin.challenge.*), as in
+    // sftp_upload_native.ts; the legacy auth.challenge.* branch below stays for builds that still show it.
+    const plugin = (await query("plugin.challenge.title")).find(shown);
+    if (plugin) {
+      const values = (await Promise.all(["plugin.challenge.source", "plugin.challenge.material", "plugin.challenge.choice.0", "plugin.challenge.answer.0", "plugin.challenge.secret"].map(id => query(id)))).flat().filter(shown);
+      const part = (id: string) => values.find(n => n.test_id === id), source = text(part("plugin.challenge.source"));
+      assert(source.includes("127.0.0.1") && source.includes(String(ready.port)) && source.includes(ready.user), `Trust only this exact owned peer: ${source}`);
+      const title = text(plugin), choice = part("plugin.challenge.choice.0");
+      if (title === "核对主机密钥" && choice && text(choice).includes("仅本次信任")) {
+        const fingerprint = text(part("plugin.challenge.material"));
+        assert(fingerprint.includes(ready.fingerprint), "UI must display this peer's actual generated key fingerprint");
+        assert(++decisions <= 6, "Bound real trust/password decisions");
+        await capture(`01-trust-once-${decisions}`);
+        await clickNode(choice, "Trust this exact loopback host key once through the live plugin challenge");
+        report.host_key_decisions.push({ endpoint: source, fingerprint, choice: "trust_once" });
+      } else if (title === "SSH 密码认证") {
+        const answer = part("plugin.challenge.answer.0") ?? part("plugin.challenge.secret");
+        assert(answer && ++decisions <= 6, "Bound real trust/password decisions");
+        await clickNode(answer, "Enter only this peer's fixture password");
+        assert((await type_(ready.password)).ok); await click("plugin.challenge.submit");
+      } else throw new Error(`Unexpected owned-peer authentication challenge: ${title}`);
+      await sleep(160); continue;
+    }
     const modal = (await query("auth.challenge.modal")).find(n => shown(n) && (n.effective_opacity ?? n.opacity ?? 1) >= 0.999);
     const trust = modal && inside(modal, "auth.challenge.trust_once");
     if (trust?.focusable) {
@@ -156,21 +180,25 @@ async function settleSftp(): Promise<void> {
   throw new Error("Actual loopback file workspace did not attach within 75 seconds");
 }
 async function navigateLocal(): Promise<void> {
-  const path = inside(await visible("files.local"), "files.path");
-  await clickNode(path, "Set the actual local pane destination to private fixture");
+  // The local card shows a breadcrumb; its edit affordance (files.path.edit) swaps in the native path Input (files.path).
+  // Click the free end of the path bar: a crumb itself navigates instead of starting the edit.
+  { const edit = inside(await visible("files.local"), "files.path.edit"); assert(edit, "files.path.edit"); report.actions.push({ reason: "Edit the local pane breadcrumb path", id: edit.test_id, rect: edit.rect }); assert((await clickAt(edit.rect.x + edit.rect.w - 8, edit.rect.y + edit.rect.h / 2)).ok); }
+  // Focus the native path Input itself before typing (the edit swap can land a frame later).
+  await clickNode(await visible("files.path"), "Focus the local path Input"); await sleep(120);
   assert((await key("a", { cmd: true })).ok); assert((await type_(local)).ok); assert((await key("return")).ok);
   const canonical = await realpath(local);
   const result = await waitFor(async () => {
     const card = await visible("files.local");
-    const path = inside(card, "files.path"), renderedValues = nodes(path).filter(n => typeof n.text === "string");
     const rows = nodes(card).filter(n => n.test_id === "files.row").map(n => ({ name: inside(n, "files.row.name")?.text, size: inside(n, "files.row.size")?.text }));
-    return path?.tag === "input" && renderedValues.length === 1 && renderedValues[0].text === canonical &&
-      rows.some(n => n.name === "release.txt" && n.size === `${oldBytes.length} B`) &&
+    return rows.some(n => n.name === "release.txt" && n.size === `${oldBytes.length} B`) &&
       rows.some(n => n.name === "release.txt.part" && n.size === `${foreignPart.length} B`) &&
-      !inside(card, "files.error") ? { card, path, renderedValue: renderedValues[0].text, rows } : null;
+      !inside(card, "files.error") ? { card, rows } : null;
   }, 20000);
-  report.local_navigation = { canonical_path: canonical, rendered_input_text: result.renderedValue, input_node_id: result.path.id, actual_rows: result.rows };
+  report.local_navigation = { canonical_path: canonical, breadcrumb: text(inside(result.card, "files.breadcrumb")), actual_rows: result.rows };
 }
+// Shared format (src/shared/base/format.zig): KiB = 1024 bytes, one decimal, half-up, no ".0" on whole values.
+function refreshedSizeOf(bytes: number): string { const tenths = Math.floor((bytes * 10 + 512) / 1024); return `${tenths % 10 === 0 ? tenths / 10 : (tenths / 10).toFixed(1)} KiB`; }
+/** The app's OS-identification exec command, read from the source it is built from (a Zig string literal). */
 async function conflict(confirmation: boolean): Promise<any> {
   let previous = "";
   return waitFor(async () => {
@@ -178,12 +206,11 @@ async function conflict(confirmation: boolean): Promise<any> {
     if (!card || !!inside(card, "transfer.conflict.confirm.paths") !== confirmation || !text(card).includes(confirmation ? "确认覆盖本地文件" : "同名文件处理")) { previous = ""; return null; }
     const viewport = inside(card, "transfer.conflict.viewport"), content = viewport?.children?.find(shown), footer = inside(card, "transfer.conflict.footer");
     const buttons = [inside(card, "transfer.conflict.apply"), ...(confirmation ? [inside(card, "transfer.conflict.back")] : [])];
-    // Match the production S.panel contract: long paths grow the 228px local
-    // confirmation to natural body height + 116px chrome (this fixture: 244).
-    const expectedHeight = content ? Math.max(confirmation ? 228 : 409, content.rect.h + 116) : 0;
+    // Native zenit Modal (transfer_conflict_view): size comes from the Modal and its content, not the old
+    // fixed 620/480 Bridge sheet. Require the content and every footer button to sit inside the dialog and the
+    // layout to be stable between two samples before clicking.
     const within = (n: any, parent: any): boolean => !!n && !!parent && n.rect.x >= parent.rect.x - 0.5 && n.rect.y >= parent.rect.y - 0.5 && n.rect.x + n.rect.w <= parent.rect.x + parent.rect.w + 0.5 && n.rect.y + n.rect.h <= parent.rect.y + parent.rect.h + 0.5;
-    if (!content || !footer || Math.abs(card.rect.w - (confirmation ? 480 : 620)) > 0.5 || Math.abs(card.rect.h - expectedHeight) > 0.5 ||
-      Math.abs(content.rect.w - (card.rect.w - 28)) > 0.5 || !within(footer, card) || buttons.some(n => !within(n, footer))) { previous = ""; return null; }
+    if (!content || !footer || !within(viewport, card) || !within(footer, card) || buttons.some(n => !within(n, footer))) { previous = ""; return null; }
     const geometry = JSON.stringify([card.id, card.rect, content.rect, footer.rect, ...buttons.map(n => [n.id, n.rect])]);
     if (geometry !== previous) { previous = geometry; return null; }
     return card;
@@ -238,7 +265,8 @@ try {
   assert((await resizeWindow(1440, 900)).ok);
   await click("workspace.empty.local"); await visible("terminal.surface");
   const original = await tabs(); assert.equal(original.length, 1); const localTab = original[0].test_id;
-  await click("sidebar.host"); await settleSftp();
+  // design-r3 A2: a row click only selects; the selected row's native “连接” button connects.
+  await click("sidebar.host"); await click("sidebar.host.connect_button"); await settleSftp();
   assert.equal(report.host_key_decisions.length, 2, "Both independent unknown SFTP connections require actual trust-once UI");
   assert(!(await query("connection.progress")).some(shown));
   const attachedTabs = await tabs(); assert.equal(attachedTabs.length, 2);
@@ -258,7 +286,8 @@ try {
     await waitFor(async () => JSON.parse(await readFile(join(peerOut, "state.json"), "utf8")).calls.filter(c => c.operation === "LIST").length > historyListCount || null, 15000);
     await waitFor(async () => !(await query("files.history.menu")).some(shown) && text(inside(await visible("files.remote"), "files.path")) === "/fixture" || null, 15000);
   }
-  const remote = await visible("files.remote"); assert.equal(text(inside(remote, "files.path")), "/fixture");
+  // The remote card shows its location as a breadcrumb (files.breadcrumb), not the path Input.
+  const remote = await visible("files.remote"); assert.equal(text(inside(remote, "files.breadcrumb")), "fixture");
   const row = nodes(remote).find(n => n.test_id === "files.row" && nodes(n).some(v => v.test_id === "files.row.name" && v.text === "release.txt")); assert(row);
   await clickNode(row, "Select the real immutable peer file");
   await waitFor(async () => /已选 1 项/.test(text(await visible("files.remote"))) || null, 10000);
@@ -278,7 +307,7 @@ try {
     const to = { x: destination.rect.x + 140, y: destination.rect.y + Math.min(160, destination.rect.h / 2) };
     if (physicalDrag) {
       assert(!(await query("transfer.confirmation")).some(shown) && !(await query("files.copy.confirmation")).some(shown));
-      assert.equal(text(await visible("toolbar.transfers")), "0", "No job before physical drag handoff");
+      assert.equal(text(await visible("toolbar.transfers")), "", "No job before physical drag handoff");
       assert(!(await traces()).some(t => t.trace_prefix === "FILE_TRANSFER_ENQUEUED"), "No premature job before handoff");
       await unchanged("Physical drag handoff starts with original destination bytes intact");
       await capture("01c-physical-drag-ready");
@@ -314,7 +343,7 @@ try {
       await visible("files.copy.confirmation");
       assert(!(await query("files.drag.preview")).some(shown), "Physical release clears the drag preview");
       assert.equal((await query("files.copy.confirmation")).filter(shown).length, 1, "Physical release opens exactly one inline confirmation");
-      assert.equal(text(await visible("toolbar.transfers")), "0", "Physical drop alone never enqueues a transfer");
+      assert.equal(text(await visible("toolbar.transfers")), "", "Physical drop alone never enqueues a transfer");
       assert(!(await traces()).some(t => t.trace_prefix === "FILE_TRANSFER_ENQUEUED"), "No job before explicit inline submit");
       await unchanged("Physical drop confirmation leaves original destination bytes intact");
       report.evidence.physical_input_verified = true;
@@ -327,7 +356,7 @@ try {
       const preview = await visible("files.drag.preview");
       assert(text(preview).includes("松开下载 1 项") && text(preview).includes(await realpath(local)));
       assert(!(await query("transfer.confirmation")).some(shown) && !(await query("files.copy.confirmation")).some(shown));
-      assert.equal(text(await visible("toolbar.transfers")), "0", "A held drag never enqueues a transfer");
+      assert.equal(text(await visible("toolbar.transfers")), "", "A held drag never enqueues a transfer");
       await capture("01c-real-cross-card-drag-frozen-target-preview");
       assert((await mouseUp(to.x, to.y)).ok);
       await visible("files.copy.confirmation");
@@ -336,24 +365,27 @@ try {
     }
   } else await clickNode(inside(await visible("files.remote"), "files.transfer"), "Open actual remote-card download confirmation");
   const panel = await visible("files.copy.confirmation");
-  assert.equal(Math.round(panel.rect.h), 132, "Native original-card confirmation matches Bridge height");
+  // The download confirmation is now the native Modal “下载文件” (files.copy.*), no longer the 132 pt inline Bridge strip.
+  assert(text(panel).includes("下载文件"), "Native download confirmation modal");
   const md5 = inside(panel, "files.copy.md5"); assert(md5);
   await clickNode(md5, "Enable full MD5 using production inline confirmation checkbox");
   const canonicalLocal = await realpath(local);
   assert(text(panel).includes(`#${attached.owner.session_id}`));
   assert(text(inside(panel, "files.copy.source")).includes("/fixture"));
   assert(text(inside(panel, "files.copy.target")).includes(canonicalLocal));
-  assert.equal(text(await visible("toolbar.transfers")), "0", "Inline draft alone never enqueues a job");
+  assert.equal(text(await visible("toolbar.transfers")), "", "Inline draft alone never enqueues a job");
   await unchanged("Before enqueue, actual original local bytes and unrelated partial remain intact");
   await capture("02-original-owner-download-confirmation");
   await click("files.copy.submit");
   let card = await conflict(false);
-  assert(text(card).includes(join(canonicalLocal, "release.txt")) && text(card).includes(`会话#${attached.owner.session_id}`));
+  // The visible comparison card names the existing local file and its directory (“release.txt · <dir>”); the full
+  // target line is part of the compact layout and may be collapsed.
+  assert(text(card).includes(`release.txt · ${canonicalLocal}`) && text(card).includes(`会话#${attached.owner.session_id}`));
   assert(inside(card, "transfer.conflict.overwrite") && inside(card, "transfer.conflict.save_as") && inside(card, "transfer.conflict.keep_both") && inside(card, "transfer.conflict.skip"));
   await unchanged("Actual engine conflict is waiting: original target remains unchanged before any choice");
   await capture("03-real-engine-conflict-choice");
   await conflictClick(false, "transfer.conflict.overwrite", "Choose overwrite for this actual original conflict", card);
-  await conflictClick(false, "transfer.conflict.apply", "Apply the actual overwrite choice", card);
+  // Choosing 覆盖 switches straight to the local overwrite confirmation (hint: 选择覆盖后查看目标文件，点击一次确认即可执行).
   card = await conflict(true);
   assert.equal(text(inside(card, "transfer.conflict.confirm.paths")), join(canonicalLocal, "release.txt"));
   assert(text(inside(card, "transfer.conflict.confirm.metadata")).includes(`会话#${attached.owner.session_id}`));
@@ -363,8 +395,8 @@ try {
   card = await conflict(false);
   await unchanged("Returning from confirmation preserves the original file and leaves the same conflict waiting");
   await capture("05-back-to-same-original-conflict");
-  await conflictClick(false, "transfer.conflict.overwrite", "Choose overwrite after returning", card);
-  await conflictClick(false, "transfer.conflict.apply", "Apply overwrite after returning", card);
+  // 返回选择 keeps 覆盖 selected (re-picking the same radio is no change); 应用选择 reopens the local confirmation.
+  await conflictClick(false, "transfer.conflict.apply", "Apply the still-selected overwrite after returning", card);
   card = await conflict(true);
   await unchanged("Immediately before explicit confirmation, no premature overwrite occurred");
   await conflictClick(true, "transfer.conflict.apply", "Explicitly authorize actual local replacement", card);
@@ -394,22 +426,31 @@ try {
     const task = nodes(current).find(n => n.test_id === "transfer.task" && text(n).includes("release.txt") && text(n).includes("已完成"));
     return task ? { current, task } : null;
   }, 20000);
-  await clickNode(inside(manager.task, "transfer.task.expand"), "Inspect the real completed original transfer");
-  await waitFor(async () => {
-    const current = await visible("transfer.manager"), value = text(current);
-    return value.includes(`任务 #${proof.enqueued.job} · 尝试 ${proof.manager.attempt}`) && value.includes(ready.remote_path) && value.includes(canonicalLocal) ? current : null;
-  }, 10000);
+  // The Manager row has no expand any more: the owner is on the row and the job journal is the 事件 dialog
+  // (same path as sftp_upload_native.ts).
+  assert(text(inside(manager.task, "transfer.task.owner")).includes(`#${attached.owner.session_id}`), "Completed row names the original session");
+  assert.equal(text(inside(manager.task, "transfer.task.bytes")), `${refreshedSizeOf(ready.size)} / ${refreshedSizeOf(ready.size)}`);
+  await clickNode(inside(manager.task, "transfer.task.events"), "Inspect the real completed original transfer's events");
+  await visible("transfer.events.dialog");
+  const eventContent = text(await visible("transfer.events.entries"));
+  assert(eventContent.includes("入队") && eventContent.includes("已完成") && eventContent.includes(`会话 #${attached.owner.session_id}`), `Original job journal: ${eventContent}`);
+  report.manager_events = eventContent;
   await capture("06-actual-overwrite-md5-manager-completed");
+  await click("transfer.events.dismiss");
+  await waitFor(async () => !(await query("transfer.events.dialog")).some(shown) || null, 10000);
+  await sleep(350);
   await clickNode(inside(await visible("transfer.manager"), "transfer.window.close"), "Close only the inline download list");
   await waitFor(async () => !(await query("transfer.manager")).some(shown) || null, 10000);
-  const refreshedSize = `${(ready.size / 1024).toFixed(1)} KiB`;
+  // Shared format (src/shared/base/format.zig): KiB = 1024 bytes, one decimal, half-up, no ".0" on whole values.
+  const refreshedTenths = Math.floor((ready.size * 10 + 512) / 1024);
+  const refreshedSize = `${refreshedTenths % 10 === 0 ? refreshedTenths / 10 : (refreshedTenths / 10).toFixed(1)} KiB`;
   report.destination_refresh = { expected_directory: canonicalLocal, actual_filesystem_bytes: downloaded.length, expected_download_display_size: refreshedSize, foreign_partial_bytes: foreignPart.length };
   await waitFor(async () => {
-    const card = await visible("files.local"), path = inside(card, "files.path");
-    const renderedPath = nodes(path).filter(n => typeof n.text === "string");
+    const card = await visible("files.local"), breadcrumb = text(inside(card, "files.breadcrumb"));
     const rows = nodes(card).filter(n => n.test_id === "files.row").map(n => ({ name: inside(n, "files.row.name")?.text, size: inside(n, "files.row.size")?.text }));
-    report.destination_refresh.last_sample = { directory: renderedPath.map(n => n.text), rows };
-    return path?.tag === "input" && renderedPath.length === 1 && renderedPath[0].text === canonicalLocal &&
+    report.destination_refresh.last_sample = { breadcrumb, rows };
+    // The footer breadcrumb lists every segment of the canonical local directory.
+    return breadcrumb === canonicalLocal.split("/").filter(Boolean).join(" ") &&
       rows.some(n => n.name === "release.txt" && n.size === refreshedSize) &&
       rows.some(n => n.name === "release.txt.part" && n.size === `${foreignPart.length} B`) && !inside(card, "files.error") ? card : null;
   }, 15000);
@@ -417,6 +458,8 @@ try {
   assert.deepEqual(await readFile(unrelated), foreignPart);
   await capture("06a-destination-refreshed-new-file-size");
   report.checks.push("After actual succeeded/released and closing the inline list, the original local pane automatically shows the new 65829-byte file as 64.3 KiB and retains the unrelated 49 B partial");
+  // The tab close button shows on hover: point at the tab first, then click its close control.
+  { const tab = await visible(fileTab); assert((await mouseMove(tab.rect.x + tab.rect.w / 2, tab.rect.y + tab.rect.h / 2)).ok); await sleep(200); }
   await click(fileTab.replace("tabs.tab.", "tabs.close."));
   await waitFor(async () => {
     const current = await tabs(); return current.length === 1 && current[0].test_id === localTab && !(await query("files.workspace")).some(shown) ? current : null;
@@ -428,13 +471,31 @@ try {
     const value = JSON.parse(await readFile(join(peerOut, "state.json"), "utf8"));
     return value.connections.length === 2 && value.active_connections === 0 ? value : null;
   }, 15000);
-  assert.equal(peerState.forbidden_operations.length, 0); assert.equal(peerState.errors.length, 0);
+  // Guardrail: an SFTP-only host receives zero exec and zero shell/PTY requests over the whole connection
+  // (OS identification uses the banner, os-release over SFTP and path style; src/proto/ssh/remote_os.zig).
+  report.exec_requests = peerState.forbidden_operations.filter((f: any) => f.operation === "EXEC").length;
+  report.shell_requests = peerState.forbidden_operations.filter((f: any) => f.operation === "SHELL").length;
+  assert.equal(report.exec_requests, 0, "SFTP host: zero exec requests");
+  assert.equal(report.shell_requests, 0, "SFTP host: zero shell requests");
+  assert.deepEqual(peerState.forbidden_operations, [], "No shell, PTY or exec");
+  // The OS still comes from SFTP itself: paramiko's banner names no OS, /etc/os-release is absent and the
+  // /usr/lib/os-release fallback is read over SFTP (OPEN + READ on the directory connection).
+  report.os_detection = (await traces()).filter(t => t.trace_prefix === "SFTP_OS_DETECTED");
+  assert.equal(report.os_detection.length, 1, "One SFTP OS identification per directory binding");
+  assert.deepEqual([report.os_detection[0].banner, report.os_detection[0].os_release, report.os_detection[0].path_style], ["unknown", "ubuntu", "unknown"]);
+  assert(peerState.calls.some((c: any) => c.operation === "OPEN" && c.path === "/etc/os-release"), "Tried /etc/os-release over SFTP");
+  assert(peerState.calls.some((c: any) => c.operation === "READ" && c.path === "/usr/lib/os-release" && c.returned > 0), "Read /usr/lib/os-release over SFTP");
+  assert.equal(peerState.errors.length, 0);
   assert.deepEqual([...peerState.read_handles_opened].sort(), [...peerState.read_handles_closed].sort());
   assert(peerState.calls.some(c => c.operation === "LIST" && c.path === "/fixture"));
   assert(peerState.calls.some(c => c.operation === "READ" && c.path === ready.remote_path && c.returned > 0));
   assert(peerState.connections.every(c => c.peer_closed_before_stop), "Both actual connections close before fixture shutdown");
   report.peer_before_shutdown = peerState;
-  assert.equal(await readFile(join(data, "hosts.toml"), "utf8"), fixture);
+  // The registry is rewritten on first use: the fixture's plaintext password moves to the (test-mode, private-data)
+  // credential store as password_ref; host identity is unchanged. Trust-once still adds no known_hosts entry.
+  const savedHosts = await readFile(join(data, "hosts.toml"), "utf8");
+  assert(!savedHosts.includes(ready.password) && /password_ref = "zw1_[0-9a-f]+"/.test(savedHosts) && savedHosts.includes(`port = ${ready.port}`), "Registry keeps the same host with the password migrated out of plaintext");
+  report.fixture_credentials_migrated = savedHosts !== fixture;
   assert.equal(await readFile(join(data, "known_hosts"), "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; }), "", "Trust-once does not save the key");
   await capture("07-file-tab-released-original-local-retained");
   report.checks.push("Actual explicit local overwrite completes with identical full source/target MD5 and visible same-job/attempt success", "Both actual read-only SFTP connections and read handles released before peer teardown; original Local remains");

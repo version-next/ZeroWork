@@ -1,9 +1,11 @@
 /** Focused @dots acceptance on an isolated Local PTY and real native window. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
+import {settingsNav} from './settings_nav.ts';
 import {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep,scrollAt} from '../zig-out/share/zenit/harness/client.ts';
 
 const out = resolve(process.argv[2]);
@@ -21,7 +23,18 @@ async function click(id:string) { const n = await visible(id); assert((await cli
 async function press(name:string,mods?:any) { assert((await key(name,mods)).ok); }
 async function type(value:string) { assert((await type_(value)).ok); }
 async function command(value:string) {
-  await type('@'); await visible('terminal.commands'); await type(value); await press('right');
+  // The file marker may be written just before zsh publishes its next trusted prompt.
+  for (let attempt=1; attempt<=3; attempt++) {
+    await type('@');
+    try {
+      await waitFor(async()=> (await query('terminal.commands')).find(shown) ?? null,4000);
+      break;
+    } catch (error) {
+      await press('c',{ctrl:true});
+      if(attempt===3)throw new Error('Trusted command palette did not open after a Local prompt', {cause:error});
+    }
+  }
+  await type(value); await press('right');
   await waitFor(async()=> !(await query('terminal.commands')).some(shown) || null);
   await press('return'); await sleep(300);
 }
@@ -55,7 +68,10 @@ try {
   const qr=(await query('terminal.dots.qr')).filter(shown);
   assert.equal(qr.length,10); assert(qr.every(n=>n.rect.w===205));
   report.checks.push('@dots displays the embedded 205px QR and the single Alipay donation hint');
-  await command('theme light'); await donationVisible(); await capture('03-light');
+  const nav=settingsNav();
+  await nav.pickTheme('light');await nav.save();
+  assert.match(await readFile(join(data,'config.toml'),'utf8'),/^theme\s*=\s*"light"/m);
+  await nav.close();await donationVisible();await capture('03-light');
   await resizeWindow(900,600); await donationVisible(); await capture('04-resized');
   report.checks.push('QR remains visible in the light theme and after window resize');
   await type("printf 'line%02d\\n' {1..60}"); await press('return'); await sleep(500);

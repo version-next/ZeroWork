@@ -8,14 +8,27 @@
 // NSWorkspace.setIcon adds Icon\r / FinderInfo / ResourceFork to the bundle,
 // which fails strict codesign verification after startup. The installed file
 // icon is supplied by the packaged CFBundleIconFile resource.
+static bool ZWAppIconSetRunning(const unsigned char *bytes, size_t length) {
+    if (![NSThread isMainThread] || !NSApp || !bytes || !length) return false;
+    NSData *data = [NSData dataWithBytes:bytes length:length];
+    NSImage *image = [[NSImage alloc] initWithData:data];
+    if (!image || !image.valid) return false;
+    image.size = NSMakeSize(512, 512);
+    NSApp.applicationIconImage = image;
+    return true;
+}
+
+// Test builds: update the running Dock tile only. Never writes the bundle's
+// preference domain (~/Library/Preferences/<bundle id>.plist).
+bool zw_app_icon_set_running(const unsigned char *bytes, size_t length) {
+    @autoreleasepool {
+        return ZWAppIconSetRunning(bytes, length);
+    }
+}
+
 bool zw_app_icon_apply(const unsigned char *bytes, size_t length, const char *background) {
     @autoreleasepool {
-        if (![NSThread isMainThread] || !NSApp || !bytes || !length) return false;
-        NSData *data = [NSData dataWithBytes:bytes length:length];
-        NSImage *image = [[NSImage alloc] initWithData:data];
-        if (!image || !image.valid) return false;
-        image.size = NSMakeSize(512, 512);
-        NSApp.applicationIconImage = image;
+        if (!ZWAppIconSetRunning(bytes, length)) return false;
         NSString *domain = NSBundle.mainBundle.bundleIdentifier;
         NSString *style = background ? [NSString stringWithUTF8String:background] : nil;
         if (domain.length && ([style isEqualToString:@"transparent"] || [style isEqualToString:@"light"] || [style isEqualToString:@"dark"])) {

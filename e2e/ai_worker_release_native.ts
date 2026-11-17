@@ -3,12 +3,16 @@
  * Build: zig build -Dtest-mode=true --prefix /tmp/zw-v04-build -j2
  * Run: ZW_AI_TEST_PREFIX=/tmp/zw-v04-build node e2e/ai_worker_release_native.ts <out>
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {createHash} from 'node:crypto';
 import {mkdir,mkdtemp,writeFile,readFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-v04-build');
 const binary=join(prefix,'bin/zerowork');
 const out=resolve(process.argv[2]??'/tmp/zw-v04-worker-native');await mkdir(out,{recursive:true});
@@ -20,8 +24,7 @@ const frame=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\
 const requests:any[]=[];let held:any=null,heldClosed=false,fixtureFailure:any=null;
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST'){res.end('{"data":[{"id":"worker-fixture"}]}');return}
- let raw='';for await(const part of req)raw+=part;
- const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length){res.end(frame({content:'Worker 验证'})+'data: [DONE]\n\n');return}
  requests.push(body);
  const user=String(body.messages.filter((m:any)=>m.role==='user').at(-1)?.content??'');
@@ -54,15 +57,18 @@ const click=async(id:string)=>{report.last_action=id;await visible(id);assert((a
 const input=async(value:string)=>{await click('ai.prompt');await h.key('a',{cmd:true});await h.type_(value)};
 const send=async(value:string)=>{await input(value);await click('ai.send')};
 const capture=async(name:string)=>{await h.mouseMove(1,1);await h.sleep(200);assert((await h.screenshot(join(out,name+'.png'))).ok);report.screenshots.push(join(out,name+'.png'))};
-const journal=async()=>String(await readFile(join(data,'ai-sessions.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+const journal=async()=>String(await readFile(join(data,'ai-sessions.v4.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
 async function endConversation(){await click('ai.close');await click('ai.close.confirmation.confirm');await absent('ai.panel');await visible('terminal.surface')}
 async function restore(){
- await click('toolbar.ai');await click('ai.sessions');await click('ai.session.restore.1');
+ await click(await aiToggleId());await click('ai.sessions');await visible('ai.sessions.menu');
+ // The welcome page's recent list reuses the session row view (ai_empty_view.zig → ai_session_row.zig), so ai.session.* ids
+ // exist twice while the welcome page is shown; click the Restore inside ai.sessions.menu.
+ report.last_action='ai.sessions.menu>ai.session.restore.1';const button=await h.waitFor(async()=>(await h.query('ai.sessions.menu')).filter(shown).flatMap(flat).find((n:any)=>n.test_id==='ai.session.restore.1'&&shown(n))??null,15000);assert((await h.clickAt(button.rect.x+button.rect.w/2,button.rect.y+button.rect.h/2)).ok,'ai.session.restore.1');
  await h.waitFor(async()=>{if((await h.query('ai.session.close.accept')).some(shown))await click('ai.session.close.accept');return !(await h.query('ai.sessions.menu')).some(shown)&&!(await h.query('ai.session.close.confirmation')).some(shown)||null},15000);
  await visible('ai.prompt');
 }
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  assert.equal(requests.length,0);
  await send('WORKER_FIRST 读取当前会话信息');await h.waitFor(async()=>text(await h.query('ai.panel')).includes('WORKER_FIRST_FINISHED')||null,20000);await absent('ai.stop');assert.equal(requests.length,2);
  await input('解绑后保留的草稿');await capture('01-completed');await endConversation();
@@ -82,7 +88,7 @@ try{
 }catch(error){report.status='failed';report.error=String(error);process.exitCode=1;await capture('failure').catch(()=>{});await h.query('ai.panel').then(tree=>writeFile(join(out,'failure-tree.json'),JSON.stringify(tree,null,2))).catch(()=>{})}
 finally{
  try{if(alive()){const windows=await h.request('POST','/zerowork/windows',{action:'snapshot'});assert.equal(windows.windows.length,1);report.close_route='POST /zerowork/windows quit';report.quit_response=await h.request('POST','/zerowork/windows',{action:'quit'});assert(report.quit_response.ok);const start=performance.now();while(alive()&&performance.now()-start<15000){for(const id of ['groups.close.accept','local.close.accept','session.close.accept'])try{if((await h.query(id)).some(shown))await h.clickTestId(id)}catch{}await Promise.race([ended,h.sleep(80)])}}}catch(error){report.quit_error=String(error)}
- if(alive()){report.quit_snapshot=await h.request('POST','/zerowork/windows',{action:'snapshot'}).catch(String);await writeFile(join(out,'quit-tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{});await capture('quit-pending').catch(()=>{});report.forced=true;app.kill('SIGTERM');await ended}
+ if(alive()){report.quit_snapshot=await h.request('POST','/zerowork/windows',{action:'snapshot'}).catch(String);await writeFile(join(out,'quit-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{});await capture('quit-pending').catch(()=>{});report.forced=true;app.kill('SIGTERM');await ended}
  report.exit_code=app.exitCode;report.signal=app.signalCode;if(report.forced||app.exitCode!==0){report.status='failed';process.exitCode=1}
  if(held)held.destroy();server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));await log.close();
  const logs=await readFile(join(out,'app.log'),'utf8');if(/leaked \[addr:|panic:|double free|use.after.free/i.test(logs)){report.status='failed';report.memory_error=true;process.exitCode=1}

@@ -2,6 +2,7 @@
  * Local transport's configurable Options.term is covered by real-PTY service
  * tests; the product Local default remains xterm-256color.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
@@ -16,9 +17,10 @@ try{
   const dir=join(out,term),child=spawn(process.execPath,['e2e/xterm_capabilities_native.ts',dir,binary,'ssh',term],{stdio:'inherit'});
   const code=await new Promise(r=>child.once('close',r));
   const report=JSON.parse(await readFile(join(dir,'report.json'),'utf8'));
-  matrix.runs.push({term,report:term+'/report.json',...report.runs[0]});
+  const run=report.runs[0];
+  matrix.runs.push({term,report:term+'/report.json',status:'failed',checks:[],...run});
   await writeFile(join(out,'matrix.json'),JSON.stringify(matrix,null,2));
-  assert.equal(code,0,term+' process failed');assert.equal(report.status,'passed');
+  assert.equal(code,0,term+' process failed: '+(run?.error??'no report'));assert.equal(report.status,'passed');
  }
  matrix.status='passed';
 }catch(e){matrix.status='failed';matrix.error=String(e);process.exitCode=1}

@@ -6,7 +6,7 @@ const std = @import("std");
 const identity = @import("identity.zig");
 const actions = @import("actions.zig");
 const OperationKey = @import("operation.zig").OperationKey;
-const Snapshot = @import("../ui/session_lifecycle.zig").Snapshot;
+const Snapshot = @import("session_lifecycle.zig").Snapshot;
 
 pub const SelectionSnapshot = struct {
     owner: identity.CommandOwner,
@@ -131,7 +131,7 @@ fn validOwner(owner: identity.CommandOwner) bool {
         .asset => |asset| @backingInt(asset.id) != 0 and asset.revision != 0,
         .session => |session| @backingInt(session.session_id) != 0 and session.generation != 0,
         .group => |group| @backingInt(group.id) != 0 and group.revision != 0,
-        .history => |history| @backingInt(history) != 0,
+        .card => |card| card.valid(),
         .transfer_owner => |transfer| @backingInt(transfer.id) != 0 and @backingInt(transfer.original_handle.session_id) != 0 and transfer.original_handle.generation != 0,
     };
 }
@@ -191,7 +191,7 @@ test "captured owner view and selection reject stale input before invoking a han
     var probe: Probe = .{};
     var command: UiCommand = .{ .command_id = try dispatcher.issue(), .kind = .toggle_sidebar, .owner = .app, .view_revision = 1 };
     var live = appContext();
-    live.owner = .{ .history = @fromBackingInt(9) };
+    live.owner = .{ .card = .{ .slot = 9, .generation = 1 } };
     try std.testing.expectEqual(RejectCode.stale_owner, (try dispatcher.submit(command, live, probe.handler())).rejected.code);
     command.command_id = try dispatcher.issue();
     live = appContext();

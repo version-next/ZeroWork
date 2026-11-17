@@ -4,7 +4,7 @@ const identity = @import("../host/identity.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 fn request() journal.Request {
-    return .{ .context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 }, .tool_id = "host.create_group", .request_key = "create-1", .canonical_hash = @splat(4), .turn_id = 1, .call_id = "provider-call-1" };
+    return .{ .context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 101 }, .content = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 }, .tool_id = "host.create_group", .request_key = "create-1", .canonical_hash = @splat(4), .turn_id = 1, .call_id = "provider-call-1" };
 }
 
 test "lifecycle journal durably reuses semantic keys across calls and restart without storing arguments" {
@@ -16,11 +16,12 @@ test "lifecycle journal durably reuses semantic keys across calls and restart wi
     input.call_id = "provider-retry-call-2";
     const repeated = try first.begin(input);
     try std.testing.expect(repeated.reused and repeated.operation_ref.eql(handle.operation_ref));
-    try first.update(handle, 1, .{ .stage = .committed, .created_group = 7, .committed_binding = .{ .group = 7 }, .committed_binding_revision = 2, .notice_revision = 2 });
+    try first.update(handle, 1, .{ .stage = .committed, .created_group = 7, .committed_binding = .{ .tab = 7 }, .committed_binding_revision = 2, .notice_revision = 2 });
     first.deinit();
     var second = try journal.Journal.open(a, io, tmp.dir, "lifecycle.json");
     defer second.deinit();
-    input.context.binding = .{ .group = 7 };
+    input.context.binding = .{ .tab = 7 };
+    input.context.content = .{ .group = 7 };
     input.context.binding_revision = 2;
     const recovered = try second.begin(input);
     try std.testing.expect(recovered.reused and recovered.operation_ref.eql(handle.operation_ref));
@@ -30,7 +31,7 @@ test "lifecycle journal durably reuses semantic keys across calls and restart wi
     try std.testing.expectEqual(@as(?u64, 7), receipt.created_group);
     try std.testing.expectEqual(@as(u64, 0), receipt.wire_notice_revision);
     try std.testing.expectEqualStrings("provider-call-1", receipt.original_call);
-    try std.testing.expectEqual(@as(u64, 101), receipt.context.binding.session);
+    try std.testing.expectEqual(@as(u64, 101), receipt.context.contentOf().session);
     input.canonical_hash[0] = 9;
     try std.testing.expectError(error.IdempotencyConflict, second.begin(input));
     input.context.task_id = identity.TaskId.generate();

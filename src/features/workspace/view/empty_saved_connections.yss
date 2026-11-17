@@ -1,0 +1,34 @@
+//! 空工作区“已保存的连接”的布局与字号（hmCmB `vDyAK`；行同环境行 ZW4 / Project Row）。行本身是原生 `W.Pressable`，
+//! 这里只给它排版与悬停 / 按下底色（Project Row 的 hover gjAf6 = bg-hover、press NQngd = bg-active）。
+const ui = @import("ui");
+
+/// 列表：宽 440，行间 1。
+style root { width: 440; height: fit; direction: column; align-items: stretch; gap: 1; flex-shrink: 0; }
+/// 标题行：24 高，左右 8。
+style heading { width: fill; height: 24; direction: row; align-items: center; padding: 0 8; flex-shrink: 0; }
+style heading_text { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-secondary; wrap: none; }
+style rows { width: fill; height: fit; direction: column; align-items: stretch; gap: 1; }
+/// 一行：28 高、圆角 6、左右 8、gap 8。被禁用协议的主机不给悬停 / 按下底色（不可连接）。
+recipe Row {
+  base {
+    width: fill; height: 28; flex-shrink: 0; min-width: 0; direction: row; align-items: center; gap: 8; padding: 0 8;
+    corner-radius: 6; background: transparent;
+    :hover { background: bg-hover; }
+    :active { background: bg-active; }
+  }
+  flag unavailable { :hover { background: transparent; } :active { background: transparent; } }
+}
+/// 图标：次要墨色；已禁用（qQaos）降为淡墨。
+recipe Icon {
+  base { width: 16; height: 16; flex-shrink: 0; icon-color: fg-secondary; }
+  flag unavailable { icon-color: zw-fg-faint; }
+}
+/// 名称：13 / 400 主墨色，单行省略，占满剩余宽度；已禁用降为淡墨（同侧栏名称）。
+recipe Name {
+  base { font-size: 13; font-weight: 400; line-height: {20.0 / 13.0}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+  flag unavailable { color: zw-fg-faint; }
+}
+style name_box { width: fill; flex: 1; min-width: 0; flex-shrink: 1; }
+/// 路由（或“已禁用”）：11 / 400 次要墨色，不收缩。
+style meta { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: fg-secondary; wrap: none; }
+style meta_box { flex-shrink: 0; }

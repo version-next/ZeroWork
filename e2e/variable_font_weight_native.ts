@@ -2,12 +2,16 @@
  * node e2e/variable_font_weight_native.ts /absolute/evidence [binary]
  * Private data, process-local fonts and public synthetic Harness only.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,rm,open,readFile,writeFile,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {settingsNav} from './settings_nav.ts';
+// Two-level settings (settings_nav.ts): 外观与主题 › 字体与排版. Saved = the floating Save Bar hides (was the footer state "已保存").
+const nav=settingsNav();
 const out=resolve(process.argv[2]??'/tmp/zerowork-variable-font-native');await mkdir(out,{recursive:true});
 const binary=resolve(process.argv[3]??'zig-out/bin/zerowork');
 const base=await realpath(await mkdtemp('/private/tmp/zerowork-variable-font-')),data=join(base,'data');await mkdir(data);
@@ -21,31 +25,45 @@ async function reveal(id:string){for(let i=0;i<8;i++){const n=await node(id),v=a
 async function click(id:string){if(id.startsWith('settings.field.')||id.startsWith('settings.slider.'))await reveal(id);await node(id);assert((await h.clickTestId(id)).ok,id);}
 async function capture(name:string){await h.mouseMove(5,5);await h.sleep(120);await h.screenshot(join(out,name+'.png'));report.captures.push(name+'.png');}
 async function value(){return (await h.inputState('settings.field.font_weight')).buffer;}
-async function preview(weight:number){assert.equal(Number(await value()),weight);const command=await node('settings.font.preview.command');report.preview_widths??={};report.preview_widths[weight]=command.rect.w;}
+// The terminal font preview (settings.font.preview) is the 预览 pane of 外观与主题 › 主题, not part of 字体与排版; leaving a subpage
+// with a draft asks first, so preview glyph widths are measured on saved values (`measure`), then the test returns to 字体与排版.
+async function atPreview(check:()=>Promise<unknown>){await nav.toPane('settings.appearance.preview');await nav.reveal('settings.font.preview');await check();await nav.toSub('appearance','font');}
+async function preview(weight:number,measure=false){assert.equal(Number(await value()),weight);if(measure)await atPreview(async()=>{const command=await node('settings.font.preview.command');report.preview_widths??={};report.preview_widths[weight]=command.rect.w;});}
 async function edit(id:string,value:string){await click(id);await h.key('a',{cmd:true});await h.type_(value);await h.key('enter');}
 async function choose(family:string){await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_(family);await click('settings.option.font_family.'+family);}
-async function save(family:string,weight:string){await click('settings.save');await h.waitFor(async()=>{const c=await readFile(config,'utf8');return c.includes('font_family = "'+family+'"')&&c.includes('font_weight = "'+weight+'"')&&(await node('settings.footer.state')).text==='已保存'?true:null;});}
-async function launch(round:number){const rpc=join(base,'rpc-'+round);await mkdir(rpc);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;log=await open(join(out,'app-'+round+'.log'),'w');child=spawn(binary,[],{env:{...process.env,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});ended=new Promise(r=>child.once('close',r));await h.waitForServerReady();await h.resizeWindow(1280,900);await click('toolbar.settings');await click('settings.nav.appearance');if(!(await h.query('settings.field.font_family')).some(shown))await click('settings.appearance.font.header');}
+async function save(family:string,weight:string){await click('settings.save');await h.waitFor(async()=>{const c=await readFile(config,'utf8');return c.includes('font_family = "'+family+'"')&&c.includes('font_weight = "'+weight+'"')&&!(await nav.dirty())?true:null;});}
+async function launch(round:number){const rpc=join(base,'rpc-'+round);await mkdir(rpc);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;log=await open(join(out,'app-'+round+'.log'),'w');child=spawn(binary,[],{env:{...process.env,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});ended=new Promise(r=>child.once('close',r));await h.waitForServerReady();await h.resizeWindow(1280,900);await nav.toSub('appearance','font');}
 async function stop(){if(child?.exitCode===null){child.kill('SIGTERM');await ended;}if(child?.pid)await cleanupOwnedBridgeDirectories(child.pid);await log?.close();}
 try{
- await launch(1);await node('settings.slider.font_weight');assert.equal(await value(),'420');await preview(420);
+ await launch(1);await node('settings.slider.font_weight');assert.equal(await value(),'420');await preview(420,true);
  assert(!(await h.query('settings.chooser.font_weight')).some(shown));
  const inputId=(await node('settings.field.font_weight')).id;
  await edit('settings.field.font_weight','421');await preview(421);assert.equal((await node('settings.field.font_weight')).id,inputId,'editing weight keeps the input mounted');await capture('variable-421');
- await edit('settings.field.font_weight','550');await preview(550);assert.notEqual(report.preview_widths[420],report.preview_widths[550],'weight changes actual preview glyph advances');await save('Inter Variable','550');
+ await edit('settings.field.font_weight','550');await preview(550);await save('Inter Variable','550');await preview(550,true);assert.notEqual(report.preview_widths[420],report.preview_widths[550],'weight changes actual preview glyph advances');
  report.checks.push('Inter Variable automatically uses slider + number, with exact intermediate weights and a stable input while editing.');
  await click('settings.slider.font_weight');const before=Number(await value());await h.key('right');assert.equal(Number(await value()),before+1);await preview(before+1);
  const track=await node('settings.slider.font_weight');await h.mouseDown(track.rect.x+track.rect.w*.25,track.rect.y+track.rect.h/2);await h.mouseMove(track.rect.x+track.rect.w*.7,track.rect.y+track.rect.h/2);await h.mouseUp(track.rect.x+track.rect.w*.7,track.rect.y+track.rect.h/2);const dragged=Number(await value());assert(dragged>550&&dragged<800);await preview(dragged);
  report.checks.push('Slider click, keyboard step of 1 and dragging synchronize the number and native preview without remounting.');
- await edit('settings.field.font_weight','901');assert.match(text(await node('settings.error.font_weight')),/100–900/);const saved=await readFile(config,'utf8');await h.clickTestId('settings.save');assert.equal(await readFile(config,'utf8'),saved);await click('settings.field.font_weight');await h.key('escape');assert.equal(Number(await value()),dragged);
- for(const invalid of ['99','420.5','NaN']){await edit('settings.field.font_weight',invalid);await node('settings.error.font_weight');await h.key('escape');assert.equal(Number(await value()),dragged);}
+ const weightField='settings.field.font_weight',weightError='settings.error.font_weight';
+ await edit(weightField,'901');assert.match(text(await node(weightError)),/100–900/);
+ const saved=await readFile(config,'utf8');await h.clickTestId('settings.save');
+ await h.waitFor(async()=> (await h.focused()).test_id===weightField||null);
+ assert.equal(await readFile(config,'utf8'),saved);
+ assert.equal(await value(),'901');
+ // Invalid Save returns focus with the invalid value. A fresh focus session captures the last valid value for Escape.
+ await edit(weightField,String(dragged));await nav.gone(weightError);
+ await click('settings.field.font_size');
+ for(const invalid of ['901','99','420.5','NaN']){
+  await edit(weightField,invalid);await node(weightError);await h.key('escape');
+  assert.equal(Number(await value()),dragged);await nav.gone(weightError);
+ }
  await edit('settings.field.font_weight','100');await preview(100);await edit('settings.field.font_weight','900');await preview(900);await edit('settings.field.font_weight','420');await save('Inter Variable','420');
  await h.resizeWindow(860,480);await reveal('settings.field.font_weight');const number=await node('settings.field.font_weight'),slider=await node('settings.slider.font_weight'),viewport=await node('settings.viewport');assert(number.rect.x+number.rect.w<=viewport.rect.x+viewport.rect.w+1);assert(slider.rect.x+slider.rect.w<number.rect.x+1);await capture('compact-variable');await h.resizeWindow(1280,900);
  report.checks.push('Range endpoints work; invalid, fractional and nonnumeric input keep the last valid preview and Escape restores it. Compact controls stay inside the viewport.');
  await choose('Menlo');assert.match(text(await node('settings.field.font_weight')),/Regular/);assert(!(await h.query('settings.slider.font_weight')).some(shown));await click('settings.field.font_weight');await node('settings.option.font_weight.regular');await node('settings.option.font_weight.bold');assert(!(await h.query('settings.option.font_weight.light')).some(shown));await h.key('escape');
- await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_('自定义');await click('settings.option.font_family.custom');await edit('settings.field.font_family','Inter Variable');await node('settings.slider.font_weight');assert.equal(await value(),'400');await edit('settings.field.font_weight','550');await save('Inter Variable','550');await reveal('settings.font.preview');await capture('variable-550');
+ await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_('自定义');await click('settings.option.font_family.custom');await edit('settings.field.font_family','Inter Variable');await node('settings.slider.font_weight');assert.equal(await value(),'400');await edit('settings.field.font_weight','550');await save('Inter Variable','550');await atPreview(()=>capture('variable-550'));
  report.checks.push('Switching to Menlo shows only native Regular/Bold and reconciles 420; typing a variable family restores the continuous control.');
- await click('settings.close');await stop();await launch(2);assert.equal(await value(),'550');await preview(550);await node('settings.slider.font_weight');await capture('restarted-variable');report.checks.push('Exact numeric weight and variable control survive a new process.');report.status='passed';
+ await nav.close();await stop();await launch(2);assert.equal(await value(),'550');await preview(550,true);await node('settings.slider.font_weight');await capture('restarted-variable');report.checks.push('Exact numeric weight and variable control survive a new process.');report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});console.error(e);}
 finally{await stop();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));await rm(base,{recursive:true,force:true});}
 if(report.status!=='passed')process.exitCode=1;else console.log('PASS',report.checks.length,'variable font native checks');

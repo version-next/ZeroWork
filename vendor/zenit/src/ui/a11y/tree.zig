@@ -1235,6 +1235,11 @@ test "characterBoundaries shares extended grapheme clusters" {
 pub fn wordBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
     const characters = try characterBoundaries(allocator, value);
     defer allocator.free(characters);
+    return wordBoundariesFrom(allocator, value, characters);
+}
+
+/// `wordBoundaries` over boundaries already produced by `characterBoundaries`.
+pub fn wordBoundariesFrom(allocator: std.mem.Allocator, value: []const u8, characters: []const u32) ![]u32 {
     const Doc = struct {
         pub fn getByteAt(_: *const @This(), _: usize) ?u8 {
             return null;
@@ -1266,6 +1271,11 @@ pub fn wordBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
 pub fn paragraphBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
     const characters = try characterBoundaries(allocator, value);
     defer allocator.free(characters);
+    return paragraphBoundariesFrom(allocator, value, characters);
+}
+
+/// `paragraphBoundaries` over boundaries already produced by `characterBoundaries`.
+pub fn paragraphBoundariesFrom(allocator: std.mem.Allocator, value: []const u8, characters: []const u32) ![]u32 {
     var result: std.ArrayList(u32) = .empty;
     defer result.deinit(allocator);
     try result.append(allocator, 0);

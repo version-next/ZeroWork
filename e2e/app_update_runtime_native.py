@@ -18,6 +18,10 @@ import tempfile
 import time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py).
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -50,6 +54,8 @@ def main():
     args = parser.parse_args()
     fixture = (args.bin_dir / 'update-fixture').resolve()
     helper = (args.bin_dir / 'ZeroWorkUpdater').resolve()
+    for binary in (fixture, helper):
+        build_mode_guard.assert_test_mode_binary(binary)
     identity = run(['python3', ROOT / 'scripts/macos_signing.py', 'identity'], cwd=ROOT, text=True).stdout.strip()
     trust = read(ROOT / 'src/update/trust.json')
     key = Ed25519PrivateKey.from_private_bytes((pathlib.Path.home() / 'Library/Application Support/com.zerowork.signing/update-ed25519.key').read_bytes())
@@ -87,8 +93,8 @@ def main():
             with zipfile.ZipFile(archive) as zipped:
                 expanded = sum(entry.file_size for entry in zipped.infolist())
             payload = {'schema': 1, 'version': '0.3.1', 'minimum_os': '14.0', 'arch': 'arm64',
-                       'url': 'https://github.com/iskylite/ZeroWork/releases/download/v0.3.1/ZeroWork-0.3.1-arm64.zip',
-                       'release_url': 'https://github.com/iskylite/ZeroWork/releases/tag/v0.3.1',
+                       'url': 'https://github.com/version-next/ZeroWork/releases/download/v0.3.1/ZeroWork-0.3.1-arm64.zip',
+                       'release_url': 'https://github.com/version-next/ZeroWork/releases/tag/v0.3.1',
                        'bytes': archive.stat().st_size, 'expanded_bytes': expanded,
                        'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'notes': 'Disposable signed runtime bridge fixture'}
             raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode()

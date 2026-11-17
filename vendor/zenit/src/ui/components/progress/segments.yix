@@ -1,0 +1,48 @@
+//! ProgressSegments view: one bar split into parts (e.g. context usage by source), each part its
+//! share in its own tone, the rest of the bar in progress-track. Styles in styles.yss, types and
+//! tests in mod.zig.
+const std = @import("std");
+const ui = @import("../../ui.zig");
+const mod = @import("mod.zig");
+const S = @import("styles.yss");
+const ProgressSegment = mod.ProgressSegment;
+const ProgressTone = mod.ProgressTone;
+
+fn countOf(segments: []const ProgressSegment) usize {
+    return @min(segments.len, mod.max_segments);
+}
+/// Part `i` clamped to what is left of the bar (parts past 100 shrink, never overflow).
+fn shareAt(segments: []const ProgressSegment, i: usize) f32 {
+    var used: f32 = 0;
+    for (segments[0..@min(i, segments.len)]) |part| used += std.math.clamp(part.value, 0, 100);
+    if (i >= segments.len) return 0;
+    return std.math.clamp(segments[i].value, 0, @max(0, 100 - @min(100, used)));
+}
+fn toneAt(segments: []const ProgressSegment, i: usize) ProgressTone {
+    return if (i < segments.len) segments[i].tone else .neutral;
+}
+fn restOf(segments: []const ProgressSegment) f32 {
+    var used: f32 = 0;
+    for (segments) |part| used += std.math.clamp(part.value, 0, 100);
+    return @max(0, 100 - used);
+}
+fn a11yOf(segments: []const ProgressSegment) ui.A11yProps {
+    const used = 100 - restOf(segments);
+    return .{ .role = .progressbar, .value_min = 0, .value_max = 100, .value_now = used, .value_range = .{ .now = used, .min = 0, .max = 100 } };
+}
+
+/// Segmented progress: `W.ProgressSegments(.{ .segments = &.{ .{ .value = 15, .tone = .neutral },
+/// .{ .value = 12, .tone = .accent } } })`. Parts (0-100 each, at most `max_segments`) sit left to
+/// right `gap` apart on a `height` bar with round ends; the remainder is the track. `segments` can
+/// be a signal; parts follow it in place.
+pub fn ProgressSegments(segments: []const ProgressSegment = &.{}, height: f32 = 4, gap: f32 = 2, width: ?f32 = null) View {
+    const count = computed(countOf(segments));
+    const has_rest = computed(restOf(segments) > 0);
+    const semantics = computed(a11yOf(segments));
+    return (
+        <row style={S.segments.of(.{ .width = width, .height = height, .gap = gap })} a11y={semantics}>
+            {for (0..count) |i| <box style={S.segment.of(.{ .percent = shareAt(segments, i), .tone = toneAt(segments, i), .height = height })} />}
+            {if (has_rest) <box style={S.segment_rest.of(.{ .height = height })} />}
+        </row>
+    );
+}

@@ -155,12 +155,31 @@ pub fn notifyAccessibilityPropertyChange(self: *Cx, node: *Node) void {
     self.focus_manager.a11y_bridge.notifyPropertyChange(node);
 }
 
+/// See `Cx.setReservedKeyChords`.
+pub fn setReservedKeyChords(self: *Cx, chords: []const @import("../events.zig").KeyChord) bool {
+    const sdk = self.system_sdk orelse return false;
+    var buf: [32]system_sdk_mod.events.ReservedChord = undefined;
+    const n = @min(chords.len, buf.len);
+    for (chords[0..n], buf[0..n]) |c, *out| out.* = .{
+        .keycode = @intFromEnum(c.key),
+        .modifiers = .{ .shift = c.mods.shift, .ctrl = c.mods.ctrl, .alt = c.mods.alt, .super = c.mods.super },
+    };
+    sdk.setReservedKeyChords(self.window_id, buf[0..n]) catch return false;
+    return true;
+}
+
 pub fn setImeCursorRect(self: *Cx, x: f32, y: f32, width: f32, height: f32) bool {
     const sdk = self.system_sdk orelse return false;
     sdk.setImeCursorRect(self.window_id, x, y, width, height) catch return false;
     return true;
 }
 
+/// Same as `measureTextWidthCallback` in the monospace face (Textarea `monospace` wrapping).
+pub fn measureMonoTextWidthCallback(context: *anyopaque, text_ptr: [*]const u8, text_len: usize, font_size: f32, font_weight: u16, italic: bool) f32 {
+    const self: *Cx = @ptrCast(@alignCast(context));
+    const line = self.text.visualLine(.{ .text = text_ptr[0..text_len], .font_family = "system", .font_size = font_size, .font_weight = font_weight, .use_italic = italic, .use_monospace = true }) catch return 0;
+    return line.width;
+}
 pub fn measureTextWidthCallback(context: *anyopaque, text_ptr: [*]const u8, text_len: usize, font_size: f32, font_weight: u16, italic: bool) f32 {
     const self: *Cx = @ptrCast(@alignCast(context));
     return self.text.measureTextWidth(text_ptr[0..text_len], font_size, font_weight, italic);

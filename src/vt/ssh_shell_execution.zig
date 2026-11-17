@@ -16,7 +16,7 @@ pub const Bridge = struct {
     attach_failure: ?[]const u8 = null,
     /// Only collect a line that began at an integrated empty prompt. Unknown
     /// foreground/authentication input is never retained for classification.
-    switch_input: @import("../ui/command_palette.zig").LineTracker = .{},
+    switch_input: @import("command_palette.zig").LineTracker = .{},
     switch_tracking: bool = false,
 
     command: ?[]u8 = null,

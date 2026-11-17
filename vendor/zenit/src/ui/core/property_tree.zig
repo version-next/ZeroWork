@@ -69,7 +69,8 @@ pub const ClipNode = struct {
     world_aabb: ComputedRect,
     /// Actual clip shape consumed by render runtime.
     shape_kind: display_list_mod.ClipShapeKind = .rect,
-    radius: f32 = 0,
+    /// Rounded-clip corner radii TL, TR, BR, BL (.rounded_rect only).
+    radii: [4]f32 = .{ 0, 0, 0, 0 },
     polygon: display_list_mod.ClipPolygon = .{},
     /// true means currently using bounds as conservative degeneration, not precise shape clip.
     bounds_fallback: bool = false,
@@ -113,7 +114,10 @@ pub const EffectNode = struct {
     blend_mode: types.BlendMode = .normal,
     /// Lens warp of the composited surface (opacity / composited_group kinds).
     warp: types.ContentWarp = .{},
-    /// Liquid glass effect parameters (GPU-ready format).
+    /// Liquid glass effect parameters (GPU-ready format). `glass.group` is the group's style
+    /// handle (the live shape table, owned by the group component): read it while the frame is
+    /// being built only. The layer plan built from this effect holds its own copy of the table
+    /// (LayerTree.plan_glass_tables), and that is what is read once the frame is displayed.
     glass: types.ResolvedGlassParams = .{},
     corner_radius: [4]f32 = .{ 0, 0, 0, 0 },
     requires_offscreen: bool = false,

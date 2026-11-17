@@ -1,7 +1,12 @@
-/** Public Harness, isolated real Local sessions. Root owns execution/native slot.
- * node e2e/group_workspace_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
+/** Public Harness, isolated real Local sessions: workspace chrome captures and the @grp group workspace.
+ * node e2e/workspace_visual_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR [--theme dark|light|sauber] [--sidebar-only 1]
  * --prepare-only 1 writes a plan without starting an app.
+ *
+ * The local terminal starts from the home's “本地终端” (`workspace.empty.local`): the sidebar's own local entry
+ * (sidebar.local) was removed in 83a600af, and opening a session keeps the sidebar (no auto-collapse, so there is no
+ * sidebar.restore to press afterwards); ⌘B hides it.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -12,8 +17,9 @@ import { fileURLToPath } from "node:url";
 import { waitForServerReady, waitFor, query, clickAt, key, type_, screenshot, sleep, resizeWindow, tree, screenPos } from "../zig-out/share/zenit/harness/client.ts";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args: Record<string,string> = {};
-for(let i=2;i<process.argv.length;i+=2) { assert(["--binary","--expected-sha","--out","--prepare-only","--sidebar-only"].includes(process.argv[i]) && process.argv[i+1]); args[process.argv[i]]=process.argv[i+1]; }
+for(let i=2;i<process.argv.length;i+=2) { assert(["--binary","--expected-sha","--out","--prepare-only","--sidebar-only","--theme"].includes(process.argv[i]) && process.argv[i+1]); args[process.argv[i]]=process.argv[i+1]; }
 assert(args["--out"]);
+const theme=args["--theme"]??"dark";assert(["dark","light","sauber"].includes(theme),"--theme dark | light | sauber");
 const output=resolve(args["--out"]); await mkdir(output,{recursive:true}); assert.equal((await readdir(output)).length,0);
 const report:any={status:"prepared_not_run",checks:[],screenshots:[],input:"Synthetic public Harness only",visual_status:"not_reviewed",limits:["Physical pointer, IME, window blur, VoiceOver require separate native acceptance","Runner cleanup SIGTERM is not normal application shutdown proof","Local mixed-group paths only; SSH reconnect/offline and AI impacts require their own fixtures"]};
 const save=()=>writeFile(join(output,"report.json"),JSON.stringify(report,null,2));
@@ -21,7 +27,7 @@ if(args["--prepare-only"]==="1") { report.plan=["Create two real zsh services vi
 assert(args["--binary"] && /^[a-f0-9]{64}$/.test(args["--expected-sha"]??""));
 const sourceBinary=resolve(args["--binary"]), binary=join(output,"zerowork-frozen"); await copyFile(sourceBinary,binary); await copyFile(join(dirname(sourceBinary),"zw_ipc.so"),join(output,"zw_ipc.so")); assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"),args["--expected-sha"]);
 const isolated=await mkdtemp(join(tmpdir(),"zw-group-workspace-")), rpc=join(isolated,"rpc"),data=join(isolated,"data"); await Promise.all([mkdir(rpc),mkdir(data)]);
-await writeFile(join(data,"config.toml"),'[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\nfont_size = 14\n');
+await writeFile(join(data,"config.toml"),`[meta]\nconfig_revision = 1\n[ui]\ntheme = "${theme}"\nfont_family = "Menlo"\nfont_size = 14\n`);
 await writeFile(join(data,"hosts.toml"),'[[hosts]]\nname="prod-web-01"\nhost="10.0.1.24"\nuser="deploy"\ngroup="团队服务器"\n[[hosts]]\nname="dev-api-02"\nhost="10.0.2.18"\nuser="developer"\ngroup="团队服务器"\n[[hosts]]\nname="assets"\nhost="10.0.1.36"\nuser="files"\nprotocol="sftp"\ngroup="团队服务器"\n');
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const log=await open(join(output,"app.log"),"w");
@@ -39,9 +45,11 @@ const type=async(text:string)=>{report.last_action={kind:"type",text,at:new Date
 const menuItem=async(label:string)=>{
  const menu=await visible("groups.member_menu");const n=flat(menu).find(n=>n.text===label);assert(n,`Missing member menu item ${label}`);await clickNode(n);
 };
-const tabs=async()=>{const strip=(await query("tabs.strip")).find(shown);return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??"")&&!flat(n).some(c=>c.test_id==="groups.close")):[]};
+const tabs=async()=>{const strip=(await query("tabs.strip")).find(shown);return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??"")&&!flat(n).some(c=>c.test_id==="groups.close"||c.test_id==="groups.tab.count")):[]};
 const panes=async()=>{const result:any[]=[];for(let id=1;id<=4;id++){const rect=await screenPos(`groups.pane.${id}`);if(rect.w>0&&rect.h>0)result.push({test_id:`groups.pane.${id}`,rect})}return result};
-const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);await writeFile(join(output,`${name}.tree.json`),JSON.stringify(await tree(),null,2));const observed:any={geometry:{}};for(const id of ["workspace.sidebar","sidebar.header","sidebar.search.well","sidebar.viewport","sidebar.group","sidebar.host","sidebar.bottom","sidebar.local","sidebar.footer.new","tabs.strip","tabs.tab.1","groups.workspace","groups.pane.1","groups.pane.2","groups.pane.header","groups.broadcast.1","groups.pin.1","groups.menu.1"]){observed.geometry[id]=await screenPos(id)};for(const id of ["sidebar.search","tabs.strip","groups.workspace","groups.close.confirm","groups.close.partial","local.close.confirmation"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
+const capture=async(name:string)=>{assert((await screenshot(join(output,`${name}.png`))).ok);await writeFile(join(output,`${name}.tree.json`),JSON.stringify(await tree({visibleOnly:true}),null,2));const observed:any={geometry:{}};for(const id of ["workspace.sidebar","sidebar.header","sidebar.search.well","sidebar.viewport","sidebar.group","sidebar.host","sidebar.bottom","workspace.empty.local","sidebar.footer.new","tabs.strip","tabs.tab.1","groups.workspace","groups.pane.1","groups.pane.2","groups.pane.header","groups.broadcast.1","groups.pin.1","groups.menu.1"]){observed.geometry[id]=await screenPos(id)};for(const id of ["sidebar.search","tabs.strip","groups.workspace","groups.close.confirm","groups.close.partial","local.close.confirmation"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
+/** Resize and wait (bounded) until the shell has taken the new size. */
+const resize=async(w:number,h:number)=>{assert((await resizeWindow(w,h)).ok);await waitFor(async()=>{const r=await screenPos("workspace.shell");return Math.abs(r.w-w)<1&&Math.abs(r.h-h)<1||null},5000)};
 const check=(name:string,detail:any)=>report.checks.push({name,status:"passed",detail});
 async function joinTrustedGroup(label:string):Promise<void>{
  // Shell startup is async and user rc files may take seconds. A real shell
@@ -58,7 +66,7 @@ async function joinTrustedGroup(label:string):Promise<void>{
  for(let attempt=1;attempt<=3;attempt++){
    await capture(`before-${label}-trusted-at-${attempt}`);await type("@");
    try{await waitFor(async()=>(await query("terminal.commands")).some(shown)||null,4000);ready=true;break}
-   catch(error){report.readiness_attempt={label,attempt,result:"trusted-popup-unavailable"};await save();await press("c",{ctrl:true});await sleep(300)}
+   catch(error){report.readiness_attempt={label,attempt,result:"trusted-popup-unavailable"};await save();await press("c",{ctrl:true})}
  }
  assert(ready,`Real shell ${label} started, but production trusted @ editor never became available`);
  await capture(`${label}-trusted-editor-ready`);await type("grp Acceptance");
@@ -70,17 +78,22 @@ async function joinTrustedGroup(label:string):Promise<void>{
 
 try {
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,"owner.json"),"utf8")).pid),child.pid);
- await resizeWindow(1440,900);await capture("00-empty-wide");await click("sidebar.local");await visible("terminal.surface");
- await sleep(1000);await click("sidebar.restore");await capture("00-sidebar-local-wide");await resizeWindow(860,480);await capture("00-sidebar-local-compact");await resizeWindow(1440,900);await key("b",{cmd:true});await capture("00-local-wide");await resizeWindow(860,480);await capture("00-local-compact");await resizeWindow(1440,900);if(args["--sidebar-only"]==="1"){check("sidebar Local Terminal starts a real Local session",{});report.status="captured_pending_visual_review";await save();process.exitCode=0;}else {const firstTab=(await tabs())[0].test_id;
- await joinTrustedGroup("first");await visible("groups.workspace");await visible("groups.waiting");
+ await resize(1440,900);await visible("workspace.sidebar");await capture("00-empty-wide");
+ await click("workspace.empty.local");await visible("terminal.surface");
+ assert((await visible("workspace.sidebar")).rect.w>0,"opening the local session keeps the sidebar");await capture("00-sidebar-local-wide");
+ await resize(860,480);await visible("workspace.sidebar");await capture("00-sidebar-local-compact");await resize(1440,900);
+ await press("b",{cmd:true});await hidden("workspace.sidebar");await visible("workspace.sidebar.restore");await capture("00-local-wide");
+ await resize(860,480);await capture("00-local-compact");await resize(1440,900);if(args["--sidebar-only"]==="1"){check("sidebar Local Terminal starts a real Local session",{});report.status="captured_pending_visual_review";await save();process.exitCode=0;}else {const firstTab=(await tabs())[0].test_id;
+ await joinTrustedGroup("first");await visible("groups.workspace"); /* 88529dc0: a one-member group shows its pane (no "waiting" placeholder) */
  const firstPane=(await panes())[0].test_id; assert.equal((await panes()).length,1);await capture("01-single-member-real-pane");
  await click("toolbar.new_session");await click("session.menu.local");await visible("terminal.surface");
  const secondTab=(await tabs()).find(n=>n.test_id!==firstTab).test_id;
  await joinTrustedGroup("second");await waitFor(async()=>(await panes()).length===2||null,15000);
  const ids=(await panes()).map(n=>n.test_id);assert(ids.includes(firstPane));assert.equal(new Set(ids).size,2);assert.equal((await tabs()).length,2);check("two actual sessions plus one group tab",{sessionTabs:[firstTab,secondTab],panes:ids});
  const firstId=firstPane.split(".").at(-1)!, secondId=ids.find(id=>id!==firstPane)!.split(".").at(-1)!;
- let pp=await panes();assert(Math.abs(pp[0].rect.y-pp[1].rect.y)<1);assert(Math.abs(pp[1].rect.x-pp[0].rect.x-pp[0].rect.w-4)<=1);await capture("02-side-by-side");await resizeWindow(860,480);await capture("02-side-by-side-compact");await resizeWindow(1440,900);
- await click(`groups.menu.${firstId}`);await menuItem("全部改为上下排列");await sleep(200);pp=await panes();assert(Math.abs(pp[0].rect.x-pp[1].rect.x)<1);assert(Math.abs(pp[1].rect.y-pp[0].rect.y-pp[0].rect.h-4)<=1);await capture("03-stacked");
+ let pp=await panes();assert(Math.abs(pp[0].rect.y-pp[1].rect.y)<1);assert(Math.abs(pp[1].rect.x-pp[0].rect.x-pp[0].rect.w-4)<=1);await capture("02-side-by-side");await resize(860,480);await capture("02-side-by-side-compact");await resize(1440,900);
+ await click(`groups.menu.${firstId}`);await menuItem("全部改为上下排列");
+ pp=await waitFor(async()=>{const now=await panes();return now.length===2&&Math.abs(now[0].rect.x-now[1].rect.x)<1?now:null},5000).catch(async()=>assert.fail(`panes stack after “全部改为上下排列”: ${JSON.stringify(await panes())}`));assert(Math.abs(pp[0].rect.x-pp[1].rect.x)<1);assert(Math.abs(pp[1].rect.y-pp[0].rect.y-pp[0].rect.h-4)<=1);await capture("03-stacked");
  report.status="captured_pending_visual_review";}
 } catch(error) { report.status="failed";report.error=String(error);await capture("failed").catch(()=>{});process.exitCode=1 }
 finally {await save();if(child.exitCode===null)child.kill("SIGTERM");await Promise.race([ended,sleep(3000)]);await log.close()}

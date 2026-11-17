@@ -1,0 +1,91 @@
+//! Runtime fixture for window chrome written as templates (ZeroWork G28 / G29): a glass sidebar
+//! that fills its column with a flexible scroll list (`W.GlassBox fill`), and a content page whose
+//! viewport carries its own scroll edge effect (`W.ScrollArea scrollEdge`) under a titlebar edge
+//! (`W.TitlebarEdge`). Lives outside tests/yix so it is not an LP3 equivalence input.
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub fn Sidebar(rows: usize = 3) View {
+    return (
+        <W.GlassBox testId="chrome.nav" width={216} fill={.height} padding={.{ .top = 10, .right = 8, .bottom = 10, .left = 8 }} bodyGap={12}>
+            <box testId="chrome.nav.top" style={.{ .height = .{ .px = 28 } }} />
+            <W.ScrollArea testId="chrome.nav.list" direction={.vertical} style={.{ .height = .{ .grow = .{ .min = 0 } } }}>
+                <text>{rows}</text>
+            </W.ScrollArea>
+            <box testId="chrome.nav.note" style={.{ .height = .{ .px = 20 } }} />
+        </W.GlassBox>
+    );
+}
+
+pub fn Page(edgeHeight: f32 = 48) View {
+    return (
+        <box testId="chrome.page" style={.{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .position = .relative }}>
+            <W.ScrollArea testId="chrome.viewport" direction={.vertical} scrollEdge={.{ .edge = .top, .style = .soft, .height = edgeHeight }}>
+                <box style={.{ .height = .{ .px = 2000 } }} />
+            </W.ScrollArea>
+            <W.TitlebarEdge testId="chrome.edge" />
+        </box>
+    );
+}
+
+pub fn Shell() View {
+    return (
+        <row testId="chrome.shell" style={.{ .width = .{ .px = 900 }, .height = .{ .px = 600 } }}>
+            <Sidebar />
+            <Page />
+        </row>
+    );
+}
+
+/// G27: history buttons as a toolbar group in a header row; back is disabled by a parameter.
+pub fn Header(canBack: bool = false, onBack: ?Handler(void) = null) View {
+    return (
+        <row testId="chrome.header" style={.{ .width = .{ .px = 600 }, .height = .{ .px = 48 }, .align_items = .center }}>
+            <W.GlassToolbarGroup testId="chrome.history" label="History">
+                <W.GlassToolbarButton testId="chrome.history.back" icon={ui.icons.chevron_left} label="Back" disabled={!canBack} onClick={onBack} />
+                <W.GlassToolbarButton testId="chrome.history.forward" icon={ui.icons.chevron_right} label="Forward" disabled={true} />
+            </W.GlassToolbarGroup>
+            <spacer />
+            <W.GlassToolbar testId="chrome.toolbar">
+                <W.GlassToolbarGroup>
+                    <W.GlassToolbarButton icon={ui.icons.search} label="Search" />
+                </W.GlassToolbarGroup>
+            </W.GlassToolbar>
+        </row>
+    );
+}
+
+/// G32 / G33: a shortcut row (keycaps following parameters) and an external link button with a
+/// trailing icon.
+pub fn ShortcutRow(caps: []const []const u8 = &.{}, tone: W.KbdTone = .neutral) View {
+    return (
+        <row testId="chrome.shortcut" style={.{ .align_items = .center }}>
+            <W.Kbd testId="chrome.kbd" keys={caps} tone={tone} />
+            <W.Button testId="chrome.link" label="GitHub" variant={.link} iconAsset={ui.icons.external_link} iconPosition={.trailing} />
+        </row>
+    );
+}
+
+/// G38: the window's notification stack declared in a template, driven by a post source.
+pub fn Toasts(post: W.NotificationPost = .{}) View {
+    return <box testId="chrome.toasts"><W.NotificationHost post={post} position={.top_right} /></box>;
+}
+
+/// G35: builders whose Props declare `test_id` (Slider: the track) take `testId` there.
+/// G35 with a `ref` on the element (the builder is wrapped): `testId` still lands on the track.
+pub fn SliderRefRow(id: []const u8 = "chrome.slider.ref", slider: *ui.view.Ref(W.slider.SliderResult)) View {
+    return (
+        <row testId="chrome.slider.ref.row">
+            <W.Slider ref={slider} testId={id} value={0.5} />
+        </row>
+    );
+}
+
+pub fn SliderRow(id: []const u8 = "chrome.slider") View {
+    return (
+        <row testId="chrome.slider.row">
+            <W.Slider testId={id} value={0.5} />
+            <W.GlassToolbar testId="chrome.slider.toolbar" />
+        </row>
+    );
+}

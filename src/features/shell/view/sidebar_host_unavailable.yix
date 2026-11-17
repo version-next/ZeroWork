@@ -1,0 +1,22 @@
+//! 侧栏主机行的“已禁用”（PLUGIN_ARCH_PLAN 6.2.1 Q5；Pencil XqqLV 稿 2 的 qQaos / RfJyL，用户已拍板）：协议插件被禁用时，
+//! 它的已保存主机留在原分组原位置，行尾用“已禁用”代替连接按钮；原因与恢复路径在原生 `W.Tooltip` 里
+//! （悬停时打开；回车 / 双击这一行也只打开同一个提示，不发起连接）。外观是 zenit 默认；显隐与开合由宿主
+//! （`sidebar_view.HostRow`）控制。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("sidebar_host_unavailable.yss");
+
+pub const ids = struct {
+    pub const label = "sidebar.host.unavailable";
+    pub const tooltip = "sidebar.host.unavailable.tooltip";
+};
+
+pub fn HostUnavailable(reason: []const u8 = "", open: bool = false, onOpenChange: ?Handler(bool) = null) View {
+    return (
+        <box style={S.slot}>
+            <W.Tooltip text={reason} position={.right} open={open} onOpenChange={onOpenChange} parts={.{ .content = ids.tooltip }}>
+                <text testId={ids.label} style={S.label}>已禁用</text>
+            </W.Tooltip>
+        </box>
+    );
+}

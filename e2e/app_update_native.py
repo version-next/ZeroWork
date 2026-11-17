@@ -4,6 +4,10 @@ Build first: zig build build-update-tools -Dtest-mode=true -Doptimize=ReleaseFas
 """
 import argparse, base64, hashlib, json, os, pathlib, plistlib, shutil, signal, subprocess, tempfile, time, uuid, zipfile
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py).
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'zig-out/bin')
@@ -11,6 +15,7 @@ parser.add_argument('--output',type=pathlib.Path,default=ROOT/'dist/update-valid
 args=parser.parse_args()
 OUT=args.output;OUT.mkdir(parents=True,exist_ok=True)
 FIXTURE=(args.bin_dir/'update-fixture').resolve();HELPER=(args.bin_dir/'ZeroWorkUpdater').resolve()
+for _binary in (FIXTURE,HELPER): build_mode_guard.assert_test_mode_binary(_binary)
 IDENTITY=subprocess.check_output(['python3','scripts/macos_signing.py','identity'],cwd=ROOT,text=True).strip()
 TRUST=json.loads((ROOT/'src/update/trust.json').read_bytes())
 KEY=Ed25519PrivateKey.from_private_bytes((pathlib.Path.home()/'Library/Application Support/com.zerowork.signing/update-ed25519.key').read_bytes())
@@ -45,7 +50,7 @@ class Case:
   self.txn=self.root/('txn-'+str(uuid.uuid4()));self.txn.mkdir(mode=0o700)
   archive=self.txn/'update.zip';run(['ditto','-c','-k','--keepParent','--norsrc','--noextattr',candidate,archive])
   with zipfile.ZipFile(archive) as z: expanded=sum(x.file_size for x in z.infolist())
-  payload={'schema':1,'version':'0.3.1','minimum_os':'14.0','arch':'arm64','url':'https://github.com/iskylite/ZeroWork/releases/download/v0.3.1/ZeroWork-0.3.1-arm64.zip','release_url':'https://github.com/iskylite/ZeroWork/releases/tag/v0.3.1','bytes':archive.stat().st_size,'expanded_bytes':expanded,'sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),'notes':'Isolated signed fixture'}
+  payload={'schema':1,'version':'0.3.1','minimum_os':'14.0','arch':'arm64','url':'https://github.com/version-next/ZeroWork/releases/download/v0.3.1/ZeroWork-0.3.1-arm64.zip','release_url':'https://github.com/version-next/ZeroWork/releases/tag/v0.3.1','bytes':archive.stat().st_size,'expanded_bytes':expanded,'sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),'notes':'Isolated signed fixture'}
   write(self.txn/'envelope.json',seal(payload));write(self.txn/'workspace.json',{'phase':'before-close','windows':[{'tabs':['fixture-local']}],'replay_tasks':False})
   helper=self.txn/'ZeroWorkUpdater';shutil.copy2(HELPER,helper);helper.chmod(0o700);run(['codesign','--force','--sign',IDENTITY,'--identifier','com.zerowork.updater',helper])
   parent=subprocess.Popen([str(self.target/'Contents/MacOS/ZeroWork'),'--parent',str(self.stop)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);self.processes.append(parent)

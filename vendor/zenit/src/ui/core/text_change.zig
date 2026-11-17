@@ -29,7 +29,7 @@ pub fn signature(text: ?types.TextProps) Signature {
     hashValue(&layout, text != null);
     hashValue(&paint, text != null);
     if (text) |t| {
-        const content_hash = std.hash.Wyhash.hash(0, t.content);
+        const content_hash = @import("trace").work_counters.hashText(0, t.content);
         hashValue(&layout, content_hash);
         hashValue(&paint, content_hash);
         inline for (.{ "font_size", "font_weight", "font_family", "line_height", "wrap", "max_lines", "baseline_ratio", "use_symbols_font", "use_monospace_font", "use_italic_font", "monospace_char_width", "spans_affect_layout" }) |field| {

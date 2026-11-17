@@ -2,6 +2,9 @@
 //! and reserved shortcuts before calling route; the renderer never receives App.
 const std = @import("std");
 const identity = @import("identity.zig");
+/// Input leases are part of the AI's environment (LIFECYCLE.md §5.2–5.3): granting a new lease and
+/// every revocation (focus, authorization, close, transfer, takeover, release) publish.
+const environment = @import("environment.zig");
 pub const LeaseKind = enum { human_focus, automation };
 pub const RevokeReason = enum { released, owner_changed, lost_focus, owner_closed, permission_changed, takeover, window_transfer };
 var next_context_instance: std.atomic.Value(u64) = .init(1);
@@ -137,6 +140,7 @@ pub const Context = struct {
             self.automation = lease;
             self.automation_guard.set(lease, null, null, std.math.maxInt(u64));
         }
+        environment.publish();
         return lease;
     }
     /// Called only by the host after generic approval and owner preflight.
@@ -274,6 +278,7 @@ pub const Context = struct {
             self.revocations[self.revocation_count] = .{ .lease = lease, .reason = reason };
             self.revocation_count += 1;
             slot.* = null;
+            environment.publish();
             // Best effort remote key/button release; failure is not represented
             // as success, and can never keep the local lease alive.
             self.consumer.consume(self.consumer.context, .release_all) catch {};
@@ -349,9 +354,11 @@ test "input focus authorization close and full revocation queue never leave stal
     try std.testing.expectEqual(@as(usize, 0), driver.count);
 }
 
-pub const ChildIntent = enum { create, edit };
+/// `create_jump`: a new SSH host that the parent adds as its first jump hop
+/// (design-r3 稿 4). `subject` names the parent's target for the child's copy.
+pub const ChildIntent = enum { create, edit, create_jump };
 pub const ChildResult = union(enum) { saved: struct { asset_id: identity.ConnectionId, revision: u64 }, cancelled, failed: []const u8 };
-pub const ChildRequest = struct { request_id: u64, parent_editor_id: u64, draft_revision: u64, contribution_id: []const u8, intent: ChildIntent };
+pub const ChildRequest = struct { request_id: u64, parent_editor_id: u64, draft_revision: u64, contribution_id: []const u8, intent: ChildIntent, subject: []const u8 = "" };
 pub const ChildCompletion = struct { request: ChildRequest, result: ChildResult };
 /// A host callback resolves the registered contribution and opens its editor
 /// slot. Parents receive IDs and completion values, never plugin instances.
@@ -373,7 +380,7 @@ pub const EditorHost = struct {
     pub fn deinit(self: *EditorHost) void {
         if (self.probes) |probes| probes.destroy();
         for (self.parents.items) |parent| if (parent.probes) |probes| probes.destroy();
-        for (self.pending.items) |item| self.allocator.free(item.contribution_id);
+        for (self.pending.items) |item| freeRequest(self.allocator, item);
         self.pending.deinit(self.allocator);
         self.parents.deinit(self.allocator);
     }
@@ -394,6 +401,11 @@ pub const EditorHost = struct {
         const bound = if (self.probe_host) |host| try host.bindParent(parent_editor_id, revision) else null;
         self.parents.appendAssumeCapacity(.{ .id = parent_editor_id, .revision = revision, .probes = bound });
         if (self.probes) |probes| if (probes.editor_id == parent_editor_id) try probes.setDraftRevision(revision);
+    }
+    /// The parent's current draft revision, as last registered by its shell.
+    pub fn parentRevision(self: *const EditorHost, parent_editor_id: u64) ?u64 {
+        for (self.parents.items) |parent| if (parent.id == parent_editor_id) return parent.revision;
+        return null;
     }
     pub fn probesFor(self: *const EditorHost, parent_editor_id: u64) ?@import("probe_contract.zig").EditorProbes {
         for (self.parents.items) |parent| if (parent.id == parent_editor_id) {
@@ -434,19 +446,25 @@ pub const EditorHost = struct {
         while (i < self.pending.items.len) {
             if (self.pending.items[i].parent_editor_id == parent_editor_id) {
                 const removed = self.pending.orderedRemove(i);
-                self.allocator.free(removed.contribution_id);
+                freeRequest(self.allocator, removed);
             } else i += 1;
         }
     }
     pub fn openChild(self: *EditorHost, parent_editor_id: u64, draft_revision: u64, contribution_id: []const u8, intent: ChildIntent) !u64 {
+        return self.openChildFor(parent_editor_id, draft_revision, contribution_id, intent, "");
+    }
+    pub fn openChildFor(self: *EditorHost, parent_editor_id: u64, draft_revision: u64, contribution_id: []const u8, intent: ChildIntent, subject: []const u8) !u64 {
         if (!self.current(parent_editor_id, draft_revision)) return error.StaleDraft;
+        if (subject.len > 1024) return error.InvalidContribution;
         if (self.pending.items.len == capacity) return error.EditorQueueFull;
         if (contribution_id.len == 0 or contribution_id.len > 256) return error.InvalidContribution;
         if (self.next_request == std.math.maxInt(u64)) return error.RequestIdentityExhausted;
         const owned = try self.allocator.dupe(u8, contribution_id);
         errdefer self.allocator.free(owned);
+        const owned_subject = try self.allocator.dupe(u8, subject);
+        errdefer self.allocator.free(owned_subject);
         try self.pending.ensureUnusedCapacity(self.allocator, 1);
-        const request: ChildRequest = .{ .request_id = self.next_request, .parent_editor_id = parent_editor_id, .draft_revision = draft_revision, .contribution_id = owned, .intent = intent };
+        const request: ChildRequest = .{ .request_id = self.next_request, .parent_editor_id = parent_editor_id, .draft_revision = draft_revision, .contribution_id = owned, .intent = intent, .subject = owned_subject };
         // Reserve ID and record before callback. A callback may schedule async
         // work, but cannot complete synchronously until this call returns.
         self.next_request += 1;
@@ -459,13 +477,17 @@ pub const EditorHost = struct {
     pub fn complete(self: *EditorHost, request_id: u64, result: ChildResult, context: *anyopaque, deliver: *const fn (*anyopaque, ChildCompletion) void) !bool {
         for (self.pending.items, 0..) |request, i| if (request.request_id == request_id) {
             const removed = self.pending.orderedRemove(i);
-            defer self.allocator.free(removed.contribution_id);
+            defer freeRequest(self.allocator, removed);
             if (!self.current(request.parent_editor_id, request.draft_revision)) return false;
             if (result == .saved and (@backingInt(result.saved.asset_id) == 0 or result.saved.revision == 0)) return error.InvalidSavedAsset;
             deliver(context, .{ .request = request, .result = result });
             return true;
         };
         return false;
+    }
+    fn freeRequest(allocator: std.mem.Allocator, request: ChildRequest) void {
+        allocator.free(request.contribution_id);
+        allocator.free(request.subject);
     }
     fn current(self: *const EditorHost, id: u64, revision: u64) bool {
         for (self.parents.items) |parent| if (parent.id == id) return parent.revision == revision;
@@ -521,4 +543,38 @@ test "input leases never alias another context or a later mount in the same wind
     const back = try returned.acquire(.automation, 2);
     try std.testing.expect(back.context_instance != old.context_instance);
     try std.testing.expectError(error.StaleInputLease, returned.route(old, 1, .{ .text = "return" }, false));
+}
+
+test "input lease grants and revocations publish the environment and repeated writes do not" {
+    var driver: TestDriver = .{};
+    var context: Context = .{ .owner = .{ .session_id = @fromBackingInt(1) }, .window_id = @fromBackingInt(1), .window = .{ .context = &driver, .request_fullscreen = TestDriver.request, .fullscreen_state = TestDriver.state, .transfer = TestDriver.transfer }, .consumer = .{ .context = &driver, .consume = TestDriver.consume } };
+    try context.setAuthorization(true, 2);
+    context.setFocus(true, false);
+    var before = environment.revision();
+    const lease = try context.acquire(.automation, 2);
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    // The live lease is returned again: no new grant.
+    try std.testing.expectEqual(lease.id, (try context.acquire(.automation, 2)).id);
+    context.setFocus(true, false);
+    try std.testing.expectEqual(before, environment.revision());
+    context.setFocus(false, false);
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    // Nothing is left to revoke.
+    context.setFocus(false, false);
+    context.release(lease);
+    try std.testing.expectEqual(before, environment.revision());
+    context.setFocus(true, false);
+    const second = try context.acquire(.automation, 2);
+    before = environment.revision();
+    context.release(second);
+    try std.testing.expect(environment.revision() > before);
+    _ = try context.acquire(.automation, 2);
+    before = environment.revision();
+    context.close();
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    context.close();
+    try std.testing.expectEqual(before, environment.revision());
 }

@@ -1,4 +1,5 @@
 /** Production native cleanup View. Real Local settlement is application_host's test. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -32,7 +33,7 @@ for(const fixture of fixtures.filter(f=>!process.env.TASK_FINISH_FIXTURE||f.name
   assert.equal(text(title),fixture.state==='working'?'执行仍在进行':fixture.state==='cleanup_pending'?'清理待核实':'任务已结束');
   assert(row.rect.x>=0&&row.rect.y>=0&&row.rect.x+row.rect.w<=fixture.width+.5&&row.rect.y+row.rect.h<=240);
   const viewport=await visible('ai.task_finish.resources_viewport'),resources=await visible('ai.task_finish.resources');
-  assert(text(resources).includes(fixture.long?'production-session':'Local Terminal'));
+  assert(text(resources).includes(fixture.long?'production-session':'本地终端'));
   assert(viewport.rect.w>100&&viewport.rect.h>=16);
   if(fixture.decision){
    const keep=await visible('ai.task_finish.keep'),close=await visible('ai.task_finish.close');

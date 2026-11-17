@@ -12,6 +12,11 @@ import subprocess
 import time
 import tomllib
 import urllib.request
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 p = argparse.ArgumentParser()
 p.add_argument('--binary', required=True)
@@ -19,6 +24,7 @@ p.add_argument('--sha', required=True)
 p.add_argument('--config', required=True)
 p.add_argument('--out', required=True)
 a = p.parse_args()
+build_mode_guard.assert_runner_binary(a.binary)
 workspace = Path(__file__).resolve().parent.parent
 binary, config_path, out = Path(a.binary).resolve(), Path(a.config).resolve(), Path(a.out).resolve()
 assert hashlib.sha256(binary.read_bytes()).hexdigest() == a.sha

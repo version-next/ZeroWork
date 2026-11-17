@@ -1,0 +1,14 @@
+const ui = @import("ui");
+pub const Mode = enum { a, b };
+pub fn Branches(shown: bool, mode: Mode) View {
+    return <col>{if (shown) <box><text>shown</text></box> else <box><text>hidden</text></box>}{switch (mode) { .a => <box><text>alpha</text></box>, .b => <box><text>beta</text></box> }}</col>;
+}
+pub fn Rows(items: []const u32) View {
+    return <col>{for (items) |item| <box key={item}><text>row</text></box>}</col>;
+}
+pub fn Frame(children: View, header: View, footer: View) View {
+    return <col><box>{header}</box><box>{children}</box><box>{footer}</box></col>;
+}
+pub fn Slots() View {
+    return <Frame header={<box><text>header</text></box>} footer={<box><text>footer</text></box>}><box><text>body</text></box></Frame>;
+}

@@ -59,9 +59,17 @@ pub const AnimateConfig = struct {
     easing: Easing = .ease_out_quad,
     /// Delay (seconds).
     delay: f32 = 0,
+    /// Cycles to play (0 = repeat until replaced). Each cycle runs `from` -> `to`.
+    loops: u32 = 1,
+    /// Alternate direction on every other cycle (`from` -> `to` -> `from` ...).
+    yoyo: bool = false,
     /// Completion callback.
     on_complete: ?ctrl_mod.CallbackFn = null,
     on_complete_ctx: ?*anyopaque = null,
+    /// Start from `from` (or the current value) even when an animation of the same prop is running
+    /// or was set earlier this frame (`NodeAnimations.restart`). Default false: continue from the
+    /// running animation's value and velocity (interruption-safe).
+    restart: bool = false,
 };
 
 /// Active animation list on node (fixed size, zero-alloc tick).
@@ -84,6 +92,17 @@ pub const NodeAnimations = struct {
     /// controller, take its current_value + velocity, seed new controller, interruption-safe, avoid
     /// value jumps on hover/active switch.
     pub fn set(self: *NodeAnimations, prop: AnimatableProp, ctrl: AnimationController) void {
+        self.put(prop, ctrl, true);
+    }
+
+    /// Add or replace property animation starting exactly from the new controller's `from`: a
+    /// running (or not yet ticked) animation of the same prop is replaced without seeding, so two
+    /// calls in one frame (jump to a value, then animate away from it) behave as written.
+    pub fn restart(self: *NodeAnimations, prop: AnimatableProp, ctrl: AnimationController) void {
+        self.put(prop, ctrl, false);
+    }
+
+    fn put(self: *NodeAnimations, prop: AnimatableProp, ctrl: AnimationController, continue_from_old: bool) void {
         if (ctrl.isScopeRetiring()) return;
         var accepted = ctrl.cloneForNode();
         accepted.node_owned = true;
@@ -108,7 +127,7 @@ pub const NodeAnimations = struct {
                 // velocity=0 etc driver-specific anchors); then seed writes old current/velocity,
                 // lets real tick sequence pick up from old state.
                 entry.controller.play();
-                entry.controller.seed(old_value, old_velocity);
+                if (continue_from_old) entry.controller.seed(old_value, old_velocity);
                 return;
             }
         }
@@ -317,6 +336,9 @@ pub const NodeAnimations = struct {
             },
             .border_width => {
                 node.style.border.setUniformWidth(v);
+                if (comptime @hasField(@TypeOf(node.style.border), "overlay")) {
+                    if (!node.style.border.overlay) node.markLayoutDirty();
+                } else node.markLayoutDirty();
                 node.markInteractionDirty();
                 node.markRenderDirty();
             },
@@ -423,6 +445,8 @@ pub fn animateNode(node: anytype, allocator: Allocator, config: AnimateConfig) v
         node.frame_state.frame_local.runtime.commands = a;
         break :blk a;
     };
+    // New tick work: the before-render tick must visit this node again (quiet-subtree skip).
+    if (comptime @hasDecl(@TypeOf(node.*), "invalidateTickQuietChain")) node.invalidateTickQuietChain();
 
     const from = config.from orelse NodeAnimations.getCurrentPropValue(node, config.prop);
 
@@ -433,10 +457,12 @@ pub fn animateNode(node: anytype, allocator: Allocator, config: AnimateConfig) v
         .easing = config.easing,
         .delay = config.delay,
     });
+    ctrl.loops = config.loops;
+    ctrl.yoyo = config.yoyo;
     ctrl.on_complete = config.on_complete;
     ctrl.on_complete_ctx = config.on_complete_ctx;
 
-    anims.set(config.prop, ctrl);
+    if (config.restart) anims.restart(config.prop, ctrl) else anims.set(config.prop, ctrl);
     // set may seed an interrupted controller from its current value/velocity.
     // Publish that accepted state, not the unseeded config.from value.
     for (anims.entries[0..anims.count]) |*entry| {
@@ -775,6 +801,31 @@ test "tween 中断 — 新 controller 从 old current_value 起步，无跳变" 
     // (error much less than v_at_interrupt's 50%).
     try std.testing.expect(node.style.opacity > v_at_interrupt * 0.85);
     try std.testing.expect(node.style.opacity < v_at_interrupt * 1.01);
+}
+
+test "animateNode restart: starts from `from` even right after another animation of the prop this frame" {
+    setTestTime(1000.0);
+    var node = MockNode{};
+    node.style.opacity = 1;
+    defer if (node.frame_state.frame_local.runtime.commands) |a| std.testing.allocator.destroy(a);
+    // Default: a second call in the same frame continues from the first one's value (1), so its
+    // "from 0" is overridden (interruption-safe).
+    animateNode(&node, std.testing.allocator, .{ .prop = .opacity, .to = 0.5, .duration = 0.3 });
+    animateNode(&node, std.testing.allocator, .{ .prop = .opacity, .from = 0, .to = 1, .duration = 0.3 });
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), node.style.opacity, 0.0001);
+    // restart: jumps to `from` now and holds it through the delay, then runs to `to`.
+    animateNode(&node, std.testing.allocator, .{ .prop = .opacity, .from = 0, .to = 1, .duration = 0.2, .delay = 0.1, .restart = true });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.style.opacity, 0.0001);
+    setTestTime(1050.0);
+    _ = node.frame_state.frame_local.runtime.commands.?.tick(&node, std.testing.allocator, 1050.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.style.opacity, 0.0001);
+    setTestTime(1400.0);
+    _ = node.frame_state.frame_local.runtime.commands.?.tick(&node, std.testing.allocator, 1400.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), node.style.opacity, 0.0001);
+    // A zero-length restart is a jump, applied at once.
+    animateNode(&node, std.testing.allocator, .{ .prop = .translate_y, .to = 10, .duration = 0.3 });
+    animateNode(&node, std.testing.allocator, .{ .prop = .translate_y, .from = 40, .to = 40, .duration = 0, .restart = true });
+    try std.testing.expectApproxEqAbs(@as(f32, 40), node.style.translate_y, 0.0001);
 }
 
 test "spring 中断 — velocity 续衔，不视觉抖动" {

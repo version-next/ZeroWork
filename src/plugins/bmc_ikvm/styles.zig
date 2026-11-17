@@ -1,16 +1,26 @@
 //! Native KVM content aligned to the approved Mist workspace geometry.
 //! Product palette and materials follow the existing theme registry.
 const ui = @import("ui");
-pub const theme = @import("../../ui/app_theme.zig");
-const shell = @import("../../ui/shell_styles.zig");
-pub const toolbar_height: f32 = 44;
-// Identity (108), five 64-point actions, six gaps and outer padding.
-pub const expanded_toolbar_width: f32 = 480;
-// Outer padding (22), monitor/status (58), five icons (160), six gaps (24).
+pub const theme = @import("../../shared/ui/theme/app_theme.zig");
+const material = @import("../../shared/ui/styles/surface_material.zig");
+const shell = @import("../../features/shell/view/shell_styles.zig");
+// Pencil TcJSa "KVM toolbar" (uy2Fa): 40 high, padding [0,8,0,12], gap 2,
+// flush on the focused view island (no floating card).
+pub const toolbar_height: f32 = 40;
+pub const tool_width: f32 = 76;
+pub const tool_height: f32 = 28;
+// Identity (108), connection state (82), five 76-point menus (icon 14 + label
+// + chevron 11, padding [0,8], gap 5), gaps and outer padding.
+pub const expanded_toolbar_width: f32 = 600;
+// Outer padding (20), monitor/status (58), five icons (160), six gaps (12).
 pub const icon_toolbar_width: f32 = 264;
-// Round the outer video surface only. Its 8-point black inset preserves every
-// source pixel and all edge input targets in both fit and original modes.
-pub const video_card_radius: f32 = 16;
+// j8WXoF O1 status slot (sm Tag with the longest full label, or "AI 操作中" + sm "接管") and
+// its leading gap: the toolbar folds this much earlier while a status is shown.
+pub const status_reserve_width: f32 = 176;
+// The video sits directly under the toolbar; the host island (radius 12,
+// overflow hidden) rounds the outer corners. The 8-point black inset preserves
+// every source pixel and all edge input targets in both fit and original modes.
+pub const video_card_radius: f32 = 0;
 pub const popup_width: f32 = 296;
 pub const boot_width: f32 = 312;
 pub const select_width: f32 = 180;
@@ -23,56 +33,53 @@ pub const progress_padding: f32 = 20;
 pub const progress_gap: f32 = 12;
 pub const progress_action_height: f32 = 32;
 pub const log_width: f32 = 760;
+pub const popup_max_height: f32 = 730;
+/// KVM menu Popovers: distance from their trigger and from the window edge (props; the menu body
+/// height is fitted to the room this placement leaves).
+pub const popup_offset: f32 = 8;
+pub const popup_viewport_padding: f32 = 12;
+// uy2Fa: toolbar padding [0,8,0,12] and gap 2. Beside the native controls (measured) the labelled
+// toolbar keeps the identity (icon 15 + gap 6 + title, 108) and the icon toolbar its icon and gap (21).
+pub const toolbar_gap: f32 = 2;
+pub const toolbar_labelled_reserve: f32 = 20 + 108 + toolbar_gap * 2;
+pub const toolbar_icon_reserve: f32 = 20 + 15 + 6 + toolbar_gap * 2;
 
 pub fn root(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .fill(), .direction = .column, .gap = 0, .min_width = 0, .min_height = 0, .overflow_hidden = true };
 }
 pub fn workspaceRoot(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .fill(), .min_width = 0, .min_height = 0, .direction = .column, .gap = 16, .padding = .{}, .background = ui.Color.TRANSPARENT };
+    // TcJSa: the toolbar and the video share one island; no gap between them.
+    return .{ .width = .fill(), .height = .fill(), .min_width = 0, .min_height = 0, .direction = .column, .gap = 0, .padding = .{}, .background = ui.Color.TRANSPARENT };
 }
-pub fn toolbar(t: *const ui.ThemeTokens) ui.BoxStyle {
-    var style = shell.floating(t);
-    style.width = .fill();
-    style.padding = .{ .left = 16, .right = 6, .top = 6, .bottom = 6 };
-    style.min_width = 0;
-    style.gap = 4;
-    return style;
+pub fn toolbar(_: *const ui.ThemeTokens) ui.BoxStyle {
+    // uy2Fa: height 40, padding [0,8,0,12], gap 2, alignItems center, no fill.
+    return .{ .width = .fill(), .height = .{ .px = toolbar_height }, .min_width = 0, .direction = .row, .align_items = .center, .padding = .{ .left = 12, .right = 8 }, .gap = 2, .flex_shrink = 0, .background = ui.Color.TRANSPARENT };
 }
 pub fn connectionIdentity(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .min_width = 0, .direction = .row, .align_items = .center, .gap = 8 };
+    // Icon 15 + gap 6 + title, content sized; the status follows it and a
+    // spacer keeps the menus right-aligned. Shrinks (title ellipsis) first.
+    // Narrower than zenit's own controls need: the box clips rather than paint under them.
+    return .{ .width = .{ .fit = .{} }, .min_width = 0, .flex_shrink = 1, .direction = .row, .align_items = .center, .gap = 6, .overflow_hidden = true };
 }
-pub fn connectionTitle(tokens: *const ui.ThemeTokens) ui.TextStyle {
-    var style = title(tokens);
-    style.text_overflow = .ellipsis;
-    return style;
+pub const connection_icon_size: f32 = 15;
+pub fn connectionIcon() ui.Style {
+    return .{ .width = .{ .px = connection_icon_size }, .height = .{ .px = connection_icon_size }, .flex_shrink = 0 };
 }
-pub fn disconnect() ui.BoxStyle {
-    var style = tool();
-    style.width = .{ .px = 82 };
-    style.opacity = 1;
-    return style;
+pub fn connectionTitle(_: *const ui.ThemeTokens) ui.TextStyle {
+    // uy2Fa title: 13 / 600, fg_1.
+    return .{ .font_size = 13, .font_weight = 600, .line_height = 1.5, .color = theme.current().fg_1, .selectable = false, .text_overflow = .ellipsis };
 }
-pub fn tool() ui.BoxStyle {
-    return .{ .width = .{ .px = 64 }, .height = .{ .px = 32 }, .min_height = 32, .padding = .{ .left = 8, .right = 8 }, .gap = 4, .border = .{ .width = 0, .radius = 8 }, .font_size = 12, .font_weight = 500, .text_color = theme.current().fg_1, .background = ui.Color.TRANSPARENT, .flex_shrink = 0 };
+/// KVM popups sit on remote video, whose brightness is unrelated to the app theme:
+/// they are mounted with a fixed dark colour scheme (zenit Popover `color_scheme`), and
+/// their own paint reads that scheme's palette (bugfix-2, #64 key-menu contrast).
+pub const popup_scheme: ui.ColorScheme = .dark;
+pub fn popupPalette() theme.Colors {
+    return theme.schemeColors(popup_scheme);
 }
-pub fn iconTool() ui.BoxStyle {
-    var style = tool();
-    style.width = .{ .px = 32 };
-    style.padding = ui.Padding.ZERO;
-    style.border = .{ .width = 0, .radius = 16 };
-    return style;
-}
-pub fn moreRow() ui.BoxStyle {
-    var style = tool();
-    style.width = .fill();
-    style.height = .{ .px = 40 };
-    style.padding = .{ .left = 12, .right = 30 };
-    style.gap = 12;
-    style.justify = .start;
-    return style;
-}
-pub fn toolHover() ui.BoxStyle {
-    return .{ .background = theme.states().hover };
+/// Secondary text: inside the fixed-scheme popups it is the scheme's supporting ink, which
+/// strengthens toward fg_1 as the material clears over arbitrary video; elsewhere fg_2.
+fn secondaryInk(t: *const ui.ThemeTokens) ui.Color {
+    return if (theme.tokenScheme(t) != null) t.tokens.color.zw_fg_supporting else theme.current().fg_2;
 }
 pub fn videoWorkspace(_: *const ui.ThemeTokens) ui.BoxStyle {
     // workspaceRoot owns the 16-point gap below the floating toolbar.
@@ -81,22 +88,32 @@ pub fn videoWorkspace(_: *const ui.ThemeTokens) ui.BoxStyle {
 pub fn videoCard(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .fill(), .min_width = 0, .min_height = 0, .padding = ui.Padding.all(8), .gap = 0, .background = ui.Color.BLACK, .border = .{ .width = 0, .radius = video_card_radius }, .overflow_hidden = true, .clip_shape = .{ .rounded_rect = video_card_radius } };
 }
-pub fn video() ui.BoxStyle {
+/// The picture viewport: this view's box around the native ScrollArea (input target, positions
+/// the connection card).
+pub fn video(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .fill(), .min_width = 0, .min_height = 0, .background = ui.Color.BLACK, .padding = ui.Padding.ZERO, .gap = 0, .border = .{ .width = 0, .radius = 0 }, .overflow_hidden = true, .clip_shape = .{ .rounded_rect = 0 }, .hit_behavior = .@"opaque" };
+}
+/// The scrolled extent inside the picture ScrollArea.
+pub fn canvas(width: f32, height: f32) ui.BoxStyle {
+    return .{ .width = .{ .px = width }, .height = .{ .px = height }, .flex_shrink = 0 };
+}
+/// This view's box around a native toolbar control: content sized, never squeezed.
+pub fn toolSlot(_: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} }, .flex_shrink = 0 };
+}
+/// A popover's content: fixed header over the scroll viewport.
+pub fn popupPanel(_: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0, .min_width = 0 };
+}
+/// The box that gives a native ScrollArea its height (the area fills it).
+pub fn scrollViewport(height: f32) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .px = height }, .min_width = 0, .flex_shrink = 0 };
+}
+pub fn menuViewport(height: f32) ui.BoxStyle {
+    return scrollViewport(height);
 }
 pub fn image() ui.Style {
     return .{ .position = .absolute, .width = .{ .px = 1 }, .height = .{ .px = 1 }, .flex_shrink = 0, .border = .{ .width = 0, .radius = 0 } };
-}
-pub fn popup() ui.BoxStyle {
-    return .{ .direction = .column, .gap = 0, .padding = ui.Padding.ZERO, .min_width = 0, .background = theme.current().overlay, .glass = theme.overlayGlass(), .border = .{ .width = 0, .radius = 12 }, .shadow = .{ .offset_y = 20, .blur = 50, .color = theme.current().shadow }, .hit_behavior = .@"opaque" };
-}
-// Same nested menu material as the shared SSH surfaces. bg_primary is an
-// inline workspace material and must not back a Select above another popup.
-pub fn selectDropdown() ui.BoxStyle {
-    return .{ .direction = .column, .gap = 0, .padding = ui.Padding.all(5), .background = theme.layerBackground(2), .glass = theme.overlayGlass(), .border = .{ .width = 0, .radius = 10 }, .corner_radius = 10, .hit_shape = .{ .rounded_rect = 10 }, .clip_shape = .{ .rounded_rect = 10 }, .hit_behavior = .@"opaque", .shadow = .{ .offset_y = 12, .blur = 24, .color = theme.current().shadow } };
-}
-pub fn selectOption() ui.BoxStyle {
-    return .{ .height = .{ .px = 32 }, .min_height = 32, .padding = .{ .top = 7, .bottom = 7, .left = 9, .right = 9 }, .border = .{ .width = 0, .radius = 7 }, .corner_radius = 7, .flex_shrink = 0 };
 }
 pub fn popupBody(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 12, .padding = ui.Padding.all(12), .min_width = 0, .flex_shrink = 0 };
@@ -104,25 +121,32 @@ pub fn popupBody(_: *const ui.ThemeTokens) ui.BoxStyle {
 pub fn popupHead(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .px = popup_header_height }, .direction = .row, .align_items = .center, .gap = 8, .padding = ui.Padding.all(12), .flex_shrink = 0, .min_width = 0 };
 }
-pub fn title(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 13, .font_weight = 700, .line_height = 1.5, .color = theme.current().fg_1, .selectable = false };
+pub fn title(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 13, .font_weight = 700, .line_height = 1.5, .color = theme.paletteFor(t).fg_1, .selectable = false };
 }
-pub fn body(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 12, .font_weight = 400, .line_height = 1.5, .color = theme.current().fg_1, .selectable = false };
+pub fn body(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 12, .font_weight = 400, .line_height = 1.5, .color = theme.paletteFor(t).fg_1, .selectable = false };
 }
-pub fn confirmationDetail(tokens: *const ui.ThemeTokens) ui.TextStyle {
-    var style = body(tokens);
-    style.wrap = .word;
-    return style;
+pub fn value(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 11, .font_weight = 700, .line_height = 1.5, .color = theme.paletteFor(t).fg_1, .selectable = false, .text_overflow = .ellipsis };
 }
-pub fn value(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 11, .font_weight = 700, .line_height = 1.5, .color = theme.current().fg_1, .selectable = false, .text_overflow = .ellipsis };
+pub fn hint(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 11, .font_weight = 400, .line_height = 1.5, .color = secondaryInk(t), .wrap = .word, .selectable = false };
 }
-pub fn hint(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 11, .font_weight = 400, .line_height = 1.5, .color = theme.current().fg_2, .wrap = .word, .selectable = false };
+pub fn well(t: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .fill(), .direction = .row, .align_items = .center, .justify = .space_between, .padding = .{ .top = 9, .bottom = 9, .left = 10, .right = 10 }, .gap = 8, .background = material.fill(theme.paletteFor(t).well, .solid), .border = .{ .radius = 8 }, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn well(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .direction = .row, .align_items = .center, .justify = .space_between, .padding = .{ .top = 9, .bottom = 9, .left = 10, .right = 10 }, .gap = 8, .background = theme.current().well, .border = .{ .radius = 8 }, .min_width = 0, .flex_shrink = 0 };
+/// A step's diagnostic text block on the connection progress surface, which lies on the pane
+/// island (first material layer).
+pub fn diagnosticFill() ui.Color {
+    return material.fill(theme.current().well, .canvas);
+}
+/// Wells inside the connection log's native Modal: an opaque panel, so an opaque well.
+pub fn logWellFill() ui.Color {
+    return material.fill(theme.current().well, .solid);
+}
+pub fn logFooterFill() ui.Color {
+    return material.fill(theme.current().surface_2, .solid);
 }
 pub fn field(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .px = 32 }, .direction = .row, .align_items = .center, .justify = .space_between, .gap = 8, .min_width = 0, .flex_shrink = 0 };
@@ -130,17 +154,8 @@ pub fn field(_: *const ui.ThemeTokens) ui.BoxStyle {
 pub fn actions(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .direction = .row, .justify = .end, .align_items = .center, .gap = 8, .flex_shrink = 0 };
 }
-pub fn action() ui.BoxStyle {
-    return .{ .width = .{ .fit = .{ .min = 78 } }, .height = .{ .px = 30 }, .min_height = 30, .padding = .{ .left = 12, .right = 12, .top = 3, .bottom = 3 }, .border = .{ .radius = 7 }, .font_size = 12 };
-}
-pub fn close() ui.BoxStyle {
-    return .{ .width = .{ .px = 27.9140625 }, .height = .{ .px = 31.5 }, .padding = ui.Padding.ZERO, .border = .{ .radius = 7 }, .background = ui.Color.TRANSPARENT };
-}
 pub fn keyRow(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .direction = .row, .gap = 6, .flex_shrink = 0 };
-}
-pub fn keyButton() ui.BoxStyle {
-    return .{ .height = .{ .px = 32 }, .min_height = 32, .width = .fill(), .min_width = 0, .padding = ui.Padding.all(8), .font_size = 11, .background = theme.current().well, .border = .{ .width = 0, .radius = 7 } };
 }
 pub fn waiting(_: *const ui.ThemeTokens) ui.BoxStyle {
     return progressCard();
@@ -192,11 +207,13 @@ pub fn progressDetail(_: *const ui.ThemeTokens) ui.TextStyle {
 pub fn progressNotice(_: *const ui.ThemeTokens) ui.TextStyle {
     return .{ .font_size = 11, .line_height = 18.0 / 11.0, .color = progressSecondary(), .selectable = false, .text_overflow = .ellipsis };
 }
+/// The progress body's content column inside the native ScrollArea.
+pub fn progressList(_: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 12, .min_width = 0, .flex_shrink = 0 };
+}
+/// A progress step row: zenit's native Pressable (an unstyled pressable), laid out as the row.
 pub fn progressSteps(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 8, .min_width = 0, .flex_shrink = 0 };
-}
-pub fn progressStep(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .{ .fit = .{} }, .min_height = 34, .direction = .row, .align_items = .center, .justify = .start, .gap = 8, .padding = .{ .top = 8, .bottom = 8, .left = 10, .right = 10 }, .min_width = 0, .flex_shrink = 0, .background = ui.Color.TRANSPARENT, .border = .{ .width = 0, .radius = 8 } };
 }
 pub fn progressStepBackdrop(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .min_height = 34, .direction = .row, .gap = 0, .padding = ui.Padding.ZERO, .min_width = 0, .flex_shrink = 0, .background = ui.Color.TRANSPARENT, .border = .{ .width = 0, .radius = 8 } };
@@ -222,23 +239,22 @@ pub fn progressRouteBox(_: *const ui.ThemeTokens) ui.BoxStyle {
 pub fn progressActions(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .justify = .end, .align_items = .center, .gap = 8, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn progressAction() ui.BoxStyle {
-    return .{ .width = .{ .px = 76 }, .height = .{ .px = progress_action_height }, .min_height = progress_action_height, .padding = .{ .left = 14, .right = 14, .top = 6, .bottom = 6 }, .font_size = 12, .font_weight = 500, .border = .{ .radius = 7 }, .flex_shrink = 0 };
-}
 pub fn logText(_: *const ui.ThemeTokens) ui.TextStyle {
     return .{ .font_size = 11, .line_height = 1.7, .color = theme.current().fg_1, .wrap = .word, .selectable = false, .use_monospace_font = true };
 }
+/// The log dialog's content column (the Modal body is edge to edge).
+pub fn logContent(compact: bool) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0, .padding = .{ .top = 8, .left = if (compact) 18 else 24, .right = if (compact) 18 else 24, .bottom = logContentBottom(compact) }, .min_width = 0, .min_height = 0, .flex_shrink = 0 };
+}
+pub fn logContentBottom(compact: bool) f32 {
+    return if (compact) 12 else 20;
+}
+/// The log list's viewport: a well that gives the native ScrollArea its height.
+pub fn logViewport(height: f32) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .px = height }, .min_width = 0, .background = logWellFill(), .border = .{ .width = 0, .radius = 9 }, .overflow_hidden = true, .flex_shrink = 0 };
+}
 pub fn logFooter(compact: bool) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .justify = .end, .align_items = .center, .padding = if (compact) .{ .top = 10, .bottom = 10, .left = 18, .right = 18 } else .{ .top = 14, .bottom = 14, .left = 24, .right = 24 }, .background = theme.current().surface_2, .min_width = 0, .flex_shrink = 0 };
-}
-pub fn logClose() ui.BoxStyle {
-    return .{ .width = .{ .fit = .{} }, .height = .{ .px = 34 }, .min_height = 34, .padding = .{ .left = 14, .right = 14, .top = 8, .bottom = 8 }, .font_size = 12, .font_weight = 500, .border = .{ .radius = 7 }, .flex_shrink = 0 };
-}
-pub fn inputHint(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 11, .line_height = 1.5, .color = ui.arb.hex(0xf4f4f5), .wrap = .word, .selectable = false };
-}
-pub fn inputHintBox() ui.BoxStyle {
-    return .{ .position = .absolute, .inset = .{ .left = .{ .px = 14 }, .right = .{ .px = 14 }, .bottom = .{ .px = 12 } }, .padding = .{ .left = 9, .right = 9, .top = 5, .bottom = 5 }, .background = ui.arb.hexA(0, 0.65), .border = .{ .radius = 5 }, .hit_behavior = .pass_through, .z_index = 2 };
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .justify = .end, .align_items = .center, .padding = if (compact) .{ .top = 10, .bottom = 10, .left = 18, .right = 18 } else .{ .top = 14, .bottom = 14, .left = 24, .right = 24 }, .background = logFooterFill(), .min_width = 0, .flex_shrink = 0 };
 }
 pub fn orderText(_: *const ui.ThemeTokens) ui.TextStyle {
     return .{ .font_size = 11, .line_height = 2.0, .color = theme.current().fg_1, .wrap = .word, .selectable = false, .use_monospace_font = true };
@@ -246,10 +262,6 @@ pub fn orderText(_: *const ui.ThemeTokens) ui.TextStyle {
 pub fn orderRow() ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn segment(selected: bool) ui.BoxStyle {
-    return .{ .height = .{ .px = 28 }, .min_height = 28, .width = .fill(), .min_width = 0, .padding = .{}, .font_size = 13, .font_weight = 500, .text_color = if (selected) theme.current().accent_ink else theme.current().fg_1, .background = if (selected) theme.current().overlay else ui.Color.TRANSPARENT, .border = .{ .width = 0, .radius = 6 } };
-}
-
 // Display panel: 296-point panel, 16-point content inset.
 pub fn displayBody(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0, .padding = .{}, .min_width = 0, .flex_shrink = 0 };
@@ -260,26 +272,21 @@ pub fn displayHead(t: *const ui.ThemeTokens) ui.BoxStyle {
     s.padding = .{ .left = 16, .right = 12 };
     return s;
 }
-pub fn displayTitle(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 14, .font_weight = 600, .color = theme.current().fg_1, .selectable = false };
+pub fn displayTitle(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 14, .font_weight = 600, .color = theme.paletteFor(t).fg_1, .selectable = false };
 }
 pub fn displayControls(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 8, .padding = .{ .top = 4, .left = 16, .right = 16, .bottom = 16 }, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn displayScale(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .{ .px = 34 }, .direction = .row, .gap = 3, .padding = ui.Padding.all(3), .background = theme.current().well, .border = .{ .width = 0, .radius = 8 }, .min_width = 0, .flex_shrink = 0 };
-}
-pub fn displayAction() ui.BoxStyle {
-    return .{ .height = .{ .px = 32 }, .min_height = 32, .padding = .{ .left = 10, .right = 10 }, .gap = 6, .font_size = 13, .font_weight = 500, .border = .{ .width = 0, .radius = 8 }, .flex_shrink = 0 };
+/// The box around the native segmented scale control.
+pub fn displayScale() ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .min_width = 0, .flex_shrink = 0 };
 }
 pub fn displayPerformance(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0, .padding = .{ .left = 16, .right = 16, .bottom = 14 }, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn displayDivider(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .{ .px = 1 }, .background = theme.current().border, .flex_shrink = 0 };
-}
-pub fn displaySwitch(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .fill(), .height = .{ .px = 28 }, .direction = .row_reverse, .justify = .space_between, .align_items = .center, .margin = .{ .top = 12 }, .flex_shrink = 0 };
+pub fn displaySwitchRow(_: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .align_items = .center, .margin = .{ .top = 12 }, .flex_shrink = 0 };
 }
 pub fn displayStats(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 4, .margin = .{ .top = 8 }, .min_width = 0, .flex_shrink = 0 };
@@ -287,12 +294,12 @@ pub fn displayStats(_: *const ui.ThemeTokens) ui.BoxStyle {
 pub fn displayStatRow(_: *const ui.ThemeTokens) ui.BoxStyle {
     return .{ .width = .fill(), .height = .{ .px = 20 }, .direction = .row, .justify = .space_between, .align_items = .center, .gap = 12, .min_width = 0, .flex_shrink = 0 };
 }
-pub fn displayStatLabel(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 13, .line_height = 20.0 / 13.0, .color = theme.current().fg_2, .selectable = false };
+pub fn displayStatLabel(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = 13, .line_height = 20.0 / 13.0, .color = secondaryInk(t), .selectable = false };
 }
 pub fn displayStatValue(t: *const ui.ThemeTokens) ui.TextStyle {
     var s = displayStatLabel(t);
-    s.color = theme.current().fg_1;
+    s.color = theme.paletteFor(t).fg_1;
     s.text_align = .end;
     return s;
 }
@@ -301,15 +308,3 @@ pub fn displayFooter(_: *const ui.ThemeTokens) ui.BoxStyle {
 }
 
 // Video-local contrast is stable across shell themes; never intercept input.
-pub fn fpsHud(_: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .position = .absolute, .inset = .{ .top = .{ .px = 12 }, .right = .{ .px = 12 } }, .direction = .column, .gap = 2, .padding = .{ .top = 6, .bottom = 6, .left = 10, .right = 10 }, .background = ui.Color.rgba(18, 20, 24, 199), .border = .{ .radius = 7 }, .hit_behavior = .pass_through, .hit_roles = .{ .pointer = false, .scroll = false }, .flex_shrink = 0 };
-}
-pub fn fpsPrimary(_: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = 11, .line_height = 16.0 / 11.0, .font_weight = 500, .use_monospace_font = true, .color = ui.Color.hex(0xf3f4f6), .selectable = false };
-}
-pub fn fpsSecondary(t: *const ui.ThemeTokens) ui.TextStyle {
-    var s = fpsPrimary(t);
-    s.font_weight = 400;
-    s.color = ui.Color.hex(0xc6cad1);
-    return s;
-}

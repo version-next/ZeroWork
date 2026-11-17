@@ -158,7 +158,8 @@ pub const Map = struct {
             if (!active) continue;
             const split = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidFormat;
             const name = std.mem.trim(u8, line[0..split], " ");
-            const action = std.meta.stringToEnum(Action, name) orelse return error.UnknownAction;
+            // Actions from other versions are preserved by config.zig as opaque text.
+            const action = std.meta.stringToEnum(Action, name) orelse continue;
             if (seen[@backingInt(action)]) return error.DuplicateAction;
             seen[@backingInt(action)] = true;
             const quoted = std.mem.trim(u8, line[split + 1 ..], " ");
@@ -175,56 +176,7 @@ pub const Map = struct {
         for (map.chords, 0..) |chord, i| try map.set(@fromBackingInt(@intCast(i)), chord);
         return map;
     }
-    pub fn rowText(self: Map, label: []const u8, buffer: []u8) ![]const u8 {
-        for (rows) |row| if (std.mem.eql(u8, row.label, label)) {
-            var writer = std.Io.Writer.fixed(buffer);
-            for (row.actions, 0..) |action, i| {
-                if (row.actions.len == 9 and i != 0 and i != 8) continue;
-                if (i > 0) try writer.writeAll(if (row.actions.len == 9) " – " else " / ");
-                const chord = self.get(action);
-                try writer.print("{s}{s}{s}{s}{s}", .{ if (chord.command) "⌘" else "", if (chord.control) "⌃" else "", if (chord.shift) "⇧" else "", if (chord.option) "⌥" else "", symbol(chord.key) });
-            }
-            return writer.buffered();
-        };
-        return error.UnknownRow;
-    }
 };
-fn symbol(key: KeyCode) []const u8 {
-    return switch (key) {
-        .tab => "⇥",
-        .right => "→",
-        .left_bracket => "[",
-        .right_bracket => "]",
-        .semicolon => ";",
-        .a => "A",
-        .b => "B",
-        .c => "C",
-        .d => "D",
-        .e => "E",
-        .f => "F",
-        .g => "G",
-        .h => "H",
-        .i => "I",
-        .j => "J",
-        .k => "K",
-        .l => "L",
-        .m => "M",
-        .n => "N",
-        .o => "O",
-        .p => "P",
-        .q => "Q",
-        .r => "R",
-        .s => "S",
-        .t => "T",
-        .u => "U",
-        .v => "V",
-        .w => "W",
-        .x => "X",
-        .y => "Y",
-        .z => "Z",
-        else => @tagName(key),
-    };
-}
 fn defaults() [27]Chord {
     return .{ .{ .key = .t }, .{ .key = .w }, .{ .key = .@"1" }, .{ .key = .@"2" }, .{ .key = .@"3" }, .{ .key = .@"4" }, .{ .key = .@"5" }, .{ .key = .@"6" }, .{ .key = .@"7" }, .{ .key = .@"8" }, .{ .key = .@"9" }, .{ .key = .left_bracket, .shift = true }, .{ .key = .right_bracket, .shift = true }, .{ .key = .tab, .command = false, .control = true }, .{ .key = .d }, .{ .key = .d, .shift = true }, .{ .key = .c }, .{ .key = .v }, .{ .key = .f }, .{ .key = .semicolon }, .{ .key = .right, .command = false }, .{ .key = .k }, .{ .key = .r }, .{ .key = .b }, .{ .key = .j }, .{ .key = .u }, .{ .key = .i, .shift = true } };
 }

@@ -13,7 +13,11 @@ pub const bootstrap_product = @import("ssh_bootstrap_product.zig");
 
 /// Configuration is acquired without disk IO. Every window with the same
 /// absolute data-root/path receives this same owner, journal and IO mutex.
-pub const JournalConfig = struct { data_root: []const u8, path: []const u8 = "ai/lifecycle.json", dir: ?std.Io.Dir = null, io: ?std.Io = null };
+/// Execution journal file (schema 3 with M10 tab bindings). Earlier versions read only
+/// `legacy_file_name`; it is migrated once and then left untouched.
+pub const file_name = "ai/lifecycle.v4.json";
+pub const legacy_file_name = "ai/lifecycle.json";
+pub const JournalConfig = struct { data_root: []const u8, path: []const u8 = file_name, dir: ?std.Io.Dir = null, io: ?std.Io = null };
 var registry_mutex: std.atomic.Mutex = .unlocked;
 var owners: [8]?*ProcessJournal = @splat(null);
 fn lock(mutex: *std.atomic.Mutex) void {
@@ -84,7 +88,7 @@ pub const ProcessJournal = struct {
             self.dir = try std.Io.Dir.cwd().openDir(self.io, self.data_root, .{ .follow_symlinks = false });
             self.owns_directory = true;
         }
-        if (self.store == null) self.store = try journal.Journal.open(std.heap.page_allocator, self.io, self.dir.?, self.path);
+        if (self.store == null) self.store = if (std.mem.eql(u8, self.path, file_name)) try journal.Journal.openMigrating(std.heap.page_allocator, self.io, self.dir.?, self.path, legacy_file_name) else try journal.Journal.open(std.heap.page_allocator, self.io, self.dir.?, self.path);
         return &self.store.?;
     }
     pub fn begin(self: *ProcessJournal, request: journal.Request) !journal.Handle {
@@ -148,7 +152,7 @@ pub const Authorized = struct {
     disconnect_binding: ?@import("../host/session_host.zig").ServiceHandle = null,
     bootstrap_required: bool = false,
 };
-pub const GroupPlan = struct { id: u64, token: *anyopaque, binding_revision: u64, notice_revision: u64 };
+pub const GroupPlan = struct { id: u64, tab: u64, token: *anyopaque, binding_revision: u64, notice_revision: u64 };
 pub const CloseSnapshot = struct {
     operation_ref: identity.HostOperationId,
     session: identity.SessionHandle,
@@ -351,14 +355,14 @@ pub const Runtime = struct {
         const plan = prepared.result.group_plan;
         // Release prepared allocations even when cancellation or journal IO fails.
         defer _ = self.controllerCall(scheduler, invocation.context, .{ .release_group = plan }, null) catch {};
-        if (plan.id == 0 or plan.binding_revision <= invocation.context.binding_revision or plan.notice_revision == 0) return error.InvalidControllerReceipt;
+        if (plan.id == 0 or plan.tab == 0 or plan.binding_revision <= invocation.context.binding_revision or plan.notice_revision == 0) return error.InvalidControllerReceipt;
         try cancelled(cancel);
         try self.journal_owner.update(handle, 1, .{ .stage = .dispatch_started, .created_group = plan.id });
         try self.validatePermit(permit, invocation, authorized);
         _ = try self.controllerCall(scheduler, invocation.context, .{ .commit_group = plan }, cancel);
         // If this sync fails, the durable dispatch_started receipt fences retries
         // even though the UI already published. Never rebuild from the name.
-        try self.journal_owner.update(handle, 2, .{ .stage = .committed, .created_group = plan.id, .committed_binding = .{ .group = plan.id }, .committed_binding_revision = plan.binding_revision, .notice_revision = plan.notice_revision });
+        try self.journal_owner.update(handle, 2, .{ .stage = .committed, .created_group = plan.id, .committed_binding = .{ .tab = plan.tab }, .committed_binding_revision = plan.binding_revision, .notice_revision = plan.notice_revision });
         var record = try self.journal_owner.snapshot(a, handle);
         defer record.deinit(a);
         return recordResult(a, invocation, record, false);
@@ -467,7 +471,7 @@ fn sessionPending(snapshot: lifecycle.Snapshot, wait_for: @TypeOf(@as(tools.Requ
 }
 
 test "efficiency interactive readiness waits beyond transport without changing legacy revision semantics" {
-    var snapshot: lifecycle.Snapshot = .{ .operation_ref = .generate(), .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .group = .{ .id = @fromBackingInt(1) }, .retention = .keep };
+    var snapshot: lifecycle.Snapshot = .{ .operation_ref = .generate(), .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .group = .{ .id = @fromBackingInt(1) }, .retention = .keep };
     try std.testing.expect(sessionPending(snapshot, .transport));
     snapshot.state = .ready;
     snapshot.execution_readiness = .initializing;
@@ -569,7 +573,7 @@ fn recordResult(a: std.mem.Allocator, invocation: host.Invocation, record: journ
         .cancelled_unsent => .cancelled_unsent,
         else => .failed,
     };
-    return jsonResult(a, invocation, status, .{ .operation_ref = try tools.operationRef(a, invocation.context, record.operation_ref), .state = if (unknown) "outcome_unknown" else @tagName(record.stage), .idempotent_reuse = reused, .result_acknowledgement_required = std.mem.eql(u8, invocation.tool_id, "host.close_session") and record.stage == .committed, .code = if (record.stage == .prepared) @as(?[]const u8, "OperationBusy") else if (unknown) @as(?[]const u8, "OutcomeUnknown") else null, .group_ref = if (record.created_group) |group| try queries.groupRef(a, invocation.context, group) else null, .session_ref = if (record.created_session) |session| try queries.sessionRef(a, invocation.context, session) else null, .initial_member = if (record.context.binding == .session) record.context.binding.session else @as(?u64, null), .handoff_revision = record.committed_binding_revision, .same_conversation_id = record.context.conversation_id, .source_revision = record.revision, .notice_revision = record.notice_revision, .side_effect_started = record.dispatch_started, .local_released = record.local_released and !unknown, .remote_effect_unknown = unknown, .recovery_hint = if (unknown) "Inspect the original operation; do not replay or create another resource to recover this reply." else if (record.stage == .prepared) "Original operation is in progress; do not dispatch another copy." else "Use the original receipt." }, record.dispatch_started, unknown);
+    return jsonResult(a, invocation, status, .{ .operation_ref = try tools.operationRef(a, invocation.context, record.operation_ref), .state = if (unknown) "outcome_unknown" else @tagName(record.stage), .idempotent_reuse = reused, .result_acknowledgement_required = std.mem.eql(u8, invocation.tool_id, "host.close_session") and record.stage == .committed, .code = if (record.stage == .prepared) @as(?[]const u8, "OperationBusy") else if (unknown) @as(?[]const u8, "OutcomeUnknown") else null, .group_ref = if (record.created_group) |group| try queries.groupRef(a, invocation.context, group) else null, .session_ref = if (record.created_session) |session| try queries.sessionRef(a, invocation.context, session) else null, .initial_member = if (record.context.contentOf() == .session) record.context.contentOf().session else @as(?u64, null), .handoff_revision = record.committed_binding_revision, .same_conversation_id = record.context.conversation_id, .source_revision = record.revision, .notice_revision = record.notice_revision, .side_effect_started = record.dispatch_started, .local_released = record.local_released and !unknown, .remote_effect_unknown = unknown, .recovery_hint = if (unknown) "Inspect the original operation; do not replay or create another resource to recover this reply." else if (record.stage == .prepared) "Original operation is in progress; do not dispatch another copy." else "Use the original receipt." }, record.dispatch_started, unknown);
 }
 fn sessionResult(a: std.mem.Allocator, invocation: host.Invocation, operation: identity.HostOperationId, snapshot: lifecycle.Snapshot, timed_out: bool, reused: bool) !host.Result {
     if (!snapshot.context.conversation_id.eql(invocation.context.conversation_id) or !snapshot.context.task_id.eql(invocation.context.task_id)) return error.InvalidControllerReceipt;

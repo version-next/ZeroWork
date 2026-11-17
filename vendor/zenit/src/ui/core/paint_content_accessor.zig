@@ -9,6 +9,7 @@
 //! world.LayoutOutputTable; this layer handles callback dispatch + mock fallback.
 
 const std = @import("std");
+const TextLayout = @import("text_layout.zig").TextLayout;
 const world_mod = @import("world.zig");
 
 /// Count of property accesses still using **old process-level global callbacks**
@@ -409,20 +410,40 @@ pub fn writeLayoutOutput(world_ref: ?*world_mod.World, element_id_raw: u32, node
 }
 
 /// Layout cache writes are fallible and transactional. The mock fallback owns
-/// one stable allocation per actual text node; production uses chunked storage.
-pub fn storeTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, value: *const @import("text_layout.zig").TextLayout) !void {
+/// one stable allocation per actual text node (spill tables included, page
+/// allocator); production uses chunked storage.
+pub fn storeTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, value: *const TextLayout) !void {
     if (world_ref) |w| return w.layout_output.storeTextLayout(world_mod.ElementId.fromRaw(element_id_raw), value);
     const p = standaloneLayoutOutputPtr(node_ptr) orelse return error.OutOfMemory;
-    const target = if (p.artifacts.text_layout) |text| @constCast(text) else try std.heap.page_allocator.create(@import("text_layout.zig").TextLayout);
-    target.* = value.*;
+    if (p.artifacts.text_layout) |text| return @constCast(text).assign(std.heap.page_allocator, value);
+    const target = try std.heap.page_allocator.create(TextLayout);
+    errdefer std.heap.page_allocator.destroy(target);
+    target.* = .{};
+    try target.assign(std.heap.page_allocator, value);
     p.artifacts.text_layout = target;
 }
 pub fn clearTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) void {
     if (world_ref) |w| return w.layout_output.clearTextLayout(world_mod.ElementId.fromRaw(element_id_raw));
     if (!g_standalone_layout_output_init) return;
     const p = g_standalone_layout_output.get(node_ptr) orelse return;
-    if (p.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+    if (p.artifacts.text_layout) |text| destroyStandaloneText(text);
     p.artifacts.text_layout = null;
+}
+fn destroyStandaloneText(text: *const TextLayout) void {
+    const owned = @constCast(text);
+    owned.deinitStorage(std.heap.page_allocator);
+    std.heap.page_allocator.destroy(owned);
+}
+/// Scratch line table for computing a long layout of `world_ref`'s nodes (the table's own);
+/// mock nodes without a World share one on the page allocator.
+var g_standalone_line_scratch = @import("text_layout.zig").LineScratch.init(std.heap.page_allocator);
+pub fn lineScratch(world_ref: ?*world_mod.World) *@import("text_layout.zig").LineScratch {
+    if (world_ref) |w| return &w.layout_output.line_scratch;
+    return &g_standalone_line_scratch;
+}
+/// An allocation needed for a text layout failed outside storeTextLayout: abandon the frame.
+pub fn noteLayoutAllocationFailure(world_ref: ?*world_mod.World) void {
+    if (world_ref) |w| w.layout_output.noteAllocationFailure();
 }
 
 /// Node.destroy must not leave a mock's text payload pinned until process
@@ -430,7 +451,7 @@ pub fn clearTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_p
 pub fn releaseStandaloneLayoutOutput(node_ptr: usize) void {
     if (!g_standalone_layout_output_init) return;
     const entry = g_standalone_layout_output.fetchRemove(node_ptr) orelse return;
-    if (entry.value.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+    if (entry.value.artifacts.text_layout) |text| destroyStandaloneText(text);
     std.heap.page_allocator.destroy(entry.value);
 }
 
@@ -511,7 +532,7 @@ pub fn deinitStandaloneStorage() void {
         // otherwise freeing the map alone leaks each NodeLayoutOutput.
         var it = g_standalone_layout_output.valueIterator();
         while (it.next()) |slot_ptr| {
-            if (slot_ptr.*.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+            if (slot_ptr.*.artifacts.text_layout) |text| destroyStandaloneText(text);
             std.heap.page_allocator.destroy(slot_ptr.*);
         }
         g_standalone_layout_output.deinit();

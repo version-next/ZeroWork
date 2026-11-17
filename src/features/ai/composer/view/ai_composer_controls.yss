@@ -1,0 +1,107 @@
+//! AI composer tool row and its popovers (Pencil Kaf7E A3 / ⑤ / O1–O4 / O6). The controls are
+//! native (ghost sm Buttons, Tooltips, Menus, Popovers, Slider, Divider, ProgressRing / Segments,
+//! Pressable); these styles only lay out the row and the popovers' own content (view:
+//! ai_composer_controls.yix).
+const ui = @import("ui");
+
+/// Tool row: 2 apart (Kaf7E A3 Toolbar gap 2); the Textarea footer row pads it. Takes the footer's
+/// width and no more (min 0, shrinks): the collapse logic measures this row.
+style row { width: fill; height: fill; direction: row; align-items: center; gap: 2; flex-shrink: 1; min-width: 0; }
+/// Send / Stop: the host's native primary sm icon Buttons, side by side.
+style trailing { width: fit; height: fit; direction: row; align-items: center; gap: 4; flex-shrink: 0; }
+style no_shrink { flex-shrink: 0; }
+/// Popover / menu mount points take no room on the row.
+style wrapper { position: absolute; width: 0; height: 0; padding: 0; gap: 0; }
+
+/// Popover content columns (the native Popover draws the surface).
+style model_body { width: fill; height: fit; min-height: 0; direction: column; gap: 4; }
+style usage_body { width: fill; height: fit; min-height: 0; direction: column; gap: 8; }
+
+// ── O4 model popover ─────────────────────────────────────────────────────────────────────
+style model_card { width: fill; height: 192; direction: column; gap: 0; flex-shrink: 0; min-height: 0; }
+/// A list row's root (the list sizes it: 28 for a header, 30 for a model).
+style list_row { width: fill; direction: column; }
+style models { width: fill; height: fill; min-height: 0; flex: 1; }
+style empty_text { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-secondary; text-overflow: clip; }
+style empty_box { width: fill; height: 30; flex: 1; min-width: 0; }
+style error_text { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: danger; text-overflow: clip; }
+style error_box { width: fill; height: 16; flex: 1; min-width: 0; }
+/// Reasoning area: the header (16), and the slider area (28) when the model has effort steps.
+/// Its height is its content's (28 without the slider, 64 with it): a fixed 40 let the slider and
+/// its mark labels spill out of the popover over the tool row.
+style reasoning_card { width: fill; height: fit; direction: column; padding: 4 8 8 8; gap: 8; flex-shrink: 0; }
+style reasoning_header { width: fill; height: 16; direction: row; align-items: center; gap: 8; flex-shrink: 0; }
+style effort_title { font-size: 10; font-weight: 400; line-height: {16.5 / 10.0}; color: zw-fg-faint; text-overflow: clip; }
+style effort_title_box { width: fill; height: 16.5; flex: 1; min-width: 0; }
+style effort_name { font-size: 10; font-weight: 500; line-height: {16.5 / 10.0}; color: fg-primary; text-overflow: clip; }
+style effort_name_box { width: fit; height: 16.5; flex-shrink: 0; }
+style slider_area { width: fill; height: 28; direction: column; flex-shrink: 0; }
+style slider_box { width: fill; height: 16; flex-shrink: 0; }
+style slider { width: fill; height: 16; padding: 5 12 0 12; flex-shrink: 0; }
+
+/// Provider group row: 26 high, chevron + logo + 13/600 name.
+style group_row { width: fill; height: 26; direction: row; align-items: center; justify: start; padding: 0 8; gap: 6; flex-shrink: 0; min-width: 0; }
+style group_chevron { width: 12; height: 12; flex-shrink: 0; icon-color: fg-secondary; }
+style group_name { font-size: 13; font-weight: 600; line-height: {18.0 / 13.0}; color: fg-primary; text-overflow: clip; }
+style group_name_box { width: fill; height: 18; flex: 1; min-width: 0; }
+/// Model row: 30 high, padding 0 8, gap 8; the current model sits on the selection fill.
+recipe ModelRow {
+  base { width: fill; height: 30; direction: row; align-items: center; justify: start; padding: 0 8; gap: 8; background: transparent; corner-radius: 6; flex-shrink: 0; min-width: 0; }
+  flag selected { background: selection-bg; }
+}
+/// The details tooltip's trigger: the whole row (all rows share the card width, aligned columns).
+style row_hint { width: fill; height: 30; min-width: 0; }
+/// Native Tooltip pins its column to `align-items: start`: the trigger stretches itself so every
+/// row shares the card width (aligned columns).
+style row_trigger { width: fill; height: 30; min-width: 0; align-self: stretch; }
+style marker { width: 12; height: 16; direction: row; align-items: center; justify: center; flex-shrink: 0; }
+style marker_dot { width: 4; height: 4; background: zw-fg-faint; corner-radius: 2; flex-shrink: 0; }
+style marker_text { font-size: 12; font-weight: 600; line-height: {16.0 / 12.0}; color: info; text-align: center; text-overflow: clip; }
+style marker_text_box { width: 4.234375; height: 16; min-width: 0; flex-shrink: 0; }
+recipe ModelName {
+  base { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: fg-primary; text-overflow: ellipsis; }
+  flag off { color: zw-fg-faint; }
+}
+style model_name_box { width: fill; height: 16; flex: 1; min-width: 0; overflow: hidden; }
+recipe ModelContext {
+  base { font-size: 10; font-weight: 400; line-height: {13.0 / 10.0}; color: fg-secondary; text-overflow: clip; text-align: end; use-monospace-font: true; }
+  flag off { color: zw-fg-faint; }
+}
+style context_box($w: f32) { width: $w; height: 13; min-width: 0; flex-shrink: 0; }
+style capability { width: 13; height: 13; flex-shrink: 0; }
+recipe CapabilityIcon {
+  base { width: 14; height: 14; flex-shrink: 0; icon-color: zw-fg-faint; }
+  flag on { icon-color: info; }
+}
+/// Brand mark (provider settings and model rows): a rounded tile with the brand glyph, or the
+/// name's first character.
+style brand_tile { width: 16; height: 16; align-items: center; justify: center; background: bg-hover; corner-radius: 4; flex-shrink: 0; }
+style brand_glyph { width: {16.0 * 2.0 / 3.0}; height: {16.0 * 2.0 / 3.0}; icon-color: fg-primary; }
+style brand_initial { font-size: {16.0 * 0.43}; font-weight: 600; color: fg-secondary; }
+
+// ── O6 usage popover ─────────────────────────────────────────────────────────────────────
+style usage_scroll { width: fill; height: fit; min-height: 0; }
+style usage_content { width: fill; direction: column; gap: 8; padding: 4; }
+style usage_head { width: fill; height: 16; direction: row; align-items: center; gap: 8; padding: 0 4; flex-shrink: 0; }
+style usage_caption { font-size: 11; font-weight: 500; line-height: {16.0 / 11.0}; color: zw-fg-faint; text-overflow: ellipsis; }
+style usage_caption_box { width: fill; height: 16; flex: 1; min-width: 0; }
+style usage_total { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: fg-secondary; text-overflow: clip; }
+style usage_total_box { width: fit; height: 16; flex-shrink: 0; }
+style usage_legend { width: fill; direction: column; gap: 2; padding: 2 4; flex-shrink: 0; }
+style usage_row { width: fill; height: 22; direction: row; align-items: center; gap: 6; flex-shrink: 0; }
+/// Legend dot in its part's tone (the same role token the native segment paints).
+recipe UsageSwatch {
+  base { width: 6; height: 6; corner-radius: 3; flex-shrink: 0; background: fg-tertiary; }
+  variant tone = neutral {
+    neutral { background: fg-tertiary; }
+    accent { background: progress-fill; }
+    success { background: progress-success; }
+    warning { background: progress-warning; }
+    danger { background: progress-error; }
+  }
+}
+style usage_name { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-primary; text-overflow: clip; }
+style usage_name_box { width: fill; height: 18; flex: 1; min-width: 0; }
+style usage_value { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-secondary; text-overflow: clip; }
+style usage_value_box { width: fit; height: 18; flex-shrink: 0; }
+style usage_action { width: fill; direction: row; padding: 0 4; flex-shrink: 0; }

@@ -2,6 +2,7 @@
  * Root alone owns native launch and CUA; prepare-only does not start anything.
  * Physical CUA selects original VT text and opens its ordinary context menu.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -9,6 +10,7 @@ import { copyFile, mkdir, mkdtemp, open, readFile, readdir, writeFile } from "no
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { waitForServerReady, waitFor, query, clickAt, key, type_, inputState, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
 
 const options: Record<string, string> = {};
 for (let i = 2; i < process.argv.length; i += 2) {
@@ -200,7 +202,7 @@ try {
   await click("sidebar.host"); await settleAuthentication(async () => !(await query("connection.progress")).some(shown) && text((await query("workspace.pane")).find(shown)).includes("ZW_AUX_SOURCE_READY"), "01-original-ssh");
   assert.equal((await tabs()).length, 2);
   await capture("01-original-owner");
-  await click("toolbar.ai"); await visible("ai.prompt");
+  await click(await aiToggleId()); await visible("ai.prompt");
   await click("ai.composer.attachment"); await click("ai.attachment.remote_file");
   await visible("ai.remote.picker");
   await settleAuthentication(async () => (await query("ai.remote.entry")).some(shown), "02-original-owner-readonly");

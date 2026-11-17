@@ -1,15 +1,17 @@
 /** Real @up chooser regression: disposable loopback SSH, actual NSOpenPanel,
  * native window captures while modal, cancel only; never selects/uploads files. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,readdir,rm} from 'node:fs/promises';
 import {join,resolve,dirname} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as h from '../vendor/zenit/e2e/client.ts';
+const python=process.env.ZW_TEST_PYTHON;assert(python,'ZW_TEST_PYTHON (audited Python with paramiko, run with -I) is required');
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);await mkdir(out,{recursive:false});
 const iso=await realpath(await mkdtemp('/private/tmp/zw-up-picker-')),rpc=join(iso,'rpc'),data=join(iso,'data'),remote=join(iso,'remote');await mkdir(rpc);await mkdir(data);
 const peerLog=await open(join(out,'peer.log'),'w');
-const peer=spawn(process.env.ZW_TEST_PYTHON??'uv',process.env.ZW_TEST_PYTHON?['e2e/builtin_records_ssh_peer.py','--out',join(out,'peer'),'--sftp-root',remote]:['run','--with','paramiko','python','e2e/builtin_records_ssh_peer.py','--out',join(out,'peer'),'--sftp-root',remote],{stdio:['ignore',peerLog.fd,peerLog.fd]});
+const peer=spawn(python,['-I','e2e/builtin_records_ssh_peer.py','--out',join(out,'peer'),'--sftp-root',remote],{stdio:['ignore',peerLog.fd,peerLog.fd]});
 const peerEnd=new Promise(r=>peer.once('close',r));let app:any,appEnd:Promise<unknown>|undefined,appLog:any;
 const report:any={status:'running',binary,binary_sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),out,checks:[],modal_captures:[],uploads:false,limits:['Modal screenshot pixels require visual review; post-cancel palette state is asserted.']};
 const shown=(n:any)=>n?.rect?.w>0&&n.rect.h>0&&n.hidden!==true&&n.visible!==false;
@@ -29,7 +31,9 @@ try{
  await writeFile(join(mac,'../Info.plist'),`<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>zerowork</string><key>CFBundleIdentifier</key><string>local.zerowork.uploadpicker.${process.pid}</string><key>CFBundleName</key><string>Upload Picker Verification</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`);
  await copyFile(binary,join(mac,'zerowork'));for(const name of ['zw_ipc.so','zw_execution.so','zw_execution_guard','zw_secret_consume.so'])await copyFile(join(dirname(binary),name),join(mac,name));
  process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;appLog=await open(join(out,'app.log'),'w');
- app=spawn(join(mac,'zerowork'),[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'0',ZENIT_E2E_REAL_ACTIVATION:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',appLog.fd,appLog.fd]});appEnd=new Promise(r=>app.once('close',r));
+ // This manual check needs the real NSOpenPanel: never inherit the runner's test dialog injection (ZEROWORK_E2E_DIALOG_DIR).
+ const appEnv:any={...process.env};delete appEnv.ZEROWORK_E2E_DIALOG_DIR;
+ app=spawn(join(mac,'zerowork'),[],{env:{...appEnv,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'0',ZENIT_E2E_REAL_ACTIVATION:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',appLog.fd,appLog.fd]});appEnd=new Promise(r=>app.once('close',r));
  report.pid=app.pid;report.rpc=rpc;await writeFile(join(out,'session.json'),JSON.stringify(report,null,2));
  await h.waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1280,820);
  const host=await visible('sidebar.host');await h.mouseMove(host.rect.x+host.rect.w-22,host.rect.y+host.rect.h/2);await click('sidebar.host.connect');

@@ -5,11 +5,13 @@
 
 const std = @import("std");
 const ui = @import("ui");
-const S = @import("../../ui/wizard_styles.zig");
-const Stepper = @import("../../ui/connection_stepper.zig");
+const S = @import("../../features/connections/wizard/view/wizard_styles.zig");
+const Rows = @import("_editor_rows.yss.zig");
+const panel_header = @import("../../shared/ui/components/panel_header/panel_header.zig");
+const Stepper = @import("../../features/connections/wizard/view/connection_stepper.zig");
 const hosts_mod = @import("../../config/hosts.zig");
 const identity = @import("../../host/identity.zig");
-pub const TestProgress = @import("../../ui/wizard_test_progress.zig");
+pub const TestProgress = @import("../../features/connections/wizard/model/wizard_test_progress.zig");
 const auth_options = [_]ui.widgets.checkbox.RadioOption{
     .{ .value = "password", .label = "密码", .test_id = "wizard.auth.password" },
     .{ .value = "key", .label = "私钥文件", .test_id = "wizard.auth.key" },
@@ -27,6 +29,8 @@ fn allocateDraftId() !u64 {
     }
 }
 
+const JumpGuide = @import("../../features/connections/mod.zig").jump_guide_view.JumpGuide;
+const JumpGuideAction = @import("../../features/connections/mod.zig").jump_guide_view.Action;
 fn parseAssetValue(value: []const u8) !identity.ConnectionId {
     if (!std.mem.startsWith(u8, value, "conn:") or value.len <= 5) return error.InvalidIdentity;
     for (value[5..]) |byte| if (byte < '0' or byte > '9') return error.InvalidIdentity;
@@ -40,8 +44,10 @@ fn parseAssetValue(value: []const u8) !identity.ConnectionId {
 /// 向导三步。
 pub const Step = enum { protocol, form, confirm };
 
-/// Persisted protocol compatibility; the production picker exposes SSH and SFTP only.
-pub const Protocol = enum { ssh, sftp, scp, mosh, telnet, serial, ftps, vnc, rdp, kvm };
+/// 本编辑器实现的协议，只有 SSH 与 SFTP（以代码为准，PLUGIN_ARCH_PLAN 6.2.1 Q1）。这个枚举从不持久化：
+/// `hosts.toml` 的协议由 `config/hosts.zig` 解析，其它协议值原样保存为 `protocol_id`（未知插件可列出、不可连接，
+/// V0.2 §4.2），不会经过这里。将来要做的协议先写设计文档、再进 `host/plugin_roadmap.zig`。
+pub const Protocol = enum { ssh, sftp };
 
 /// 认证方式（表单 radio）。Agent 使用本机 SSH agent；keyboard-interactive
 /// 不是凭据类型，而是服务器在认证协商中提出挑战时进入独立挑战模态。
@@ -163,7 +169,6 @@ pub const Draft = struct {
             .protocol = switch (self.protocol) {
                 .ssh => .ssh,
                 .sftp => .sftp,
-                else => return error.UnsupportedProtocol,
             },
             .auth_mode = switch (self.auth) {
                 .agent => .agent,
@@ -362,6 +367,35 @@ pub const RemoteEditor = struct {
     connection_configs: ?@import("../../host/connection_config_resolver.zig").Resolver = null,
     protocol_id: []const u8 = "ssh",
     stepper: ?*ui.Node = null,
+    footer_hint: ?*ui.Node = null,
+    advanced_summary: ?*ui.Node = null,
+    advanced_summary_buf: [192]u8 = undefined,
+    /// Review "back to" rows: the current value of each stack (this view's text).
+    back_values: [3]?*ui.Node = @splat(null),
+    /// Native controls mounted by this view (leaf widgets). Theme retinting of
+    /// this view's own text never descends into them.
+    native_roots: std.ArrayList(*ui.Node) = .empty,
+    /// Modal geometry (`W.Modal` `width` / `height` sources).
+    modal_width: ?*ui.Signal(f32) = null,
+    modal_height: ?*ui.Signal(?f32) = null,
+    /// Labels / glyphs of native buttons whose text follows state.
+    test_label: ?*ui.Signal([]const u8) = null,
+    save_only_label: ?*ui.Signal([]const u8) = null,
+    reveal_label: ?*ui.Signal([]const u8) = null,
+    reveal_icon: ?*ui.Signal(?ui.SvgAsset) = null,
+    logs_toggle_icon: ?*ui.Signal(?ui.SvgAsset) = null,
+    logs_copy_icon: ?*ui.Signal(?ui.SvgAsset) = null,
+    test_filter_text: ?*ui.Signal([]const u8) = null,
+    test_follow_text: ?*ui.Signal([]const u8) = null,
+    /// The password field stays a password field; this shows its text (native `revealed`).
+    sig_password_revealed: ?*ui.Signal(bool) = null,
+    /// Route choice ("direct" / "jump"), a native RadioGroup.
+    sig_access: ?*ui.Signal(?[]const u8) = null,
+    advanced_open: ?*ui.Signal(bool) = null,
+    review_open: ?*ui.Signal(bool) = null,
+    test_filter_selected: [10]?*ui.Signal(bool) = @splat(null),
+    /// The newest shown log row: where a following log view scrolls to.
+    test_stick_pending: bool = false,
 
     /// Save errors are pre-commit; return a receipt after disk commit, even
     /// when opening subsequently fails. Cancellation returns null.
@@ -400,10 +434,8 @@ pub const RemoteEditor = struct {
     cancel_btn: ?*ui.Node = null,
     save_only_btn: ?*ui.Node = null,
     test_btn: ?*ui.Node = null,
-    strict_checkbox: ?*ui.Node = null,
-    compression_checkbox: ?*ui.Node = null,
+    strict_select: ?*ui.Node = null,
     remember_checkbox: ?*ui.Node = null,
-    auth_group: ?*ui.Node = null,
     identity_body: ?*ui.Node = null,
     auth_body: ?*ui.Node = null,
     identity_card: ?*ui.Node = null,
@@ -418,8 +450,11 @@ pub const RemoteEditor = struct {
     step_titles: [3]?*ui.Node = @splat(null),
     step_details: [3]?*ui.Node = @splat(null),
     step_disabled: [3]?*ui.Signal(bool) = @splat(null),
-    step_styles: [3]?*ui.Signal(ui.BoxStyle) = @splat(null),
     scrolls: [3]?ui.widgets.ScrollAreaResult = @splat(null),
+    /// This view's boxes around / inside each native ScrollArea: the frame takes
+    /// the step's share of the body, the column carries padding and gap.
+    scroll_frames: [3]?*ui.Node = @splat(null),
+    scroll_columns: [3]?*ui.Node = @splat(null),
     route_editor: ?*ui.Node = null,
     route_hint: ?*ui.Node = null,
     summary_identity: ?*ui.Node = null,
@@ -434,21 +469,18 @@ pub const RemoteEditor = struct {
     summary_route_captions: [10]?*ui.Node = @splat(null),
     summary_route_arrows: [9]?*ui.Node = @splat(null),
     protocol_icon: ?*ui.Node = null,
-    protocol_select_icon: ?*ui.Node = null,
     protocol_header: ?*ui.Node = null,
+    protocol_select: ?ui.widgets.SelectResult = null,
     summary_icon: ?*ui.Node = null,
     review_disclosure: ?*ui.Node = null,
     strict_focus_pending: bool = false,
     inputs: std.ArrayList(ui.widgets.input.InputResult) = .empty,
     field_feedback: std.ArrayList(*FieldFeedback) = .empty,
     validation_focus_group: ?*ui.Node = null,
-    selects: std.ArrayList(ui.widgets.SelectResult) = .empty,
-    buttons: std.ArrayList(ButtonPaint) = .empty,
     editor_actions: std.ArrayList(*EditorAction) = .empty,
     jump_add_disabled: ?*ui.Signal(bool) = null,
     owned_ids: std.ArrayList([]u8) = .empty,
     agent_notice: ?*ui.Node = null,
-    route_choices: [2]?RouteChoice = @splat(null),
     route_empty_hint: ?*ui.Node = null,
     route_card: ?*ui.Node = null,
     route_body: ?*ui.Node = null,
@@ -456,7 +488,8 @@ pub const RemoteEditor = struct {
     copy_expanded: bool = false,
     copy_open: ?*ui.Signal(bool) = null,
     copy_dialog: ?*ui.Node = null,
-    copy_body: ?*ui.Node = null,
+    /// This view's column inside the copy dialog's body slot.
+    copy_panel: ?*ui.Node = null,
     copy_footer: ?*ui.Node = null,
     copy_trigger: ?*ui.Node = null,
     review_test_card: ?*ui.Node = null,
@@ -474,12 +507,7 @@ pub const RemoteEditor = struct {
     test_rows: [128]TestLogRow = undefined,
     test_scroll: ?ui.widgets.ScrollAreaResult = null,
     test_follow_row: ?*ui.Node = null,
-    test_follow_label: ?*ui.Node = null,
     test_follow_hint: ?*ui.Node = null,
-    test_filter_label: ?*ui.Node = null,
-    test_copy_icon: ?*ui.Node = null,
-    test_copy_feedback: ?*@import("../../ui/copy_button.zig").Button = null,
-    test_disclosure_icon: ?*ui.Node = null,
     test_actions: [10]?*TestHopAction = @splat(null),
     review_body: ?*ui.Node = null,
     review_path: ?*ui.Node = null,
@@ -489,6 +517,8 @@ pub const RemoteEditor = struct {
     on_cancel_test: ?*const fn (*anyopaque, TestProgress.operations.OperationKey) void = null,
     cancel_test_ctx: ?*anyopaque = null,
     painted_colors: ?S.theme.Colors = null,
+    /// Raised by the window's theme publication; consumed where this view repaints.
+    theme_watch: @import("../../shared/ui/theme/theme_watch.zig").ThemeWatch = .{},
     route_previews: [2]RoutePreview = @splat(.{}),
 
     save_failure: ?SaveFailure = null,
@@ -532,6 +562,17 @@ pub const RemoteEditor = struct {
     jump_count: usize = 0,
     // Direct access hides the route without discarding its in-progress draft.
     dormant_jump_count: usize = 0,
+    /// "经 SSH 跳板连接" chosen while no saved host can be a hop (design-r3
+    /// 稿 4): the route shows the empty state and the step cannot advance.
+    jump_requested: bool = false,
+    /// Nested "新建跳板主机" editor: the parent's target name (owned).
+    jump_child_target: ?[]u8 = null,
+    editor_host: ?*@import("../../host/content_context.zig").EditorHost = null,
+    child_request: ?u64 = null,
+    jump_guide: ?*JumpGuide = null,
+    jump_footer: ?*ui.Node = null,
+    group_field: ?*ui.Node = null,
+    protocol_picker_node: ?*ui.Node = null,
     dormant_socks_exit: ?usize = null,
     jumps: [8][]const u8 = undefined,
     route_ids: [8]identity.ConnectionId = undefined,
@@ -568,13 +609,10 @@ pub const RemoteEditor = struct {
     socks_details: ?*ui.Node = null,
     commands_details: ?*ui.Node = null,
     advanced_expanded: bool = false,
-    height_motion: @import("../../ui/layout_motion.zig").Height = .{},
-    advanced_disclosure: ?*@import("../../ui/layout_motion.zig").Disclosure = null,
+    height_motion: @import("../../shared/ui/styles/layout_motion.zig").Height = .{},
+    advanced_disclosure: ?*@import("../../shared/ui/styles/layout_motion.zig").Disclosure = null,
     advanced_body: ?*ui.Node = null,
     advanced_toggle: ?*ui.Node = null,
-    advanced_chevron: ?*ui.Node = null,
-    parent_presentation_visible: bool = true,
-    parent_barrier_color: ui.Color = ui.Color.TRANSPARENT,
     direct_label: ?*ui.Node = null,
     ssh_card: ?*ui.Node = null,
     sftp_card: ?*ui.Node = null,
@@ -651,7 +689,6 @@ pub const RemoteEditor = struct {
     agent_dot: ?*ui.Node = null,
     cred_pw_row: ?*ui.Node = null,
     password_input: ?ui.widgets.input.InputResult = null,
-    password_control: ?*ui.Node = null,
     password_reveal_button: ?*ui.Node = null,
     password_reveal_error: ?*ui.Node = null,
     password_reveal_disabled: ?*ui.Signal(bool) = null,
@@ -675,6 +712,9 @@ pub const RemoteEditor = struct {
         self.cx = cx;
         self.scope = scope;
         self.painted_colors = S.theme.current();
+        try self.theme_watch.bind(cx, scope);
+        // Mounted in the current theme: the first publication after this one repaints.
+        _ = self.theme_watch.take();
         const feedback_guard = try scope.childScope();
         try feedback_guard.onCleanup(RemoteEditor, self, releaseFieldFeedback);
         if (self.draft_id == 0) self.draft_id = try allocateDraftId();
@@ -731,14 +771,29 @@ pub const RemoteEditor = struct {
         self.sig_command_info = try scope.createSignal(?[]const u8, "inherit");
         self.logs_open = try scope.createSignal(bool, false);
         self.test_action_disabled = try scope.createSignal(bool, false);
+        self.modal_width = try scope.createSignal(f32, S.width);
+        self.modal_height = try scope.createSignal(?f32, S.max_height);
+        self.test_label = try scope.createText("测试连接", .{});
+        self.save_only_label = try scope.createText("仅保存", .{});
+        self.reveal_label = try scope.createText("查看密码", .{});
+        self.reveal_icon = try scope.createSignal(?ui.SvgAsset, ui.icons.eye);
+        self.logs_toggle_icon = try scope.createSignal(?ui.SvgAsset, ui.icons.chevron_down);
+        self.logs_copy_icon = try scope.createSignal(?ui.SvgAsset, ui.icons.copy);
+        self.test_filter_text = try scope.createText("全部节点", .{});
+        self.test_follow_text = try scope.createText("跟随中", .{});
+        self.sig_password_revealed = try scope.createSignal(bool, false);
+        self.sig_access = try scope.createSignal(?[]const u8, "direct");
+        self.advanced_open = try scope.createSignal(bool, false);
+        self.review_open = try scope.createSignal(bool, false);
+        for (&self.test_filter_selected) |*v| v.* = try scope.createSignal(bool, false);
         const ModalParts = struct { overlay: *ui.Node, dialog: *ui.Node, body: *ui.Node, portaled: bool };
         const modal: ModalParts = if (self.embedded) blk: {
-            const panel = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .flex = 1, .direction = .column, .min_height = 0 }, .{});
-            const content = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .flex = 1, .direction = .column, .min_height = 0 }, .{});
+            const panel = try ui.box(cx, .{ .width = .fill(), .height = S.shrink, .flex = 1, .direction = .column, .min_height = 0 }, .{});
+            const content = try ui.box(cx, .{ .width = .fill(), .height = S.shrink, .flex = 1, .direction = .column, .min_height = 0 }, .{});
             try panel.appendChild(self.alloc, content);
             break :blk .{ .overlay = panel, .dialog = panel, .body = content, .portaled = false };
         } else blk: {
-            const value = try ui.widgets.Modal(.{ .open = ui.split(self.open.?, cx.on(RemoteEditor, self, openChanged)), .width = S.width, .max_height = S.max_height, .background = S.theme.current().overlay, .close_on_overlay = false }).mount(scope, cx);
+            const value = try ui.widgets.Modal(.{ .open = ui.split(self.open.?, cx.on(RemoteEditor, self, openChanged)), .width = self.modal_width.?, .height = self.modal_height.?, .max_height = S.max_height, .body_padding = ui.Padding.all(0), .body_gap = @as(f32, 0), .close_on_overlay = false }).mount(scope, cx);
             break :blk .{ .overlay = value.overlay, .dialog = value.dialog, .body = value.body, .portaled = value.portaled };
         };
         self.root = modal.overlay;
@@ -746,8 +801,6 @@ pub const RemoteEditor = struct {
         if (!self.embedded) {
             modal.overlay.meta.ownership.meta.test_id = "wizard.overlay";
             modal.dialog.meta.ownership.meta.test_id = "wizard.dialog";
-            modal.dialog.setStyleInline(self.alloc, S.panel(cx.tokens));
-            modal.body.setStyleInline(self.alloc, S.modalBody());
         }
         const header = try ui.box(cx, S.header(), .{});
         self.header = header;
@@ -755,21 +808,34 @@ pub const RemoteEditor = struct {
         self.protocol_icon = try ui.iconTint(cx, ui.icons.plug, S.theme.current().accent, S.icon(18));
         self.protocol_icon.?.meta.ownership.meta.test_id = "wizard.protocol.icon";
         try header.appendChild(self.alloc, self.protocol_icon.?);
-        self.title = try ui.text(cx, "新建连接", S.text(13, 700, false));
+        self.title = try ui.text(cx, "新建主机", S.text(13, 700, false));
         try header.appendChild(self.alloc, self.title.?);
         try header.appendChild(self.alloc, try ui.spacer(cx));
         const protocol_options = [_]ui.widgets.SelectOption{
             .{ .value = "ssh", .label = "SSH", .icon = ui.icons.terminal, .test_id = "wizard.protocol.ssh" },
             .{ .value = "sftp", .label = "SFTP", .icon = ui.icons.folder_open, .test_id = "wizard.protocol.sftp" },
         };
-        const protocol = try ui.widgets.Select(.{ .options = &protocol_options, .value = self.sig_protocol.?, .leading_icon = ui.icons.terminal, .width = 104, .disabled = self.locked.?, .on_change = cx.on(RemoteEditor, self, onProtocolChanged) }).mount(scope, cx);
-        skinSelect(self, protocol, 30, 12);
-        self.protocol_select_icon = protocol.leading_icon;
+        const protocol = try ui.widgets.Select(.{ .panel_width = .trigger, .options = &protocol_options, .value = self.sig_protocol.?, .width = 112, .disabled = self.locked.?, .on_change = cx.on(RemoteEditor, self, onProtocolChanged) }).mount(scope, cx);
         protocol.trigger.meta.ownership.meta.test_id = "wizard.protocol";
+        try self.native_roots.append(self.alloc, protocol.wrapper);
+        self.protocol_select = protocol;
         self.protocol_header = protocol.wrapper;
         try header.appendChild(self.alloc, protocol.wrapper);
-        _ = try action(self, header, "关闭向导", "wizard.close", 22, 22, false, null, onCancelClick, ui.icons.x);
+        // panel-heads：统一关闭按钮（Modal 的 Esc 经 `openChanged(false)` 同样 `onCancelClick`）。
+        try header.appendChild(self.alloc, try panel_header.mountClose(scope, cx, .{ .label = "关闭向导", .test_id = "wizard.close", .on_close = cx.on(RemoteEditor, self, onCancelClick) }));
         try modal.body.appendChild(self.alloc, header);
+        // Standalone editors draw the Island B v3 window themselves (Stage →
+        // View island → Pane); embedded ones sit inside the shell's pane.
+        const content_parent = if (self.embedded) modal.body else blk: {
+            const stage = try ui.boxStyled(cx, S.stage, .{});
+            const view_island = try ui.boxStyled(cx, S.island, .{});
+            const pane = try ui.boxStyled(cx, S.pane, .{});
+            pane.meta.ownership.meta.test_id = "wizard.pane";
+            try view_island.appendChild(self.alloc, pane);
+            try stage.appendChild(self.alloc, view_island);
+            try modal.body.appendChild(self.alloc, stage);
+            break :blk pane;
+        };
         const body = try ui.box(cx, S.body(), .{});
         self.body = body;
         const stepper = try Stepper.row(cx);
@@ -779,8 +845,7 @@ pub const RemoteEditor = struct {
             ctx.* = .{ .wizard = self, .step = @fromBackingInt(@intCast(i)) };
             try scope.onCleanup(StepAction, ctx, StepAction.cleanup);
             self.step_disabled[i] = try scope.createSignal(bool, i != 0);
-            self.step_styles[i] = try scope.createSignal(ui.BoxStyle, S.step(i == 0));
-            const entry = try Stepper.append(cx, scope, stepper, i, ([_][]const u8{ "wizard.step.identity", "wizard.step.route", "wizard.step.review" })[i], self.step_disabled[i].?, self.step_styles[i].?, cx.on(StepAction, ctx, StepAction.click));
+            const entry = try Stepper.append(cx, scope, stepper, i, ([_][]const u8{ "wizard.step.identity", "wizard.step.route", "wizard.step.review" })[i], self.step_disabled[i].?, cx.on(StepAction, ctx, StepAction.click));
             self.step_buttons[i] = entry.button;
             self.step_numbers[i] = entry.badge;
             self.step_digits[i] = entry.digit;
@@ -788,20 +853,25 @@ pub const RemoteEditor = struct {
             self.step_titles[i] = entry.title;
         }
         try body.appendChild(self.alloc, stepper);
+        self.jump_guide = try JumpGuide.create(cx, scope, .{ .context = self, .act = guideAction });
         self.step1_view = try mountIdentity(self);
         self.refreshSshDefaults();
         self.step2_view = try mountRoute(self);
         self.confirm_card = try mountReview(self);
         const contents = [_]*ui.Node{ self.step1_view.?, self.step2_view.?, self.confirm_card.? };
         for (contents, 0..) |content, i| {
-            const scroll = try ui.widgets.ScrollArea(.{ .direction = .vertical }).mount(scope, cx);
-            scroll.container.setStyleInline(self.alloc, S.scroll());
+            // The frame and the padded column are this view's boxes; the ScrollArea between them is native.
+            const frame = try ui.box(cx, S.scroll(), .{});
+            const scroll = try ui.widgets.ScrollArea(.{ .direction = .vertical, .scroll_edge = .{ .edge = .bottom, .height = S.scroll_hint_height, .fade_width = S.scroll_hint_height } }).mount(scope, cx);
             scroll.container.meta.ownership.meta.test_id = ([_][]const u8{ "wizard.scroll.identity", "wizard.scroll.route", "wizard.scroll.review" })[i];
-            scroll.content.setStyleInline(self.alloc, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 6, .flex_shrink = 0 });
-            if (i <= 1) scroll.content.setStyleInline(self.alloc, .{ .padding = .{ .left = 4, .right = 20, .bottom = 20 } });
-            try scroll.content.appendChild(self.alloc, content);
-            try body.appendChild(self.alloc, scroll.container);
+            const column = try ui.box(cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 6, .flex_shrink = 0, .padding = .{ .right = 16, .bottom = 20 } }, .{});
+            try column.appendChild(self.alloc, content);
+            try scroll.content.appendChild(self.alloc, column);
+            try frame.appendChild(self.alloc, scroll.container);
+            try body.appendChild(self.alloc, frame);
             self.scrolls[i] = scroll;
+            self.scroll_frames[i] = frame;
+            self.scroll_columns[i] = column;
         }
         self.step1_scroll = self.scrolls[0].?.container;
         self.step2_scroll = self.scrolls[1].?.container;
@@ -809,19 +879,26 @@ pub const RemoteEditor = struct {
         self.step2_scroll_state = self.scrolls[1].?.state;
         self.step1_scroll_content = self.scrolls[0].?.content;
         self.step2_scroll_content = self.scrolls[1].?.content;
-        try modal.body.appendChild(self.alloc, body);
+        try content_parent.appendChild(self.alloc, body);
         const footer = try ui.box(cx, S.footer(), .{});
         self.footer = footer;
         footer.meta.ownership.meta.test_id = "wizard.footer";
-        self.back_btn = try action(self, footer, "上一步", "wizard.back", 64, 34, false, self.locked, onBackClick, null);
-        self.cancel_btn = try action(self, footer, "取消", "wizard.cancel", 52, 34, false, null, onCancelClick, null);
+        self.back_btn = try button(self, footer, .{ .id = "wizard.back", .label = .{ .value = "上一步" }, .disabled = self.locked }, cx.on(RemoteEditor, self, onBackClick));
+        self.cancel_btn = try button(self, footer, .{ .id = "wizard.cancel", .label = .{ .value = "取消" }, .variant = .ghost }, cx.on(RemoteEditor, self, onCancelClick));
+        // Footer Hint (hb6dT c2S70S): the next stack, 12 muted.
+        self.footer_hint = try ui.text(cx, "", S.footerHint());
+        self.footer_hint.?.meta.ownership.meta.test_id = "wizard.footer.hint";
+        try footer.appendChild(self.alloc, self.footer_hint.?);
         try footer.appendChild(self.alloc, try ui.spacer(cx));
-        self.test_btn = try action(self, footer, "测试连接", "wizard.test", 76, 34, false, self.test_action_disabled, onTestClick, null);
-        self.save_only_btn = try action(self, footer, "仅保存", "wizard.save_only", 64, 34, false, self.save_disabled, onSaveOnlyClick, null);
-        self.next1_btn = try action(self, footer, "下一步", "wizard.next.identity", 64, 34, true, self.next1_disabled, onNext1Click, null);
-        self.next2_btn = try action(self, footer, "下一步", "wizard.next.route", 64, 34, true, self.next2_disabled, onNext2Click, null);
-        self.save_btn = try action(self, footer, "保存并连接", "wizard.save", 88, 34, true, self.open_disabled, onSaveClick, null);
-        try modal.body.appendChild(self.alloc, footer);
+        self.test_btn = try button(self, footer, .{ .id = "wizard.test", .label = .{ .signal = self.test_label.? }, .disabled = self.test_action_disabled }, cx.on(RemoteEditor, self, onTestClick));
+        self.save_only_btn = try button(self, footer, .{ .id = "wizard.save_only", .label = .{ .signal = self.save_only_label.? }, .disabled = self.save_disabled }, cx.on(RemoteEditor, self, onSaveOnlyClick));
+        self.next1_btn = try button(self, footer, .{ .id = "wizard.next.identity", .label = .{ .value = "下一步" }, .variant = .primary, .disabled = self.next1_disabled }, cx.on(RemoteEditor, self, onNext1Click));
+        self.next2_btn = try button(self, footer, .{ .id = "wizard.next.route", .label = .{ .value = "下一步" }, .variant = .primary, .disabled = self.next2_disabled }, cx.on(RemoteEditor, self, onNext2Click));
+        self.save_btn = try button(self, footer, .{ .id = "wizard.save", .label = .{ .value = "保存并连接" }, .variant = .primary, .disabled = self.open_disabled }, cx.on(RemoteEditor, self, onSaveClick));
+        try content_parent.appendChild(self.alloc, footer);
+        self.jump_footer = try self.jump_guide.?.mountFooter(scope);
+        self.jump_footer.?.setDisplay(.none);
+        try content_parent.appendChild(self.alloc, self.jump_footer.?);
         self.step = .protocol;
         try self.setAssets(self.assets);
         self.syncAll();
@@ -845,12 +922,13 @@ pub const RemoteEditor = struct {
     fn removeViewportHook(self: *RemoteEditor) void {
         self.password_authorization.cancel();
         self.cx.removeAfterLayoutHook(self);
+        if (self.jump_child_target) |target| self.alloc.free(target);
+        self.jump_child_target = null;
         if (self.test_source) |*source| source.deinit();
         self.releaseAssetValues();
         self.inputs.deinit(self.alloc);
         self.field_feedback.deinit(self.alloc);
-        self.selects.deinit(self.alloc);
-        self.buttons.deinit(self.alloc);
+        self.native_roots.deinit(self.alloc);
         self.editor_actions.deinit(self.alloc);
         for (self.owned_ids.items) |value| self.alloc.free(value);
         self.owned_ids.deinit(self.alloc);
@@ -873,101 +951,76 @@ pub const RemoteEditor = struct {
         // after the whole wizard has closed underneath another modal.
         if (!self.isVisible()) return .done;
         self.pollPasswordVisibility();
-        for (self.selects.items) |select| {
-            paintSelectTypography(select.trigger);
-            paintSelectTypography(select.panel);
-            paintSelectMenu(select);
-            // Select's reactive label restores its mount-time palette after
-            // loadDraft/value updates. Reapply the live role to that owned
-            // content only, preserving placeholder and option semantics.
-            const selected = if (select.value) |value| value.peek() != null else false;
-            paintSelectContent(select.content_slot, if (selected) S.theme.current().fg_2 else S.theme.current().fg_3);
-        }
-        if (self.startup_textarea) |area| paintSelectTypography(area.input);
-        for (self.inputs.items) |input| if (input.state.text_display_node) |text| paintInputTypography(text);
-        if (self.remember_checkbox) |checkbox| paintCheckboxLabels(checkbox);
-        if (self.compression_checkbox) |group| paintAuthLabels(group);
-        if (self.auth_group) |group| paintAuthLabels(group);
-        if (!self.embedded) {
-            const parent_visible = !self.copy_open.?.peek();
-            if (self.parent_presentation_visible != parent_visible) {
-                if (!parent_visible) self.parent_barrier_color = self.root.?.getBackground();
-                self.root.?.setBackground(if (parent_visible) self.parent_barrier_color else ui.Color.TRANSPARENT);
-                self.modal.?.setDisplay(if (parent_visible) .flex else .none);
-                self.parent_presentation_visible = parent_visible;
-                return .needs_layout;
-            }
-        }
-        if (self.copy_open.?.peek()) {
-            var corrected = false;
-            for ([_]?*ui.Node{ self.copy_dialog, self.copy_body }) |entry| if (entry) |node| {
-                if (!std.meta.eql(node.style.padding, ui.Padding.all(0)) or node.style.gap != 0) {
-                    node.setStyleInline(self.alloc, .{ .padding = .{}, .gap = 0 });
-                    corrected = true;
-                }
-            };
-            if (corrected) return .needs_layout;
-        }
         if (self.validation_focus_group) |group| {
             self.validation_focus_group = null;
             const area = self.scrolls[0].?;
-            area.state.content_height = area.content.globalRect().h;
-            area.state.viewport_height = area.container.globalRect().h;
             ui.widgets.scrollIntoView(area.state, area.content, group, .nearest);
         }
         if (self.test_reveal_pending and self.step == .confirm) {
             self.test_reveal_pending = false;
             const area = self.scrolls[2].?;
-            area.state.content_height = area.content.globalRect().h;
-            area.state.viewport_height = area.container.globalRect().h;
             ui.widgets.scrollIntoView(area.state, area.content, self.review_test_card.?, .start);
         }
-        self.updateTestScroll();
+        if (self.test_stick_pending) {
+            self.test_stick_pending = false;
+            self.stickTestLogs();
+        }
         if (self.updateViewport()) return .needs_layout;
         var route_changed = false;
         for (&self.route_previews) |*preview| route_changed = self.resizeRoutePreview(preview) or route_changed;
         if (route_changed) return .needs_layout;
         if (self.strict_focus_pending and self.step == .protocol and self.advanced_expanded) {
             self.strict_focus_pending = false;
-            self.cx.setFocus(self.strict_checkbox.?);
+            self.cx.setFocus(self.strict_select.?);
             const scroll = self.scrolls[0].?;
-            // This hook precedes the SDK's scrollbar before-render metric
-            // update. Use the completed layout so the first focus request can
-            // reach a just-expanded advanced card in this same frame.
-            scroll.state.content_height = scroll.content.globalRect().h;
-            scroll.state.viewport_height = scroll.container.globalRect().h;
-            ui.widgets.scrollIntoView(scroll.state, scroll.content, self.strict_checkbox.?, .nearest);
+            ui.widgets.scrollIntoView(scroll.state, scroll.content, self.strict_select.?, .nearest);
         }
         return .done;
     }
+    /// Advanced row summary (hb6dT LBYoY): the current non-secret options,
+    /// e.g. "严格验证主机密钥 · 超时 15 秒 · 保活 30 秒 · UTF-8 · 启动命令 1 条".
+    fn refreshAdvancedSummary(self: *RemoteEditor) void {
+        const node = self.advanced_summary orelse return;
+        var writer = std.Io.Writer.fixed(&self.advanced_summary_buf);
+        writer.writeAll(if (self.strict_host_key_checking) "严格验证主机密钥" else "严格验证已关闭") catch {};
+        if (self.ssh_defaults) |defaults| writer.print(" · 超时 {d} 秒 · 保活 {d} 秒", .{ defaults.connect_timeout_sec, defaults.keepalive_sec }) catch {};
+        const encoding = trim(self.sig_encoding.?.peek());
+        if (encoding.len != 0) writer.print(" · {s}", .{encoding}) catch {};
+        if (self.protocol == .ssh) {
+            var lines: usize = 0;
+            var it = std.mem.tokenizeAny(u8, self.sig_startup.?.peek(), "\r\n");
+            while (it.next()) |line| {
+                if (trim(line).len != 0) lines += 1;
+            }
+            if (lines != 0) writer.print(" · 启动命令 {d} 条", .{lines}) catch {};
+        }
+        const value = writer.buffered();
+        if (node.getText()) |current| if (std.mem.eql(u8, current.content, value)) return;
+        node.setTextContent(self.alloc, value) catch return;
+        if (self.back_values[2]) |text| text.setTextContent(self.alloc, value) catch {};
+    }
     pub fn updateViewport(self: *RemoteEditor) bool {
         const compact = self.cx.viewport.width <= 860 or self.cx.viewport.height <= 480;
-        const inset: f32 = if (compact) 18 else 20;
-        const body_padding = ui.Padding{ .left = inset, .right = inset };
+        // Pane Body padding [20,28,0,28] (compact 14/20). The scroll content
+        // keeps a 16pt scrollbar lane inside the right inset.
+        const inset: f32 = if (compact) 20 else S.body_inset;
+        const body_padding = ui.Padding{ .left = inset, .right = inset - 16, .top = if (compact) 14 else S.body_top };
         var geometry_changed = false;
         if (self.body) |body| if (!std.meta.eql(body.style.padding, body_padding)) {
             body.setStyleInline(self.alloc, .{ .padding = body_padding, .gap = if (compact) 12 else 14 });
-            for (self.scrolls, 0..) |slot, i| if (slot) |scroll| {
-                const edge: f32 = if (compact) 0 else if (i <= 1) 4 else 0;
-                scroll.content.setStyleInline(self.alloc, .{ .padding = .{ .left = edge, .right = edge + 16, .bottom = if (compact) 12 else 20 } });
+            if (self.stepper) |stepper| stepper.setStyleInline(self.alloc, .{ .margin = .{ .right = 16 } });
+            for (self.scroll_columns) |slot| if (slot) |column| {
+                column.setStyleInline(self.alloc, .{ .padding = .{ .left = 0, .right = 16, .bottom = if (compact) 12 else 20 } });
             };
-            if (self.confirm_card) |review| review.setStyleInline(self.alloc, .{ .padding = .{ .left = if (compact) 0 else 4, .right = if (compact) 0 else 4 } });
-            if (self.footer) |footer| footer.setStyleInline(self.alloc, .{ .height = .{ .px = if (compact) 54 else 62 }, .padding = .{ .left = if (compact) 18 else 24, .right = if (compact) 18 else 24, .top = if (compact) 10 else 14, .bottom = if (compact) 10 else 14 } });
+            if (self.confirm_card) |review| review.setStyleInline(self.alloc, .{ .padding = .{} });
+            if (self.footer) |footer| footer.setStyleInline(self.alloc, .{ .height = .{ .px = S.footer_height }, .padding = .{}, .margin = .{ .left = inset, .right = inset } });
             geometry_changed = true;
         };
         if (self.embedded) {
-            const colors = S.theme.current();
-            if (self.painted_colors == null or !std.meta.eql(self.painted_colors.?, colors)) self.retheme();
+            if (self.theme_watch.take()) self.retheme();
             return geometry_changed;
         }
         if (self.modal == null) return false;
-        // Modal's deferred style host can initialise after the outer app mount.
-        // Persist the caller's body override once that host is actually ready.
-        if (self.header.?.parent) |modal_body| if (!std.meta.eql(modal_body.style.padding, ui.Padding.ZERO)) {
-            modal_body.setStyleInline(self.alloc, S.modalBody());
-            modal_body.markLayoutDirty();
-            return true;
-        };
         const available_w = @max(1, self.cx.viewport.width - 32);
         const available_h = @max(1, self.cx.viewport.height - @as(f32, if (compact) 48 else 32));
         const width = @min(S.width, available_w);
@@ -978,12 +1031,10 @@ pub const RemoteEditor = struct {
             self.viewport_width = width;
             self.viewport_height = height;
             self.viewport_step = self.step;
-            self.modal.?.setStyleInline(self.alloc, .{ .width = .{ .px = width }, .height = .{ .px = height } });
-            for (&self.scrolls) |*slot| if (slot.*) |scroll| scroll.container.setStyleInline(self.alloc, S.scroll());
-            self.modal.?.markLayoutDirty();
+            self.modal_width.?.set(width);
+            self.modal_height.?.set(height);
         }
-        const colors = S.theme.current();
-        if (self.painted_colors == null or !std.meta.eql(self.painted_colors.?, colors)) self.retheme();
+        if (self.theme_watch.take()) self.retheme();
         return changed or geometry_changed;
     }
 
@@ -1000,10 +1051,11 @@ pub const RemoteEditor = struct {
                 const content_height = scroll.content.globalRect().h - (if (self.advanced_disclosure) |section_motion| section_motion.root.globalRect().h else @as(f32, 0));
                 if (content_height > 0) {
                     const compact = self.cx.viewport.width <= 860 or self.cx.viewport.height <= 480;
-                    const header_height: f32 = if (compact and self.embedded) 48 else 52;
-                    const footer_height: f32 = if (compact) 54 else 62;
+                    // Title bar 44 + window frame (Stage 6, island 4×2) + Body top inset.
+                    const header_height: f32 = S.header_height + S.frame_height + (if (compact) @as(f32, 14) else S.body_top);
+                    const footer_height: f32 = S.footer_height;
                     const gap: f32 = if (compact) 12 else 14;
-                    return @min(S.max_height, header_height + 60 + gap + content_height + footer_height);
+                    return @min(S.max_height, header_height + S.stepper_height + gap + content_height + footer_height);
                 }
             }
         }
@@ -1071,6 +1123,13 @@ pub const RemoteEditor = struct {
         self.resolveLoadedGroup();
         // The copy action is meaningful only when a real source host exists.
         if (assets.len == 0) self.closeCopy();
+        // Hosts became available while the empty state was shown: offer the
+        // ordinary hop picker instead (a pending "新建跳板主机" fills hop 1).
+        if (self.jump_requested and self.jump_count == 0 and self.child_request == null and self.availableJumpHosts() != 0) {
+            self.jump_requested = false;
+            self.jump_count = 1;
+            self.editing_order = true;
+        }
         if (self.root != null and self.topo_addr != null) {
             self.refreshEditorRows();
             self.refreshValidity();
@@ -1139,12 +1198,13 @@ pub const RemoteEditor = struct {
         self.group_edited = false;
         self.loaded_scrollback_explicit = draft.scrollback_explicit or draft.scrollback != 25000;
         self.dormant_jump_count = 0;
+        self.jump_requested = false;
         self.dormant_socks_exit = null;
         self.validation_focus_group = null;
         for (self.field_feedback.items) |feedback| {
             feedback.touched = false;
             feedback.message.set("");
-            feedback.resize(false);
+            feedback.invalid.set(false);
         }
         self.strict_focus_pending = false;
         self.identity_expanded = true;
@@ -1256,10 +1316,13 @@ pub const RemoteEditor = struct {
         self.refreshAccessChoices();
         self.refreshEditorActions();
         const route_error = self.routeError();
+        const jump_empty = self.jumpEmpty();
+        if (self.jump_guide) |guide| guide.setEmpty(jump_empty);
         if (self.route_empty_hint) |node| {
             node.setTextContent(self.alloc, route_error) catch {};
-            node.setDisplay(if (route_error.len != 0) .flex else .none);
+            node.setDisplay(if (route_error.len != 0 and !jump_empty) .flex else .none);
         }
+        self.refreshFooterHint();
         // The name/address/authentication form is always required.  Only the
         // optional topology is conditional on selecting at least one hop.
         inline for (.{ "step2_topology", "step2_topology_title" }) |field_name| if (@field(self, field_name)) |node| node.setDisplay(if (has_jumps) .flex else .none);
@@ -1332,7 +1395,8 @@ pub const RemoteEditor = struct {
         if (self.commands_details) |node| node.setDisplay(if (self.protocol == .ssh) .flex else .none);
         if (self.command_info_row) |node| node.setDisplay(if (self.protocol == .ssh) .flex else .none);
         if (self.advanced_disclosure) |section_motion| section_motion.setExpanded(self.advanced_expanded);
-        if (self.advanced_chevron) |node| paintIcon(node, if (self.advanced_expanded) ui.icons.chevron_down else ui.icons.chevron_right, 10, S.theme.current().fg_1);
+        if (self.advanced_open) |open_| open_.set(self.advanced_expanded);
+        self.refreshAdvancedSummary();
         if (self.identity_body) |node| node.setDisplay(if (self.identity_expanded) .flex else .none);
         if (self.auth_body) |node| node.setDisplay(if (self.auth_expanded) .flex else .none);
         if (self.route_body) |node| node.setDisplay(if (self.route_expanded) .flex else .none);
@@ -1341,15 +1405,12 @@ pub const RemoteEditor = struct {
         self.refreshTestProjection() catch {};
     }
     fn refreshAccessChoices(self: *RemoteEditor) void {
-        for (self.route_choices, 0..) |entry, index| if (entry) |choice| {
-            const selected = (self.jump_count > 0) == (index == 1);
-            choice.style.set(S.accessChoice(false));
-            choice.highlight.setBackground(S.theme.popupSelection());
-            choice.highlight.setDisplay(if (selected) .flex else .none);
-            choice.title.setTextColor(if (selected) S.theme.current().accent else S.theme.current().fg_1);
-            choice.detail.setTextColor(S.theme.current().fg_2);
-            if (choice.root.behavior.interaction.a11y) |*access| access.pressed = selected;
-        };
+        if (self.sig_access) |choice| choice.set(if (self.routeIsJump()) "jump" else "direct");
+    }
+    fn onAccessPicked(self: *RemoteEditor, value: []const u8) void {
+        if (std.mem.eql(u8, value, "jump")) self.onAccessJump() else self.onAccessDirect();
+        // The handlers may refuse (locked): the group shows the route as it is.
+        self.refreshAccessChoices();
     }
     fn refreshEditorActions(self: *RemoteEditor) void {
         const locked = self.isLocked();
@@ -1361,8 +1422,31 @@ pub const RemoteEditor = struct {
             .command_remove => action_.index >= self.command_count,
         });
     }
+    fn routeIsJump(self: *const RemoteEditor) bool {
+        return self.jump_count > 0 or self.jump_requested;
+    }
+    fn jumpEmpty(self: *const RemoteEditor) bool {
+        return self.jump_requested and self.jump_count == 0;
+    }
+    /// Saved SSH hosts that can be a hop: not the host being edited.
+    pub fn availableJumpHosts(self: *const RemoteEditor) usize {
+        var count: usize = 0;
+        for (self.assets) |asset| {
+            if (asset.protocol != .ssh) continue;
+            if (self.source_owner) |owner| if (asset.source_owner.?.id == owner.id) continue;
+            count += 1;
+        }
+        return count;
+    }
     fn onAccessDirect(self: *RemoteEditor) void {
-        if (self.isLocked() or self.jump_count == 0) return;
+        if (self.isLocked()) return;
+        if (self.jumpEmpty()) {
+            self.jump_requested = false;
+            self.refreshEditorRows();
+            self.onFieldChange("");
+            return;
+        }
+        if (self.jump_count == 0) return;
         self.dormant_jump_count = self.jump_count;
         self.dormant_socks_exit = if (self.sig_socks_exit.?.get()) |value| std.fmt.parseInt(usize, value, 10) catch null else null;
         self.jump_count = 0;
@@ -1384,7 +1468,81 @@ pub const RemoteEditor = struct {
             self.onFieldChange("");
             return;
         }
+        // design-r3 稿 4: always selectable. Without a usable host the route
+        // shows the empty state (create one, or go direct) instead of doing
+        // nothing.
+        if (self.availableJumpHosts() == 0) {
+            self.jump_requested = true;
+            self.refreshEditorRows();
+            self.onFieldChange("");
+            return;
+        }
         self.onAddJump();
+    }
+    /// "新建跳板主机": a nested SSH editor in this window; its saved host
+    /// becomes hop 1 (`childCompleted`). The parent draft stays untouched.
+    fn onNewJumpHost(self: *RemoteEditor) void {
+        if (self.isLocked() or self.child_request != null) return;
+        const host = self.editor_host orelse return;
+        const revision = host.parentRevision(self.draft_id) orelse return;
+        self.child_request = host.openChildFor(self.draft_id, revision, "ssh", .create_jump, self.sig_name.?.get()) catch |err| {
+            @import("../../platform/applog.zig").warn(.ui, "jump host editor unavailable: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+    pub fn childCompleted(self: *RemoteEditor, completion: @import("../../host/content_context.zig").ChildCompletion) void {
+        if (self.child_request == null or self.child_request.? != completion.request.request_id) return;
+        self.child_request = null;
+        if (completion.request.intent != .create_jump or completion.result != .saved) return;
+        const saved = completion.result.saved;
+        for (self.assets) |asset| if (asset.source_owner.?.id == saved.asset_id) {
+            var buffer: [32]u8 = undefined;
+            const value = self.ownAssetString(std.fmt.bufPrint(&buffer, "conn:{d}", .{@backingInt(saved.asset_id)}) catch return) catch return;
+            if (self.jump_count == 8) return;
+            // The new host is the first hop; any chosen hops follow it.
+            var index = self.jump_count;
+            while (index > 0) : (index -= 1) self.setJump(index, self.jump_values[index - 1].?.get());
+            self.setJump(0, value);
+            self.jump_count += 1;
+            self.jump_requested = false;
+            self.dormant_jump_count = 0;
+            self.editing_order = true;
+            self.refreshEditorRows();
+            self.onFieldChange("");
+            if (self.jump_guide) |guide| guide.announceSaved(asset.name) catch {};
+            return;
+        };
+    }
+    fn refreshFooterHint(self: *RemoteEditor) void {
+        const hint = self.footer_hint orelse return;
+        const text: []const u8 = switch (self.step) {
+            .protocol => "下一步：连接路径",
+            .form => if (self.jumpEmpty()) "至少需要 1 个跳板才能继续" else "下一步：核对与测试",
+            .confirm => "",
+        };
+        if (hint.getText()) |current| if (std.mem.eql(u8, current.content, text)) return;
+        hint.setTextContent(self.alloc, text) catch {};
+    }
+    fn guideAction(raw: *anyopaque, request: JumpGuideAction) void {
+        const self: *RemoteEditor = @ptrCast(@alignCast(raw));
+        switch (request) {
+            .new_host => self.onNewJumpHost(),
+            .direct => self.onAccessDirect(),
+            .back, .cancel => self.onCancelClick(),
+            .save => self.save(true),
+        }
+    }
+    /// Nested "新建跳板主机" (design-r3 稿 4): only name, address, port, user
+    /// and authentication; advanced options keep their defaults; the footer
+    /// returns to the parent's route step.
+    pub fn configureJumpChild(self: *RemoteEditor, target: []const u8) !void {
+        if (self.jump_child_target) |old| self.alloc.free(old);
+        self.jump_child_target = try self.alloc.dupe(u8, target);
+        if (self.jump_guide) |guide| try guide.setChildTarget(self.jump_child_target.?);
+        for ([_]?*ui.Node{ self.stepper, self.protocol_header, self.protocol_picker_node, self.copy_trigger, self.group_field, self.step2_advanced, self.footer }) |slot| if (slot) |node| node.setDisplay(.none);
+        if (self.jump_footer) |node| node.setDisplay(.flex);
+        if (self.title) |title| title.setTextContent(self.alloc, "新建主机 › 新建跳板主机") catch {};
+        self.refreshSaveState();
     }
     fn onOrder(self: *RemoteEditor) void {
         if (self.isLocked()) return;
@@ -1523,7 +1681,6 @@ pub const RemoteEditor = struct {
             current.value = snapshot;
             current.value.hops = frozen_hops;
         } else self.test_source = try TestProgress.Owned.init(self.alloc, snapshot);
-        self.updateTestScroll();
         const appended = self.test_history.ingest(&self.test_source.?.value);
         if (!self.test_following) self.test_new_logs += appended;
         if (appended != 0) self.test_copy_result = null;
@@ -1738,6 +1895,7 @@ pub const RemoteEditor = struct {
     }
     fn validDraft(self: *RemoteEditor) bool {
         if (!self.validIdentityDraft() or !self.validBasicDraft()) return false;
+        if (self.jumpEmpty()) return false;
         for (self.jump_values[0..self.jump_count]) |value| if (value.?.get() == null) return false;
         return true;
     }
@@ -1746,7 +1904,7 @@ pub const RemoteEditor = struct {
 
     fn applyStep(self: *RemoteEditor) void {
         if (self.step != .protocol) self.resetPasswordVisibility();
-        for (self.scrolls, 0..) |slot, i| if (slot) |scroll| scroll.container.setDisplay(if (i == @backingInt(self.step)) .flex else .none);
+        for (self.scroll_frames, 0..) |slot, i| if (slot) |frame| frame.setDisplay(if (i == @backingInt(self.step)) .flex else .none);
         const review = self.step == .confirm;
         self.back_btn.?.setDisplay(if (self.step != .protocol) .flex else .none);
         self.next1_btn.?.setDisplay(if (self.step == .protocol) .flex else .none);
@@ -1754,6 +1912,8 @@ pub const RemoteEditor = struct {
         self.save_only_btn.?.setDisplay(if (review) .flex else .none);
         self.save_btn.?.setDisplay(if (review) .flex else .none);
         self.test_btn.?.setDisplay(if (review) .flex else .none);
+        if (self.footer_hint) |hint| hint.setDisplay(if (review) .none else .flex);
+        self.refreshFooterHint();
         self.paintSteps();
         self.refreshValidity();
         if (review) self.refreshSummary();
@@ -1772,7 +1932,6 @@ pub const RemoteEditor = struct {
                     break;
                 }
             };
-            self.step_styles[i].?.set(S.step(current));
             Stepper.paint(self.cx, .{ .button = node, .badge = self.step_numbers[i].?, .digit = self.step_digits[i].?, .check = self.step_checks[i].?, .title = self.step_titles[i].? }, current, i < @backingInt(self.step), invalid);
         };
     }
@@ -1808,13 +1967,8 @@ pub const RemoteEditor = struct {
 
     fn refreshPasswordRevealControl(self: *RemoteEditor) void {
         if (self.password_reveal_disabled) |disabled| disabled.set(self.isLocked() or self.password_authorization.active or self.sig_password.?.peek().len == 0);
-        if (self.password_reveal_button) |button| {
-            if (button.behavior.interaction.a11y) |*a11y| a11y.label = if (self.password_visible) "隐藏密码" else "查看密码";
-            const asset = if (self.password_visible) ui.icons.eye_off else ui.icons.eye;
-            for (self.buttons.items) |entry| if (entry.node == button) {
-                if (entry.icon) |icon| if (asset.icon_id) |id| if (asset.pickRep(16)) |rep| icon.setIcon(.{ .icon_id = id, .rep = rep, .tint = S.theme.current().fg_2 });
-            };
-        }
+        if (self.reveal_label) |label| label.set(if (self.password_visible) "隐藏密码" else "查看密码");
+        if (self.reveal_icon) |icon| icon.set(if (self.password_visible) ui.icons.eye_off else ui.icons.eye);
     }
 
     fn resetPasswordVisibility(self: *RemoteEditor) void {
@@ -1823,15 +1977,7 @@ pub const RemoteEditor = struct {
         self.password_visible_until = 0;
         self.password_approval_deadline = 0;
         if (!self.nodes_alive) return;
-        if (self.password_input) |input| {
-            input.state.input_type = .password;
-            if (input.input_container.behavior.interaction.a11y) |*a11y| {
-                a11y.secure = true;
-                a11y.value_text = null;
-                a11y.editable_text = null;
-            }
-            input.state.markVisualDirty();
-        }
+        if (self.sig_password_revealed) |revealed| revealed.set(false);
         if (self.password_reveal_error) |node| node.setDisplay(.none);
         self.refreshPasswordRevealControl();
     }
@@ -1872,11 +2018,7 @@ pub const RemoteEditor = struct {
                     self.password_authorization.cancel();
                     self.password_visible = true;
                     self.password_visible_until = @import("../../platform/realtime.zig").monotonicNs() + 30 * std.time.ns_per_s;
-                    if (self.password_input) |input| {
-                        input.state.input_type = .text;
-                        if (input.input_container.behavior.interaction.a11y) |*a11y| a11y.secure = false;
-                        input.state.markVisualDirty();
-                    }
+                    if (self.sig_password_revealed) |revealed| revealed.set(true);
                     self.refreshPasswordRevealControl();
                 }
             },
@@ -1960,6 +2102,10 @@ pub const RemoteEditor = struct {
         if (self.locked) |v| v.set(busy);
         if (self.save_disabled) |v| v.set(!self.canSave());
         if (self.open_disabled) |v| v.set(!self.canOpen());
+        if (self.jump_guide) |guide| {
+            guide.setSaveState(!self.canSave(), self.saving);
+            guide.setLocked(busy);
+        }
         if (self.test_kind != .pending) if (self.test_action_disabled) |v| v.set(self.saving or !self.validDraft() or self.sftpRouteUnavailable());
         if (self.route_hint) |hint| {
             hint.setDisplay(if (self.sftpRouteUnavailable()) .flex else .none);
@@ -1979,19 +2125,13 @@ pub const RemoteEditor = struct {
         }
         if (self.next1_disabled) |v| v.set(busy or !self.validIdentityDraft());
         if (self.next2_disabled) |v| v.set(busy or !self.validDraft());
-        self.paintButtons();
+        self.refreshAuth();
+        self.refreshAccessChoices();
+        self.refreshEditorActions();
         const editing = self.source_owner != null;
-        if (self.title) |title| title.setTextContent(self.alloc, if (editing) "编辑连接" else "新建连接") catch {};
+        if (self.title) |title| title.setTextContent(self.alloc, if (editing) "编辑主机" else "新建主机") catch {};
         self.refreshProtocolAppearance();
-        for (self.buttons.items) |button| {
-            if (button.node == self.save_only_btn) {
-                if (button.label) |label| label.setTextContent(self.alloc, if (editing) "保存更改" else "仅保存") catch {};
-                if (button.node.behavior.interaction.a11y) |*a11y| a11y.label = if (editing) "保存更改" else "仅保存";
-            } else if (button.node == self.save_btn) {
-                if (button.label) |label| label.setTextContent(self.alloc, "保存并连接") catch {};
-                if (button.node.behavior.interaction.a11y) |*a11y| a11y.label = "保存并连接";
-            }
-        }
+        if (self.save_only_label) |label| label.set(if (editing) "保存更改" else "仅保存");
         if (self.save_error_node) |node| {
             node.setDisplay(if (self.save_failure != null) .flex else .none);
             if (self.save_failure) |failure| {
@@ -2001,7 +2141,7 @@ pub const RemoteEditor = struct {
                     error.AccessDenied, error.PermissionDenied => "无法写入主机配置。请检查文件权限后重试。",
                     error.CredentialDenied, error.CredentialLocked, error.CredentialUnavailable, error.CredentialStorageFailure => "无法保存密码到系统钥匙串。草稿已保留，请解锁或授权钥匙串后重试，也可取消保存密码。",
                     error.OutOfMemory => "内存不足。连接草稿已保留，请重试。",
-                    else => "保存连接配置失败。草稿已保留，请重试。",
+                    else => "保存主机配置失败。草稿已保留，请重试。",
                 };
                 node.setTextContent(self.alloc, message) catch {};
             }
@@ -2021,6 +2161,7 @@ pub const RemoteEditor = struct {
         }
         const route = if (path.writer.buffered().len != 0) path.writer.buffered() else "直连";
         if (self.review_path) |label| label.setTextContent(self.alloc, route) catch {};
+        self.refreshBackRows(draft, route);
         const subtitle = std.fmt.allocPrint(self.alloc, "独立连接会话 · {s}", .{draft.group orelse "未分组"}) catch return;
         defer self.alloc.free(subtitle);
         self.summary_identity.?.setTextContent(self.alloc, subtitle) catch {};
@@ -2231,14 +2372,12 @@ pub const RemoteEditor = struct {
     fn refreshProtocolAppearance(self: *RemoteEditor) void {
         const asset = if (self.protocol == .sftp) ui.icons.folder_open else ui.icons.terminal;
         if (self.protocol_icon) |icon| paintIcon(icon, ui.icons.plug, 18, S.theme.current().accent);
-        if (self.protocol_select_icon) |icon| paintIcon(icon, asset, 16, S.theme.current().fg_2);
         if (self.summary_icon) |icon| paintIcon(icon, asset, 20, S.theme.current().accent);
     }
     fn onProtocolChanged(self: *RemoteEditor, selected: ?[]const u8) void {
         if (self.isLocked()) return;
         const value = selected orelse return;
         const protocol = std.meta.stringToEnum(Protocol, value) orelse return;
-        if (protocol != .ssh and protocol != .sftp) return;
         self.sig_password.?.set("");
         self.sig_save_password.?.set(true);
         self.sig_key_passphrase.?.set("");
@@ -2388,8 +2527,30 @@ pub const RemoteEditor = struct {
         self.step = .form;
         self.applyStep();
     }
+    /// Stack 3 "高级选项" row: back to Stack 1 with the advanced options open
+    /// and the host key policy focused.
+    fn onSummaryAdvanced(self: *RemoteEditor) void {
+        if (self.isLocked()) return;
+        self.step = .protocol;
+        self.advanced_expanded = true;
+        self.strict_focus_pending = true;
+        self.refreshEditorRows();
+        self.applyStep();
+    }
+    fn refreshBackRows(self: *RemoteEditor, draft: Draft, route: []const u8) void {
+        var buffer: [256]u8 = undefined;
+        const auth_text = switch (draft.auth) {
+            .key => "私钥文件",
+            .agent => "SSH Agent",
+            .password => if (draft.save_password) "密码，存入钥匙串" else "密码",
+        };
+        if (self.back_values[0]) |node| node.setTextContent(self.alloc, std.fmt.bufPrint(&buffer, "{s} · {s} · {s}", .{ draft.name, draft.group orelse "未分组", auth_text }) catch draft.name) catch {};
+        if (self.back_values[1]) |node| node.setTextContent(self.alloc, if (draft.jump_chain.len == 0) "从本机直接连接" else std.fmt.bufPrint(&buffer, "经 {s}", .{route}) catch route) catch {};
+        self.refreshAdvancedSummary();
+    }
     fn onReviewToggle(self: *RemoteEditor) void {
         self.review_expanded = !self.review_expanded;
+        self.review_open.?.set(self.review_expanded);
         self.refreshTestProjection() catch {};
         self.cx.requestRedraw();
     }
@@ -2397,15 +2558,12 @@ pub const RemoteEditor = struct {
         self.logs_open.?.set(!self.logs_open.?.get());
         self.logs_scroll.?.setDisplay(if (self.logs_open.?.get()) .flex else .none);
         self.test_follow_row.?.setDisplay(if (self.logs_open.?.get()) .flex else .none);
-        if (self.test_disclosure_icon) |icon| {
-            const asset = if (self.logs_open.?.get()) ui.icons.chevron_up else ui.icons.chevron_down;
-            if (asset.icon_id) |id| if (asset.pickRep(16)) |rep| icon.setIcon(.{ .icon_id = id, .rep = rep, .tint = S.theme.current().fg_2 });
-        }
+        self.logs_toggle_icon.?.set(if (self.logs_open.?.get()) ui.icons.chevron_up else ui.icons.chevron_down);
+        if (self.logs_open.?.get() and self.test_following) self.requestStick();
     }
     fn onLogsCopy(self: *RemoteEditor) void {
         const text = self.test_log_text.getText() orelse return;
         self.test_copy_result = ui.platform_services.clipboardSetText(self.cx.system_sdk, text.content);
-        if (self.test_copy_feedback) |feedback| feedback.report(self.test_copy_result.?);
         self.refreshTestProjection() catch {};
     }
     fn onTestFilterAll(self: *RemoteEditor) void {
@@ -2429,24 +2587,37 @@ pub const RemoteEditor = struct {
             self.test_new_logs = 0;
         }
         self.refreshTestProjection() catch {};
-        self.updateTestScroll();
     }
-    fn updateTestScroll(self: *RemoteEditor) void {
+    /// The log viewport reports its settled offset: scrolling up, away from the
+    /// end, stops following.
+    fn onTestLogsScrolled(self: *RemoteEditor, y: f32) void {
         const scroll = self.test_scroll orelse return;
-        const y = scroll.state.scroll_y;
-        const max = scroll.state.maxScrollY();
-        if (y < self.test_last_scroll - 0.5 and y < max - 1) self.test_following = false;
-        if (self.test_source != null and self.logs_open.?.get() and self.test_following) {
-            // This hook runs before SDK metrics; use the actual finished layout.
-            scroll.state.content_height = scroll.content.globalRect().h;
-            scroll.state.viewport_height = scroll.container.globalRect().h;
-            ui.widgets.setScrollY(scroll.state, scroll.content, scroll.state.maxScrollY());
+        if (y < self.test_last_scroll - 0.5 and y < scroll.state.maxScrollY() - 1 and self.test_following) {
+            self.test_following = false;
+            self.refreshFollowLabel();
         }
+        self.test_last_scroll = y;
+    }
+    fn refreshFollowLabel(self: *RemoteEditor) void {
+        const label = self.test_follow_text orelse return;
+        var buffer: [64]u8 = undefined;
+        label.set(if (self.test_source != null and self.test_source.?.value.finished) "查看记录" else if (self.test_following) "跟随中" else if (self.test_new_logs != 0) std.fmt.bufPrint(&buffer, "{d} 条新日志 ↓", .{self.test_new_logs}) catch "跳到底部" else "跳到底部");
+    }
+    /// A following log view shows its newest row once the rows are laid out.
+    fn requestStick(self: *RemoteEditor) void {
+        self.test_stick_pending = true;
+        self.cx.requestRedraw();
+    }
+    fn stickTestLogs(self: *RemoteEditor) void {
+        const scroll = self.test_scroll orelse return;
+        if (self.test_source == null or !self.logs_open.?.peek() or !self.test_following) return;
+        var last: ?*ui.Node = null;
+        for (self.test_rows) |row| {
+            if (row.node.style.display == .none) break;
+            last = row.node;
+        }
+        if (last) |row| ui.widgets.scrollIntoView(scroll.state, scroll.content, row, .end);
         self.test_last_scroll = scroll.state.scroll_y;
-        if (self.test_follow_label) |label| {
-            var buffer: [64]u8 = undefined;
-            label.setTextContent(self.alloc, if (self.test_source != null and self.test_source.?.value.finished) "查看记录" else if (self.test_following) "跟随中" else if (self.test_new_logs != 0) std.fmt.bufPrint(&buffer, "{d} 条新日志 ↓", .{self.test_new_logs}) catch "跳到底部" else "跳到底部") catch {};
-        }
     }
     fn clearTestProjection(self: *RemoteEditor) void {
         if (self.test_source) |*source| source.deinit();
@@ -2470,20 +2641,10 @@ pub const RemoteEditor = struct {
         if (self.review_body) |node| node.setDisplay(if (self.review_expanded) .flex else .none);
         if (self.review_disclosure) |node| paintIcon(node, if (self.review_expanded) ui.icons.chevron_down else ui.icons.chevron_right, 16, S.theme.current().fg_3);
         self.test_action_disabled.?.set(if (pending) self.test_cancel_sent or self.on_cancel_test == null or source == null or source.?.cancelled or source.?.cleanup != .not_started else self.saving or !self.validDraft() or self.sftpRouteUnavailable());
-        for (self.buttons.items) |*button| if (button.node == self.test_btn) {
+        {
             const unavailable = self.sftpRouteUnavailable() and !pending;
-            const label: []const u8 = if (pending) (if (self.test_cancel_sent or (source != null and source.?.cancelled)) "正在取消" else "取消测试") else if (unavailable) "检测 SFTP · 不可用" else if (self.test_kind != .none) "重新测试" else if (self.protocol == .sftp) "检测 SFTP" else "测试连接";
-            button.width = if (unavailable) S.unavailable_test_width else S.test_action_width;
-            button.height = 34;
-            var style = S.button(button.width, button.height, false);
-            const is_disabled = if (button.disabled) |disabled| disabled.peek() else false;
-            style.opacity = if (is_disabled) 0.4 else 1;
-            if (is_disabled and button.primary) style.gradient = .{ .from = style.background.?, .to = style.background.?, .direction = .diagonal };
-            button.style.set(style);
-            button.node.setStyleInline(self.alloc, style);
-            if (button.label) |node| try node.setTextContent(self.alloc, label);
-            if (button.node.behavior.interaction.a11y) |*a11y| a11y.label = label;
-        };
+            self.test_label.?.set(if (pending) (if (self.test_cancel_sent or (source != null and source.?.cancelled)) "正在取消" else "取消测试") else if (unavailable) "检测 SFTP · 不可用" else if (self.test_kind != .none) "重新测试" else if (self.protocol == .sftp) "检测 SFTP" else "测试连接");
+        }
         for (self.test_stages) |row| row.node.setDisplay(.none);
         if (source == null) return;
         var buffer: [1024]u8 = undefined;
@@ -2514,6 +2675,7 @@ pub const RemoteEditor = struct {
             const visible = index == 0 or index == 9 or (index < source.?.hops.len);
             node.setDisplay(if (visible) .flex else .none);
             if (self.test_actions[index]) |ctx| ctx.key = source.?.key;
+            if (self.test_filter_selected[index]) |selected| selected.set(hop != null and self.test_filter == hop);
             if (hop) |i| {
                 const value = source.?.hops[i];
                 try preview.names[index].?.setTextContent(self.alloc, value.name);
@@ -2521,16 +2683,17 @@ pub const RemoteEditor = struct {
                 try preview.users[index].?.setTextContent(self.alloc, source.?.node(i, &buffer));
                 const last = source.?.latest(i);
                 preview.users[index].?.setTextColor(if (last != null and last.?.status == .failed) S.theme.current().danger else if (source.?.finished and source.?.failure == null and !source.?.cancelled) S.theme.current().ok else if (last != null and last.?.status == .started and source.?.cleanup == .not_started) S.theme.current().accent else S.theme.current().fg_2);
-                node.setBackground(if (self.test_filter == i) S.theme.popupSelection() else S.testNode().background.?);
             }
         }
         for (preview.arrows, 0..) |node, index| node.?.setDisplay(if (index < source.?.hops.len) .flex else .none);
         self.test_logs_area.setDisplay(.flex);
         self.logs_scroll.?.setDisplay(if (self.logs_open.?.get()) .flex else .none);
         self.test_follow_row.?.setDisplay(if (self.logs_open.?.get()) .flex else .none);
-        try self.test_filter_label.?.setTextContent(self.alloc, if (self.test_filter) |hop| std.fmt.bufPrint(&buffer, "第{d}跳", .{hop + 1}) catch "节点" else "全部节点");
+        self.logs_toggle_icon.?.set(if (self.logs_open.?.get()) ui.icons.chevron_up else ui.icons.chevron_down);
+        self.test_filter_text.?.set(if (self.test_filter) |hop| std.fmt.bufPrint(&buffer, "第{d}跳", .{hop + 1}) catch "节点" else "全部节点");
         try self.refreshTestLogs();
-        self.updateTestScroll();
+        self.refreshFollowLabel();
+        if (self.test_following) self.requestStick();
     }
     fn refreshTestLogs(self: *RemoteEditor) !void {
         const source = if (self.test_source) |*owned| &owned.value else return;
@@ -2574,6 +2737,7 @@ pub const RemoteEditor = struct {
         try self.test_log_text.setTextContent(self.alloc, plain.writer.buffered());
         self.test_log_text.setDisplay(.none);
         var buffer: [192]u8 = undefined;
+        self.logs_copy_icon.?.set(if (self.test_copy_result) |ok| (if (ok) ui.icons.check else ui.icons.circle_alert) else ui.icons.copy);
         const hint = if (self.test_copy_result) |ok| (if (ok) @as([]const u8, "已复制") else "复制失败，请重试") else if (source.finished) "本次已结束 · 日志保留" else try std.fmt.bufPrint(&buffer, "{s} · 本次尝试 #{d}{s}", .{ if (self.test_following) @as([]const u8, "实时跟随") else "已暂停跟随", source.key.attempt_id.?, if (self.test_history.dropped != 0) @as([]const u8, " · 更早日志已省略") else "" });
         try self.test_follow_hint.?.setTextContent(self.alloc, hint);
     }
@@ -2581,7 +2745,7 @@ pub const RemoteEditor = struct {
     fn resizeRoutePreview(self: *RemoteEditor, preview: *RoutePreview) bool {
         const row = preview.row orelse return false;
         const count = if (preview == &self.route_previews[1] and self.test_source != null) self.test_source.?.value.hops.len + 1 else self.jump_count + 2;
-        const available = @max(@as(f32, 0), row.parent.?.globalRect().w);
+        const available = @max(@as(f32, 0), preview.viewport.?.globalRect().w);
         const natural: f32 = 146 * @as(f32, @floatFromInt(count)) + 24 * @as(f32, @floatFromInt(count - 1));
         const width = @max(available, natural);
         if (row.style.width == .px and row.style.width.px == width) return false;
@@ -2615,26 +2779,10 @@ pub const RemoteEditor = struct {
         preview.users[9].?.setTextContent(self.alloc, "待连接") catch {};
     }
 
-    fn paintButtons(self: *RemoteEditor) void {
-        for (self.buttons.items) |button| {
-            var style = if (button.width == 0) S.disclosure() else S.button(button.width, button.height, button.primary);
-            const review_link = if (button.node.meta.ownership.meta.test_id) |id| std.mem.eql(u8, id, "wizard.review.modify") or std.mem.eql(u8, id, "wizard.review.route.modify") else false;
-            if (button.quiet or review_link) style.background = ui.Color.TRANSPARENT;
-            const is_disabled = if (button.disabled) |disabled| disabled.peek() else false;
-            style.opacity = if (is_disabled) 0.4 else 1;
-            if (is_disabled and button.primary) style.gradient = .{ .from = style.background.?, .to = style.background.?, .direction = .diagonal };
-            button.style.set(style);
-            button.node.setStyleInline(self.alloc, style);
-            if (button.label) |label| label.setTextColor(if (review_link) S.theme.current().accent else if (button.width == 0) S.theme.current().fg_1 else S.action(button.primary).color);
-            if (button.icon) |icon| _ = icon.setTint(S.theme.current().fg_2);
-        }
-        self.refreshAuth();
-        self.refreshAccessChoices();
-        self.refreshEditorActions();
-        for (self.field_feedback.items) |feedback| feedback.repaint();
-    }
-
-    fn retintText(node: *ui.Node, before: S.theme.Colors, after: S.theme.Colors) void {
+    /// Recolours this view's own text after a theme change. Native controls
+    /// (`native_roots`) follow the theme themselves and are never entered.
+    fn retintText(self: *const RemoteEditor, node: *ui.Node, before: S.theme.Colors, after: S.theme.Colors) void {
+        for (self.native_roots.items) |native| if (native == node) return;
         if (node.getText()) |text| {
             inline for (.{ "fg_1", "fg_2", "fg_3", "accent_ink", "accent", "danger_ink", "danger", "warn_ink", "warn", "ok_ink", "ok" }) |role| {
                 if (std.meta.eql(text.color, @field(before, role))) {
@@ -2643,47 +2791,25 @@ pub const RemoteEditor = struct {
                 }
             }
         }
-        for (node.children.items) |child| retintText(child, before, after);
+        for (node.children.items) |child| self.retintText(child, before, after);
     }
     fn retheme(self: *RemoteEditor) void {
         const colors = S.theme.current();
         if (self.painted_colors) |before| {
-            if (self.modal) |node| retintText(node, before, colors);
-            if (self.copy_dialog) |node| retintText(node, before, colors);
+            if (self.body) |node| self.retintText(node, before, colors);
+            if (self.header) |node| self.retintText(node, before, colors);
+            if (self.footer) |node| self.retintText(node, before, colors);
+            if (self.copy_panel) |node| self.retintText(node, before, colors);
         }
         self.painted_colors = colors;
         // Embedded editors share the shell's material; layout chrome must not
         // introduce another fill when a retained editor changes theme.
         if (self.stepper) |stepper| stepper.setBackground(ui.Color.TRANSPARENT);
         if (self.footer) |footer| footer.setBackground(S.footer().background.?);
-        self.modal.?.setBackground(if (self.embedded) ui.Color.TRANSPARENT else colors.overlay);
+        if (self.embedded) self.modal.?.setBackground(ui.Color.TRANSPARENT);
         if (self.route_empty_hint) |node| node.setTextColor(S.theme.current().danger_ink);
-        for (self.jump_rows) |node| if (node) |row| row.setBackground(ui.Color.TRANSPARENT);
-        for (self.editor_actions.items) |action_| if (action_.icon) |icon| {
-            _ = icon.setTint(S.theme.current().fg_3);
-        };
+        for (self.jump_rows) |node| if (node) |row| row.setBackground(S.routeHop().background.?);
         if (self.review_test_card) |card| card.setBackground(S.testResult(undefined).background.?);
-        for (self.inputs.items) |input| {
-            const id = input.input_container.meta.ownership.meta.test_id orelse "";
-            const compound = std.mem.eql(u8, id, "wizard.group") or std.mem.eql(u8, id, "wizard.password");
-            input.input_container.setStyleInline(self.alloc, if (compound) S.groupInput() else S.input());
-            input.state.tokens = self.cx.tokens;
-            input.state.dirty = true;
-        }
-        if (self.password_control) |control| control.setBackground(S.groupControl().background.?);
-        for (self.selects.items) |select| {
-            const group_picker = std.mem.eql(u8, select.trigger.meta.ownership.meta.test_id orelse "", "wizard.group.pick");
-            if (group_picker) select.trigger.setStyleInline(self.alloc, S.groupPicker()) else select.trigger.setBackground(S.input().background.?);
-        }
-        if (self.remember_checkbox) |checkbox| paintCheckboxLabels(checkbox);
-        if (self.compression_checkbox) |group| paintAuthLabels(group);
-        if (self.startup_textarea) |area| {
-            area.state.tokens = self.cx.tokens;
-            area.state.dirty = true;
-            area.input.markLayoutDirty();
-            area.input.setBackground(S.theme.popupInset());
-        }
-        if (self.copy_dialog) |dialog| dialog.setBackground(colors.overlay);
         if (self.copy_footer) |footer| footer.setBackground(S.copyFooter().background.?);
         if (self.title) |title| title.setTextColor(S.theme.current().fg_1);
         if (self.summary_card) |card| card.setBackground(S.reviewIdentity().background.?);
@@ -2691,8 +2817,8 @@ pub const RemoteEditor = struct {
         self.paintSteps();
         self.test_logs_area.setBackground(S.testLogs().background.?);
         for (&self.route_previews) |*preview| for (preview.addresses) |node| if (node) |address| address.setTextColor(S.theme.current().fg_2);
-        self.paintButtons();
-        for (&self.route_previews) |*preview| for (preview.nodes) |node| if (node) |n| n.setBackground(S.routeNode(false).background.?);
+        for (self.field_feedback.items) |feedback| feedback.repaint();
+        for (&self.route_previews, 0..) |*preview, index| if (index == 0) for (preview.nodes) |node| if (node) |n| n.setBackground(S.routeNode(false).background.?);
         self.refreshTestRow();
         self.cx.requestRedraw();
     }
@@ -2713,6 +2839,7 @@ pub const RemoteEditor = struct {
     }
 
     fn onFieldChange(self: *RemoteEditor, _: []const u8) void {
+        self.refreshAdvancedSummary();
         if (self.password_authorization.active) self.resetPasswordVisibility();
         if (self.isLocked()) return;
         self.save_failure = null;
@@ -2733,9 +2860,13 @@ pub const RemoteEditor = struct {
 };
 
 // View nodes are retained for all three steps. Changing a step never replaces
-// an editor or a draft signal; SDK slots/results are the only widget access.
-const ButtonPaint = struct { node: *ui.Node, label: ?*ui.Node, icon: ?*ui.Node, style: *ui.Signal(ui.BoxStyle), width: f32, height: f32, primary: bool, disabled: ?*ui.Signal(bool) = null, quiet: bool = false };
+// an editor or a draft signal. Every control is a zenit widget with its default
+// look, reached through public props, slots and result parts only; the boxes
+// and text around the controls belong to this view.
+const W = ui.widgets;
 const RoutePreview = struct {
+    /// The native horizontal ScrollArea's root: the width available to the row.
+    viewport: ?*ui.Node = null,
     row: ?*ui.Node = null,
     nodes: [10]?*ui.Node = @splat(null),
     names: [10]?*ui.Node = @splat(null),
@@ -2783,100 +2914,169 @@ fn paintIcon(node: *ui.Node, asset: ui.SvgAsset, size: f32, tint: ui.Color) void
     if (asset.icon_id) |id| if (asset.pickRep(size)) |rep| node.setIcon(.{ .icon_id = id, .rep = rep, .tint = tint });
 }
 
-fn action(w: *RemoteEditor, parent: *ui.Node, label: []const u8, id: []const u8, width: f32, height: f32, primary: bool, disabled: ?*ui.Signal(bool), comptime callback: *const fn (*RemoteEditor) void, icon: ?ui.SvgAsset) !*ui.Node {
-    const source: ui.Source(bool) = if (disabled) |signal| .{ .signal = signal } else .{ .value = false };
-    const base = try w.scope.createSignal(ui.BoxStyle, S.button(width, height, primary));
-    const node = try ui.widgets.Button(.{ .variant = @as(ui.widgets.ButtonVariant, if (primary) .primary else .ghost), .a11y_label = label, .disabled = source, .base_style = base, .on_click = w.cx.on(RemoteEditor, w, callback) }).mount(w.scope, w.cx);
-    for (node.children.items) |child| child.setDisplay(.none);
-    node.setStyleInline(w.alloc, S.button(width, height, primary));
-    node.meta.ownership.meta.test_id = id;
-    var label_node: ?*ui.Node = null;
-    var icon_node: ?*ui.Node = null;
-    if (icon) |asset| {
-        icon_node = try ui.iconTint(w.cx, asset, if (primary) S.action(true).color else S.theme.current().fg_2, .{ .width = .{ .px = 16 }, .height = .{ .px = 16 }, .flex_shrink = 0 });
-        try node.appendChild(w.alloc, icon_node.?);
-    } else {
-        const test_action = std.mem.eql(u8, id, "wizard.test");
-        label_node = try ui.text(w.cx, label, if (test_action) S.testActionText() else S.action(primary));
-        if (test_action) label_node.?.setStyleInline(w.alloc, S.testActionLabel());
-        try node.appendChild(w.alloc, label_node.?);
+// Layout boxes of this view: geometry only, no control look.
+const L = struct {
+    /// A full-width column that takes the height of its content.
+    fn column(gap: f32) ui.BoxStyle {
+        return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = gap, .min_width = 0, .flex_shrink = 0 };
     }
-    try w.buttons.append(w.alloc, .{ .node = node, .label = label_node, .icon = icon_node, .style = base, .width = width, .height = height, .primary = primary, .disabled = disabled, .quiet = std.mem.eql(u8, id, "wizard.close") });
+    /// One of the equal columns of a field row.
+    fn cell() ui.BoxStyle {
+        return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 4, .min_width = 0, .flex = 1, .flex_basis = 0, .flex_shrink = 1 };
+    }
+    /// A row of controls resting on a common bottom edge (a labelled field beside a button).
+    fn baseline(gap: f32) ui.BoxStyle {
+        return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .align_items = .end, .gap = gap, .min_width = 0, .flex_shrink = 0 };
+    }
+    /// A centred row that takes the height of its content.
+    fn line(gap: f32) ui.BoxStyle {
+        return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .align_items = .center, .gap = gap, .min_width = 0, .flex_shrink = 0 };
+    }
+    /// The share of a row a growing control takes.
+    fn grow() ui.BoxStyle {
+        return .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .min_width = 0, .flex = 1, .flex_shrink = 1 };
+    }
+};
+
+const ButtonSpec = struct {
+    id: []const u8,
+    label: ui.Source([]const u8) = .{ .value = "" },
+    /// Accessible name of a button without a visible label.
+    name: ui.Source([]const u8) = .{ .value = "" },
+    variant: W.ButtonVariant = .secondary,
+    small: bool = false,
+    icon: ui.Source(?ui.SvgAsset) = .{ .value = null },
+    icon_only: bool = false,
+    block: bool = false,
+    disabled: ?*ui.Signal(bool) = null,
+};
+
+/// A native Button with its default look; label, glyph and state come in as props.
+fn button(w: *RemoteEditor, parent: *ui.Node, spec: ButtonSpec, on_click: ui.Handler(void)) !*ui.Node {
+    const disabled: ui.Source(bool) = if (spec.disabled) |signal| .{ .signal = signal } else .{ .value = false };
+    const node = try W.Button(.{
+        .label = spec.label,
+        .a11y_label = spec.name,
+        .variant = spec.variant,
+        .size = @as(W.ButtonSize, if (spec.small) .sm else .md),
+        .icon_asset = spec.icon,
+        .icon_only = spec.icon_only,
+        .block = spec.block,
+        .disabled = disabled,
+        .on_click = on_click,
+    }).mount(w.scope, w.cx);
+    node.meta.ownership.meta.test_id = spec.id;
+    try w.native_roots.append(w.alloc, node);
     try parent.appendChild(w.alloc, node);
     return node;
 }
 
-fn disclosure(w: *RemoteEditor, parent: *ui.Node, label: []const u8, id: []const u8, comptime callback: *const fn (*RemoteEditor) void) !*ui.Node {
-    const row = try ui.box(w.cx, S.row(18), .{});
-    const base = try w.scope.createSignal(ui.BoxStyle, S.disclosure());
-    const node = try ui.widgets.Button(.{ .variant = .ghost, .a11y_label = label, .disabled = w.locked.?, .base_style = base, .hover_style = S.disclosureHover(), .pressed_style = S.disclosureHover(), .on_click = w.cx.on(RemoteEditor, w, callback) }).mount(w.scope, w.cx);
-    node.meta.ownership.meta.test_id = id;
-    const title = try ui.text(w.cx, label, .{ .font_size = 12, .line_height = 1.5, .color = S.theme.current().fg_1 });
-    const chevron = try ui.iconTint(w.cx, ui.icons.chevron_right, S.theme.current().fg_1, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 }, .flex_shrink = 0 });
-    w.advanced_chevron = chevron;
-    const content = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .px = 18 }, .min_width = 0, .flex = 1, .direction = .row, .align_items = .center, .justify = .start, .gap = 4, .hit_behavior = .pass_through }, .{});
-    try content.appendChild(w.alloc, chevron);
+const RowSpec = struct {
+    id: []const u8,
+    name: []const u8,
+    /// The row's per-state look (a YSS style from `editor_rows.yss`), resolved by zenit against the theme.
+    look: ui.view.Look = .{},
+    disabled: ?*ui.Signal(bool) = null,
+    selected: ?*ui.Signal(bool) = null,
+    expanded: ?*ui.Signal(bool) = null,
+};
+
+/// A clickable row whose content is this view's: `W.Pressable` gives the button
+/// semantics (click, keyboard, focus ring, a11y); `spec.look` is the row's YSS look, which zenit
+/// resolves per state (disabled / selected / expanded, hover / press) against the theme.
+/// The returned root is its children slot.
+fn pressRow(w: *RemoteEditor, parent: *ui.Node, spec: RowSpec, on_click: ui.Handler(void)) !*ui.Node {
+    const disabled: ui.Source(bool) = if (spec.disabled) |signal| .{ .signal = signal } else .{ .value = false };
+    const selected: ui.Source(bool) = if (spec.selected) |signal| .{ .signal = signal } else .{ .value = false };
+    const expanded: ui.Source(bool) = if (spec.expanded) |signal| .{ .signal = signal } else .{ .value = false };
+    const node = try ui.view.render(w.scope, w.cx, ui.view.with(W.Pressable(.{ .a11y_label = spec.name, .disabled = disabled, .selected = selected, .expanded = expanded, .look = spec.look, .on_click = on_click }), .{}));
+    node.meta.ownership.meta.test_id = spec.id;
+    try parent.appendChild(w.alloc, node);
+    return node;
+}
+
+// Advanced row (hb6dT b7EPH): top hairline, padding [12,4,12,0], gap 8 —
+// Title 12.5/500 · Summary (fill, 12 muted) · chevron 14 muted.
+fn disclosure(w: *RemoteEditor, parent: *ui.Node) !void {
+    const row = try ui.box(w.cx, S.disclosureRow(), .{});
+    const node = try pressRow(w, row, .{ .id = "wizard.advanced.toggle", .name = "高级选项", .look = .from(Rows.advanced_toggle), .disabled = w.locked, .expanded = w.advanced_open }, w.cx.on(RemoteEditor, w, RemoteEditor.onAdvancedToggle));
+    const title = try ui.text(w.cx, "高级选项", S.disclosureTitle());
+    const summary = try ui.text(w.cx, "", S.footerHint());
+    summary.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .flex = 1, .flex_shrink = 1 });
+    summary.meta.ownership.meta.test_id = "wizard.advanced.summary";
+    w.advanced_summary = summary;
+    const Chevron = struct {
+        fn asset(open: bool) ui.SvgAsset {
+            return if (open) ui.icons.chevron_down else ui.icons.chevron_right;
+        }
+
+        fn tint(_: *const ui.ThemeTokens) ui.Color {
+            return S.muted();
+        }
+    };
+    const chevron = try ui.view.render(w.scope, w.cx, ui.view.box(.{
+        .style = .{ .width = 14, .height = 14, .flex_shrink = 0 },
+    }, .{ui.view.icon(.{
+        .style = .{ .width = 14, .height = 14 },
+        .tint = Chevron.tint,
+    }, ui.map(w.advanced_open.?, Chevron.asset))}));
+    const content = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .px = 15 }, .min_width = 0, .flex = 1, .direction = .row, .align_items = .center, .justify = .start, .gap = 8, .hit_behavior = .pass_through }, .{});
     try content.appendChild(w.alloc, title);
+    try content.appendChild(w.alloc, summary);
+    try content.appendChild(w.alloc, chevron);
     try node.appendChild(w.alloc, content);
-    try w.buttons.append(w.alloc, .{ .node = node, .label = title, .icon = null, .style = base, .width = 0, .height = 18, .primary = false, .disabled = w.locked, .quiet = true });
-    try row.appendChild(w.alloc, node);
     try parent.appendChild(w.alloc, row);
-    return row;
 }
 
 const FieldKind = enum { name, host, user, port, key_path, scrollback };
+
+/// Validation of one field. The Input stays native: it is told `invalid`, and the
+/// message is this view's text under it. Validation starts when focus leaves the
+/// field's group (the group box is this view's).
 const FieldFeedback = struct {
     wizard: *RemoteEditor,
     kind: FieldKind,
     message: *ui.Signal([]const u8),
+    invalid: *ui.Signal(bool),
     touched: bool = false,
     attached: bool = false,
-    input: ui.widgets.input.InputResult = undefined,
+    input: W.input.InputResult = undefined,
     group: *ui.Node = undefined,
     error_node: ?*ui.Node = null,
-    previous_blur: ?ui.HandlerRef = null,
 
-    fn prepare(w: *RemoteEditor, id: []const u8) !?*FieldFeedback {
-        const kind: FieldKind = if (std.mem.eql(u8, id, "wizard.name")) .name else if (std.mem.eql(u8, id, "wizard.host")) .host else if (std.mem.eql(u8, id, "wizard.user")) .user else if (std.mem.eql(u8, id, "wizard.port")) .port else if (std.mem.eql(u8, id, "wizard.key_path")) .key_path else if (std.mem.eql(u8, id, "wizard.scrollback")) .scrollback else return null;
-        const self = try w.scope.createState(FieldFeedback, .{ .wizard = w, .kind = kind, .message = try w.scope.createText("", .{}) });
+    fn create(w: *RemoteEditor, kind: FieldKind) !*FieldFeedback {
+        const self = try w.scope.createState(FieldFeedback, .{ .wizard = w, .kind = kind, .message = try w.scope.createText("", .{}), .invalid = try w.scope.createSignal(bool, false) });
         try w.field_feedback.append(w.alloc, self);
         return self;
     }
-    fn attach(self: *FieldFeedback, input: ui.widgets.input.InputResult, group: *ui.Node, label: []const u8) !void {
+    fn attach(self: *FieldFeedback, input: W.input.InputResult, group: *ui.Node) !void {
+        const w = self.wizard;
         self.input = input;
         self.group = group;
-        self.previous_blur = input.input_container.behavior.events.on_blur;
+        group.behavior.events.on_blur_within = ui.Cx.simpleHandler(blurred, self);
         self.attached = true;
-        input.input_container.behavior.events.on_blur = ui.Cx.simpleHandler(blurred, self);
-        if (input.input_container.behavior.interaction.a11y) |*attrs| {
-            attrs.label = label;
-            attrs.required = true;
-        }
-        // Input's public wrapper includes its own helper Text after the field shell.
-        // Use that native error presentation and preserve SDK focus/IME cleanup.
-        for (input.node.children.items) |child| if (child.getText() != null) {
-            self.error_node = child;
-            const id = try std.fmt.allocPrint(self.wizard.alloc, "wizard.{s}.error", .{@tagName(self.kind)});
-            try self.wizard.owned_ids.append(self.wizard.alloc, id);
-            child.meta.ownership.meta.test_id = id;
-            if (child.getText()) |old| {
-                var props = old;
-                props.font_size = 10.5;
-                props.line_height = 16.0 / 10.5;
-                child.setText(props);
-            }
-            child.setStyleInline(self.wizard.alloc, S.errorLabel());
-        };
-        input.node.setStyleInline(self.wizard.alloc, .{ .gap = 4 });
+        var style = S.text(11, 400, false);
+        style.color = S.theme.current().danger_ink;
+        const node = try ui.text(w.cx, "", style);
+        var id: [48]u8 = undefined;
+        const value = try std.fmt.bufPrint(&id, "wizard.{s}.error", .{@tagName(self.kind)});
+        const owned = try w.alloc.dupe(u8, value);
+        errdefer w.alloc.free(owned);
+        try w.owned_ids.append(w.alloc, owned);
+        node.meta.ownership.meta.test_id = owned;
+        node.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0 });
+        node.setDisplay(.none);
+        self.error_node = node;
+        try group.appendChild(w.alloc, node);
     }
+    /// The group box outlives this state by a teardown step; stop listening first.
     fn releaseBlur(self: *FieldFeedback) void {
         if (!self.attached) return;
-        self.input.input_container.behavior.events.on_blur = self.previous_blur;
+        self.group.behavior.events.on_blur_within = null;
         self.attached = false;
     }
     fn blurred(raw: *anyopaque) void {
         const self: *FieldFeedback = @ptrCast(@alignCast(raw));
-        if (self.previous_blur) |callback| callback.invoke();
         if (!self.wizard.isVisible() or self.wizard.isLocked()) return;
         self.touched = true;
         self.refresh();
@@ -2912,186 +3112,199 @@ const FieldFeedback = struct {
     }
     fn refresh(self: *FieldFeedback) void {
         const message = if (self.touched) self.errorMessage() else "";
-        self.message.set(message);
-        self.resize(message.len != 0);
-        self.repaint();
-    }
-    fn resize(self: *FieldFeedback, invalid: bool) void {
-        self.group.setStyleInline(self.wizard.alloc, .{ .height = .{ .px = if (invalid) 75.5 else 55.5 } });
-        self.input.node.setStyleInline(self.wizard.alloc, .{ .height = .{ .px = if (invalid) 54 else 34 }, .flex_shrink = 0 });
+        if (!std.mem.eql(u8, self.message.peek(), message)) self.message.set(message);
+        self.invalid.set(message.len != 0);
+        if (self.error_node) |node| {
+            if (node.getText()) |current| if (!std.mem.eql(u8, current.content, message)) node.setTextContent(self.wizard.alloc, message) catch {};
+            node.setDisplay(if (message.len != 0) .flex else .none);
+        }
     }
     fn repaint(self: *FieldFeedback) void {
         if (self.error_node) |node| node.setTextColor(S.theme.current().danger_ink);
     }
 };
 
-fn field(w: *RemoteEditor, parent: *ui.Node, label: []const u8, value: *ui.Signal([]const u8), placeholder: []const u8, id: []const u8, width: ?f32, secret: bool) !ui.widgets.input.InputResult {
-    const group = try ui.box(w.cx, S.field(width), .{});
-    const title = try fieldLabel(w.cx, label);
-    title.style.height = .{ .px = 16.5 };
-    if (std.mem.eql(u8, id, "wizard.scrollback")) {
-        const label_row = try ui.hstack(w.cx, .{ .width = .fill(), .height = .{ .px = 16.5 }, .gap = 8, .align_items = .center, .flex_shrink = 0 }, .{});
-        try label_row.appendChild(w.alloc, title);
-        try label_row.appendChild(w.alloc, try ui.text(w.cx, "0 不限制", S.text(10, 400, true)));
-        try group.appendChild(w.alloc, label_row);
-    } else try group.appendChild(w.alloc, title);
-    const feedback = try FieldFeedback.prepare(w, id);
-    const input = try ui.widgets.Input(.{ .error_msg = if (feedback) |f| ui.Source([]const u8){ .signal = f.message } else ui.Source([]const u8){ .value = "" }, .value = value, .embedded = std.mem.eql(u8, id, "wizard.password"), .readonly = std.mem.eql(u8, id, "wizard.encoding"), .placeholder = if (std.mem.eql(u8, id, "wizard.scrollback")) ui.Source([]const u8){ .signal = w.sig_scrollback_hint.? } else ui.Source([]const u8){ .value = placeholder }, .input_type = @as(ui.widgets.input.InputType, if (secret) .password else .text), .disabled = w.locked.?, .on_change = if (std.mem.eql(u8, id, "wizard.scrollback")) w.cx.on(RemoteEditor, w, RemoteEditor.onScrollbackChanged) else w.cx.on(RemoteEditor, w, RemoteEditor.onFieldChange), .on_submit = w.cx.on(RemoteEditor, w, RemoteEditor.onFieldSubmit) }).mountResult(w.scope, w.cx);
-    @import("../../ui/app_theme.zig").styleInput(input);
-    input.node.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 34 }, .min_width = 0, .flex_shrink = 1 });
-    input.input_container.setStyleInline(w.alloc, S.input());
-    input.input_container.meta.ownership.meta.test_id = id;
-    input.state.font_size = 11;
-    input.state.line_height = 16;
-    input.state.padding_h = 0;
-    input.state.char_width = 6.3;
-    input.state.tokens = w.cx.tokens;
-    input.state.dirty = true;
-    if (feedback) |f| try f.attach(input, group, label);
+const FieldSpec = struct {
+    label: []const u8,
+    value: *ui.Signal([]const u8),
+    id: []const u8,
+    placeholder: ui.Source([]const u8) = .{ .value = "" },
+    helper: []const u8 = "",
+    feedback: ?FieldKind = null,
+    kind: ui.Source(W.InputType) = .{ .value = .text },
+    /// A password field showing its text (stays secure for IME, clipboard and accessibility).
+    revealed: ui.Source(bool) = .{ .value = false },
+    readonly: bool = false,
+};
+
+/// A labelled native Input (label, helper, required and invalid are its own
+/// props) in this view's column, with the validation message under it.
+fn field(w: *RemoteEditor, parent: *ui.Node, spec: FieldSpec) !W.input.InputResult {
+    const group = try ui.box(w.cx, L.cell(), .{});
+    const feedback = if (spec.feedback) |kind| try FieldFeedback.create(w, kind) else null;
+    const invalid: ui.Source(bool) = if (feedback) |f| .{ .signal = f.invalid } else .{ .value = false };
+    const scrollback = spec.feedback != null and spec.feedback.? == .scrollback;
+    const input = try W.Input(.{
+        .label_text = spec.label,
+        .value = spec.value,
+        .placeholder = spec.placeholder,
+        .helper = spec.helper,
+        .invalid = invalid,
+        .required = spec.feedback != null and !scrollback,
+        .readonly = spec.readonly,
+        .input_type = spec.kind,
+        .revealed = spec.revealed,
+        .disabled = w.locked.?,
+        .on_change = if (scrollback) w.cx.on(RemoteEditor, w, RemoteEditor.onScrollbackChanged) else w.cx.on(RemoteEditor, w, RemoteEditor.onFieldChange),
+        .on_submit = w.cx.on(RemoteEditor, w, RemoteEditor.onFieldSubmit),
+    }).mountResult(w.scope, w.cx);
+    input.input_container.meta.ownership.meta.test_id = spec.id;
+    try w.native_roots.append(w.alloc, input.node);
     try w.inputs.append(w.alloc, input);
-    if (std.mem.eql(u8, id, "wizard.password")) {
-        w.password_input = input;
-        const control = try ui.box(w.cx, S.groupControl(), .{});
-        w.password_control = control;
-        input.input_container.setStyleInline(w.alloc, S.groupInput());
-        try control.appendChild(w.alloc, input.node);
-        w.password_reveal_button = try action(w, control, "查看密码", "wizard.password.reveal", 32, 32, false, w.password_reveal_disabled, RemoteEditor.onPasswordReveal, ui.icons.eye);
-        try group.appendChild(w.alloc, control);
-    } else try group.appendChild(w.alloc, input.node);
+    try group.appendChild(w.alloc, input.node);
+    if (feedback) |f| try f.attach(input, group);
     try parent.appendChild(w.alloc, group);
     return input;
 }
-fn twoFields(w: *RemoteEditor, parent: *ui.Node, label_a: []const u8, a: *ui.Signal([]const u8), id_a: []const u8, label_b: []const u8, b: *ui.Signal([]const u8), id_b: []const u8) !void {
-    const row = try ui.box(w.cx, S.fieldRow(), .{});
-    _ = try field(w, row, label_a, a, "", id_a, null, false);
-    _ = try field(w, row, label_b, b, "", id_b, null, false);
-    try parent.appendChild(w.alloc, row);
-}
+
 fn fieldLabel(cx: *ui.Cx, value: []const u8) !*ui.Node {
     const label = try ui.textStyled(cx, S.label, value);
-    label.setStyleInline(cx.allocator, .{ .height = .{ .px = 16.5 }, .flex_shrink = 0 });
+    label.setStyleInline(cx.allocator, .{ .height = .{ .px = S.label_height }, .flex_shrink = 0 });
     return label;
 }
+
+/// A label with a native Tooltip on a native ghost info button.
 fn helpLabel(w: *RemoteEditor, label: []const u8, explanation: []const u8, test_id: []const u8) !*ui.Node {
-    const row = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .px = 16.5 }, .direction = .row, .align_items = .center, .gap = 5, .flex_shrink = 0 }, .{});
+    const row = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .align_items = .center, .gap = 5, .flex_shrink = 0 }, .{});
     try row.appendChild(w.alloc, try fieldLabel(w.cx, label));
-    const tip = try ui.widgets.Tooltip(.{ .text = explanation, .open_delay_ms = 450 }).mount(w.scope, w.cx);
-    const help = try ui.widgets.Button(.{ .variant = .ghost, .icon_only = true, .icon_asset = ui.icons.info, .icon_size = 12, .icon_tint = S.theme.current().fg_2, .a11y_label = explanation, .base_style = .{ .width = .{ .px = 16 }, .height = .{ .px = 16 }, .padding = .{}, .border = .{ .radius = 4 }, .flex_shrink = 0 } }).mount(w.scope, w.cx);
-    help.meta.ownership.meta.test_id = test_id;
-    try tip.trigger.appendChild(w.alloc, help);
-    try row.appendChild(w.alloc, tip.wrapper);
+    const tip = try ui.view.render(w.scope, w.cx, ui.view.with(W.Tooltip(.{ .text = explanation }), .{
+        ui.view.attrs(.{ .test_id = test_id }, W.Button(.{ .variant = .ghost, .size = .sm, .icon_only = true, .icon_asset = ui.icons.info, .a11y_label = explanation })),
+    }));
+    try w.native_roots.append(w.alloc, tip);
+    try row.appendChild(w.alloc, tip);
     return row;
 }
-fn readonlyField(w: *RemoteEditor, parent: *ui.Node, label: []const u8, text: []const u8) !*ui.Node {
-    const group = try ui.box(w.cx, S.field(null), .{});
+
+/// A read-only fact (a global default shown for reference): label over plain text.
+fn fact(w: *RemoteEditor, parent: *ui.Node, label: []const u8, text: []const u8, test_id: []const u8) !*ui.Node {
+    const group = try ui.box(w.cx, L.cell(), .{});
     try group.appendChild(w.alloc, try fieldLabel(w.cx, label));
-    const well = try ui.box(w.cx, S.input(), .{});
-    well.style.direction = .row;
-    well.style.align_items = .center;
-    const value = try ui.textStyled(w.cx, S.readonlyValue, text);
-    value.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .flex = 1 });
-    try well.appendChild(w.alloc, value);
-    try group.appendChild(w.alloc, well);
+    const value = try ui.textStyled(w.cx, S.inputValue, text);
+    value.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0 });
+    value.meta.ownership.meta.test_id = test_id;
+    try group.appendChild(w.alloc, value);
     try parent.appendChild(w.alloc, group);
     return value;
+}
+
+const SelectSpec = struct {
+    id: []const u8,
+    label: ?[]const u8 = null,
+    help: ?struct { text: []const u8, id: []const u8 } = null,
+    options: ui.Source([]const W.SelectOption),
+    value: *ui.Signal(?[]const u8),
+    placeholder: []const u8 = "",
+    searchable: bool = false,
+    on_change: ui.Handler(?[]const u8),
+    /// Receives this view's own field box (label + control), when the caller shows / hides or names it.
+    field: ?*?*ui.Node = null,
+    field_id: ?[]const u8 = null,
+};
+
+/// A native Select filling this view's column, under this view's label.
+fn selectField(w: *RemoteEditor, parent: *ui.Node, style: ui.BoxStyle, spec: SelectSpec) !W.SelectResult {
+    const group = try ui.box(w.cx, style, .{});
+    if (spec.help) |help| {
+        try group.appendChild(w.alloc, try helpLabel(w, spec.label.?, help.text, help.id));
+    } else if (spec.label) |label| try group.appendChild(w.alloc, try fieldLabel(w.cx, label));
+    const result = try W.Select(.{ .fill = true, .panel_width = .trigger, .options = spec.options, .placeholder = spec.placeholder, .value = spec.value, .searchable = spec.searchable, .disabled = w.locked.?, .on_change = spec.on_change }).mount(w.scope, w.cx);
+    result.trigger.meta.ownership.meta.test_id = spec.id;
+    try w.native_roots.append(w.alloc, result.wrapper);
+    try group.appendChild(w.alloc, result.wrapper);
+    try parent.appendChild(w.alloc, group);
+    if (spec.field_id) |id| group.meta.ownership.meta.test_id = id;
+    if (spec.field) |out| out.* = group;
+    return result;
 }
 
 fn mountIdentity(w: *RemoteEditor) !*ui.Node {
     const cx = w.cx;
     const root = try ui.boxStyled(cx, S.formSection, .{});
-    if (w.protocol_picker) |picker| try root.appendChild(w.alloc, try picker.mount(picker.context, cx, w.scope));
+    try root.appendChild(w.alloc, try w.jump_guide.?.mountBanner(w.scope));
+    if (w.protocol_picker) |picker| {
+        w.protocol_picker_node = try picker.mount(picker.context, cx, w.scope);
+        try root.appendChild(w.alloc, w.protocol_picker_node.?);
+    }
     const card = try ui.boxStyled(cx, S.identitySection, .{});
     w.identity_card = card;
     card.meta.ownership.meta.test_id = "wizard.identity.card";
-    const head = try ui.box(cx, S.row(30), .{});
-    try head.appendChild(w.alloc, try ui.text(cx, "连接信息", S.text(12, 700, false)));
-    w.copy_trigger = try action(w, head, "从已有主机复制", "wizard.copy.open", 116, 28, false, w.copy_open_disabled, RemoteEditor.onCopyToggle, null);
+    const head = try ui.box(cx, L.line(6), .{});
+    try head.appendChild(w.alloc, try ui.text(cx, "主机信息", S.text(12, 700, false)));
+    w.copy_trigger = try button(w, head, .{ .id = "wizard.copy.open", .label = .{ .value = "从已有主机复制" }, .variant = .ghost, .small = true, .disabled = w.copy_open_disabled }, cx.on(RemoteEditor, w, RemoteEditor.onCopyToggle));
     try card.appendChild(w.alloc, head);
     const details = try ui.boxStyled(cx, S.identityFields, .{});
     w.identity_body = details;
-    const copy_modal = try ui.widgets.Modal(.{ .open = ui.split(w.copy_open.?, cx.on(RemoteEditor, w, RemoteEditor.onCopyOpenChanged)), .width = 440, .max_height = 320, .background = S.theme.current().overlay }).mount(w.scope, cx);
+
+    // Copy dialog: a native Modal; its body slot holds this view's column.
+    const copy_modal = try W.Modal(.{ .open = ui.split(w.copy_open.?, cx.on(RemoteEditor, w, RemoteEditor.onCopyOpenChanged)), .width = @as(f32, 440), .max_height = @as(f32, 320), .body_padding = ui.Padding.all(0), .body_gap = @as(f32, 0) }).mount(w.scope, cx);
     w.copy_dialog = copy_modal.dialog;
-    w.copy_body = copy_modal.body;
     copy_modal.dialog.meta.ownership.meta.test_id = "wizard.copy.dialog";
-    copy_modal.dialog.setStyleInline(w.alloc, .{ .width = .{ .px = 440 }, .height = .{ .fit = .{} }, .max_height = 320, .padding = .{}, .gap = 0, .direction = .column, .overflow_hidden = true, .border = .{ .radius = 14 } });
-    copy_modal.body.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .fit = .{} }, .padding = .{}, .gap = 0, .direction = .column });
+    const copy_panel = try ui.box(cx, L.column(0), .{});
+    w.copy_panel = copy_panel;
     const copy_head = try ui.box(cx, S.copyHeader(), .{});
     try copy_head.appendChild(w.alloc, try ui.text(cx, "从已有主机复制", S.text(13, 700, false)));
     try copy_head.appendChild(w.alloc, try ui.spacer(cx));
-    _ = try action(w, copy_head, "关闭", "wizard.copy.close", 24, 24, false, null, RemoteEditor.onCopyCancel, ui.icons.x);
-    try copy_modal.body.appendChild(w.alloc, copy_head);
-    const copy_bar = try ui.box(cx, .{ .width = .fill(), .height = .{ .px = 73.5 }, .padding = .{ .left = 24, .right = 24, .bottom = 20 }, .direction = .column, .gap = 5, .flex_shrink = 0 }, .{});
-    w.copy_bar = copy_bar;
-    copy_bar.meta.ownership.meta.test_id = "wizard.copy.row";
-    try copy_bar.appendChild(w.alloc, try fieldLabel(cx, "选择复制来源"));
-    const source = try ui.widgets.Select(.{ .options = w.asset_options.?, .placeholder = "选择复制来源", .value = w.sig_copy_source.?, .width = 392, .searchable = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCopySourceChanged) }).mount(w.scope, cx);
-    skinSelect(w, source, 32, 12);
-    source.trigger.meta.ownership.meta.test_id = "wizard.copy.source";
-    try copy_bar.appendChild(w.alloc, source.wrapper);
-    try copy_modal.body.appendChild(w.alloc, copy_bar);
+    // panel-heads：统一关闭按钮（复制弹窗的 Esc 经 `onCopyOpenChanged(false)` 同样关闭）。
+    try copy_head.appendChild(w.alloc, try panel_header.mountClose(w.scope, cx, .{ .label = "关闭", .test_id = "wizard.copy.close", .on_close = cx.on(RemoteEditor, w, RemoteEditor.onCopyCancel) }));
+    try copy_panel.appendChild(w.alloc, copy_head);
+    var copy_bar_style = L.column(5);
+    copy_bar_style.padding = .{ .left = 24, .right = 24, .bottom = 20 };
+    _ = try selectField(w, copy_panel, copy_bar_style, .{ .id = "wizard.copy.source", .label = "选择复制来源", .options = .{ .signal = w.asset_options.? }, .value = w.sig_copy_source.?, .placeholder = "选择复制来源", .searchable = true, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCopySourceChanged), .field = &w.copy_bar, .field_id = "wizard.copy.row" });
     const copy_foot = try ui.box(cx, S.copyFooter(), .{});
     w.copy_footer = copy_foot;
-    _ = try action(w, copy_foot, "取消", "wizard.copy.cancel", 76, 34, false, null, RemoteEditor.onCopyCancel, null);
+    _ = try button(w, copy_foot, .{ .id = "wizard.copy.cancel", .label = .{ .value = "取消" } }, cx.on(RemoteEditor, w, RemoteEditor.onCopyCancel));
     try copy_foot.appendChild(w.alloc, try ui.spacer(cx));
-    _ = try action(w, copy_foot, "复制到当前草稿", "wizard.copy.apply", 128, 34, true, w.copy_disabled, RemoteEditor.onCopyApply, null);
-    try copy_modal.body.appendChild(w.alloc, copy_foot);
+    _ = try button(w, copy_foot, .{ .id = "wizard.copy.apply", .label = .{ .value = "复制到当前草稿" }, .variant = .primary, .disabled = w.copy_disabled }, cx.on(RemoteEditor, w, RemoteEditor.onCopyApply));
+    try copy_panel.appendChild(w.alloc, copy_foot);
+    try copy_modal.body.appendChild(w.alloc, copy_panel);
     if (!copy_modal.portaled) try root.appendChild(w.alloc, copy_modal.overlay);
+
     const name_row = try ui.box(cx, S.fieldRow(), .{});
-    _ = try field(w, name_row, "连接名称", w.sig_name.?, "", "wizard.name", null, false);
-    const group_field = try ui.box(cx, S.field(null), .{});
-    try group_field.appendChild(w.alloc, try fieldLabel(cx, "资产分组"));
-    const group_control = try ui.box(cx, S.groupControl(), .{});
+    _ = try field(w, name_row, .{ .label = "主机名称", .value = w.sig_name.?, .id = "wizard.name", .feedback = .name });
+    // Asset group: a native Input for the name (a new group may be typed) beside a
+    // native Select of the existing groups; both keep their own frames.
+    const group_field = try ui.box(cx, L.cell(), .{});
+    const group_control = try ui.box(cx, L.baseline(8), .{});
     group_control.meta.ownership.meta.test_id = "wizard.group.control";
-    const group_input = try ui.widgets.Input(.{ .value = w.sig_group.?, .placeholder = "未分组，可输入新分组", .embedded = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onGroupInput) }).mountResult(w.scope, cx);
-    @import("../../ui/app_theme.zig").styleInput(group_input);
-    group_input.node.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .height = .{ .px = 34 } });
-    group_input.input_container.setStyleInline(w.alloc, S.groupInput());
+    const group_slot = try ui.box(cx, L.grow(), .{});
+    const group_input = try W.Input(.{ .label_text = "资产分组", .value = w.sig_group.?, .placeholder = "未分组，可输入新分组", .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onGroupInput) }).mountResult(w.scope, cx);
     group_input.input_container.meta.ownership.meta.test_id = "wizard.group";
-    group_input.state.font_size = 11;
-    group_input.state.line_height = 16;
-    group_input.state.padding_h = 0;
-    group_input.state.char_width = 6.3;
-    group_input.state.tokens = cx.tokens;
-    group_input.state.dirty = true;
+    try w.native_roots.append(w.alloc, group_input.node);
     try w.inputs.append(w.alloc, group_input);
-    try group_control.appendChild(w.alloc, group_input.node);
-    const group_select = try ui.widgets.Select(.{ .options = w.group_options.?, .value = w.sig_group_selection.?, .width = 32, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onGroupChanged) }).mount(w.scope, cx);
-    skinSelect(w, group_select, 34, 12);
-    group_select.trigger.setStyleInline(w.alloc, S.groupPicker());
-    group_select.trigger.addBeforeRender(clearGroupInnerChrome);
-    group_select.content_slot.setStyleInline(w.alloc, .{ .display = .none });
+    try group_slot.appendChild(w.alloc, group_input.node);
+    try group_control.appendChild(w.alloc, group_slot);
+    const group_select = try W.Select(.{ .options = w.group_options.?, .value = w.sig_group_selection.?, .placeholder = "已有分组", .width = 132, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onGroupChanged) }).mount(w.scope, cx);
     group_select.trigger.meta.ownership.meta.test_id = "wizard.group.pick";
-    group_select.chrome.meta.ownership.meta.test_id = "wizard.group.menu";
-    group_select.chrome.setStyleInline(w.alloc, .{ .min_width = (S.width - 48 - 16) / 2 });
+    group_select.panel.meta.ownership.meta.test_id = "wizard.group.menu";
+    try w.native_roots.append(w.alloc, group_select.wrapper);
     try group_control.appendChild(w.alloc, group_select.wrapper);
-    group_control.behavior.events.event_context = try w.scope.createState(GroupControlChrome, .{ .input = group_input, .select = group_select });
-    group_control.addBeforeRender(GroupControlChrome.paint);
     try group_field.appendChild(w.alloc, group_control);
+    w.group_field = group_field;
     try name_row.appendChild(w.alloc, group_field);
     try details.appendChild(w.alloc, name_row);
+
     const target_row = try ui.box(cx, S.fieldRow(), .{});
-    _ = try field(w, target_row, "主机地址", w.sig_host.?, "", "wizard.host", null, false);
-    _ = try field(w, target_row, "端口", w.sig_port.?, "", "wizard.port", null, false);
+    _ = try field(w, target_row, .{ .label = "主机地址", .value = w.sig_host.?, .id = "wizard.host", .feedback = .host });
+    _ = try field(w, target_row, .{ .label = "端口", .value = w.sig_port.?, .id = "wizard.port", .feedback = .port });
     try details.appendChild(w.alloc, target_row);
+
     const identity_row = try ui.box(cx, S.fieldRow(), .{});
-    _ = try field(w, identity_row, "用户名", w.sig_user.?, "", "wizard.user", null, false);
-    const auth_field = try ui.box(cx, S.field(null), .{});
+    _ = try field(w, identity_row, .{ .label = "用户名", .value = w.sig_user.?, .id = "wizard.user", .feedback = .user });
+    const auth_field = try ui.box(cx, L.cell(), .{});
     try auth_field.appendChild(w.alloc, try fieldLabel(cx, "认证方式"));
-    const auth_group = try ui.widgets.RadioGroup(.{ .options = &auth_options, .value = w.sig_auth.?, .focus_ring = S.radioFocus(), .horizontal = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onAuthPicked) }).mount(w.scope, cx);
-    w.auth_group = auth_group;
-    auth_group.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .height = .{ .px = 34 }, .align_items = .center, .gap = 12 });
-    for (auth_group.children.items) |choice| {
-        if (choice.children.items.len < 2) continue;
-        choice.setStyle(w.alloc, .gap, 6);
-        const circle = choice.children.items[0];
-        circle.setStyle(w.alloc, .width, .{ .px = 14 });
-        circle.setStyle(w.alloc, .height, .{ .px = 14 });
-        if (circle.children.items.len != 0) {
-            circle.children.items[0].setStyle(w.alloc, .width, .{ .px = 7 });
-            circle.children.items[0].setStyle(w.alloc, .height, .{ .px = 7 });
-        }
-    }
+    const auth_group = try W.RadioGroup(.{ .options = &auth_options, .value = w.sig_auth.?, .horizontal = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onAuthPicked) }).mount(w.scope, cx);
     auth_group.meta.ownership.meta.test_id = "wizard.auth";
+    try w.native_roots.append(w.alloc, auth_group);
     try auth_field.appendChild(w.alloc, auth_group);
     try identity_row.appendChild(w.alloc, auth_field);
     try details.appendChild(w.alloc, identity_row);
@@ -3105,39 +3318,29 @@ fn mountIdentity(w: *RemoteEditor) !*ui.Node {
     w.auth_body = auth_body;
     const key = try ui.boxStyled(cx, S.stack, .{});
     w.cred_key_row = key;
-    const key_group = try ui.box(cx, S.field(null), .{});
-    try key_group.appendChild(w.alloc, try fieldLabel(cx, "私钥文件路径"));
-    const key_row = try ui.box(cx, S.fieldRow(), .{});
-    const key_feedback = (try FieldFeedback.prepare(w, "wizard.key_path")).?;
-    const key_input = try ui.widgets.Input(.{ .error_msg = key_feedback.message, .value = w.sig_key_path.?, .placeholder = "~/.ssh/id_ed25519", .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onFieldChange), .on_submit = cx.on(RemoteEditor, w, RemoteEditor.onFieldSubmit) }).mountResult(w.scope, cx);
-    @import("../../ui/app_theme.zig").styleInput(key_input);
-    key_input.node.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .height = .{ .px = 34 } });
-    key_input.input_container.setStyleInline(w.alloc, S.input());
-    key_input.input_container.meta.ownership.meta.test_id = "wizard.key_path";
-    key_input.state.font_size = 11;
-    key_input.state.line_height = 16;
-    key_input.state.padding_h = 0;
-    key_input.state.dirty = true;
-    try key_feedback.attach(key_input, key_group, "私钥文件");
-    try w.inputs.append(w.alloc, key_input);
-    try key_row.appendChild(w.alloc, key_input.node);
-    _ = try action(w, key_row, "选择私钥文件", "wizard.key_path.pick", 28, 28, false, w.locked, RemoteEditor.onPickKey, ui.icons.folder_open);
-    try key_group.appendChild(w.alloc, key_row);
-    try key.appendChild(w.alloc, key_group);
-    _ = try field(w, key, "私钥口令 · 仅本次使用", w.sig_key_passphrase.?, "可留空，连接时再输入", "wizard.key_passphrase", null, true);
+    const key_row = try ui.box(cx, L.baseline(8), .{});
+    _ = try field(w, key_row, .{ .label = "私钥文件路径", .value = w.sig_key_path.?, .id = "wizard.key_path", .placeholder = .{ .value = "~/.ssh/id_ed25519" }, .feedback = .key_path });
+    _ = try button(w, key_row, .{ .id = "wizard.key_path.pick", .name = .{ .value = "选择私钥文件" }, .icon = .{ .value = ui.icons.folder_open }, .icon_only = true, .disabled = w.locked }, cx.on(RemoteEditor, w, RemoteEditor.onPickKey));
+    try key.appendChild(w.alloc, key_row);
+    _ = try field(w, key, .{ .label = "私钥口令 · 仅本次使用", .value = w.sig_key_passphrase.?, .id = "wizard.key_passphrase", .placeholder = .{ .value = "可留空，连接时再输入" }, .kind = .{ .value = .password } });
     try auth_body.appendChild(w.alloc, key);
     const pw = try ui.boxStyled(cx, S.stack, .{});
     w.cred_pw_row = pw;
-    const password_row = try ui.box(cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .align_items = .end, .gap = 16 }, .{});
+    const password_row = try ui.box(cx, L.baseline(8), .{});
     try pw.appendChild(w.alloc, password_row);
-    _ = try field(w, password_row, "密码", w.sig_password.?, "可留空，连接时再输入", "wizard.password", null, true);
-    const remember = try ui.widgets.Checkbox(.{ .checked = w.sig_save_password.?, .label = "保存密码", .box_size = @as(f32, 14), .label_font_size = @as(f32, 11), .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onSavePasswordChanged) }).mount(w.scope, cx);
-    remember.setStyleInline(w.alloc, .{ .width = .{ .fit = .{} }, .height = .{ .px = 34 }, .gap = 8, .flex_shrink = 0 });
+    // A native password field throughout; `revealed` follows `sig_password_revealed`: the reveal
+    // button asks the system for authorization and only then shows the text.
+    w.password_input = try field(w, password_row, .{ .label = "密码", .value = w.sig_password.?, .id = "wizard.password", .placeholder = .{ .value = "可留空，连接时再输入" }, .kind = .{ .value = .password }, .revealed = .{ .signal = w.sig_password_revealed.? } });
+    w.password_reveal_button = try button(w, password_row, .{ .id = "wizard.password.reveal", .name = .{ .signal = w.reveal_label.? }, .variant = .ghost, .icon = .{ .signal = w.reveal_icon.? }, .icon_only = true, .disabled = w.password_reveal_disabled }, cx.on(RemoteEditor, w, RemoteEditor.onPasswordReveal));
+    const remember = try W.Checkbox(.{ .checked = w.sig_save_password.?, .label = "保存密码", .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onSavePasswordChanged) }).mount(w.scope, cx);
     remember.meta.ownership.meta.test_id = "wizard.password.remember";
     w.remember_checkbox = remember;
-    paintCheckboxLabels(remember);
-    try password_row.appendChild(w.alloc, remember);
-    const reveal_error = try ui.textStyled(cx, S.hint, "无法完成系统身份验证，密码保持隐藏，请重试。");
+    try w.native_roots.append(w.alloc, remember);
+    // The checkbox sits on the control line of the row (the field's label is above it).
+    const remember_slot = try ui.box(cx, .{ .height = .{ .px = S.control_height }, .direction = .row, .align_items = .center, .flex_shrink = 0, .margin = .{ .left = 8 } }, .{});
+    try remember_slot.appendChild(w.alloc, remember);
+    try password_row.appendChild(w.alloc, remember_slot);
+    const reveal_error = try ui.textStyled(cx, S.hint, "无法完成系统认证，密码保持隐藏，请重试。");
     reveal_error.setTextColor(S.theme.current().danger);
     reveal_error.setDisplay(.none);
     reveal_error.meta.ownership.meta.test_id = "wizard.password.reveal.error";
@@ -3154,49 +3357,28 @@ fn mountIdentity(w: *RemoteEditor) !*ui.Node {
     const advanced = try ui.boxStyled(cx, S.advancedSection, .{});
     w.step2_advanced = advanced;
     advanced.meta.ownership.meta.test_id = "wizard.advanced.card";
-    _ = try disclosure(w, advanced, "高级选项", "wizard.advanced.toggle", RemoteEditor.onAdvancedToggle);
+    try disclosure(w, advanced);
     const advanced_body = try ui.boxStyled(cx, S.formSection, .{});
     w.advanced_body = advanced_body;
     advanced_body.meta.ownership.meta.test_id = "wizard.advanced.body";
     const policy_row = try ui.box(cx, S.fieldRow(), .{});
-    policy_row.setStyleInline(w.alloc, .{ .align_items = .end });
-    const policy_field = try ui.box(cx, S.field(null), .{});
-    try policy_field.appendChild(w.alloc, try fieldLabel(cx, "主机密钥策略"));
-    const policy_options = [_]ui.widgets.SelectOption{
+    const policy_options = [_]W.SelectOption{
         .{ .value = "true", .label = "严格验证主机密钥（推荐）", .test_id = "wizard.strict.enabled" },
         .{ .value = "false", .label = "关闭严格验证（测试环境）", .test_id = "wizard.strict.disabled" },
     };
-    const policy = try ui.widgets.Select(.{ .options = &policy_options, .value = w.sig_strict_policy.?, .width = S.width - 48, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onStrictPolicyChanged) }).mount(w.scope, cx);
-    skinSelect(w, policy, 34, 12);
-    policy.wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0 });
-    policy.trigger.meta.ownership.meta.test_id = "wizard.strict_host_key";
-    w.strict_checkbox = policy.trigger;
-    try policy_field.appendChild(w.alloc, policy.wrapper);
-    try policy_row.appendChild(w.alloc, policy_field);
+    const policy = try selectField(w, policy_row, L.cell(), .{ .id = "wizard.strict_host_key", .label = "主机密钥策略", .options = .{ .value = &policy_options }, .value = w.sig_strict_policy.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onStrictPolicyChanged) });
+    w.strict_select = policy.trigger;
 
-    const compression_field = try ui.box(cx, S.field(null), .{});
+    const compression_field = try ui.box(cx, L.cell(), .{});
     try compression_field.appendChild(w.alloc, try fieldLabel(cx, "SSH 传输压缩"));
     const compression_choice = try w.scope.createSignal(?[]const u8, if (w.compression) "on" else "off");
-    const compression_options = [_]ui.widgets.checkbox.RadioOption{
+    const compression_options = [_]W.checkbox.RadioOption{
         .{ .value = "off", .label = "关闭", .test_id = "wizard.compression.disabled" },
         .{ .value = "on", .label = "开启", .test_id = "wizard.compression.enabled" },
     };
-    const compression = try ui.widgets.RadioGroup(.{ .options = &compression_options, .value = compression_choice, .focus_ring = S.radioFocus(), .horizontal = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCompressionPicked) }).mount(w.scope, cx);
-    compression.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .height = .{ .px = 34 }, .align_items = .center, .gap = 12 });
-    for (compression.children.items) |choice| {
-        if (choice.children.items.len < 2) continue;
-        choice.setStyle(w.alloc, .gap, 6);
-        const circle = choice.children.items[0];
-        circle.setStyle(w.alloc, .width, .{ .px = 14 });
-        circle.setStyle(w.alloc, .height, .{ .px = 14 });
-        if (circle.children.items.len != 0) {
-            circle.children.items[0].setStyle(w.alloc, .width, .{ .px = 7 });
-            circle.children.items[0].setStyle(w.alloc, .height, .{ .px = 7 });
-        }
-    }
+    const compression = try W.RadioGroup(.{ .options = &compression_options, .value = compression_choice, .horizontal = true, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCompressionPicked) }).mount(w.scope, cx);
     compression.meta.ownership.meta.test_id = "wizard.compression";
-    if (compression.behavior.interaction.a11y) |*a11y| a11y.label = "SSH 传输压缩";
-    w.compression_checkbox = compression;
+    try w.native_roots.append(w.alloc, compression);
     try w.scope.createEffect(.{ .checked = w.sig_compression.?, .choice = compression_choice }, struct {
         fn run(ctx: anytype) void {
             ctx.choice.set(if (ctx.checked.get()) "on" else "off");
@@ -3207,95 +3389,51 @@ fn mountIdentity(w: *RemoteEditor) !*ui.Node {
     try advanced_body.appendChild(w.alloc, policy_row);
 
     const defaults = try ui.box(cx, S.fieldRow(), .{});
-    w.connect_timeout_fact = try readonlyField(w, defaults, "连接超时（全局默认）", "—");
-    w.connect_timeout_fact.?.meta.ownership.meta.test_id = "wizard.ssh.connect_timeout";
-    w.keepalive_fact = try readonlyField(w, defaults, "保活间隔（全局默认）", "—");
-    w.keepalive_fact.?.meta.ownership.meta.test_id = "wizard.ssh.keepalive";
+    w.connect_timeout_fact = try fact(w, defaults, "连接超时（全局默认）", "—", "wizard.ssh.connect_timeout");
+    w.keepalive_fact = try fact(w, defaults, "保活间隔（全局默认）", "—", "wizard.ssh.keepalive");
     try advanced_body.appendChild(w.alloc, defaults);
     const terminal_row = try ui.box(cx, S.fieldRow(), .{});
-    _ = try field(w, terminal_row, "字符编码", w.sig_encoding.?, "UTF-8", "wizard.encoding", null, false);
-    _ = try field(w, terminal_row, "终端最大显示行数", w.sig_scrollback.?, "继承全局；0 不限制", "wizard.scrollback", null, false);
+    _ = try field(w, terminal_row, .{ .label = "字符编码", .value = w.sig_encoding.?, .id = "wizard.encoding", .placeholder = .{ .value = "UTF-8" }, .readonly = true });
+    _ = try field(w, terminal_row, .{ .label = "终端最大显示行数", .value = w.sig_scrollback.?, .id = "wizard.scrollback", .placeholder = .{ .signal = w.sig_scrollback_hint.? }, .helper = "0 不限制", .feedback = .scrollback });
     try advanced_body.appendChild(w.alloc, terminal_row);
     const info_row = try ui.box(cx, S.fieldRow(), .{});
     info_row.meta.ownership.meta.test_id = "wizard.command_info.row";
     w.command_info_row = info_row;
-    const info_field = try ui.box(cx, S.field(null), .{});
-    info_field.meta.ownership.meta.test_id = "wizard.command_info.field";
-    try info_field.appendChild(w.alloc, try helpLabel(w, "命令信息", "在命令首行右缘显示 AI、返回码与运行时间；鼠标悬停在命令上时隐藏，不影响复制。保存后立即更新已打开的此主机终端。", "wizard.command_info.help"));
-    const info_options = [_]ui.widgets.SelectOption{
+    const info_options = [_]W.SelectOption{
         .{ .value = "inherit", .label = "继承全局设置", .test_id = "wizard.command_info.inherit" },
         .{ .value = "on", .label = "显示", .test_id = "wizard.command_info.on" },
         .{ .value = "off", .label = "隐藏", .test_id = "wizard.command_info.off" },
     };
-    const info_choice = try ui.widgets.Select(.{ .options = &info_options, .value = w.sig_command_info.?, .width = (S.width - 64) / 2, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCommandInfoPicked) }).mount(w.scope, cx);
-    skinSelect(w, info_choice, 34, 12);
-    info_choice.wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0 });
-    info_choice.trigger.meta.ownership.meta.test_id = "wizard.command_info";
-    try info_field.appendChild(w.alloc, info_choice.wrapper);
-    try info_row.appendChild(w.alloc, info_field);
-
-    const shell_field = try ui.box(cx, S.field(null), .{});
-    w.shell_integration_field = shell_field;
-    try shell_field.appendChild(w.alloc, try helpLabel(w, "自动会话初始化", "每次连接 SSH 时发送文本钩子以获取命令状态，不上传文件。登录后会自动运行其他程序的主机可关闭；下次新建会话或重连生效。", "wizard.shell_integration.help"));
-    const shell_options = [_]ui.widgets.SelectOption{
+    _ = try selectField(w, info_row, L.cell(), .{ .id = "wizard.command_info", .label = "命令信息", .help = .{ .text = "在命令首行右缘显示 AI、返回码与运行时间；鼠标悬停在命令上时隐藏，不影响复制。保存后立即更新已打开的此主机终端。", .id = "wizard.command_info.help" }, .options = .{ .value = &info_options }, .value = w.sig_command_info.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onCommandInfoPicked), .field_id = "wizard.command_info.field" });
+    const shell_options = [_]W.SelectOption{
         .{ .value = "inherit", .label = "继承全局设置", .test_id = "wizard.shell_integration.inherit" },
         .{ .value = "on", .label = "开启", .test_id = "wizard.shell_integration.on" },
         .{ .value = "off", .label = "关闭", .test_id = "wizard.shell_integration.off" },
     };
-    const shell_choice = try ui.widgets.Select(.{ .options = &shell_options, .value = w.sig_shell_integration.?, .width = (S.width - 64) / 2, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onShellIntegrationPicked) }).mount(w.scope, cx);
-    skinSelect(w, shell_choice, 34, 12);
-    shell_choice.wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0 });
-    shell_choice.trigger.meta.ownership.meta.test_id = "wizard.shell_integration";
-    try shell_field.appendChild(w.alloc, shell_choice.wrapper);
-    try info_row.appendChild(w.alloc, shell_field);
+    _ = try selectField(w, info_row, L.cell(), .{ .id = "wizard.shell_integration", .label = "自动会话初始化", .help = .{ .text = "每次连接 SSH 时发送文本钩子以获取命令状态，不上传文件。登录后会自动运行其他程序的主机可关闭；下次新建会话或重连生效。", .id = "wizard.shell_integration.help" }, .options = .{ .value = &shell_options }, .value = w.sig_shell_integration.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onShellIntegrationPicked), .field = &w.shell_integration_field });
     try advanced_body.appendChild(w.alloc, info_row);
 
     const commands = try ui.boxStyled(cx, S.commandField, .{});
     w.commands_card = commands;
     w.commands_details = commands;
-    try commands.appendChild(w.alloc, try fieldLabel(cx, "启动命令 · 每行一条，连接后依次执行"));
-    const textarea = try ui.widgets.Textarea(.{ .value = w.sig_startup.?, .rows = 4, .placeholder = "cd /var/www/app", .error_msg = w.startup_error.?, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onStartupTextChanged) }).mountResult(w.scope, cx);
+    const textarea = try W.Textarea(.{ .label_text = "启动命令 · 每行一条，连接后依次执行", .value = w.sig_startup.?, .rows = 4, .placeholder = "cd /var/www/app", .error_msg = w.startup_error.?, .disabled = w.locked.?, .on_change = cx.on(RemoteEditor, w, RemoteEditor.onStartupTextChanged) }).mountResult(w.scope, cx);
     textarea.input.meta.ownership.meta.test_id = "wizard.startup";
     textarea.wrapper.meta.ownership.meta.test_id = "wizard.startup.field";
-    textarea.state.font_size = 12;
-    textarea.state.line_height = 18;
-    textarea.state.padding_h = 11;
-    textarea.state.padding_v = 9;
-    textarea.state.wrap_map.font_size = 12;
-    textarea.state.wrap_map.rebuildAll(textarea.state.doc);
-    if (textarea.state.vl_state) |list| {
-        list.props.item_height = 18;
-        ui.widgets.virtual_list.updateItemCount(list, list.item_count);
-        list.container_node.setStyleInline(w.alloc, .{ .padding = .{ .left = 11, .right = 11, .top = 9, .bottom = 9 } });
-    }
-    textarea.state.dirty = true;
-    textarea.input.setStyleInline(w.alloc, .{ .border = .{ .radius = 8, .width = 0, .color = ui.Color.TRANSPARENT } });
-    textarea.wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0 });
+    try w.native_roots.append(w.alloc, textarea.wrapper);
     w.startup_textarea = textarea;
     try commands.appendChild(w.alloc, textarea.wrapper);
     try advanced_body.appendChild(w.alloc, commands);
-    w.advanced_disclosure = try @import("../../ui/layout_motion.zig").Disclosure.mount(cx, w.scope, advanced_body, w.advanced_expanded);
+    w.advanced_disclosure = try @import("../../shared/ui/styles/layout_motion.zig").Disclosure.mount(cx, w.scope, advanced_body, w.advanced_expanded);
     try advanced.appendChild(w.alloc, w.advanced_disclosure.?.root);
     try root.appendChild(w.alloc, advanced);
     return root;
 }
 
-const RouteChoice = struct { root: *ui.Node, highlight: *ui.Node, style: *ui.Signal(S.ButtonStyle), title: *ui.Node, detail: *ui.Node };
-fn mountAccessChoice(w: *RemoteEditor, parent: *ui.Node, index: usize, title: []const u8, detail: []const u8, id: []const u8, comptime callback: *const fn (*RemoteEditor) void) !void {
-    const style = try w.scope.createSignal(S.ButtonStyle, S.accessChoice(false));
-    const root = try ui.widgets.Button(.{ .a11y_label = title, .disabled = w.locked.?, .base_style = style, .on_click = w.cx.on(RemoteEditor, w, callback) }).mount(w.scope, w.cx);
-    root.meta.ownership.meta.test_id = id;
-    const highlight = try ui.box(w.cx, .{ .position = .absolute, .inset = .{ .left = .{ .px = 0 }, .right = .{ .px = 0 }, .top = .{ .px = 0 }, .bottom = .{ .px = 0 } }, .width = .fill(), .height = .fill(), .background = S.theme.popupSelection(), .border = .{ .radius = 8 }, .hit_behavior = .pass_through }, .{});
-    try root.appendChild(w.alloc, highlight);
-    const heading = try ui.text(w.cx, title, S.text(12, 600, false));
-    heading.setStyleInline(w.alloc, .{ .position = .absolute, .inset = .{ .left = .{ .px = 14 }, .top = .{ .px = 12 }, .right = .{ .px = 14 } }, .height = .{ .px = 18 } });
-    const subtitle = try ui.text(w.cx, detail, S.text(10, 400, false));
-    subtitle.setStyleInline(w.alloc, .{ .position = .absolute, .inset = .{ .left = .{ .px = 14 }, .top = .{ .px = 34 }, .right = .{ .px = 14 } }, .height = .{ .px = 15 } });
-    try root.appendChild(w.alloc, heading);
-    try root.appendChild(w.alloc, subtitle);
-    try parent.appendChild(w.alloc, root);
-    w.route_choices[index] = .{ .root = root, .highlight = highlight, .style = style, .title = heading, .detail = subtitle };
-}
+const access_options = [_]W.checkbox.RadioOption{
+    .{ .value = "direct", .label = "从本机直接连接", .description = "本机 → 目标主机", .test_id = "wizard.access.direct" },
+    .{ .value = "jump", .label = "经 SSH 跳板连接", .description = "通过有序跳板访问目标", .test_id = "wizard.access.jump" },
+};
+
 fn mountRoute(w: *RemoteEditor) !*ui.Node {
     const root = try ui.boxStyled(w.cx, S.formSection, .{});
     const card = try ui.boxStyled(w.cx, S.formSection, .{});
@@ -3304,12 +3442,12 @@ fn mountRoute(w: *RemoteEditor) !*ui.Node {
     try card.appendChild(w.alloc, try ui.text(w.cx, "连接路径", S.text(12, 700, false)));
     const detail = try ui.boxStyled(w.cx, S.formSection, .{});
     w.route_body = detail;
-    var access_style = S.row(61);
-    access_style.gap = 10;
-    const access = try ui.box(w.cx, access_style, .{});
-    try mountAccessChoice(w, access, 0, "从本机直接连接", "本机 → 目标主机", "wizard.access.direct", RemoteEditor.onAccessDirect);
-    try mountAccessChoice(w, access, 1, "经 SSH 跳板连接", "通过有序跳板访问目标", "wizard.access.jump", RemoteEditor.onAccessJump);
+    // Direct or through jump hosts: a native RadioGroup (each option carries its description).
+    const access = try W.RadioGroup(.{ .options = &access_options, .value = w.sig_access.?, .horizontal = true, .disabled = w.locked.?, .on_change = w.cx.on(RemoteEditor, w, RemoteEditor.onAccessPicked) }).mount(w.scope, w.cx);
+    access.meta.ownership.meta.test_id = "wizard.access";
+    try w.native_roots.append(w.alloc, access);
     try detail.appendChild(w.alloc, access);
+    try detail.appendChild(w.alloc, try w.jump_guide.?.mountEmpty(w.scope));
     const editor = try ui.boxStyled(w.cx, S.stack, .{});
     w.route_editor = editor;
     for (0..8) |i| {
@@ -3324,21 +3462,17 @@ fn mountRoute(w: *RemoteEditor) !*ui.Node {
         number.setStyleInline(w.alloc, .{ .width = .{ .px = 22 }, .height = .{ .px = 22 }, .flex_shrink = 0, .background = S.theme.popupSelection(), .border = .{ .radius = 11 } });
         try number_slot.appendChild(w.alloc, number);
         try jump_row.appendChild(w.alloc, number_slot);
-        const picker = try ui.widgets.Select(.{ .options = w.jump_options[i].?, .placeholder = "选择 SSH 主机", .value = w.jump_values[i].?, .width = 566, .disabled = w.locked.?, .on_change = w.cx.on(RemoteEditor, w, RemoteEditor.onSelection) }).mount(w.scope, w.cx);
-        skinSelect(w, picker, 34, 12);
-        picker.wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0, .flex = 1 });
         var id: [48]u8 = undefined;
-        picker.trigger.meta.ownership.meta.test_id = try ownedId(w, &id, "wizard.route.hop.{d}", i);
-        try jump_row.appendChild(w.alloc, picker.wrapper);
-        const actions = try ui.box(w.cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 32 }, .direction = .row, .align_items = .center, .gap = 8, .flex_shrink = 0 }, .{});
-        try actions.appendChild(w.alloc, try editorAction(w, w.cx, "上移", i, .jump_up));
-        try actions.appendChild(w.alloc, try editorAction(w, w.cx, "下移", i, .jump_down));
-        try actions.appendChild(w.alloc, try editorAction(w, w.cx, "删除", i, .jump_remove));
+        _ = try selectField(w, jump_row, L.grow(), .{ .id = try ownedId(w, &id, "wizard.route.hop.{d}", i), .options = .{ .signal = w.jump_options[i].? }, .value = w.jump_values[i].?, .placeholder = "选择 SSH 主机", .on_change = w.cx.on(RemoteEditor, w, RemoteEditor.onSelection) });
+        const actions = try ui.box(w.cx, .{ .height = .{ .fit = .{} }, .direction = .row, .align_items = .center, .gap = 4, .flex_shrink = 0 }, .{});
+        try editorAction(w, actions, "上移", i, .jump_up);
+        try editorAction(w, actions, "下移", i, .jump_down);
+        try editorAction(w, actions, "删除", i, .jump_remove);
         try jump_row.appendChild(w.alloc, actions);
         w.jump_rows[i] = jump_row;
         try editor.appendChild(w.alloc, jump_row);
     }
-    _ = try action(w, editor, "添加跳板", "wizard.route.add", 712, 30, false, w.jump_add_disabled, RemoteEditor.onAddJump, null);
+    _ = try button(w, editor, .{ .id = "wizard.route.add", .label = .{ .value = "添加跳板" }, .icon = .{ .value = ui.icons.plus }, .block = true, .disabled = w.jump_add_disabled }, w.cx.on(RemoteEditor, w, RemoteEditor.onAddJump));
     try detail.appendChild(w.alloc, editor);
     w.route_empty_hint = try ui.textStyled(w.cx, S.paragraph, "请选择 SSH 跳板主机，或切换为从本机直接连接。");
     w.route_empty_hint.?.meta.ownership.meta.test_id = "wizard.route.error";
@@ -3354,11 +3488,13 @@ fn mountRoute(w: *RemoteEditor) !*ui.Node {
 }
 
 fn mountRoutePreview(w: *RemoteEditor, index: usize) !*ui.Node {
-    const scroll = try ui.widgets.ScrollArea(.{ .height = 76, .direction = .horizontal }).mount(w.scope, w.cx);
-    scroll.container.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 76 }, .flex_shrink = 0 });
-    const row = scroll.content;
-    row.setStyleInline(w.alloc, .{ .width = .{ .px = 668 }, .height = .{ .px = 76 }, .direction = .row, .align_items = .center, .justify = .center, .gap = 6, .flex_shrink = 0 });
+    // A native horizontal ScrollArea of fixed height; the row inside its content
+    // slot is this view's box (its width follows the hop count).
+    const scroll = try W.ScrollArea(.{ .height = 76, .direction = .horizontal }).mount(w.scope, w.cx);
+    const row = try ui.box(w.cx, .{ .width = .{ .px = 668 }, .height = .{ .px = 76 }, .direction = .row, .align_items = .center, .justify = .center, .gap = 6, .flex_shrink = 0 }, .{});
+    try scroll.content.appendChild(w.alloc, row);
     var preview = &w.route_previews[index];
+    preview.viewport = scroll.container;
     preview.row = row;
     for (0..10) |i| {
         if (i != 0) {
@@ -3372,14 +3508,21 @@ fn mountRoutePreview(w: *RemoteEditor, index: usize) !*ui.Node {
             ctx.* = .{ .wizard = w, .index = i };
             try w.scope.onCleanup(TestHopAction, ctx, TestHopAction.cleanup);
             w.test_actions[i] = ctx;
-            const button = try ui.widgets.Button(.{ .variant = .ghost, .a11y_label = if (i == 0) @as([]const u8, "全部节点日志") else "筛选节点日志", .on_click = w.cx.on(TestHopAction, ctx, TestHopAction.click) }).mount(w.scope, w.cx);
-            for (button.children.items) |child| child.setDisplay(.none);
-            button.setStyleInline(w.alloc, S.testNode());
             var id: [48]u8 = undefined;
-            button.meta.ownership.meta.test_id = try ownedId(w, &id, "wizard.test.hop.{d}", i);
-            break :blk button;
-        } else try ui.box(w.cx, S.routeNode(i == 9), .{});
+            // A hop card of the test: press to filter the log by that hop.
+            break :blk try pressRow(w, row, .{ .id = try ownedId(w, &id, "wizard.test.hop.{d}", i), .name = if (i == 0) "全部节点日志" else "筛选节点日志", .look = .from(Rows.test_hop), .selected = w.test_filter_selected[i] }, w.cx.on(TestHopAction, ctx, TestHopAction.click));
+        } else blk: {
+            const plain = try ui.box(w.cx, S.routeNode(i == 9), .{});
+            try row.appendChild(w.alloc, plain);
+            break :blk plain;
+        };
         preview.nodes[i] = node;
+        // A Pressable lays its slot out as a row: the hop card's stacked lines sit in this view's own column inside it.
+        const lines = if (index == 1) blk: {
+            const column = try ui.box(w.cx, .{ .width = .fill(), .height = .fill(), .min_width = 0, .direction = .column, .gap = 3, .hit_behavior = .pass_through }, .{});
+            try node.appendChild(w.alloc, column);
+            break :blk column;
+        } else node;
         preview.names[i] = try ui.text(w.cx, if (i == 0) "Local" else "", if (index == 1) S.testNodeText(.name) else S.title(w.cx.tokens));
         preview.addresses[i] = try ui.text(w.cx, if (i == 0) "127.0.0.1" else "", if (index == 1) S.testNodeText(.address) else S.text(10.5, 400, true));
         preview.users[i] = try ui.text(w.cx, if (i == 0) "本机" else "待连接", if (index == 1) S.testNodeText(.status) else S.hint(w.cx.tokens));
@@ -3388,13 +3531,12 @@ fn mountRoutePreview(w: *RemoteEditor, index: usize) !*ui.Node {
             try name_row.appendChild(w.alloc, try ui.iconTint(w.cx, if (i == 0) ui.icons.laptop else ui.icons.server, S.theme.current().fg_2, .{ .width = .{ .px = 14 }, .height = .{ .px = 14 }, .flex_shrink = 0 }));
             preview.names[i].?.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 16 }, .min_width = 0 });
             try name_row.appendChild(w.alloc, preview.names[i].?);
-            try node.appendChild(w.alloc, name_row);
+            try lines.appendChild(w.alloc, name_row);
             preview.addresses[i].?.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 14 } });
             preview.users[i].?.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 16 } });
-        } else try node.appendChild(w.alloc, preview.names[i].?);
-        try node.appendChild(w.alloc, preview.addresses[i].?);
-        try node.appendChild(w.alloc, preview.users[i].?);
-        try row.appendChild(w.alloc, node);
+        } else try lines.appendChild(w.alloc, preview.names[i].?);
+        try lines.appendChild(w.alloc, preview.addresses[i].?);
+        try lines.appendChild(w.alloc, preview.users[i].?);
         if (index == 0 and i > 0 and i < 9) {
             w.jump_addresses[i - 1] = preview.addresses[i];
             w.jump_users[i - 1] = preview.users[i];
@@ -3426,7 +3568,7 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
     w.summary_identity.?.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 16 } });
     try identity_copy.appendChild(w.alloc, w.summary_identity.?);
     try summary.appendChild(w.alloc, identity_copy);
-    _ = try action(w, summary, "编辑连接信息", "wizard.review.modify", 96, 28, false, w.locked, RemoteEditor.onSummaryModify, null);
+    _ = try button(w, summary, .{ .id = "wizard.review.modify", .label = .{ .value = "编辑主机信息" }, .variant = .link, .small = true, .disabled = w.locked }, w.cx.on(RemoteEditor, w, RemoteEditor.onSummaryModify));
     try root.appendChild(w.alloc, summary);
     const details = try ui.boxStyled(w.cx, S.reviewFields, .{});
     w.summary_details = details;
@@ -3457,10 +3599,10 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
     try root.appendChild(w.alloc, details);
     const route_card = try ui.box(w.cx, S.reviewRoute(), .{});
     w.summary_route_card = route_card;
-    const route_header = try ui.box(w.cx, S.row(28), .{});
+    const route_header = try ui.box(w.cx, L.line(6), .{});
     try route_header.appendChild(w.alloc, try ui.textStyled(w.cx, S.title, "连接路径"));
     try route_header.appendChild(w.alloc, try ui.spacer(w.cx));
-    _ = try action(w, route_header, "编辑路径", "wizard.review.route.modify", 76, 28, false, w.locked, RemoteEditor.onSummaryRouteModify, null);
+    _ = try button(w, route_header, .{ .id = "wizard.review.route.modify", .label = .{ .value = "编辑路径" }, .variant = .link, .small = true, .disabled = w.locked }, w.cx.on(RemoteEditor, w, RemoteEditor.onSummaryRouteModify));
     try route_card.appendChild(w.alloc, route_header);
     const route_list = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .row, .flex_wrap = .wrap, .align_items = .center, .gap = 10, .flex_shrink = 0 }, .{});
     route_list.meta.ownership.meta.test_id = "wizard.review.route";
@@ -3469,32 +3611,60 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
         const item = try ui.box(w.cx, .{ .width = .{ .fit = .{} }, .height = .{ .px = 36 }, .direction = .row, .align_items = .center, .gap = 10, .flex_shrink = 0 }, .{});
         w.summary_route_nodes[i] = item;
         if (i != 0) {
-            const arrow = try ui.iconTint(w.cx, ui.icons.arrow_right, S.theme.current().fg_2, S.icon(14));
+            // Chain link (zp7WE ethOj): a 1pt hairline between hops.
+            const arrow = try ui.boxStyled(w.cx, S.chainLink, .{});
             w.summary_route_arrows[i - 1] = arrow;
             try item.appendChild(w.alloc, arrow);
         }
         const node = try ui.box(w.cx, .{ .width = .{ .fit = .{} }, .min_width = 80, .max_width = 180, .height = .{ .px = 36 }, .direction = .column, .gap = 3, .flex_shrink = 0 }, .{});
-        const name = try ui.text(w.cx, "", S.readonlyValue(undefined));
+        // Hop top (WZJnQ): 9 dot · 7 · name 12.5/500; meta indented 16.
+        const top = try ui.box(w.cx, .{ .width = .{ .fit = .{} }, .height = .{ .px = 18 }, .direction = .row, .align_items = .center, .gap = 7, .flex_shrink = 0 }, .{});
+        try top.appendChild(w.alloc, try ui.box(w.cx, S.chainDot(i == 0), .{}));
+        const name = try ui.text(w.cx, "", S.chainName());
         name.setStyleInline(w.alloc, .{ .height = .{ .px = 18 }, .max_width = 180 });
         w.summary_route_names[i] = name;
-        const caption = try ui.textStyled(w.cx, S.hint, "");
-        caption.setStyleInline(w.alloc, .{ .height = .{ .px = 15 } });
+        const caption = try ui.text(w.cx, "", S.chainMeta());
+        caption.setStyleInline(w.alloc, .{ .height = .{ .px = 15 }, .margin = .{ .left = 16 } });
         w.summary_route_captions[i] = caption;
-        try node.appendChild(w.alloc, name);
+        try top.appendChild(w.alloc, name);
+        try node.appendChild(w.alloc, top);
         try node.appendChild(w.alloc, caption);
         try item.appendChild(w.alloc, node);
         try route_list.appendChild(w.alloc, item);
     }
     try route_card.appendChild(w.alloc, route_list);
     try root.appendChild(w.alloc, route_card);
+    // Summary (zp7WE QgEGN): "back to" rows reuse the step navigation.
+    const back = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0, .flex_shrink = 0 }, .{});
+    back.meta.ownership.meta.test_id = "wizard.review.back";
+    const back_keys = [_][]const u8{ "连接与认证", "连接路径", "高级选项" };
+    const back_ids = [_][]const u8{ "wizard.review.back.identity", "wizard.review.back.route", "wizard.review.back.advanced" };
+    inline for (0..3) |i| {
+        const callback = switch (i) {
+            0 => RemoteEditor.onSummaryModify,
+            1 => RemoteEditor.onSummaryRouteModify,
+            else => RemoteEditor.onSummaryAdvanced,
+        };
+        const row = try pressRow(w, back, .{ .id = back_ids[i], .name = "返回" ++ back_keys[i], .look = .from(Rows.back_row.of(.{ .first = i == 0 })), .disabled = w.locked }, w.cx.on(RemoteEditor, w, callback));
+        const key = try ui.text(w.cx, back_keys[i], S.backKey());
+        key.setStyleInline(w.alloc, .{ .width = .{ .px = 84 }, .height = .{ .px = 15 }, .flex_shrink = 0 });
+        try row.appendChild(w.alloc, key);
+        var value_style = S.backValue();
+        value_style.color = S.theme.current().fg_2;
+        const value = try ui.text(w.cx, "", value_style);
+        value.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 15 }, .min_width = 0, .flex = 1 });
+        w.back_values[i] = value;
+        try row.appendChild(w.alloc, value);
+        try row.appendChild(w.alloc, try ui.iconTint(w.cx, ui.icons.chevron_right, S.muted(), S.icon(14)));
+    }
+    try root.appendChild(w.alloc, back);
     const note = try ui.textStyled(w.cx, S.paragraph, "仅保存配置不会建立会话。连接时逐跳核对身份并完成认证，不跳过失败阶段。");
     try root.appendChild(w.alloc, note);
     const card = try ui.boxStyled(w.cx, S.testResult, .{});
     w.review_test_card = card;
     card.meta.ownership.meta.test_id = "wizard.test.card";
-    const header = try action(w, card, "展开检测详情", "wizard.test.toggle", 668, 18, false, null, RemoteEditor.onReviewToggle, null);
-    for (header.children.items) |child| child.setDisplay(.none);
-    header.setStyleInline(w.alloc, .{ .width = .fill(), .justify = .start, .background = ui.Color.TRANSPARENT, .margin = .{ .bottom = 8 } });
+    // The card's heading row opens / closes the details.
+    const header = try pressRow(w, card, .{ .id = "wizard.test.toggle", .name = "展开检测详情", .look = .from(Rows.test_toggle), .expanded = w.review_open }, w.cx.on(RemoteEditor, w, RemoteEditor.onReviewToggle));
     const title = try ui.text(w.cx, "连接预检", S.text(12, 500, false));
     title.setStyleInline(w.alloc, .{ .width = .{ .px = 150 }, .height = .{ .px = 18 }, .flex_shrink = 0 });
     try header.appendChild(w.alloc, title);
@@ -3541,30 +3711,29 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
     w.authentication_area.setDisplay(.none);
     w.test_logs_area = try ui.box(w.cx, S.testLogs(), .{});
     w.test_logs_area.meta.ownership.meta.test_id = "wizard.test.logs";
-    const log_header = try ui.box(w.cx, S.row(28), .{});
+    const log_header = try ui.box(w.cx, L.line(6), .{});
     const log_title = try ui.text(w.cx, "阶段日志", S.text(11, 500, false));
     log_title.setStyleInline(w.alloc, .{ .width = .{ .px = 100 }, .height = .{ .px = 16 }, .flex_shrink = 0 });
     try log_header.appendChild(w.alloc, log_title);
     try log_header.appendChild(w.alloc, try ui.spacer(w.cx));
-    const filter = try action(w, log_header, "全部节点", "wizard.test.logs.filter", 112, 26, false, null, RemoteEditor.onTestFilterAll, null);
-    w.test_filter_label = filter.children.items[filter.children.items.len - 1];
-    const copy = try action(w, log_header, "复制日志", "wizard.test.logs.copy", 24, 24, false, null, RemoteEditor.onLogsCopy, ui.icons.copy);
-    copy.setBackground(ui.Color.TRANSPARENT);
-    w.test_copy_icon = copy.children.items[copy.children.items.len - 1];
-    w.test_copy_feedback = try @import("../../ui/copy_button.zig").Button.attach(w.cx, w.scope, copy);
-    const toggle = try action(w, log_header, "展开或收起阶段日志", "wizard.test.logs.toggle", 24, 24, false, null, RemoteEditor.onLogsToggle, ui.icons.chevron_up);
-    toggle.setBackground(ui.Color.TRANSPARENT);
-    w.test_disclosure_icon = toggle.children.items[toggle.children.items.len - 1];
+    _ = try button(w, log_header, .{ .id = "wizard.test.logs.filter", .label = .{ .signal = w.test_filter_text.? }, .small = true }, w.cx.on(RemoteEditor, w, RemoteEditor.onTestFilterAll));
+    _ = try button(w, log_header, .{ .id = "wizard.test.logs.copy", .name = .{ .value = "复制日志" }, .variant = .ghost, .small = true, .icon = .{ .signal = w.logs_copy_icon.? }, .icon_only = true }, w.cx.on(RemoteEditor, w, RemoteEditor.onLogsCopy));
+    _ = try button(w, log_header, .{ .id = "wizard.test.logs.toggle", .name = .{ .value = "展开或收起阶段日志" }, .variant = .ghost, .small = true, .icon = .{ .signal = w.logs_toggle_icon.? }, .icon_only = true }, w.cx.on(RemoteEditor, w, RemoteEditor.onLogsToggle));
     try w.test_logs_area.appendChild(w.alloc, log_header);
-    const logs = try ui.widgets.ScrollArea(.{ .height = 80, .direction = .vertical, .rubber_band_y = false }).mount(w.scope, w.cx);
+    // The log viewport: a native ScrollArea of fixed height that reports its offset;
+    // the rows live in this view's column inside its content slot.
+    const logs = try W.ScrollArea(.{ .height = 80, .direction = .vertical, .rubber_band_y = false, .on_scroll_y_change = w.cx.on(RemoteEditor, w, RemoteEditor.onTestLogsScrolled) }).mount(w.scope, w.cx);
     w.test_scroll = logs;
-    w.logs_scroll = logs.container;
-    logs.container.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 80 }, .flex_shrink = 0 });
     logs.container.meta.ownership.meta.test_id = "wizard.test.logs.viewport";
-    logs.content.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 0 });
+    // This view's box around the viewport carries its show / hide (the log toggle).
+    const logs_box = try ui.box(w.cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .flex_shrink = 0 }, .{});
+    try logs_box.appendChild(w.alloc, logs.container);
+    w.logs_scroll = logs_box;
+    const log_rows = try ui.box(w.cx, L.column(0), .{});
+    try logs.content.appendChild(w.alloc, log_rows);
     w.test_log_text = try ui.textStyled(w.cx, S.logs, "");
     w.test_log_text.style.width = .fill();
-    try logs.content.appendChild(w.alloc, w.test_log_text);
+    try log_rows.appendChild(w.alloc, w.test_log_text);
     for (&w.test_rows) |*row| {
         row.node = try ui.box(w.cx, S.row(20), .{});
         for (&row.text, 0..) |*text, column| {
@@ -3572,20 +3741,19 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
             text.*.setStyleInline(w.alloc, .{ .width = if (column == 3) .fill() else .{ .px = ([_]f32{ 56, 46, 58 })[column] }, .height = .{ .px = 16 }, .min_width = 0, .flex_shrink = 0 });
             try row.node.appendChild(w.alloc, text.*);
         }
-        try logs.content.appendChild(w.alloc, row.node);
+        try log_rows.appendChild(w.alloc, row.node);
         row.node.setDisplay(.none);
     }
-    try w.test_logs_area.appendChild(w.alloc, logs.container);
-    const follow = try ui.box(w.cx, S.row(26), .{});
+    try w.test_logs_area.appendChild(w.alloc, logs_box);
+    const follow = try ui.box(w.cx, L.line(6), .{});
     w.test_follow_row = follow;
     w.test_follow_hint = try ui.text(w.cx, "", S.text(9.5, 400, false));
     w.test_follow_hint.?.setStyleInline(w.alloc, .{ .width = .fill(), .height = .{ .px = 16 }, .min_width = 0, .flex = 1 });
     try follow.appendChild(w.alloc, w.test_follow_hint.?);
-    const follow_button = try action(w, follow, "跟随中", "wizard.test.logs.follow", 112, 26, false, null, RemoteEditor.onTestFollow, null);
-    w.test_follow_label = follow_button.children.items[follow_button.children.items.len - 1];
+    _ = try button(w, follow, .{ .id = "wizard.test.logs.follow", .label = .{ .signal = w.test_follow_text.? }, .small = true }, w.cx.on(RemoteEditor, w, RemoteEditor.onTestFollow));
     try w.test_logs_area.appendChild(w.alloc, follow);
     w.test_logs_area.setDisplay(.none);
-    logs.container.setDisplay(.none);
+    logs_box.setDisplay(.none);
     follow.setDisplay(.none);
     try content.appendChild(w.alloc, w.test_logs_area);
     try card.appendChild(w.alloc, content);
@@ -3597,127 +3765,6 @@ fn mountReview(w: *RemoteEditor) !*ui.Node {
     return root;
 }
 
-fn paintInputTypography(node: *ui.Node) void {
-    if (node.getText()) |old| {
-        if (old.font_size != 11 or old.line_height != 16.0 / 11.0) {
-            var props = old;
-            props.font_size = 11;
-            props.line_height = 16.0 / 11.0;
-            node.setText(props);
-        }
-    }
-}
-
-fn paintSelectTypography(node: *ui.Node) void {
-    if (node.getText()) |old| {
-        if (old.font_size != 12 or old.line_height != 1.5) {
-            var props = old;
-            props.font_size = 12;
-            props.line_height = 1.5;
-            node.setText(props);
-        }
-    }
-    for (node.children.items) |child| paintSelectTypography(child);
-}
-
-fn paintSelectContent(node: *ui.Node, color: ui.Color) void {
-    if (node.getText()) |text| {
-        if (!std.meta.eql(text.color, color)) node.setTextColor(color);
-    }
-    for (node.children.items) |child| paintSelectContent(child, color);
-}
-
-// Read the Select's public derived state; keep its controlled event/selection
-// pipeline intact while the host supplies the live V3 surface roles.
-fn paintSelectMenu(select: ui.widgets.SelectResult) void {
-    const colors = S.theme.current();
-    const state = ui.widgets.select.stateOf(select);
-    select.trigger.setBorderColor(ui.Color.TRANSPARENT);
-    _ = select.chevron_down.setTint(colors.fg_2);
-    _ = select.chevron_up.setTint(colors.fg_2);
-    for (state.option_nodes, 0..) |row, i| {
-        const sized = switch (row.style.height) {
-            .px => |height| height == 32,
-            else => false,
-        };
-        if (!sized) row.setStyleInline(state.allocator, .{ .height = .{ .px = 32 }, .padding = .{ .top = 7, .bottom = 7, .left = 9, .right = 9 }, .border = .{ .radius = 7 }, .flex_shrink = 0 });
-        const selected = state.isSelected(i);
-        const highlighted = if (state.highlighted_index) |index| index == i else state.shown_open and selected;
-        row.setBackground(if (highlighted) colors.hover else if (selected) colors.selection else ui.Color.TRANSPARENT);
-        paintSelectContent(row, if (state.options[i].disabled) colors.fg_3 else if (selected) colors.accent_ink else colors.fg_1);
-        _ = state.check_nodes[i].setTint(colors.accent_ink);
-    }
-}
-
-fn paintAuthLabels(group: *ui.Node) void {
-    for (group.children.items) |choice| {
-        if (choice.children.items.len < 2) continue;
-        const node = choice.children.items[1];
-        if (node.getText()) |old| {
-            if (old.font_size == 12 and old.line_height == 1.5 and !old.selectable) continue;
-            var props = old;
-            props.font_size = 12;
-            props.line_height = 1.5;
-            props.selectable = false;
-            node.setText(props);
-        }
-    }
-}
-
-fn paintCheckboxLabels(node: *ui.Node) void {
-    if (node.getText()) |old| {
-        var props = old;
-        props.font_size = 11;
-        props.line_height = 1.5;
-        props.color = S.theme.current().fg_1;
-        node.setText(props);
-    }
-    for (node.children.items) |child| paintCheckboxLabels(child);
-}
-
-// Input and Select retain their native event handlers; only the outer field
-// paints the compound control, including focus on the arrow or its open menu.
-const GroupControlChrome = struct {
-    input: ui.widgets.input.InputResult,
-    select: ui.widgets.SelectResult,
-
-    fn paint(node: *ui.Node) void {
-        const self: *GroupControlChrome = @ptrCast(@alignCast(node.behavior.events.event_context.?));
-        var focused = self.input.state.focused or self.select.open.?.peek();
-        if (self.input.state.cx_ref) |cx| {
-            var ancestor = cx.focused_node;
-            while (ancestor) |current| : (ancestor = current.parent) {
-                if (current == node) {
-                    focused = true;
-                    break;
-                }
-            }
-        }
-        node.setBackground(if (self.input.state.disabled) S.theme.states().disabled else if (focused) S.theme.states().focus else S.theme.popupInset());
-    }
-};
-
-fn clearGroupInnerChrome(node: *ui.Node) void {
-    node.setBackground(ui.Color.TRANSPARENT);
-    node.setBorderWidth(0);
-}
-
-fn skinSelect(w: *RemoteEditor, result: ui.widgets.SelectResult, height: f32, size: f32) void {
-    result.wrapper.setStyleInline(w.alloc, .{ .height = .{ .px = height }, .flex_shrink = 0 });
-    var style = S.input();
-    style.height = .{ .px = height };
-    style.font_size = size;
-    result.trigger.setStyleInline(w.alloc, style);
-    // Select owns a separate Popover trigger wrapper with the initial pixel
-    // width. Let that wrapper follow its responsive field as well.
-    if (result.trigger.parent) |trigger_wrapper| trigger_wrapper.setStyleInline(w.alloc, .{ .width = .fill(), .min_width = 0 });
-    // HTML preview: 5px panel inset, contiguous 32px rows, radius10/7.
-    result.chrome.setStyleInline(w.alloc, .{ .padding = ui.Padding.all(5), .gap = 0, .background = S.theme.current().overlay, .border = .{ .radius = 10, .width = 0 } });
-    result.panel.setStyleInline(w.alloc, .{ .gap = 0 });
-    const state = ui.widgets.select.stateOf(result);
-    for (state.option_nodes) |row| row.setStyleInline(w.alloc, .{ .height = .{ .px = 32 }, .padding = .{ .top = 7, .bottom = 7, .left = 9, .right = 9 }, .border = .{ .radius = 7 }, .flex_shrink = 0 });
-    w.selects.append(w.alloc, result) catch {};
-}
 fn ownedId(w: *RemoteEditor, buf: []u8, comptime format: []const u8, value: usize) ![]const u8 {
     const value_text = try std.fmt.bufPrint(buf, format, .{value});
     const owned = try w.alloc.dupe(u8, value_text);
@@ -3750,7 +3797,7 @@ test "password reveal stays masked until fresh authorization and hides on lifecy
     editor.show();
     editor.onPasswordReveal();
     try std.testing.expect(editor.password_authorization.active);
-    try std.testing.expectEqual(ui.widgets.input.InputType.password, editor.password_input.?.state.input_type);
+    try std.testing.expect(editor.password_input.?.state.masked());
     editor.password_authorization.test_result = .cancelled;
     editor.pollPasswordVisibility();
     try std.testing.expect(!editor.password_visible);
@@ -3763,9 +3810,12 @@ test "password reveal stays masked until fresh authorization and hides on lifecy
     editor.password_authorization.test_result = .approved;
     editor.pollPasswordVisibility();
     try std.testing.expect(editor.password_visible);
-    try std.testing.expectEqual(ui.widgets.input.InputType.text, editor.password_input.?.state.input_type);
-    editor.onPasswordReveal();
+    // Shown, still a password field (secure for IME, clipboard and accessibility).
+    try std.testing.expect(!editor.password_input.?.state.masked());
     try std.testing.expectEqual(ui.widgets.input.InputType.password, editor.password_input.?.state.input_type);
+    try std.testing.expect(editor.password_input.?.input_container.behavior.interaction.a11y.?.secure);
+    editor.onPasswordReveal();
+    try std.testing.expect(editor.password_input.?.state.masked());
     try std.testing.expect(editor.password_input.?.input_container.behavior.interaction.a11y.?.value_text == null);
     editor.onPasswordReveal();
     editor.password_authorization.test_result = .approved;
@@ -3798,24 +3848,6 @@ test "password reveal stays masked until fresh authorization and hides on lifecy
     editor.onPasswordReveal();
     editor.loadDraft(.{ .name = "next", .host = "next.invalid", .user = "fixture" });
     try std.testing.expect(!editor.password_authorization.active and !editor.password_visible);
-}
-
-test "authentication radio labels cannot create a text selection highlight" {
-    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
-    defer cx.deinit();
-    const scope = try ui.Scope.init(std.testing.allocator, null, cx.owner);
-    defer scope.dispose();
-    const selected = try scope.createSignal(?[]const u8, "password");
-    const group = try ui.widgets.RadioGroup(.{ .options = &auth_options, .value = selected, .horizontal = true }).mount(scope, cx);
-    cx.root = group;
-    paintAuthLabels(group);
-    for (group.children.items) |choice| {
-        const label = choice.children.items[1];
-        try std.testing.expect(!label.getText().?.selectable);
-    }
-    selected.set("private_key");
-    paintAuthLabels(group);
-    for (group.children.items) |choice| try std.testing.expect(!choice.children.items[1].getText().?.selectable);
 }
 
 test "Draft.validate rejects empty name host user and zero port" {
@@ -3919,7 +3951,6 @@ const EditorAction = struct {
     index: usize,
     kind: EditorKind,
     disabled: *ui.Signal(bool),
-    icon: ?*ui.Node = null,
     fn cleanup(self: *EditorAction) void {
         self.wizard.alloc.destroy(self);
     }
@@ -3973,22 +4004,18 @@ const EditorAction = struct {
         w.onFieldChange("");
     }
 };
-fn editorAction(self: *RemoteEditor, cx: *ui.Cx, label: []const u8, index: usize, kind: EditorKind) !*ui.Node {
+/// Hop row action: a native ghost icon button.
+fn editorAction(self: *RemoteEditor, parent: *ui.Node, label: []const u8, index: usize, kind: EditorKind) !void {
     const state = try self.alloc.create(EditorAction);
     state.* = .{ .wizard = self, .index = index, .kind = kind, .disabled = try self.scope.createSignal(bool, false) };
     try self.scope.onCleanup(EditorAction, state, EditorAction.cleanup);
     try self.editor_actions.append(self.alloc, state);
-    var action_style = S.button(28, 28, false);
-    action_style.background = ui.Color.TRANSPARENT;
-    const node = try ui.widgets.Button(.{ .variant = .ghost, .a11y_label = label, .disabled = state.disabled, .base_style = action_style, .on_click = cx.on(EditorAction, state, EditorAction.click) }).mount(self.scope, cx);
-    node.setStyleInline(self.alloc, action_style);
     const icon = switch (kind) {
         .jump_up => ui.icons.chevron_up,
         .jump_down => ui.icons.chevron_down,
-        .jump_remove, .command_remove => ui.icons.x,
+        // Remove (kiUlJ T3FQAX): trash-2.
+        .jump_remove, .command_remove => ui.icons.trash_2,
     };
-    state.icon = try ui.iconTint(cx, icon, S.theme.current().fg_3, .{ .width = .{ .px = 14 }, .height = .{ .px = 14 } });
-    try node.appendChild(self.alloc, state.icon.?);
     var id: [64]u8 = undefined;
     const prefix = switch (kind) {
         .jump_up => "wizard.route.up.",
@@ -4000,8 +4027,7 @@ fn editorAction(self: *RemoteEditor, cx: *ui.Cx, label: []const u8, index: usize
     const owned = try self.alloc.dupe(u8, value);
     errdefer self.alloc.free(owned);
     try self.owned_ids.append(self.alloc, owned);
-    node.meta.ownership.meta.test_id = owned;
-    return node;
+    _ = try button(self, parent, .{ .id = owned, .name = .{ .value = label }, .variant = .ghost, .small = true, .icon = .{ .value = icon }, .icon_only = true, .disabled = state.disabled }, self.cx.on(EditorAction, state, EditorAction.click));
 }
 
 test "owned draft owns nested jump and command slices" {
@@ -4211,7 +4237,7 @@ test "host scrollback inherits global until explicitly edited and clearing resto
     try std.testing.expectEqualStrings("", editor.sig_scrollback.?.get());
     var host = try editor.currentDraft().toHostConfig();
     try std.testing.expect(!host.scrollback_explicit);
-    try std.testing.expect(@import("../../ui/session_runtime.zig").targetFromHost(host, &.{}).scrollback == null);
+    try std.testing.expect(@import("../../features/workspace/host/session_runtime.zig").targetFromHost(host, &.{}).scrollback == null);
     editor.sig_scrollback.?.set("0");
     editor.onScrollbackChanged("0");
     editor.setScrollbackDefault(0);
@@ -4219,7 +4245,7 @@ test "host scrollback inherits global until explicitly edited and clearing resto
     try std.testing.expectEqualStrings("0", editor.sig_scrollback.?.get());
     host = try editor.currentDraft().toHostConfig();
     try std.testing.expect(host.scrollback_explicit);
-    try std.testing.expectEqual(@as(?u32, 0), @import("../../ui/session_runtime.zig").targetFromHost(host, &.{}).scrollback);
+    try std.testing.expectEqual(@as(?u32, 0), @import("../../features/workspace/host/session_runtime.zig").targetFromHost(host, &.{}).scrollback);
     editor.sig_scrollback.?.set("");
     editor.onScrollbackChanged("");
     host = try editor.currentDraft().toHostConfig();

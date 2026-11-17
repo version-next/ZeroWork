@@ -33,11 +33,11 @@ fn demoWidth(comptime w: f32) ui.BoxStyle {
 }
 
 fn row(cx: *ui.Cx, gap: f32) !*ui.Node {
-    return ui.box(cx, .{ .direction = .row, .gap = gap, .align_items = .center }, .{});
+    return ui.box(cx, .{ .direction = .row, .gap = gap, .align_items = .center, .no_cross_stretch = true }, .{});
 }
 
 fn col(cx: *ui.Cx, gap: f32) !*ui.Node {
-    return ui.box(cx, .{ .direction = .column, .gap = gap }, .{});
+    return ui.box(cx, .{ .direction = .column, .gap = gap, .no_cross_stretch = true }, .{});
 }
 
 /// Regression: story status row (13px primary).
@@ -65,6 +65,7 @@ const ButtonVariantSpec = struct { v: W.ButtonVariant, t: []const u8 };
 const ButtonSizeSpec = struct { s: W.ButtonSize, t: []const u8 };
 
 const button_variants = [_]ButtonVariantSpec{
+    .{ .v = .base, .t = "Base" },
     .{ .v = .primary, .t = "Primary" },
     .{ .v = .secondary, .t = "Secondary" },
     .{ .v = .ghost, .t = "Ghost" },
@@ -121,6 +122,9 @@ const ButtonViews = struct {
     fn loadingBySize(ss: ButtonSizeSpec) ButtonEl {
         return W.Button(.{ .label = "Loading", .variant = .primary, .size = ss.s, .loading = true });
     }
+    fn chevronBySize(ss: ButtonSizeSpec) ButtonEl {
+        return W.Button(.{ .label = ss.t, .variant = .secondary, .size = ss.s, .icon_asset = icons.star, .chevron = true });
+    }
 };
 
 pub fn buildButton(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
@@ -165,6 +169,19 @@ pub fn buildButton(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
             W.Button(.{ .icon_only = true, .icon_asset = icons.x_close, .loading = true, .variant = .secondary }),
         }),
 
+        // -- dropdown chevron after the label (ZeroWork AI composer tool row: ghost sm, icon +
+        //    label + chevron; icon-only + chevron; trailing glyph keeps the chevron last) --
+        label("Chevron (tool row)"),
+        v.row(.{ .style = S.line(2) }, .{
+            v.attrs(.{ .test_id = "story.button.chevron.permission" }, W.Button(.{ .label = "Ask first", .variant = .ghost, .size = .sm, .icon_asset = ui.icons.shield, .chevron = true })),
+            v.attrs(.{ .test_id = "story.button.chevron.run_mode" }, W.Button(.{ .label = "Run locally", .variant = .ghost, .size = .sm, .icon_asset = ui.icons.terminal, .chevron = true })),
+            v.attrs(.{ .test_id = "story.button.chevron.model" }, W.Button(.{ .label = "Model", .variant = .ghost, .size = .sm, .icon_asset = ui.icons.sparkles, .chevron = true })),
+            W.Button(.{ .variant = .ghost, .size = .sm, .icon_only = true, .icon_asset = ui.icons.sparkles, .a11y_label = "Model", .chevron = true }),
+            W.Button(.{ .label = "Open", .variant = .ghost, .size = .sm, .icon_asset = icons.star, .icon_position = .trailing, .chevron = true }),
+            W.Button(.{ .label = "Disabled", .variant = .ghost, .size = .sm, .icon_asset = ui.icons.shield, .chevron = true, .disabled = true }),
+        }),
+        v.row(.{ .style = S.line(10) }, v.list(&button_sizes, B.chevronBySize)),
+
         // -- block (block-level, width fill) --
         label("Block (full width)"),
         v.col(.{ .style = .{ S.stack(8), S.fixedWidth(280) } }, .{
@@ -201,6 +218,8 @@ pub fn buildCheckbox(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         v.attrs(.{ .test_id = "story.checkbox.checked" }, W.Checkbox(.{ .label = "Checked", .checked = true })),
         v.attrs(.{ .test_id = "story.checkbox.indeterminate" }, W.Checkbox(.{ .label = "Indeterminate", .indeterminate = true })),
         W.Checkbox(.{ .label = "Disabled", .disabled = true }),
+        W.Checkbox(.{ .label = "Disabled selected", .checked = true, .disabled = true }),
+        W.Checkbox(.{ .label = "Disabled mixed", .indeterminate = true, .disabled = true }),
         v.text(.{ .style = S.storyLabel, .test_id = "story.checkbox.status" }, v.fmt("changed → {s}", .{ui.map(last, CheckboxStory.word)})),
     }));
 }
@@ -368,6 +387,14 @@ const radio_plan_options = [_]ui.widgets.checkbox.RadioOption{
     .{ .value = "lifetime", .label = "Lifetime", .disabled = true },
 };
 
+/// ZeroWork AI assistant question panel: options with a second line (RadioOption.description).
+const radio_question_options = [_]ui.widgets.checkbox.RadioOption{
+    .{ .value = "nginx", .label = "nginx", .description = "Check the config before restarting: nginx -t" },
+    .{ .value = "apache", .label = "apache", .description = "apachectl configtest, then a graceful restart" },
+    .{ .value = "skip", .label = "Skip the restart" },
+    .{ .value = "later", .label = "Restart tonight", .description = "Outside the maintenance window", .disabled = true },
+};
+
 pub fn buildRadio(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const selected = try scope.createSignal(?[]const u8, "x");
     return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
@@ -380,7 +407,11 @@ pub fn buildRadio(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         v.attrs(.{ .test_id = "story.radio.group" }, W.RadioGroup(.{ .options = &radio_options, .value = selected })),
         label("Horizontal, one option disabled"),
         v.attrs(.{ .test_id = "story.radio.plan" }, W.RadioGroup(.{ .options = &radio_plan_options, .value = @as(?[]const u8, "monthly"), .horizontal = true })),
-        label("Whole group disabled"),
+        label("With descriptions (AI question panel)"),
+        v.col(.{ .style = S.fixedWidth(280) }, .{
+            v.attrs(.{ .test_id = "story.radio.question" }, W.RadioGroup(.{ .options = &radio_question_options, .value = @as(?[]const u8, "nginx") })),
+        }),
+                label("Whole group disabled"),
         W.RadioGroup(.{ .options = &radio_plan_options, .value = @as(?[]const u8, "yearly"), .horizontal = true, .disabled = true }),
         v.text(.{ .style = S.storyLabel, .test_id = "story.radio.status" }, v.fmt("selected → {s}", .{ui.map(selected, RadioStory.word)})),
     }));
@@ -456,6 +487,14 @@ pub fn buildCard(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     // Select: two cards' selected from same signal, tap writes signal
     const plan = try scope.createSignal(CardPickStory.Plan, .basic);
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        // Bubble: a user's chat turn (bg-active, no border, radius panel, 8 12), right-aligned.
+        v.attrs(.{ .test_id = "story.card.bubble" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{
+            v.row(.{ .style = S.bubbleRow }, .{
+                v.with(W.Card(.{ .variant = .bubble, .width = 300 }), .{
+                    v.text(.{ .style = S.bubbleText }, "看下 compute-bmc-01 的 SEL，确认最近一次断电的原因，整理成表格。"),
+                }),
+            }),
+        })),
         // -- Variants --
         label("Variants (default / outlined / elevated)"),
         W.Card(.{ .title = "Default", .subtitle = "with subtitle", .variant = .default, .width = 320 }),
@@ -540,7 +579,10 @@ const TagEl = @TypeOf(W.Tag(.{ .label = "" }));
 
 const TagViews = struct {
     fn colored(s: TagColorSpec) TagEl {
-        return W.Tag(.{ .label = s.t, .color = s.c });
+        return W.Tag(.{ .label = s.t, .color = s.c, .closable = true });
+    }
+    fn outlined(s: TagColorSpec) TagEl {
+        return W.Tag(.{ .label = s.t, .color = s.c, .variant = .outline, .closable = true });
     }
     fn sized(s: TagSizeSpec) TagEl {
         return W.Tag(.{ .label = s.t, .color = .accent, .size = s.s });
@@ -568,6 +610,7 @@ pub fn buildTag(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         // -- all colors (incl info) --
         label("Colors"),
         v.row(.{ .style = S.line(8) }, v.list(&tag_colors, TagViews.colored)),
+        v.row(.{ .style = S.line(8) }, v.list(&tag_colors, TagViews.outlined)),
 
         // -- Sizes --
         label("Sizes (sm / md)"),
@@ -610,6 +653,17 @@ pub fn buildChip(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const f_urgent = try scope.createSignal(bool, false);
     const folder = try scope.createSignal(bool, true);
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        // Attachment spec: 44 tiles (thumbnail / type icon) and rows (icon, name, size, remove).
+        v.attrs(.{ .test_id = "story.chip.attachments" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{
+            v.row(.{ .style = S.attachmentBar }, .{
+                W.AttachmentChip(.{ .label = "dmesg.png", .icon_asset = ui.icons.image, .tile = true, .removable = false }),
+                W.AttachmentChip(.{ .label = "checker.png", .thumbnail = g_blend_checker_texture, .icon_asset = ui.icons.image, .tile = true }),
+                v.col(.{ .style = S.attachmentFiles }, .{
+                    W.AttachmentChip(.{ .label = "syslog.1", .detail = "48 KB", .icon_asset = ui.icons.file_text }),
+                    W.AttachmentChip(.{ .label = "web-01:/var/log/nginx/error.log", .detail = "Remote", .icon_asset = ui.icons.server }),
+                }),
+            }),
+        })),
         label("Filter chips (readonly = false: click toggles)"),
         v.row(.{ .style = S.line(8) }, .{
             v.attrs(.{ .test_id = "story.chip.open" }, W.Chip(.{ .label = "Open", .readonly = false, .selected = f_open, .on_click = ui.on.toggle(f_open) })),
@@ -729,11 +783,33 @@ pub fn buildAlert(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const a_warn = try scope.createSignal(bool, true);
     const restore = try ui.on.bind(scope, ResetPair{ .a = a_info, .b = a_ok, .c = a_warn }, ResetPair.run);
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
-        v.show(a_info, .{v.attrs(.{ .test_id = "story.alert.info" }, W.Alert(.{ .variant = .info, .title = "Info", .message = "Informational message.", .closable = true, .on_close = ui.on.set(a_info, false) }))}),
-        v.show(a_ok, .{v.attrs(.{ .test_id = "story.alert.success" }, W.Alert(.{ .variant = .success, .title = "Success", .message = "It worked.", .closable = true, .on_close = ui.on.set(a_ok, false) }))}),
-        v.show(a_warn, .{v.attrs(.{ .test_id = "story.alert.warning" }, W.Alert(.{ .variant = .warning, .title = "Warning", .message = "Be careful.", .closable = true, .on_close = ui.on.set(a_warn, false) }))}),
+        // Recovery: actions slot (native sm buttons) + folded details.
+        v.attrs(.{ .test_id = "story.alert.recovery" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{
+            v.with(W.Alert(.{
+                .variant = .@"error",
+                .title = "Request failed · 429 Too Many Requests",
+                .message = "Cooling down, retry in 12 s. Question and attachments are kept · retry 1/3",
+                .details_toggle_test_id = "story.alert.recovery.toggle",
+            }), .{}).slots(.{
+                .actions = .{
+                    W.Button(.{ .label = "Retry reply only · 12s", .size = .sm }),
+                    W.Button(.{ .label = "Edit question", .variant = .secondary, .size = .sm }),
+                    W.Button(.{ .label = "New plan", .variant = .secondary, .size = .sm }),
+                },
+                .details = v.text(.{ .style = S.alertDetails }, "POST /v1/messages → 429\nretry-after: 12\nx-request-id: req_01HZX…"),
+            }),
+        })),
+        v.show(a_info, .{v.attrs(.{ .test_id = "story.alert.info" }, W.Alert(.{ .variant = .info, .title = "A new version is ready", .message = "Update when you’re ready. Your workspace will be restored.", .action_label = "View update", .action_icon_asset = ui.icons.arrow_up_right, .closable = true, .on_close = ui.on.set(a_info, false) }))}),
+        v.show(a_ok, .{v.attrs(.{ .test_id = "story.alert.success" }, W.Alert(.{ .variant = .success, .title = "All changes saved", .message = "Your project is up to date across your devices.", .closable = true, .on_close = ui.on.set(a_ok, false) }))}),
+        v.show(a_warn, .{v.attrs(.{ .test_id = "story.alert.warning" }, W.Alert(.{ .variant = .warning, .title = "You’re working offline", .message = "Changes stay on this device until you reconnect.", .action_label = "Retry connection", .action_icon_asset = ui.icons.rotate_cw, .closable = true, .on_close = ui.on.set(a_warn, false) }))}),
         // not closable: no × at all
-        W.Alert(.{ .variant = .@"error", .title = "Error", .message = "Something broke." }),
+        W.Alert(.{
+            .variant = .@"error",
+            .title = "We couldn’t save your changes",
+            .message = "Your edits are safe. Check your connection and try again.",
+            .action_label = "Try again",
+            .action_icon_asset = ui.icons.rotate_ccw,
+        }),
         // No title (message only)
         W.Alert(.{ .variant = .info, .message = "Title-less alert with just a message." }),
         v.attrs(.{ .test_id = "story.alert.restore" }, W.Button(.{ .label = "Restore", .size = .sm, .variant = .secondary, .on_click = restore })),
@@ -742,6 +818,8 @@ pub fn buildAlert(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 
 // -- Notification (design § 16 in-app global alert) --
 pub const buildNotification = @import("notification_story.zig").build;
+pub const buildAnchorTransition = @import("anchor_transition_story.zig").build;
+pub const buildGenie = @import("genie_story.zig").build;
 pub const buildPaintReplay = @import("paint_replay_story.zig").build;
 
 // ── Timeline ──
@@ -1031,7 +1109,7 @@ pub fn buildGlassBox(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         const group = try W.GlassGroup(.{ .spacing = 0, .gap = 16 }).mountWithState(scope, cx);
         const card_shape: W.glass_box.GlassBoxShape = .{ .rounded = 20 };
         const card_w: f32 = 160;
-        const body_style = ui.TextStyle{ .font_size = 13, .font_weight = 450, .color = cx.tokens.tokens.color.fg_primary, .wrap = .word };
+        const body_style = ui.TextStyle{ .font_size = 13, .font_weight = 450, .color = cx.tokens.tokens.color.fg_primary, .wrap = .word_break };
         const regular = try W.GlassShape(.{ .title = "Regular", .subtitle = "adaptive, legible", .shape = card_shape, .width = card_w }).mountIn(group, scope, cx);
         try regular.body.appendChild(a, try ui.text(cx, "Functional layer content.", body_style));
         const inter = try W.GlassShape(.{ .title = "Interactive", .subtitle = "hover / press me", .shape = card_shape, .width = card_w, .interactive = true }).mountIn(group, scope, cx);
@@ -1653,14 +1731,14 @@ pub fn buildBlendLab(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         const n = try blendAbs(cx, stage, 40 + 200 * @as(f32, @floatFromInt(j)), 620, 100, 40, white);
         const ext = try n.style.ensureExtFallible(a);
         ext.corner_radius = ui.CornerRadius.uniform(10);
-        n.style.border = .{ .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 10 };
+        n.style.border = .{ .overlay = true, .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 10 };
         ext.setShadow(.{ .color = ui.Color.rgba(0, 0, 0, @intFromFloat(@round(sv[2] * 255))), .blur = 2 * sv[0], .offset_x = 0, .offset_y = sv[1] });
     }
     // Corner edge AA and scaled image
     _ = try blendAbs(cx, stage, 0, 680, 640, 80, white);
     const edge = try blendAbs(cx, stage, 20, 700, 60, 40, black);
     (try edge.style.ensureExtFallible(a)).corner_radius = ui.CornerRadius.uniform(12);
-    edge.style.border = .{ .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 12 };
+    edge.style.border = .{ .overlay = true, .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 12 };
     if (g_blend_checker_texture) |tex| {
         for ([_][3]f32{ .{ 120, 696, 48 }, .{ 200, 712, 16 } }) |cv| {
             const img = try ui.image(cx, tex, .{ .width = .{ .px = cv[2] }, .height = .{ .px = cv[2] }, .position = .absolute });
@@ -1730,7 +1808,7 @@ pub fn buildGlassConcentric(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
             const ext = try cell.style.ensureExtFallible(a);
             ext.inset = .{ .left = .{ .px = 20 + 140 * @as(f32, @floatFromInt(ci)) }, .top = .{ .px = 20 + 140 * @as(f32, @floatFromInt(r)) } };
             ext.corner_radius = ui.CornerRadius.uniform(30);
-            cell.style.border = .{ .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 30 };
+            cell.style.border = .{ .overlay = true, .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 30 };
             try W.concentric.containerShape(cell, a, 30);
             const p = pads[ci];
             var child: *ui.Node = undefined;
@@ -1757,6 +1835,72 @@ pub fn buildGlassConcentric(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     }
     try c.appendChild(a, stage);
     return c;
+}
+
+// -- JoinedSurface: rounded rectangles joined into one surface (docs/design/joined-surface.md).
+// Folder tabs: W.Tabs draws no slider (indicator .none) and publishes the selected tab
+// (active_node); a W.JoinedSurface under the tabs and the panel joins the selected tab to the
+// panel: concave joins shrink as the tab nears the panel edge (straight line when flush),
+// corners are concentric with the card (16 - 6 = 10), and switching morphs the outline.
+// "Slow x10" stretches the morph to watch it. Below: a three-row selection as one surface.
+const joined_items = [_]W.tabs.TabItem{
+    .{ .id = "overview", .label = "Overview", .test_id = "story.joined.tab.overview" },
+    .{ .id = "activity", .label = "Activity", .test_id = "story.joined.tab.activity" },
+    .{ .id = "members", .label = "Members", .test_id = "story.joined.tab.members" },
+    .{ .id = "files", .label = "Files", .test_id = "story.joined.tab.files" },
+};
+
+const JoinedStory = struct {
+    cx: *ui.Cx,
+    surface: *W.joined_surface.Surface,
+    panel: W.joined_surface.Target,
+    active: *ui.Signal(?ui.hit.NodeHandle),
+    slow: *ui.Signal(bool),
+
+    fn sync(self: *JoinedStory) void {
+        const tab: W.joined_surface.Target = if (self.active.get()) |h| .{ .node = h } else .none;
+        self.surface.setMembers(&.{ .{ .target = tab, .radii = @splat(10) }, .{ .target = self.panel, .radii = @splat(10) } }) catch |err| std.log.err("joined story: {}", .{err});
+    }
+    fn pace(self: *JoinedStory) void {
+        self.surface.setMotion(.{ .duration_s = if (self.slow.get()) 2.5 else null });
+    }
+};
+
+pub fn buildJoinedSurface(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
+    const a = cx.allocator;
+    const page = try col(cx, 12);
+    const active = try scope.createSignal(?ui.hit.NodeHandle, null);
+    const slow = try scope.createSignal(bool, false);
+    const card = try v.render(scope, cx, v.box(.{ .style = S.joinedCard, .test_id = "story.joined.card" }, {}));
+    const plate = try v.render(scope, cx, v.box(.{ .style = S.joinedPlate, .test_id = "story.joined.surface" }, {}));
+    try card.appendChild(a, plate);
+    const surface = try W.joined_surface.attach(scope, cx, plate, .{ .join_radius = 10 });
+    const tabs = try W.Tabs(.{ .items = &joined_items, .variant = .underline, .indicator = .none, .active_node = active }).mount(scope, cx);
+    try card.appendChild(a, tabs);
+    const panel = try v.render(scope, cx, v.col(.{ .style = S.joinedPanel, .test_id = "story.joined.panel" }, .{
+        label("The selected tab and this panel are one surface: one outline, one continuous border."),
+        label("Select the first tab: flush with the panel edge, the join becomes a straight line."),
+    }));
+    try card.appendChild(a, panel);
+    const story = try scope.createState(JoinedStory, .{ .cx = cx, .surface = surface, .panel = try W.joined_surface.targetOf(cx, panel), .active = active, .slow = slow });
+    try scope.createEffect(story, JoinedStory.sync);
+    try scope.createEffect(story, JoinedStory.pace);
+    try page.appendChild(a, try v.render(scope, cx, v.attrs(.{ .test_id = "story.joined.slow" }, W.Switch(.{ .label = "Slow x10", .checked = slow }))));
+    try page.appendChild(a, card);
+
+    // A selection over three lines of different lengths, as one surface.
+    try page.appendChild(a, try v.render(scope, cx, label("Selection rows (radius 4, join 4)")));
+    const stage = try v.render(scope, cx, v.box(.{ .style = S.joinedSelectionStage }, {}));
+    const selection = try v.render(scope, cx, v.box(.{ .style = S.joinedSelection, .test_id = "story.joined.selection" }, {}));
+    try stage.appendChild(a, selection);
+    const rows = try W.joined_surface.attach(scope, cx, selection, .{ .join_radius = 4 });
+    try rows.setMembers(&.{
+        .{ .target = .{ .rect = .{ .x = 180, .y = 10, .w = 360, .h = 24 } }, .radii = @splat(4) },
+        .{ .target = .{ .rect = .{ .x = 20, .y = 34, .w = 520, .h = 24 } }, .radii = @splat(4) },
+        .{ .target = .{ .rect = .{ .x = 20, .y = 58, .w = 240, .h = 24 } }, .radii = @splat(4) },
+    });
+    try page.appendChild(a, stage);
+    return page;
 }
 
 // -- GlassAppKit: NSGlassEffectView parameters (native_appkit_glass_params.swift /
@@ -1945,81 +2089,90 @@ pub fn buildGlassIosLens(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 
 pub fn buildGlassIosBars(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const a = cx.allocator;
-    const icons = ui.icons;
     const c = try col(cx, 10);
     try c.appendChild(a, try labelNode(cx, "iOS bars (idiom .ios): navigation bar, large title, bottom toolbar, tab bar, glass buttons — metrics from UIKit's own view hierarchy"));
+    // Gray 128: the backdrop every native measurement was taken over.
+    try c.appendChild(a, try iosBarsSet(scope, cx, "story.iosbars", ui.Color.rgba(128, 128, 128, 255)));
+    // The same set on a white page (system light, the common app background), framed so the page
+    // edge is visible against the white story panel. Glass adapts to what is behind it: the
+    // selection plate follows the platter body, so it reads much lighter here than over gray.
+    try c.appendChild(a, try labelNode(cx, "Light page (white, system light): the same bars over the common app background"));
+    const page = try ui.box(cx, .{ .direction = .column, .padding = ui.Padding.all(16), .background = ui.Color.rgba(255, 255, 255, 255), .border_width = 1, .border_color = ui.Color.rgba(220, 220, 216, 255) }, .{});
+    (try page.style.ensureExtFallible(a)).corner_radius = ui.CornerRadius.uniform(14);
+    page.meta.ownership.meta.test_id = "story.iosbars.white.page";
+    try page.appendChild(a, try iosBarsSet(scope, cx, "story.iosbars.white", ui.Color.rgba(255, 255, 255, 255)));
+    try c.appendChild(a, page);
+    return c;
+}
+
+/// One set of iOS bars over `bg`: navigation bar, large title, bottom toolbar and tab bar in a
+/// column, glass buttons beside them. Test ids are `<p>.nav`, `<p>.tab.home`, `<p>.btn.clear`, ...
+fn iosBarsSet(scope: *ui.Scope, cx: *ui.Cx, comptime p: []const u8, bg: ui.Color) !*ui.Node {
+    const a = cx.allocator;
+    const icons = ui.icons;
     const B = W.glass_bars;
     const bars_row = try ui.box(cx, .{ .direction = .row, .gap = 16, .align_items = .start }, .{});
     const left = try col(cx, 10);
 
-    const nav_strip = try iosStrip(cx, 70, "story.iosbars.nav");
-    const nav_icons = [_]B.BarIcon{ .{ .icon = icons.ellipsis, .label = "More", .test_id = "story.iosbars.nav.more" }, .{ .icon = icons.share, .label = "Share", .test_id = "story.iosbars.nav.share" } };
+    const nav_strip = try iosStripOn(cx, 70, p ++ ".nav", bg);
+    const nav_icons = [_]B.BarIcon{ .{ .icon = icons.ellipsis, .label = "More", .test_id = p ++ ".nav.more" }, .{ .icon = icons.share, .label = "Share", .test_id = p ++ ".nav.share" } };
     const nav = try W.GlassNavigationBar(.{
         .title = "Message",
         .subtitle = "2 unread",
         .back = cx.on(StoryNoop, &story_noop, StoryNoop.f),
-        .back_test_id = "story.iosbars.nav.back",
-        .trailing = &[_]B.BarGroup{ .{ .icons = &nav_icons }, .{ .prominent = .{ .title = "Done", .test_id = "story.iosbars.nav.done" } } },
+        .back_test_id = p ++ ".nav.back",
+        .trailing = &[_]B.BarGroup{ .{ .icons = &nav_icons }, .{ .prominent = .{ .title = "Done", .test_id = p ++ ".nav.done" } } },
         .width = 402,
     }).mount(scope, cx);
     nav.root.style.margin = .{ .top = 8 };
     try nav_strip.appendChild(a, nav.root);
     try left.appendChild(a, nav_strip);
 
-    const large_strip = try iosStrip(cx, 140, "story.iosbars.large");
+    const large_strip = try iosStripOn(cx, 140, p ++ ".large", bg);
     const large = try W.GlassNavigationBar(.{
         .title = "Library",
         .subtitle = "128 items",
         .large_title = true,
-        .trailing = &[_]B.BarGroup{.{ .icons = &[_]B.BarIcon{.{ .icon = icons.plus, .label = "Add", .test_id = "story.iosbars.large.add" }} }},
+        .trailing = &[_]B.BarGroup{.{ .icons = &[_]B.BarIcon{.{ .icon = icons.plus, .label = "Add", .test_id = p ++ ".large.add" }} }},
         .width = 402,
     }).mount(scope, cx);
     large.root.style.margin = .{ .top = 8 };
     try large_strip.appendChild(a, large.root);
     try left.appendChild(a, large_strip);
 
-    const tool_strip = try iosStrip(cx, 70, "story.iosbars.toolbar");
+    const tool_strip = try iosStripOn(cx, 70, p ++ ".toolbar", bg);
     const tool_icons = [_]B.BarIcon{ .{ .icon = icons.folder, .label = "Folder" }, .{ .icon = icons.trash, .label = "Trash" } };
     const tool = try W.GlassBottomToolbar(.{
-        .groups = &[_]B.BarGroup{ .{ .icons = &tool_icons }, .flexible_space, .{ .prominent = .{ .icon = icons.square_pen, .label = "Compose", .test_id = "story.iosbars.toolbar.compose" } } },
+        .groups = &[_]B.BarGroup{ .{ .icons = &tool_icons }, .flexible_space, .{ .prominent = .{ .icon = icons.square_pen, .label = "Compose", .test_id = p ++ ".toolbar.compose" } } },
         .width = 402,
     }).mount(scope, cx);
     tool.root.style.margin = .{ .top = 11 };
     try tool_strip.appendChild(a, tool.root);
     try left.appendChild(a, tool_strip);
 
-    const tab_strip = try iosStrip(cx, 84, "story.iosbars.tabbar");
-    const tabs = [_]B.TabItem{ .{ .icon = icons.house, .label = "Home", .test_id = "story.iosbars.tab.home" }, .{ .icon = icons.library, .label = "Library", .test_id = "story.iosbars.tab.library" }, .{ .icon = icons.radio, .label = "Radio", .test_id = "story.iosbars.tab.radio" } };
-    const tab = try W.GlassTabBar(.{ .tabs = &tabs, .search = .{ .icon = icons.search, .label = "Search", .test_id = "story.iosbars.tab.search" }, .width = 402, .test_id = "story.iosbars.tb" }).mount(scope, cx);
+    const tab_strip = try iosStripOn(cx, 84, p ++ ".tabbar", bg);
+    const tabs = [_]B.TabItem{ .{ .icon = icons.house, .label = "Home", .test_id = p ++ ".tab.home" }, .{ .icon = icons.library, .label = "Library", .test_id = p ++ ".tab.library" }, .{ .icon = icons.radio, .label = "Radio", .test_id = p ++ ".tab.radio" } };
+    const tab = try W.GlassTabBar(.{ .tabs = &tabs, .search = .{ .icon = icons.search, .label = "Search", .test_id = p ++ ".tab.search" }, .width = 402, .test_id = p ++ ".tb" }).mount(scope, cx);
     tab.root.style.margin = .{ .top = 11 };
     try tab_strip.appendChild(a, tab.root);
     try left.appendChild(a, tab_strip);
-    // The same tab bar over a white page (system light, the common app background): the
-    // selection plate follows the platter body, so it reads much lighter here than over gray.
-    const white_strip = try iosStripOn(cx, 84, "story.iosbars.tabbar.white", ui.Color.rgba(255, 255, 255, 255));
-    const white_tabs = [_]B.TabItem{ .{ .icon = icons.house, .label = "Home", .test_id = "story.iosbars.white.tab.home" }, .{ .icon = icons.library, .label = "Library", .test_id = "story.iosbars.white.tab.library" }, .{ .icon = icons.radio, .label = "Radio", .test_id = "story.iosbars.white.tab.radio" } };
-    const white_tab = try W.GlassTabBar(.{ .tabs = &white_tabs, .search = .{ .icon = icons.search, .label = "Search" }, .width = 402, .test_id = "story.iosbars.white.tb" }).mount(scope, cx);
-    white_tab.root.style.margin = .{ .top = 11 };
-    try white_strip.appendChild(a, white_tab.root);
-    try left.appendChild(a, white_strip);
     try bars_row.appendChild(a, left);
 
-    const btn_strip = try iosStrip(cx, 380, "story.iosbars.buttons");
+    const btn_strip = try iosStripOn(cx, 380, p ++ ".buttons", bg);
     btn_strip.style.width = .{ .px = 220 };
     btn_strip.style.align_items = .center;
     btn_strip.style.justify = .center;
     btn_strip.style.gap = 18;
     const styles = [_]struct { t: []const u8, s: B.GlassButtonStyle, id: []const u8 }{
-        .{ .t = "Glass", .s = .glass, .id = "story.iosbars.btn.glass" },
-        .{ .t = "Prominent", .s = .prominent_glass, .id = "story.iosbars.btn.prominent" },
-        .{ .t = "Clear", .s = .clear_glass, .id = "story.iosbars.btn.clear" },
-        .{ .t = "Prominent Clear", .s = .prominent_clear_glass, .id = "story.iosbars.btn.prominent_clear" },
+        .{ .t = "Glass", .s = .glass, .id = p ++ ".btn.glass" },
+        .{ .t = "Prominent", .s = .prominent_glass, .id = p ++ ".btn.prominent" },
+        .{ .t = "Clear", .s = .clear_glass, .id = p ++ ".btn.clear" },
+        .{ .t = "Prominent Clear", .s = .prominent_clear_glass, .id = p ++ ".btn.prominent_clear" },
     };
     for (styles) |st| try btn_strip.appendChild(a, (try W.GlassButton(.{ .title = st.t, .style = st.s, .test_id = st.id }).mount(scope, cx)).root);
-    try btn_strip.appendChild(a, (try W.GlassButton(.{ .icon = icons.heart, .label = "Like", .test_id = "story.iosbars.btn.icon" }).mount(scope, cx)).root);
+    try btn_strip.appendChild(a, (try W.GlassButton(.{ .icon = icons.heart, .label = "Like", .test_id = p ++ ".btn.icon" }).mount(scope, cx)).root);
     try bars_row.appendChild(a, btn_strip);
-    try c.appendChild(a, bars_row);
-    return c;
+    return bars_row;
 }
 
 const StoryNoop = struct {
@@ -2229,7 +2382,7 @@ pub fn buildGlassAdapt(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         var hb: [48]u8 = undefined;
         try band.appendChild(a, try ui.text(cx, try std.fmt.bufPrint(&hb, "Background {d}", .{lv}), .{ .font_size = 22, .font_weight = 700, .color = ink }));
         for (0..4) |_| {
-            try band.appendChild(a, try ui.text(cx, "Liquid Glass adapts to what is behind it: small floating controls switch between light and dark, large surfaces keep their family.", .{ .font_size = 14, .color = ink, .wrap = .word }));
+            try band.appendChild(a, try ui.text(cx, "Liquid Glass adapts to what is behind it: small floating controls switch between light and dark, large surfaces keep their family.", .{ .font_size = 14, .color = ink, .wrap = .word_break }));
         }
         try sa.content.appendChild(a, band);
     }
@@ -2256,14 +2409,14 @@ pub fn buildGlassAdapt(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 
     // Large regular panel: bottom-right corner
     const panel = try W.GlassBox(.{ .width = 220, .title = "Regular panel", .subtitle = "larger than 64 pt: keeps its family", .shape = .{ .rounded = 20 } }).mountWithState(scope, cx);
-    try panel.body.appendChild(a, try ui.text(cx, "Material still adapts: the backdrop shows through, the shadow and rim follow.", .{ .font_size = 13, .color = cx.tokens.tokens.color.fg_primary, .wrap = .word }));
+    try panel.body.appendChild(a, try ui.text(cx, "Material still adapts: the backdrop shows through, the shadow and rim follow.", .{ .font_size = 13, .color = cx.tokens.tokens.color.fg_primary, .wrap = .word_break }));
     panel.box.style.position = .absolute;
     (try panel.box.style.ensureExtFallible(a)).inset = .{ .right = .{ .px = 20 }, .bottom = .{ .px = 20 } };
     panel.box.meta.ownership.meta.test_id = "story.glassadapt.panel";
     try stage.appendChild(a, panel.box);
     try c.appendChild(a, stage);
 
-    const st = try cx.bindState(GlassAdaptStory, .{ .cx = cx, .bar = tb.runtime.items.items[0].glass, .panel = panel.state, .status = status });
+    const st = try cx.bindState(GlassAdaptStory, .{ .cx = cx, .bar = tb.runtime.items.items[0].glass.?, .panel = panel.state, .status = status });
     status.behavior.events.event_context = @ptrCast(st);
     status.addBeforeRender(GlassAdaptStory.refresh);
     return c;
@@ -2295,7 +2448,7 @@ pub fn buildGlassPopover(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     {
         const panel = pop.chrome;
         panel.setBackground(ui.Color.rgba(0, 0, 0, 0));
-        panel.style.border = .{ .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 0 };
+        panel.style.border = .{ .overlay = true, .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 0 };
         panel.style.padding = ui.Padding.all(0);
         panel.style.overflow_hidden = false;
         const ext = panel.style.ensureExtPanic(a);
@@ -2344,7 +2497,7 @@ pub fn buildGlassPopover(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     {
         const panel = menu.chrome;
         panel.setBackground(ui.Color.rgba(0, 0, 0, 0));
-        panel.style.border = .{ .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 0 };
+        panel.style.border = .{ .overlay = true, .width = 0, .color = ui.Color.rgba(0, 0, 0, 0), .radius = 0 };
         panel.style.padding = ui.Padding.all(0);
         panel.style.overflow_hidden = false;
         const ext = panel.style.ensureExtPanic(a);
@@ -2539,6 +2692,7 @@ pub fn buildGlassIslands(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     _ = scope;
     const a = cx.allocator;
     const c = try col(cx, 12);
+    c.style.ensureExtPanic(a).align_self = .stretch;
 
     const bd = try glassBackdrop(cx, 420);
     // High-freq black/white stripe target pressed under first island left edge (islands_row
@@ -2583,7 +2737,7 @@ pub fn buildGlassIslands(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
             // contrast
             // window (96 at 37% white lifts sharp black to ~160, blur ~190, can't catch regression)
             .background = ui.Color.rgba(255, 255, 255, 40),
-            .border = .{ .width = 1, .color = ui.Color.rgba(255, 255, 255, 140), .radius = 12 },
+            .border = .{ .overlay = true, .width = 1, .color = ui.Color.rgba(255, 255, 255, 140), .radius = 12 },
             .overflow_hidden = true,
         }, .{});
         const ext = try island.style.ensureExtFallible(a);
@@ -2618,20 +2772,33 @@ pub fn buildGlassIslands(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 }
 
 // ── Stack (VStack / HStack) ──
+const LayoutPreviewS = struct {
+    fn chip(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .background = t.tokens.color.bg_secondary, .padding = ui.Padding.symmetric(t.tokens.space.space100, t.tokens.space.space200), .corner_radius = t.tokens.radius.md };
+    }
+    fn text(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = t.tokens.font_size.sm, .line_height = 1.4, .color = t.tokens.color.fg_primary };
+    }
+    fn cell(t: *const ui.theme.Values) ui.BoxStyle {
+        // COMPONENTS.json Grid: 52px cells separated by 8px.
+        return .{ .width = .fixed(52), .height = .fixed(52), .background = t.tokens.color.bg_secondary, .border = .{ .overlay = true, .width = 1, .color = t.tokens.color.border, .radius = t.tokens.radius.md } };
+    }
+};
+const layout_chip_props = .{ .style = LayoutPreviewS.chip };
+const layout_text_props = .{ .style = LayoutPreviewS.text };
+fn layoutChip(text: []const u8) @TypeOf(v.box(layout_chip_props, v.text(layout_text_props, text))) {
+    return v.box(layout_chip_props, v.text(layout_text_props, text));
+}
 
 pub fn buildStack(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
         label("HStack gap=8"),
         v.with(W.HStack(.{ .gap = 8 }), .{
-            W.Button(.{ .label = "A", .variant = .secondary }),
-            W.Button(.{ .label = "B", .variant = .secondary }),
-            W.Button(.{ .label = "C", .variant = .secondary }),
+            layoutChip("One"), layoutChip("Two"), layoutChip("Three"),
         }),
         label("VStack gap=8"),
-        v.with(W.VStack(.{ .gap = 8 }), .{
-            W.Tag(.{ .label = "First" }),
-            W.Tag(.{ .label = "Second" }),
-            W.Tag(.{ .label = "Third" }),
+        v.with(W.VStack(.{ .gap = 8, .align_items = .start }), .{
+            layoutChip("One"), layoutChip("Two"), layoutChip("Three"),
         }),
         label("justify: start / center / space_between (width 320)"),
         v.with(W.VStack(.{ .gap = 6 }), .{
@@ -2656,181 +2823,143 @@ pub fn buildStack(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     }));
 }
 
-// -- Layout / Box Model --
-//
-// Not a decoration demo but a visual spec page for the layout engine. Fixed sizes and stable
-// test_id let manual screenshots and Harness geometry asserts share one tree, covering the CSS
-// padding-box absolute containing block, Flex/Grid out-of-flow, size modes, margin/gap and
-// overflow.
+// -- Layout / Box Model (Pencil P2hzl) --
+// The diagrams use real layout and preserve the Harness anchors for the geometry checks.
 const layout_col = struct {
-    const surface = ui.Color.rgba(248, 250, 252, 255);
-    const line = ui.Color.rgba(148, 163, 184, 255);
-    const padding = ui.Color.rgba(254, 243, 199, 255);
-    const content = ui.Color.rgba(219, 234, 254, 255);
-    const flow = ui.Color.rgba(37, 99, 235, 255);
-    const flow_alt = ui.Color.rgba(14, 116, 144, 255);
-    const absolute = ui.Color.rgba(225, 29, 72, 255);
-    const stretch = ui.Color.rgba(22, 163, 74, 210);
-    const guide = ui.Color.rgba(100, 116, 139, 150);
-    const ink_on_color = ui.Color.rgba(255, 255, 255, 255);
-    const violet = ui.Color.rgba(124, 58, 237, 255);
+    const surface = ui.arb.hex(0xF8F9FB);
+    const line = ui.arb.hex(0xE8EBF0);
+    const content = ui.arb.hex(0xEAEDFD);
+    const content_border = ui.arb.hex(0xB5BEF5);
+    const neutral = ui.arb.hex(0xEFEFF1);
+    const danger = ui.arb.hex(0xFEF2F2);
+    const guide = ui.arb.hex(0xD4D4D8);
+    const accent_ink = ui.arb.hex(0x3F4BBC);
+    const neutral_ink = ui.arb.hex(0x5C5C64);
+    const danger_ink = ui.arb.hex(0xDC2626);
 };
 
 const LayoutS = struct {
-    fn page(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .gap = 22, .width = .{ .px = 720 } };
+    const page = ui.css(.{ .width = .fill, .max_width = 960, .align_self = .stretch, .gap = 32 });
+    const header = ui.css(.{ .width = .fill, .gap = 8 });
+    const eyebrow = ui.css(.{ .font_size = .xs, .font_weight = 600, .color = .accent });
+    const title = ui.css(.{ .font_size = .xxxl, .font_weight = 600, .color = .fg_primary, .width = .fill, .wrap = .word_break });
+    const intro = ui.css(.{ .font_size = .md, .color = .fg_secondary, .width = .fill, .wrap = .word_break });
+    const section = ui.css(.{
+        .width = .fill,
+        .gap = 16,
+        .padding = .{ .top = 24 },
+        .border_top_width = 1,
+        .border_color = .border,
+    });
+    const sectionTitle = ui.css(.{ .font_size = .lg, .font_weight = 600, .color = .fg_primary, .width = .fill, .wrap = .word_break });
+    const sectionDetail = ui.css(.{ .font_size = .sm, .color = .fg_secondary, .width = .fill, .wrap = .word_break });
+    const footnote = ui.css(.{ .font_size = .xs, .color = .fg_tertiary, .width = .fill, .wrap = .word_break });
+    const samples = ui.css(.{ .width = .fill, .gap = 16, .flex_wrap = .wrap, .align_items = .start });
+    const sample = ui.css(.{ .width = .{ .grow = .{ .min = 280 } }, .flex_basis = 280, .gap = 8 });
+    const compactSample = ui.css(.{ .width = .{ .grow = .{ .min = 160 } }, .flex_basis = 160, .gap = 8 });
+    const grow = ui.css(.{ .width = .fill });
+    const fit = ui.css(.{ .width = .fit });
+    const listSplit = ui.css(.{ .width = .fill, .gap = 32, .flex_wrap = .wrap, .align_items = .start });
+    const listViewport = ui.css(.{ .width = .{ .grow = .{ .min = 280, .max = 460 } }, .flex_basis = 400 });
+    const listFrame = ui.css(.{ .width = .fill, .background = .bg_primary, .border_overlay = true, .border_width = 1, .border_color = .border, .corner_radius = 4 });
+    const listSteps = ui.css(.{ .width = .{ .grow = .{ .min = 240 } }, .flex_basis = 240, .gap = 16 });
+    const listStep = ui.css(.{ .width = .fill, .gap = 12, .align_items = .start });
+    const stepText = ui.css(.{ .width = .fill, .min_width = 0, .gap = 2 });
+    const stepTitle = ui.css(.{ .font_size = .md, .font_weight = 600, .color = .fg_primary });
+    const listIndexBox = ui.css(.{ .width = 20, .flex_shrink = 0 });
+    const listTextBox = ui.css(.{ .width = .fill, .min_width = 0 });
+    const listText = ui.css(.{ .font_size = .md, .line_height = 1.45, .color = .fg_primary, .wrap = .word_break });
+    const listHighlight = ui.css(.{ .color = .accent });
+    const listRow = ui.css(.{ .width = .fill, .gap = 12, .padding = .{ .x = 12, .y = 8 }, .border_overlay = true, .border_bottom_width = 1, .border_color = .border });
+    const listSelected = ui.css(.{ .background = .selection_bg });
+
+    fn listIndex(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = t.tokens.font_size.xs, .color = t.tokens.color.fg_tertiary, .use_monospace_font = true };
     }
-    fn coverage(_: *const ui.theme.Values) ui.BoxStyle {
+
+    fn arena(height: f32, padding: Padding) ui.BoxStyle {
         return .{
-            .width = .{ .px = 700 },
-            .gap = 4,
-            .padding = Padding.all(14),
-            .background = layout_col.surface,
-            .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
-        };
-    }
-    fn coverageTitle(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 13, .font_weight = 700, .color = t.tokens.color.fg_primary };
-    }
-    fn sectionTitle(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 15, .font_weight = 700, .color = t.tokens.color.fg_primary };
-    }
-    fn sectionDetail(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 12, .color = t.tokens.color.fg_secondary };
-    }
-    fn badgeText(_: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 11, .font_weight = 650, .color = layout_col.ink_on_color };
-    }
-    fn arena(width: f32, height: f32, padding: Padding) ui.BoxStyle {
-        return .{
-            .width = .{ .px = width },
-            .height = .{ .px = height },
+            .width = .{ .grow = .{} },
+            .height = .fixed(height),
+            .flex_shrink = 0,
             .position = .relative,
             .padding = padding,
-            .background = layout_col.padding,
-            .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
-            .overflow_hidden = true,
+            .background = layout_col.surface,
+            .border = .{ .overlay = true, .width = 1, .color = layout_col.line, .radius = 6 },
         };
     }
     fn contentGuide(_: *const ui.theme.Values) ui.BoxStyle {
         return .{
-            .position = .absolute,
             .width = .{ .grow = .{} },
             .height = .{ .grow = .{} },
             .justify = .center,
             .align_items = .center,
             .background = layout_col.content,
-            .border = .{ .width = 1, .color = ui.Color.rgba(96, 165, 250, 255), .radius = 4 },
+            .border = .{ .overlay = true, .width = 1, .color = layout_col.content_border, .radius = 4 },
         };
     }
-    fn contentGuideText(_: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 12, .font_weight = 650, .color = ui.Color.rgba(30, 64, 175, 255) };
-    }
-    fn vguide(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .position = .absolute, .width = .{ .px = 1 }, .height = .{ .grow = .{} }, .background = layout_col.guide };
-    }
-    fn hguide(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .position = .absolute, .width = .{ .grow = .{} }, .height = .{ .px = 1 }, .background = layout_col.guide };
-    }
-    fn stretchChild(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{
-            .position = .absolute,
-            .width = .{ .grow = .{} },
-            .height = .{ .grow = .{} },
-            .justify = .center,
-            .align_items = .center,
-            .background = layout_col.stretch,
-            .border = .{ .radius = 5 },
-        };
-    }
-    fn stretchText(_: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 12, .font_weight = 650, .color = layout_col.ink_on_color };
-    }
+    const guideText = ui.css(.{ .font_size = .xs, .color = layout_col.accent_ink });
+    const vguide = ui.BoxStyle{
+        .position = .absolute,
+        .inset = .{ .left = .{ .percent = 25 }, .top = .{ .px = 0 }, .bottom = .{ .px = 0 } },
+        .width = .fixed(1),
+        .height = .{ .grow = .{} },
+        .background = layout_col.guide,
+    };
+    const hguide = ui.BoxStyle{
+        .position = .absolute,
+        .inset = .{ .top = .{ .percent = 50 }, .left = .{ .px = 0 }, .right = .{ .px = 0 } },
+        .height = .fixed(1),
+        .width = .{ .grow = .{} },
+        .background = layout_col.guide,
+    };
+
     fn flexParent(_: *const ui.theme.Values) ui.BoxStyle {
-        var s = arena(342, 170, Padding.all(20));
+        var s = arena(110, Padding.all(20));
         s.gap = 12;
         s.align_items = .center;
         return s;
     }
     fn sizingParent(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{
-            .width = .{ .px = 700 },
-            .height = .{ .px = 100 },
-            .align_items = .center,
-            .gap = 10,
-            .padding = Padding.all(20),
-            .background = layout_col.content,
-            .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
-        };
+        var s = arena(100, Padding.all(20));
+        s.align_items = .center;
+        s.gap = 10;
+        return s;
     }
-    fn grow(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .grow = .{} } };
-    }
-    fn absolute(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .position = .absolute };
-    }
-    /// Absolute position + four-edge offset
     fn absAt(inset: ui.Inset) ui.BoxStyle {
         return .{ .position = .absolute, .inset = inset };
     }
-    /// Offset only (position from same-group style)
-    fn at(inset: ui.Inset) ui.BoxStyle {
-        return .{ .inset = inset };
-    }
-    fn fit(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .fit = .{} } };
-    }
-    /// flex.grow badge: grow + right margin 10 (rest edge stay 0)
-    fn growMarginRight(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .grow = .{} }, .margin = .{ .right = 10 } };
-    }
 };
 
-const LayoutBadge = struct { txt: []const u8, w: f32, h: f32, bg: ui.Color };
+const LayoutBadge = struct {
+    txt: []const u8,
+    w: f32,
+    h: f32,
+    tone: enum { neutral, accent, danger },
+};
 
-/// Color block badge (fixed size + center white text): component form, outer layer via
-/// attrs stack position and test_id.
 fn layoutBadgeView(p: LayoutBadge, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    const bg, const ink = switch (p.tone) {
+        .neutral => .{ layout_col.neutral, layout_col.neutral_ink },
+        .accent => .{ layout_col.content, layout_col.accent_ink },
+        .danger => .{ layout_col.danger, layout_col.danger_ink },
+    };
     return v.render(scope, cx, v.box(.{ .style = ui.BoxStyle{
-        .width = .{ .px = p.w },
-        .height = .{ .px = p.h },
+        .width = .fixed(p.w),
+        .height = .fixed(p.h),
         .justify = .center,
         .align_items = .center,
-        .background = p.bg,
-        .border = .{ .radius = 5 },
-    } }, v.text(.{ .style = LayoutS.badgeText }, p.txt)));
+        .background = bg,
+        .border = .{ .overlay = true, .radius = 4, .width = if (p.tone == .accent) 1 else 0, .color = layout_col.content_border },
+    } }, v.text(.{ .style = .{ .font_size = ui.arb.px(11), .color = ink } }, p.txt)));
 }
 
-fn layoutBadge(txt: []const u8, w: f32, h: f32, bg: ui.Color) v.ComponentOf(layoutBadgeView) {
-    return v.component(layoutBadgeView, LayoutBadge{ .txt = txt, .w = w, .h = h, .bg = bg });
-}
-
-const LayoutSection = struct { title: []const u8, detail: []const u8 };
-
-fn layoutSectionView(p: LayoutSection, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    return v.render(scope, cx, v.col(.{ .style = S.stack(3) }, .{
-        v.text(.{ .style = LayoutS.sectionTitle }, p.title),
-        v.text(.{ .style = LayoutS.sectionDetail }, p.detail),
-    }));
-}
-
-fn layoutSection(title: []const u8, detail: []const u8) v.ComponentOf(layoutSectionView) {
-    return v.component(layoutSectionView, LayoutSection{ .title = title, .detail = detail });
-}
-
-fn layoutGridPanel(_: *const ui.theme.Values) ui.BoxStyle {
-    return .{
-        .width = .{ .px = 342 },
-        .height = .{ .px = 170 },
-        .padding = Padding.all(20),
-        .background = layout_col.padding,
-        .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
-        .align_items = .center,
-    };
+fn layoutBadge(txt: []const u8, w: f32, h: f32, tone: @FieldType(LayoutBadge, "tone")) v.ComponentOf(layoutBadgeView) {
+    return v.component(layoutBadgeView, .{ .txt = txt, .w = w, .h = h, .tone = tone });
 }
 
 const layout_grid_columns = [_]ui.GridTrackSize{ .{ .px = 70 }, .{ .fr = 1 }, .{ .fr = 2 } };
-const layout_grid_rows = [_]ui.GridTrackSize{.{ .px = 52 }};
+const layout_grid_rows = [_]ui.GridTrackSize{.{ .px = 50 }};
 
 const JustifySpec = struct { justify: ui.JustifyContent, name: []const u8 };
 const layout_justify = [_]JustifySpec{
@@ -2840,20 +2969,20 @@ const layout_justify = [_]JustifySpec{
 };
 
 fn justifySampleView(spec: JustifySpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    return v.render(scope, cx, v.col(.{ .style = S.stack(5) }, .{
+    return v.render(scope, cx, v.col(.{ .style = LayoutS.compactSample }, .{
         label(spec.name),
         v.row(.{ .style = ui.BoxStyle{
-            .width = .{ .px = 220 },
+            .width = .{ .grow = .{} },
             .height = .{ .px = 92 },
             .justify = spec.justify,
             .align_items = .center,
             .gap = 8,
             .padding = Padding.all(12),
             .background = layout_col.content,
-            .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
+            .border = .{ .overlay = true, .width = 1, .color = layout_col.line, .radius = 8 },
         } }, .{
-            layoutBadge("1", 36, 30, layout_col.flow),
-            layoutBadge("2", 36, 30, layout_col.flow_alt),
+            layoutBadge("1", 36, 30, .neutral),
+            layoutBadge("2", 36, 30, .accent),
         }),
     }));
 }
@@ -2869,17 +2998,18 @@ const layout_overflow = [_]OverflowSpec{
 };
 
 fn overflowSampleView(spec: OverflowSpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    return v.render(scope, cx, v.col(.{ .style = S.stack(5) }, .{
+    return v.render(scope, cx, v.col(.{ .style = LayoutS.sample }, .{
         label(spec.name),
         v.box(.{ .style = ui.BoxStyle{
-            .width = .{ .px = 342 },
+            .width = .{ .grow = .{} },
+            .margin = .{ .right = 38 },
             .height = .{ .px = 110 },
             .position = .relative,
             .padding = Padding.all(12),
             .background = layout_col.surface,
-            .border = .{ .width = 1, .color = layout_col.line, .radius = 8 },
+            .border = .{ .overlay = true, .width = 1, .color = layout_col.line, .radius = 8 },
             .overflow_hidden = spec.clipped,
-        } }, v.attrs(.{ .style = LayoutS.absAt(.{ .left = .{ .px = 280 }, .top = .{ .px = 55 } }) }, layoutBadge("100 × 60", 100, 60, layout_col.absolute))),
+        } }, v.attrs(.{ .style = LayoutS.absAt(.{ .right = .{ .px = -38 }, .top = .{ .px = 55 } }) }, layoutBadge("100 × 60", 100, 60, .danger))),
     }));
 }
 
@@ -2887,95 +3017,207 @@ fn overflowSample(spec: OverflowSpec) v.ComponentOf(overflowSampleView) {
     return v.component(overflowSampleView, spec);
 }
 
+const layout_list_copy = [_][]const u8{
+    "Short",
+    "A medium line of explanatory text that wraps onto two rows.",
+    "Very short",
+    "This row is clearly longer: the hard part of a dynamic-height virtual list is that a row only knows its height after it has taken part in layout, yet virtual scrolling wants every row's position before painting.",
+    "Medium: wrapping makes this one taller.",
+    "One line",
+    "Short",
+};
+
+fn layoutListRow(index: usize, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    const id: ?[]const u8 = switch (index) {
+        0 => "story.layoutbox.list.short",
+        3 => "story.layoutbox.list.long",
+        4 => "story.layoutbox.list.after-long",
+        else => null,
+    };
+    return v.render(scope, cx, v.row(.{ .test_id = id, .style = .{ LayoutS.listRow, v.when(index == 3, LayoutS.listSelected) } }, .{
+        v.text(.{ .box = LayoutS.listIndexBox, .style = LayoutS.listIndex }, v.fmt("#{d}", .{index})),
+        v.text(.{ .box = LayoutS.listTextBox, .style = .{ LayoutS.listText, v.when(index == 3, LayoutS.listHighlight) } }, layout_list_copy[index % layout_list_copy.len]),
+    }));
+}
+
+fn layoutListLabel(index: usize, buf: []u8, _: ?*anyopaque) []const u8 {
+    return std.fmt.bufPrint(buf, "#{d} {s}", .{ index, layout_list_copy[index % layout_list_copy.len] }) catch "";
+}
+
+const LayoutListResize = struct {
+    cx: *ui.Cx,
+    list: *W.virtual_list.VirtualListState,
+    width: f32 = 0,
+    remeasure: bool = false,
+
+    fn afterLayout(ctx: *anyopaque, _: u8, last_round: bool) ui.AfterLayoutResult {
+        const self: *LayoutListResize = @ptrCast(@alignCast(ctx));
+        if (self.remeasure) {
+            self.remeasure = false;
+            self.list.updateVisibleItems();
+            return .done;
+        }
+        const width = self.list.container_node.rectFromWorldOrFallback().w;
+        if (width <= 0 or width == self.width) return .done;
+        if (self.width == 0) {
+            self.width = width;
+            return .done;
+        }
+        if (last_round) {
+            self.cx.needs_redraw = true;
+            return .done;
+        }
+        // Previously measured slots have fixed heights. Give the wrapped text
+        // a fresh fit pass before recording heights at the new width.
+        self.width = width;
+        self.remeasure = true;
+        W.virtual_list.invalidateAllMeasurements(self.list);
+        for (self.list.content_node.children.items) |slot| slot.markLayoutDirty();
+        return .needs_layout;
+    }
+
+    fn detach(self: *LayoutListResize) void {
+        self.cx.removeAfterLayoutHook(self);
+    }
+};
+
+fn mountLayoutList(scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    const result = try W.VirtualList(.{
+        .item_count = 200,
+        .measure_items = true,
+        .estimate_item_height = 32,
+        .height = 300,
+        .item_label_fn = layoutListLabel,
+    }).mountScoped(scope, cx, null, struct {
+        fn row(node: *ui.Node, index: usize, row_scope: *ui.Scope, row_cx: *ui.Cx, _: ?*anyopaque) void {
+            v.renderInto(row_scope, row_cx, node, layoutListRow, {}, .{index}, "Box model virtual list row") catch {
+                _ = W.virtual_list.markPoolNodeRenderIncomplete(node);
+            };
+        }
+    }.row);
+    errdefer cx.freeNode(result.container);
+    const list_scope = result.state.scope;
+    const resize = try list_scope.createState(LayoutListResize, .{ .cx = cx, .list = result.state });
+    try list_scope.onCleanup(LayoutListResize, resize, LayoutListResize.detach);
+    try cx.addAfterLayoutHook(resize, LayoutListResize.afterLayout);
+    return result.container;
+}
+
+const LayoutListStep = struct { number: []const u8, title: []const u8, detail: []const u8 };
+const layout_list_steps = [_]LayoutListStep{
+    .{ .number = "1", .title = "Estimate", .detail = "Unmeasured rows reserve estimated_height (32) so the scroll extent exists before first paint." },
+    .{ .number = "2", .title = "Measure", .detail = "Visible rows lay out; the hook records their real height in the same frame (layout → hook → layout)." },
+    .{ .number = "3", .title = "Back-fill", .detail = "Offsets after a changed row shift; total extent updates without a second frame." },
+    .{ .number = "4", .title = "Anchor", .detail = "The first visible row keeps its screen position as scroll_y absorbs the height change above it." },
+};
+
+fn layoutListStep(p: LayoutListStep) v.ComponentOf(layoutListStepView) {
+    return v.component(layoutListStepView, p);
+}
+
+fn layoutListStepView(p: LayoutListStep, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    return v.render(scope, cx, v.row(.{ .style = LayoutS.listStep }, .{
+        v.box(.{ .style = ui.css(.{ .width = 20, .height = 20, .background = layout_col.content, .corner_radius = 10, .align_items = .center, .justify = .center }) }, v.text(.{ .style = LayoutS.guideText }, p.number)),
+        v.col(.{ .style = LayoutS.stepText }, .{
+            v.text(.{ .style = LayoutS.stepTitle }, p.title),
+            v.text(.{ .style = LayoutS.sectionDetail }, p.detail),
+        }),
+    }));
+}
+
 pub fn buildLayoutBoxModel(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const L = LayoutS;
     return v.render(scope, cx, v.col(.{ .style = L.page }, .{
-        // Coverage matrix written at page top, screenshot itself serves manual acceptance
-        // checklist.
-        v.col(.{ .style = L.coverage }, .{
-            v.text(.{ .style = L.coverageTitle }, "Coverage matrix"),
-            label("padding / border / content · px / fit / percent / grow · margin / gap"),
-            label("row / justify / align · Grid px + fr · absolute inset / percent / stretch · overflow clip"),
+        v.col(.{ .style = L.header }, .{
+            v.text(.{ .style = L.eyebrow }, "08B / LAYOUT · SUPPLEMENT"),
+            v.text(.{ .style = L.title }, "Box model · dynamic lists · scrolling"),
+            v.text(.{ .style = L.intro }, "The padding-box contract, percentage and stretch insets, flex vs grid tracks, measured variable-height rows and native scroll boundaries."),
         }),
-
-        // 1) CSS padding-box anatomy. Parent 700x180, asymmetric padding L32/R44/T28/B20.
-        // Absolute right:0/bottom:0 must touch padding edge (Zenit border paint-only, so edge
-        // matches local rect edge).
-        layoutSection("1. Padding-box anatomy + absolute edges", "amber = padding box · blue = content box · red = right:0 / bottom:0 · navy = content edge"),
-        v.box(.{ .style = L.arena(700, 180, .{ .left = 32, .right = 44, .top = 28, .bottom = 20 }), .test_id = "story.layoutbox.absolute.parent" }, .{
-            v.box(.{ .style = .{ L.contentGuide, L.at(.{ .left = .{ .px = 32 }, .right = .{ .px = 44 }, .top = .{ .px = 28 }, .bottom = .{ .px = 20 } }) }, .test_id = "story.layoutbox.absolute.content-guide" }, v.text(.{ .style = L.contentGuideText }, "content 624 × 132")),
-            v.attrs(.{ .test_id = "story.layoutbox.absolute.origin", .style = L.absAt(.{ .left = .{ .px = 0 }, .top = .{ .px = 0 } }) }, layoutBadge("0,0", 38, 26, layout_col.stretch)),
-            v.attrs(.{ .test_id = "story.layoutbox.absolute.outer-edge", .style = L.absAt(.{ .right = .{ .px = 0 }, .bottom = .{ .px = 0 } }) }, layoutBadge("edge", 44, 30, layout_col.absolute)),
-            v.attrs(.{ .test_id = "story.layoutbox.absolute.content-edge", .style = L.absAt(.{ .right = .{ .px = 44 }, .bottom = .{ .px = 20 } }) }, layoutBadge("content", 58, 30, layout_col.flow)),
-        }),
-        label("Expected: content=(32,28 624×132), red right/bottom gap=0, navy right gap=44 bottom gap=20"),
-
-        // 2) Percentage resolution and double-sided grow stretch.
-        layoutSection("2. Percentage inset + double-sided stretch", "Percentages resolve against the full padding box; left+right/top+bottom constrain grow size."),
-        v.row(.{ .style = S.line(16) }, .{
-            v.col(.{ .style = S.stack(6) }, .{
-                label("left:25% · top:50% → (85.5, 75)"),
-                v.box(.{ .style = L.arena(342, 150, Padding.all(20)), .test_id = "story.layoutbox.percent.parent" }, .{
-                    v.box(.{ .style = .{ L.vguide, L.at(.{ .left = .{ .px = 85.5 } }) } }, {}),
-                    v.box(.{ .style = .{ L.hguide, L.at(.{ .top = .{ .px = 75 } }) } }, {}),
-                    v.attrs(.{ .test_id = "story.layoutbox.percent.marker", .style = L.absAt(.{ .left = .{ .percent = 25 }, .top = .{ .percent = 50 } }) }, layoutBadge("25/50", 52, 28, layout_col.absolute)),
+        v.col(.{ .style = L.section }, .{
+            v.text(.{ .style = L.sectionTitle }, "Layout / Box model"),
+            v.text(.{ .style = L.sectionDetail }, "padding / border / content · px / fit / percent / grow · gap · justify / align · grid px + fr · absolute inset · overflow clip"),
+            v.text(.{ .style = L.sectionDetail }, "1 · Padding-box anatomy + absolute edges · stage = padding box · tinted = content box · absolute children resolve against the padding box"),
+            v.col(.{ .style = L.arena(180, Padding.symmetric(28, 32)), .test_id = "story.layoutbox.absolute.parent" }, .{
+                v.box(.{ .style = L.contentGuide, .test_id = "story.layoutbox.absolute.content-guide" }, v.text(.{ .style = L.guideText }, "content box · padding 28 / 32")),
+                v.attrs(.{ .test_id = "story.layoutbox.absolute.origin", .style = L.absAt(.{ .left = .{ .px = 0 }, .top = .{ .px = 0 } }) }, layoutBadge("0,0", 38, 20, .accent)),
+                v.attrs(.{ .test_id = "story.layoutbox.absolute.outer-edge", .style = L.absAt(.{ .right = .{ .px = 0 }, .bottom = .{ .px = 0 } }) }, layoutBadge("right:0 · bottom:0", 112, 20, .accent)),
+                v.attrs(.{ .test_id = "story.layoutbox.absolute.content-edge", .style = L.absAt(.{ .right = .{ .px = 32 }, .bottom = .{ .px = 28 } }) }, layoutBadge("content edge", 82, 20, .neutral)),
+            }),
+            v.row(.{ .style = L.samples }, .{
+                v.col(.{ .style = L.sample }, .{
+                    v.text(.{ .style = L.sectionDetail }, "2 · left 25% · top 50%"),
+                    v.box(.{ .style = L.arena(150, Padding.all(20)), .test_id = "story.layoutbox.percent.parent" }, .{
+                        v.box(.{ .style = L.vguide }, {}),
+                        v.box(.{ .style = L.hguide }, {}),
+                        v.box(.{
+                            .test_id = "story.layoutbox.percent.marker",
+                            .style = .{ L.absAt(.{ .left = .{ .percent = 25 }, .top = .{ .percent = 50 } }), ui.css(.{ .padding = .{ .top = 6, .left = 6 } }) },
+                        }, layoutBadge("25 / 50", 63, 20, .accent)),
+                    }),
+                }),
+                v.col(.{ .style = L.sample }, .{
+                    v.text(.{ .style = L.sectionDetail }, "L14 / R22 / T18 / B12 + grow"),
+                    v.box(.{ .style = L.arena(150, Padding.all(20)), .test_id = "story.layoutbox.stretch.parent" }, v.box(.{
+                        .style = .{ L.contentGuide, L.absAt(.{ .left = .{ .px = 14 }, .right = .{ .px = 22 }, .top = .{ .px = 18 }, .bottom = .{ .px = 12 } }) },
+                        .test_id = "story.layoutbox.stretch.child",
+                    }, v.text(.{ .style = L.guideText }, "grow fills the inset"))),
                 }),
             }),
-            v.col(.{ .style = S.stack(6) }, .{
-                label("L14 / R22 / T18 / B12 + grow"),
-                v.box(.{ .style = L.arena(342, 150, .{ .left = 26, .right = 12, .top = 10, .bottom = 22 }), .test_id = "story.layoutbox.stretch.parent" }, v.box(.{ .style = .{ L.stretchChild, L.at(.{ .left = .{ .px = 14 }, .right = .{ .px = 22 }, .top = .{ .px = 18 }, .bottom = .{ .px = 12 } }) }, .test_id = "story.layoutbox.stretch.child" }, v.text(.{ .style = L.stretchText }, "306 × 120"))),
-            }),
-        }),
-
-        // 3) Flex and Grid both keep absolute children out of normal placement,
-        // while using the same padding-box containing block for inset resolution.
-        layoutSection("3. Flex vs Grid: in-flow content and out-of-flow absolute", "Flow items start at padding.left; the red absolute marker consumes no gap, track, or flex space."),
-        v.row(.{ .style = S.line(16) }, .{
-            v.col(.{ .style = S.stack(6) }, .{
-                label("Flex row · padding 20 · gap 12 · margins on B"),
-                v.row(.{ .style = L.flexParent, .test_id = "story.layoutbox.flex.parent" }, .{
-                    v.attrs(.{ .test_id = "story.layoutbox.flex.a" }, layoutBadge("A 64", 64, 56, layout_col.flow)),
-                    v.attrs(.{ .test_id = "story.layoutbox.flex.b", .style = .{ .margin = .{ .left = 8, .right = 6, .top = 0, .bottom = 0 } } }, layoutBadge("B +m", 64, 56, layout_col.flow_alt)),
-                    v.attrs(.{ .test_id = "story.layoutbox.flex.grow", .style = L.growMarginRight }, layoutBadge("grow", 10, 56, layout_col.violet)),
-                    v.attrs(.{ .test_id = "story.layoutbox.flex.absolute", .style = L.absAt(.{ .right = .{ .px = 0 }, .top = .{ .px = 0 } }) }, layoutBadge("abs", 34, 34, layout_col.absolute)),
+            v.row(.{ .style = L.samples }, .{
+                v.col(.{ .style = L.sample }, .{
+                    v.text(.{ .style = L.sectionDetail }, "3 · Flex row · padding 20 · gap 12 · margin on B"),
+                    v.row(.{ .style = L.flexParent, .test_id = "story.layoutbox.flex.parent" }, .{
+                        v.attrs(.{ .test_id = "story.layoutbox.flex.a" }, layoutBadge("A 64", 64, 50, .neutral)),
+                        v.attrs(.{ .test_id = "story.layoutbox.flex.b", .style = .{ .margin = .{ .left = 8, .right = 8 } } }, layoutBadge("B +m", 64, 50, .accent)),
+                        v.attrs(.{ .test_id = "story.layoutbox.flex.grow", .style = L.grow }, layoutBadge("grow", 10, 50, .neutral)),
+                        v.attrs(.{ .test_id = "story.layoutbox.flex.absolute", .style = L.absAt(.{ .right = .{ .px = 6 }, .top = .{ .px = 6 } }) }, layoutBadge("abs", 36, 20, .danger)),
+                    }),
+                }),
+                v.col(.{ .style = L.sample }, .{
+                    v.text(.{ .style = L.sectionDetail }, "Grid · 70px / 1fr / 2fr · gap 8"),
+                    v.grid(.{
+                        .columns = &layout_grid_columns,
+                        .rows = &layout_grid_rows,
+                        .column_gap = 8,
+                        .style = L.arena(110, Padding.symmetric(30, 20)),
+                        .test_id = "story.layoutbox.grid.parent",
+                    }, .{
+                        v.attrs(.{ .test_id = "story.layoutbox.grid.a", .style = L.grow }, layoutBadge("70px", 10, 50, .neutral)),
+                        v.attrs(.{ .test_id = "story.layoutbox.grid.b", .style = L.grow }, layoutBadge("1fr", 10, 50, .accent)),
+                        v.attrs(.{ .test_id = "story.layoutbox.grid.c", .style = L.grow }, layoutBadge("2fr", 10, 50, .accent)),
+                        v.attrs(.{ .test_id = "story.layoutbox.grid.absolute", .style = L.absAt(.{ .right = .{ .px = 0 }, .bottom = .{ .px = 0 } }) }, layoutBadge("abs", 36, 20, .danger)),
+                    }),
                 }),
             }),
-            v.col(.{ .style = S.stack(6) }, .{
-                label("Grid · 70px / 1fr / 2fr · gap 8"),
-                v.grid(.{
-                    .columns = &layout_grid_columns,
-                    .rows = &layout_grid_rows,
-                    .column_gap = 8,
-                    .style = layoutGridPanel,
-                    .test_id = "story.layoutbox.grid.parent",
-                }, .{
-                    v.attrs(.{ .test_id = "story.layoutbox.grid.a", .style = LayoutS.grow }, layoutBadge("70px", 10, 52, layout_col.flow)),
-                    v.attrs(.{ .test_id = "story.layoutbox.grid.b", .style = LayoutS.grow }, layoutBadge("1fr", 10, 52, layout_col.flow_alt)),
-                    v.attrs(.{ .test_id = "story.layoutbox.grid.c", .style = LayoutS.grow }, layoutBadge("2fr", 10, 52, layout_col.violet)),
-                    v.attrs(.{ .test_id = "story.layoutbox.grid.absolute", .style = LayoutS.absAt(.{ .right = .{ .px = 0 }, .bottom = .{ .px = 0 } }) }, layoutBadge("abs", 34, 34, layout_col.absolute)),
-                }),
+            v.text(.{ .style = L.footnote }, "Absolute children consume no gap, track or flex space; in-flow items start at padding.left."),
+        }),
+        v.col(.{ .style = L.section }, .{
+            v.text(.{ .style = L.sectionTitle }, "VirtualList · dynamic height"),
+            v.text(.{ .style = L.sectionDetail }, "measure_items: rows start at an estimate, real height is written back after layout, and scroll position is compensated to keep the reading line in place."),
+            v.row(.{ .style = L.listSplit }, .{
+                v.box(.{ .style = L.listViewport }, v.attrs(.{ .style = L.listFrame, .test_id = "story.layoutbox.list" }, v.component(mountLayoutList, {}))),
+                v.col(.{ .style = L.listSteps }, v.list(&layout_list_steps, layoutListStep)),
             }),
         }),
-
-        // 4) Sizing modes share the parent's content width, while the parent still
-        // owns padding. This row makes px/percent/fit/grow contributions visible.
-        layoutSection("4. Sizing modes inside one Flex row", "Parent 700 wide, padding 20 → content 660. The 20% item is 132 wide; grow receives the remainder."),
-        v.row(.{ .style = L.sizingParent, .test_id = "story.layoutbox.sizing.parent" }, .{
-            v.attrs(.{ .test_id = "story.layoutbox.sizing.px" }, layoutBadge("px 80", 80, 44, layout_col.flow)),
-            v.attrs(.{ .test_id = "story.layoutbox.sizing.percent", .style = .{ .width = .{ .percent = 20 } } }, layoutBadge("20%", 10, 44, layout_col.flow_alt)),
-            v.attrs(.{ .test_id = "story.layoutbox.sizing.fit", .style = L.fit }, layoutBadge("fit content", 10, 44, layout_col.violet)),
-            v.attrs(.{ .test_id = "story.layoutbox.sizing.grow", .style = L.grow }, layoutBadge("grow", 10, 44, layout_col.stretch)),
+        v.col(.{ .style = L.section }, .{
+            v.text(.{ .style = L.sectionTitle }, "Scrolling · wheel, trackpad, nested"),
+            v.text(.{ .style = L.sectionDetail }, "Logical-point deltas · sideways scroll on a horizontal rail · nested lists scroll inner first, then hand off to the parent at the edge · readout shows what the platform delivers"),
+            v.component(@import("scrolling_story.zig").buildSupplement, {}),
         }),
-
-        // 5) Main-axis distribution and cross-axis alignment. Each sample uses the
-        // same content width, so start/center/end drift is immediately visible.
-        layoutSection("5. Flex distribution: justify + align + gap", "Three identical 220×92 parents; only justify changes. Cross axis stays centered."),
-        v.row(.{ .style = S.line(16) }, v.list(&layout_justify, justifySample)),
-
-        // 6) Overflow is part of the box model contract. Same overflowing absolute
-        // child in both arenas; only the left parent clips at its padding-box edge.
-        layoutSection("6. Overflow clipping", "The rose block starts at (280,55), size 100×60. Left clips; right remains visible."),
-        v.row(.{ .style = S.line(16) }, v.list(&layout_overflow, overflowSample)),
+        v.col(.{ .style = L.section }, .{
+            v.text(.{ .style = L.sectionTitle }, "More box-model examples"),
+            v.text(.{ .style = L.sectionDetail }, "Sizing modes · the percentage uses the content width and grow receives the remainder."),
+            v.row(.{ .style = L.sizingParent, .test_id = "story.layoutbox.sizing.parent" }, .{
+                v.attrs(.{ .test_id = "story.layoutbox.sizing.px" }, layoutBadge("px 80", 80, 44, .neutral)),
+                v.attrs(.{ .test_id = "story.layoutbox.sizing.percent", .style = .{ .width = .{ .percent = 20 } } }, layoutBadge("20%", 10, 44, .accent)),
+                v.attrs(.{ .test_id = "story.layoutbox.sizing.fit", .style = L.fit }, layoutBadge("fit content", 10, 44, .neutral)),
+                v.attrs(.{ .test_id = "story.layoutbox.sizing.grow", .style = L.grow }, layoutBadge("grow", 10, 44, .accent)),
+            }),
+            v.text(.{ .style = L.sectionDetail }, "Flex distribution · change justify while keeping cross-axis alignment centered."),
+            v.row(.{ .style = L.samples }, v.list(&layout_justify, justifySample)),
+            v.text(.{ .style = L.sectionDetail }, "Overflow clipping · the same absolute child is clipped on the left and visible on the right."),
+            v.row(.{ .style = L.samples }, v.list(&layout_overflow, overflowSample)),
+        }),
     }));
 }
 
@@ -3073,6 +3315,49 @@ fn accordionModeItem(title: []const u8, expanded: anytype) @TypeOf(v.with(W.Acco
     return v.with(W.AccordionItem(.{ .title = title, .expanded = expanded }), v.text(accordion_body_props, @as([]const u8, "Panel body content.")));
 }
 
+// ── Disclosure ──
+const StepRowSpec = struct { icon: ui.SvgAsset, title: []const u8, args: []const u8, time: []const u8, failed: bool = false, rejected: bool = false };
+const disclosure_steps = [_]StepRowSpec{
+    .{ .icon = ui.icons.check, .title = "Read screen", .args = "1280×1024", .time = "0.4s" },
+    .{ .icon = ui.icons.check, .title = "Type keys", .args = "ipmitool sel list", .time = "1.9s" },
+    .{ .icon = ui.icons.circle_x, .title = "Read file", .args = "/var/log/pdu.log", .time = "0.2s", .failed = true },
+    .{ .icon = ui.icons.ban, .title = "Run command", .args = "sudo cat /var/log/pdu.log", .time = "—", .rejected = true },
+};
+
+fn stepRowNode(spec: StepRowSpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    return v.render(scope, cx, v.row(.{ .style = S.stepRow }, .{
+        v.icon(.{ .style = S.stepIcon, .tint = v.tintBy(spec.failed, S.stepIconTint) }, spec.icon),
+        v.text(.{ .style = v.styleBy(spec.failed, S.stepTitle) }, spec.title),
+        v.text(.{ .style = S.stepArgs }, spec.args),
+        v.spacer(),
+        if (spec.rejected) W.Tag(.{ .label = "Rejected", .size = .sm }) else null,
+        v.text(.{ .style = S.stepArgs }, spec.time),
+    }));
+}
+
+pub fn buildDisclosure(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
+    const open = try scope.createSignal(bool, true);
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        v.attrs(.{ .test_id = "story.disclosure.card" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{
+            v.col(.{ .style = S.disclosureStack }, .{
+                W.Disclosure(.{ .title = "Thinking", .icon_asset = ui.icons.brain, .trailing = "6s", .trigger_test_id = "story.disclosure.thinking" }),
+                v.with(W.Disclosure(.{
+                    .open = open,
+                    .title = "Read PDU log",
+                    .icon_asset = ui.icons.circle_alert,
+                    .icon_tone = .danger,
+                    .detail = "· 4 steps · 1 failed · 1 rejected",
+                    .detail_tone = .danger,
+                    .trailing = "9.4s",
+                    .trigger_test_id = "story.disclosure.steps",
+                    .content_test_id = "story.disclosure.steps.rail",
+                }), .{ v.component(stepRowNode, disclosure_steps[0]), v.component(stepRowNode, disclosure_steps[1]), v.component(stepRowNode, disclosure_steps[2]), v.component(stepRowNode, disclosure_steps[3]) }),
+                W.Disclosure(.{ .title = "Check power supplies", .icon_asset = ui.icons.check, .detail = "· 2 steps", .trailing = "3.1s" }),
+            }),
+        })),
+    }));
+}
+
 pub fn buildAccordion(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     var open: [3]*ui.Signal(bool) = undefined;
     for (&open, 0..) |*sig, i| sig.* = try scope.createSignal(bool, i == 0);
@@ -3140,6 +3425,27 @@ const menu_items = [_]W.MenuItem{
     .{ .id = "del", .label = "Delete", .danger = true },
 };
 
+const nested_menu_items = [_]W.MenuItem{
+    .{ .id = "export", .label = "Export as", .children = &.{
+        .{ .id = "pdf", .label = "PDF" },
+        .{ .id = "markdown", .label = "Markdown" },
+        .{ .id = "html", .label = "HTML" },
+    } },
+    .{ .id = "share", .label = "Share" },
+    .{ .id = "print", .label = "Print", .shortcut = "⌘P", .selected = true },
+};
+
+const mode_menu_items = [_]W.MenuItem{
+    .{ .kind = .header, .label = "Permissions" },
+    .{ .id = "confirm", .label = "Confirm first", .description = "Reads run automatically, the rest by policy", .icon_asset = ui.icons.hand, .selected = true },
+    .{ .id = "auto", .label = "Run automatically", .description = "Everything allowed runs without asking", .icon_asset = ui.icons.shield_check },
+    .{ .kind = .separator },
+    .{ .id = "attach", .label = "Attach existing PTY", .icon_asset = ui.icons.square_terminal, .tag = "Interactive" },
+    .{ .id = "new", .label = "New PTY", .icon_asset = ui.icons.square_plus, .tag = "Interactive" },
+    .{ .kind = .separator },
+    .{ .id = "revoke", .label = "Revoke session-list grant", .icon_asset = ui.icons.unlink, .danger = true },
+};
+
 pub fn buildMenu(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     // Selected item writes signal, status line from it (static items + string copied by menu;
     // callback id valid only this call, so store owned-text signal)
@@ -3165,6 +3471,11 @@ pub fn buildMenu(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
                 .on_click = ui.on.call(story, MenuStory.openAnother),
             })),
         }),
+        v.attrs(.{ .test_id = "story.menu.nested" }, v.with(W.Menu(.{ .items = &nested_menu_items, .on_select = ui.on.assign(picked) }), .{})
+            .trigger(W.Button(.{ .label = "Export", .variant = .secondary }))),
+        // Rows with a description line and a right-hand Tag, under a group heading.
+        v.attrs(.{ .test_id = "story.menu.mode" }, v.with(W.Menu(.{ .items = &mode_menu_items, .on_select = ui.on.assign(picked), .width = 280, .panel_test_id = "story.menu.mode.panel" }), .{})
+            .trigger(W.Button(.{ .label = "Run mode ▾", .variant = .secondary }))),
         v.text(.{ .style = S.storyLabel, .test_id = "story.menu.status" }, v.fmt("picked → {s}", .{picked})),
         v.text(.{ .style = S.storyLabel, .test_id = "story.menu.copies" }, v.fmt("Copy on_click × {d}", .{copies})),
     }));
@@ -3205,7 +3516,7 @@ pub fn buildSteps(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const step = try scope.createSignal(usize, 1);
     return v.render(scope, cx, v.col(.{ .style = S.stack(24) }, .{
         v.text(.{ .style = S.storyLabel }, v.fmt("Horizontal (step {d} active)", .{ui.map(step, StepsStory.humanIndex)})),
-        W.Steps(.{ .items = &step_items, .current = step, .check_icon_asset = icons.check }),
+        v.attrs(.{ .style = ui.BoxStyle{ .width = .{ .px = 420 } } }, W.Steps(.{ .items = &step_items, .current = step, .check_icon_asset = icons.check })),
         v.row(.{ .style = S.stack(8) }, .{
             v.attrs(.{ .test_id = "story.steps.back" }, W.Button(.{
                 .label = "Back",
@@ -3267,7 +3578,7 @@ const tree_multi_nodes = [_]W.TreeNodeData{
 
 pub fn buildTree(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
-        v.attrs(.{ .test_id = "story.tree.single" }, W.Tree(.{ .label_text = "Single tree", .nodes = &tree_nodes, .expanded = @as([]const []const u8, &.{"src"}) })),
+        v.attrs(.{ .test_id = "story.tree.single" }, W.Tree(.{ .label_text = "Single tree", .nodes = &tree_nodes, .selected = @as([]const []const u8, &.{"main"}), .expanded = @as([]const []const u8, &.{"src"}) })),
         v.attrs(.{ .test_id = "story.tree.multi" }, W.Tree(.{ .label_text = "Multi tree", .nodes = &tree_multi_nodes, .selection_mode = .multi })),
     }));
 }
@@ -3326,31 +3637,58 @@ const table_cols = [_]W.ColumnDef{
     .{ .id = "age", .header = "Age", .width = 80, .sortable = true },
 };
 
+/// Virtual-body cell (> 50 rows): the name carries the row number so recycled slots are visible.
+fn tableVirtualCell(row_i: usize, col_i: usize, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    const i = row_i % TABLE_NAMES.len;
+    if (col_i == 0) return v.render(scope, cx, v.text(table_cell_props, v.fmt("{s} #{d}", .{ TABLE_NAMES[i], row_i })));
+    return v.render(scope, cx, v.text(table_cell_props, TableSortStory.key(col_i, i)));
+}
+
 pub fn buildTable(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     // header clicks commit the sort; the rows reorder through data_version
     const sort = try scope.createSignal(?W.table.TableSort, null);
-    return v.render(scope, cx, W.Table(.{
-        .columns = &table_cols,
-        .row_count = 8,
-        .striped = true,
-        .sort = sort,
-        .data_version = ui.map(sort, TableSortStory.version),
-    }).cells(sort, tableCell));
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        W.Table(.{
+            .columns = &table_cols,
+            .row_count = 8,
+            .striped = true,
+            .sort = sort,
+            .data_version = ui.map(sort, TableSortStory.version),
+        }).cells(sort, tableCell),
+        // Above 50 rows the body is virtualized (pooled slots); rows hover exactly like above.
+        v.text(label_props, "Virtual body · 1,000 rows"),
+        v.attrs(.{ .test_id = "story.table.virtual" }, W.Table(.{
+            .columns = &table_cols,
+            .row_count = 1000,
+            .striped = true,
+            .table_height = 232,
+        }).cells({}, tableVirtualCell)),
+    }));
 }
 
 // ── Calendar ──
 pub fn buildCalendar(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    return v.render(scope, cx, W.Calendar(.{ .month = W.calendar.YearMonth{ .year = 2026, .month = 5 }, .value = @as(?W.calendar.SimpleDate, .{ .year = 2026, .month = 5, .day = 14 }) }));
+    return v.render(scope, cx, W.Calendar(.{ .month = W.calendar.YearMonth{ .year = 2026, .month = 10 }, .value = @as(?W.calendar.SimpleDate, .{ .year = 2026, .month = 10, .day = 16 }) }));
 }
 
 // ── DatePicker ──
 pub fn buildDatePicker(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    return v.render(scope, cx, W.DatePicker(.{ .placeholder = "Pick a date" }));
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        v.attrs(.{ .test_id = "story.datepicker.empty" }, W.DatePicker(.{ .placeholder = "Pick a date" })),
+        W.DatePicker(.{ .open = true, .test_id = "story.datepicker.open", .value = @as(?W.calendar.SimpleDate, .{ .year = 2026, .month = 10, .day = 16 }) }),
+    }));
+}
+
+pub fn buildDateTimePicker(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
+    return v.render(scope, cx, W.date_picker.DateTimePicker(.{ .open = true, .datetime_value = @as(?W.date_picker.DateTime, .{ .date = .{ .year = 2026, .month = 10, .day = 16 }, .time = .{ .hour = 14, .minute = 30 } }) }));
 }
 
 // ── DateRangePicker ──
 pub fn buildDateRangePicker(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    return v.render(scope, cx, W.DateRangePicker(.{}));
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        v.attrs(.{ .test_id = "story.daterange.empty" }, W.DateRangePicker(.{})),
+        W.DateRangePicker(.{ .confirm_selection = true, .open = true, .value = @as(?W.date_range_picker.DateRange, .{ .start = .{ .year = 2026, .month = 10, .day = 12 }, .end = .{ .year = 2026, .month = 10, .day = 18 } }) }),
+    }));
 }
 
 // ── Tooltip ──
@@ -3410,6 +3748,15 @@ pub fn buildSheet(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 
 // ── Popover ──
 const PopS = struct {
+    fn content(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .width = .fixed(220), .padding = ui.Padding.all(t.tokens.space.space400), .gap = t.tokens.space.space200 };
+    }
+    fn title(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = t.tokens.font_size.md, .font_weight = 600, .line_height = 1.4, .color = t.tokens.color.fg_primary };
+    }
+    fn caption(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = t.tokens.font_size.sm, .line_height = 1.4, .color = t.tokens.color.fg_secondary };
+    }
     /// Body text in popup (13px primary color)
     fn body(t: *const ui.theme.Values) ui.TextStyle {
         return .{ .font_size = 13, .color = t.tokens.color.fg_primary };
@@ -3429,7 +3776,7 @@ const PopS = struct {
             .width = .{ .px = 220 },
             .height = .{ .px = 80 },
             .background = t.tokens.color.bg_secondary,
-            .border = .{ .radius = 10, .width = 1, .color = t.tokens.color.border },
+            .border = .{ .overlay = true, .radius = 10, .width = 1, .color = t.tokens.color.border },
             .overflow_hidden = true,
             .clip_shape = .{ .rounded_rect = 10 },
             .shadows = ui.ShadowList.of(&.{
@@ -3474,7 +3821,7 @@ fn blockChrome(_: *const ui.theme.Values) ui.BoxStyle {
         .padding = ui.Padding.symmetric(4, 4),
         .height = .{ .fit = .{} },
         .background = ui.Color.rgba(255, 255, 255, 255),
-        .border = .{ .radius = 10, .width = 1, .color = ui.Color.rgba(224, 224, 228, 255) },
+        .border = .{ .overlay = true, .radius = 10, .width = 1, .color = ui.Color.rgba(224, 224, 228, 255) },
         .overflow_hidden = false,
         .z_index = 82, // Same as downstream editor floats: overrides popover-assigned z-layer
         .shadows = ui.ShadowList.of(&.{
@@ -3525,8 +3872,14 @@ fn storyGradientSlab(w: f32, h: f32) v.Box(SlabProps, void, null) {
 
 pub fn buildPopover(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
-        v.with(W.Popover(.{ .position = .bottom_start, .trigger = .click }), v.text(pop_text_props, "Popover content!"))
-            .trigger(W.Button(.{ .label = "Toggle Popover" })),
+        v.with(W.Popover(.{ .position = .bottom_start, .trigger = .click }), v.col(.{ .style = PopS.content }, .{
+            v.text(.{ .style = PopS.title }, "Popover content"),
+            v.text(.{ .style = PopS.caption }, "Contextual content"),
+        }))
+            .trigger(W.Button(.{ .label = "Toggle Popover" })).parts(.{
+            .trigger = "story.popover.basic.trigger",
+            .chrome = "story.popover.basic.panel",
+        }),
 
         // -- Other positions + hover trigger --
         label("Positions (top / right) + hover trigger"),
@@ -3603,17 +3956,69 @@ const zx_yellow = ui.Color.rgba(250, 204, 21, 255);
 const zx_teal = ui.Color.rgba(20, 150, 140, 255);
 
 const ZxS = struct {
-    fn arena(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .px = 220 }, .height = .{ .px = 110 }, .position = .relative };
+    const page = ui.css(.{ .width = .fill, .max_width = 960, .align_self = .stretch, .gap = .space800 });
+    const header = ui.css(.{ .width = .fill, .gap = .space200 });
+    const eyebrow = ui.css(.{ .font_size = .xs, .font_weight = 600, .color = .accent });
+    const title = ui.css(.{ .font_size = .xxxl, .font_weight = 600, .color = .fg_primary });
+    const intro = ui.css(.{ .font_size = .md, .color = .fg_secondary, .width = .fill, .wrap = .word_break });
+    const section = ui.css(.{
+        .width = .fill,
+        .gap = .space400,
+        .padding = .{ .top = .space600 },
+        .border_top_width = 1,
+        .border_color = .border,
+    });
+    const heading = ui.css(.{ .font_size = .xl, .font_weight = 600, .color = .fg_primary, .width = .fill, .wrap = .word_break });
+    const caption = ui.css(.{ .font_size = .sm, .color = .fg_secondary, .width = .fill, .wrap = .word_break });
+    const split = ui.css(.{ .width = .fill, .gap = .space600, .flex_wrap = .wrap, .align_items = .center });
+    const notes = ui.css(.{ .width = .{ .grow = .{ .min = 220 } }, .flex_basis = 220, .gap = .space400 });
+    const noteTitle = ui.css(.{ .font_size = .sm, .font_weight = 600, .color = .fg_primary, .width = .fill, .wrap = .word_break });
+    const note = ui.css(.{ .width = .fill, .min_width = 0, .gap = .space100 });
+    const tierDescription = ui.css(.{ .font_size = .xs, .color = .fg_secondary, .width = .fill, .wrap = .word_break });
+    const tierNumber = ui.css(.{ .width = 42, .font_size = .xs, .color = .fg_secondary });
+    const tierName = ui.css(.{ .font_size = .md, .font_weight = 600, .color = .fg_primary });
+    const tierRow = ui.css(.{ .width = .fill, .gap = .space300, .align_items = .center, .padding = .{ .x = .space300, .y = .space200 } });
+    const chip = ui.css(.{ .font_size = .xs, .font_weight = 600, .color = .fg_inverse });
+    const ladder = ui.css(.{
+        .width = 292,
+        .background = .bg_primary,
+        .border_width = 1,
+        .border_color = .border,
+        .corner_radius = .control,
+    });
+
+    fn tierFill(active: bool, t: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .background = if (active) t.tokens.color.selection_bg else t.tokens.color.transparent };
     }
-    fn stage(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .px = 420 }, .height = .{ .px = 150 }, .position = .relative };
+
+    fn specimen(t: *const ui.theme.Values, height: f32) ui.BoxStyle {
+        return .{
+            .width = .{ .grow = .{ .min = 320, .max = 560 } },
+            .flex_basis = 320,
+            .height = .fixed(height),
+            .position = .relative,
+            .background = t.tokens.color.bg_tertiary,
+            .border = .{ .overlay = true, .width = 1, .color = t.tokens.color.border, .radius = t.tokens.radius.control },
+        };
+    }
+    fn arena(t: *const ui.theme.Values) ui.BoxStyle {
+        return specimen(t, 148);
+    }
+    fn stage(t: *const ui.theme.Values) ui.BoxStyle {
+        return specimen(t, 150);
+    }
+    fn dialogStage(t: *const ui.theme.Values) ui.BoxStyle {
+        var style = specimen(t, 200);
+        style.justify = .center;
+        style.padding = Padding.all(t.tokens.space.space600);
+        style.gap = t.tokens.space.space300;
+        return style;
     }
     fn clipbox(_: *const ui.theme.Values) ui.BoxStyle {
         return .{
             .position = .absolute,
             .gap = 16,
-            .width = .{ .px = 420 },
+            .width = .pct(100),
             .height = .{ .px = 64 },
             .padding = Padding.all(12),
             .background = ui.Color.rgba(229, 231, 235, 255),
@@ -3626,7 +4031,7 @@ const ZxS = struct {
             .position = .absolute,
             .align_items = .center,
             .justify = .center,
-            .width = .{ .px = 420 },
+            .width = .pct(100),
             .height = .{ .px = 100 },
             .background = zx_orange,
             // top=48 < clipbox height 64: overlaps with clipbox bottom edge
@@ -3647,24 +4052,67 @@ const ZxS = struct {
     }
 };
 
-const ZxSibling = struct { color: ui.Color, z: i16, off: f32 };
+const ZxSibling = struct { color: ui.Color, z: i16, off: f32, label: []const u8 };
 const zx_siblings = [_]ZxSibling{
-    .{ .color = zx_red, .z = 3, .off = 0 }, // DOM first + z highest -> must be topmost
-    .{ .color = zx_green, .z = 2, .off = 30 },
-    .{ .color = zx_blue, .z = 1, .off = 60 },
+    .{ .color = zx_red, .z = 3, .off = 0, .label = "A · declared 1st · z 3" }, // DOM first + z highest -> must be topmost
+    .{ .color = zx_green, .z = 2, .off = 30, .label = "B · declared 2nd · z 2" },
+    .{ .color = zx_blue, .z = 1, .off = 60, .label = "C · declared 3rd · z 1" },
 };
 
 const ZxBoxProps = struct { style: ui.BoxStyle };
 
-fn zxSibling(s: ZxSibling) v.Box(ZxBoxProps, void, null) {
+const zx_chip_props = .{ .style = ZxS.chip };
+
+fn zxSibling(s: ZxSibling) v.Box(ZxBoxProps, v.Text(@TypeOf(zx_chip_props), []const u8), null) {
     return v.box(ZxBoxProps{ .style = .{
         .position = .absolute,
         .width = .{ .px = 130 },
         .height = .{ .px = 80 },
+        .align_items = .end,
+        .justify = .end,
+        .padding = Padding.symmetric(4, 8),
+        .corner_radius = 6,
         .background = s.color,
         .z_index = s.z,
-        .inset = .{ .left = .{ .px = s.off }, .top = .{ .px = s.off / 3 } },
-    } }, {});
+        .inset = .{ .left = .{ .px = s.off + 16 }, .top = .{ .px = s.off * 0.6 + 16 } },
+    } }, v.text(zx_chip_props, s.label));
+}
+
+const zx_note_props = .{ .style = ZxS.note };
+const zx_note_title_props = .{ .style = ZxS.noteTitle };
+const zx_note_detail_props = .{ .style = ZxS.caption };
+
+fn zxNote(title: []const u8, detail: []const u8) @TypeOf(v.col(zx_note_props, .{
+    v.text(zx_note_title_props, @as([]const u8, "")),
+    v.text(zx_note_detail_props, @as([]const u8, "")),
+})) {
+    return v.col(zx_note_props, .{
+        v.text(zx_note_title_props, title),
+        v.text(zx_note_detail_props, detail),
+    });
+}
+
+const ZxTier = struct { z: []const u8, name: []const u8, detail: []const u8, active: bool = false };
+const zx_tiers = [_]ZxTier{
+    .{ .z = "3000", .name = "tooltip", .detail = "Tooltip" },
+    .{ .z = "2000", .name = "toast", .detail = "Notifications and toast messages" },
+    .{ .z = "1000", .name = "dialog", .detail = "Modal, Sheet, nested dialogs", .active = true },
+    .{ .z = "100", .name = "overlay", .detail = "Popover, Menu, Select, ComboBox, DatePicker" },
+    .{ .z = "—", .name = "content", .detail = "Normal flow and sibling z_index" },
+};
+
+fn zxTier(tier: ZxTier) v.ComponentOf(zxTierRow) {
+    return v.component(zxTierRow, tier);
+}
+
+fn zxTierRow(tier: ZxTier, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    return v.render(scope, cx, v.row(.{ .style = .{ ZxS.tierRow, v.styleBy(tier.active, ZxS.tierFill) } }, .{
+        v.text(.{ .style = ZxS.tierNumber }, tier.z),
+        v.col(.{ .style = ZxS.note }, .{
+            v.text(.{ .style = ZxS.tierName }, tier.name),
+            v.text(.{ .style = ZxS.tierDescription }, tier.detail),
+        }),
+    }));
 }
 
 const ZxSlabProps = struct { style: ui.BoxStyle, test_id: []const u8 };
@@ -3676,37 +4124,61 @@ fn zxSlab(w: f32, h: f32, color: ui.Color, test_id: []const u8) v.Box(ZxSlabProp
 pub fn buildZIndex(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const vis = try scope.createSignal(bool, false);
     const vis2 = try scope.createSignal(bool, false);
-    return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
-        // -- A. Sibling z_index sorting --
-        label("Sibling z-index (DOM order reversed, z must win)"),
-        v.box(.{ .style = ZxS.arena, .test_id = "story.zindex.siblings" }, v.list(&zx_siblings, zxSibling)),
-
-        // -- B. overflow container + popover/tooltip + obstacles --
-        // The stage uses absolute positioning to place obstacles above the clipbox bottom (top=48 <
-        // clipbox height 64), ensuring short bubbles like tooltip (drawn from trigger bottom
-        // + offset, ~24px high) still overlap obstacles; otherwise the assertion tests empty air.
-        label("Overflow container: popover & tooltip must escape clip and cover the obstacle"),
-        v.box(.{ .style = ZxS.stage }, .{
-            v.row(.{ .style = ZxS.clipbox, .test_id = "story.zindex.clipbox" }, .{
-                v.with(W.Popover(.{ .position = .bottom_start, .trigger = .click }), zxSlab(180, 90, zx_indigo, "story.zindex.pop.slab"))
-                    .trigger(W.Button(.{ .label = "Pop", .variant = .secondary }))
-                    .parts(.{ .trigger = "story.zindex.pop.trigger" }),
-                v.with(W.Tooltip(.{ .text = "Tooltip above everything", .position = .bottom }), .{})
-                    .trigger(W.Button(.{ .label = "Tip", .variant = .secondary }))
-                    .parts(.{ .trigger = "story.zindex.tip.trigger", .content = "story.zindex.tip.content" }),
-            }),
-            // Obstacles: DOM after clipbox sibling (no z naturally paints above float layer),
-            // absolute positioned top=48 overlapping clipbox bottom. Contains rotate 45 degree
-            // transform node, regression target for transform z-layer penetration.
-            v.row(.{ .style = ZxS.obstacle, .test_id = "story.zindex.obstacle" }, v.box(.{ .style = ZxS.diamond, .test_id = "story.zindex.diamond" }, {})),
+    return v.render(scope, cx, v.col(.{ .style = ZxS.page }, .{
+        v.col(.{ .style = ZxS.header }, .{
+            v.text(.{ .style = ZxS.eyebrow }, "06B / OVERLAYS · SUPPLEMENT"),
+            v.text(.{ .style = ZxS.title }, "Layering · ZIndex"),
+            v.text(.{ .style = ZxS.intro }, "z_index orders siblings. Floating layers portal out of clipped parents into a StackTier. Each nested dialog adds its own scrim."),
         }),
-
-        // C. complex layout + triple-nest: modal(dialog) -> body complex col-layout with tooltip +
-        //    popover(inherits over dialog) -> popover opens second modal (over popover). tier chain
-        //    full verify: dialog 1000 < inherit popover < second dialog < tooltip 3000.
-        v.attrs(.{ .test_id = "story.zindex.modal.open" }, W.Button(.{ .label = "Open Nested Modal", .on_click = ui.on.set(vis, true) })),
-        v.with(W.Modal(.{ .title = "Nested tiers", .width = 440, .open = vis }), .{
-            v.text(pop_text_props, "Popover from inside a modal must stack above the dialog."),
+        v.col(.{ .style = ZxS.section }, .{
+            v.text(.{ .style = ZxS.heading }, "Sibling z-index"),
+            v.text(.{ .style = ZxS.caption }, "Higher z paints above lower z. The card declared last sits underneath because it has the lowest z."),
+            v.row(.{ .style = ZxS.split }, .{
+                v.box(.{ .style = ZxS.arena, .test_id = "story.zindex.siblings" }, v.list(&zx_siblings, zxSibling)),
+                v.col(.{ .style = ZxS.notes }, .{
+                    zxNote("z_index has sibling semantics only", "Equal z keeps declaration order. A child stays in its parent’s stacking order relative to the parent’s siblings."),
+                    zxNote("Lift it with a portal instead", "Floating content mounts at the window root, where a StackTier decides the paint order."),
+                }),
+            }),
+        }),
+        v.col(.{ .style = ZxS.section }, .{
+            v.text(.{ .style = ZxS.heading }, "Escaping a clipped container"),
+            v.text(.{ .style = ZxS.caption }, "Popover and Tooltip leave the overflow-hidden toolbar and paint over the sibling below without being cut."),
+            v.row(.{ .style = ZxS.split }, .{
+                v.box(.{ .style = ZxS.stage }, .{
+                    v.row(.{ .style = ZxS.clipbox, .test_id = "story.zindex.clipbox" }, .{
+                        v.with(W.Popover(.{ .position = .bottom_start, .trigger = .click }), zxSlab(180, 90, zx_indigo, "story.zindex.pop.slab"))
+                            .trigger(W.Button(.{ .label = "Pop", .variant = .secondary }))
+                            .parts(.{ .trigger = "story.zindex.pop.trigger" }),
+                        v.with(W.Tooltip(.{ .text = "Tooltip above everything", .position = .bottom }), .{})
+                            .trigger(W.Button(.{ .label = "Tip", .variant = .secondary }))
+                            .parts(.{ .trigger = "story.zindex.tip.trigger", .content = "story.zindex.tip.content" }),
+                        v.text(.{ .style = ZxS.caption }, "Overflow clip edge ↓"),
+                    }),
+                    // The obstacle overlaps the toolbar and includes a rotated child.
+                    v.row(.{ .style = ZxS.obstacle, .test_id = "story.zindex.obstacle" }, v.box(.{ .style = ZxS.diamond, .test_id = "story.zindex.diamond" }, {})),
+                }),
+                v.col(.{ .style = ZxS.notes }, .{
+                    zxNote("Portal", "Floating content mounts at the window root, beyond the parent’s clip and radius."),
+                    zxNote("StackTier", "Base order rises from content to overlay, dialog, toast and tooltip. Nested popovers can rise above the layer that owns their trigger."),
+                    zxNote("Anchor", "Position still follows the trigger rect. Painting and hit-testing move to the portal."),
+                }),
+            }),
+        }),
+        v.col(.{ .style = ZxS.section }, .{
+            v.text(.{ .style = ZxS.heading }, "StackTier ladder · nested modal"),
+            v.text(.{ .style = ZxS.caption }, "A modal opened from another modal stacks above it with its own scrim. Escape dismisses the frontmost open layer first."),
+            v.row(.{ .style = ZxS.split }, .{
+                v.col(.{ .style = ZxS.ladder }, v.list(&zx_tiers, zxTier)),
+                v.col(.{ .style = ZxS.dialogStage }, .{
+                    v.text(.{ .style = ZxS.tierName }, "Project settings"),
+                    v.text(.{ .style = ZxS.caption }, "Changes apply to every member of the workspace."),
+                    v.attrs(.{ .test_id = "story.zindex.modal.open" }, W.Button(.{ .label = "Open nested modals", .on_click = ui.on.set(vis, true) })),
+                }),
+            }),
+        }),
+        v.with(W.Modal(.{ .title = "Project settings", .width = 440, .open = vis }), .{
+            v.text(.{ .style = ZxS.intro }, "Changes apply to every member of the workspace."),
             // Complex layout: two-column nested cards, each internally nested column, float
             // triggers buried in deep hierarchy, verify z inheritance independent of "trigger is
             // dialog body direct child".
@@ -3723,7 +4195,7 @@ pub fn buildZIndex(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
                     // Column B: popover inside modal, second modal opened from popover content
                     v.col(.{ .style = S.stack(8) }, v.with(W.Popover(.{ .position = .bottom_start, .trigger = .click }), v.col(.{ .style = ZxS.popBody }, .{
                         zxSlab(160, 70, zx_indigo, "story.zindex.modal.pop.slab"),
-                        v.attrs(.{ .test_id = "story.zindex.modal2.open" }, W.Button(.{ .label = "Open Modal 2", .on_click = ui.on.set(vis2, true) })),
+                        v.attrs(.{ .test_id = "story.zindex.modal2.open" }, W.Button(.{ .label = "Discard changes…", .on_click = ui.on.set(vis2, true) })),
                     })).trigger(W.Button(.{ .label = "Pop in modal", .variant = .secondary }))
                         .parts(.{ .trigger = "story.zindex.modal.pop.trigger" })),
                 }),
@@ -3733,8 +4205,10 @@ pub fn buildZIndex(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         // sequence increments + trigger nesting inheritance double-ensures). Mount order
         // unchanged from prior version: first modal and its popover mount before second
         // modal.
-        v.with(W.Modal(.{ .title = "Second modal", .width = 300, .open = vis2 }), zxSlab(200, 80, zx_teal, "story.zindex.modal2.slab"))
-            .parts(.{ .dialog = "story.zindex.modal2.dialog" }),
+        v.with(W.Modal(.{ .title = "Discard changes?", .width = 300, .open = vis2 }), v.col(.{ .style = S.stack(12) }, .{
+            v.text(.{ .style = ZxS.intro }, "Escape dismisses this dialog first."),
+            zxSlab(200, 80, zx_teal, "story.zindex.modal2.slab"),
+        })).parts(.{ .dialog = "story.zindex.modal2.dialog" }),
     }));
 }
 
@@ -3761,7 +4235,34 @@ pub fn buildMarkdown(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         \\
         \\Read the [guide](https://example.com/guide).
     ;
-    return v.render(scope, cx, v.box(.{ .style = demoWidth(420) }, .{W.Markdown(.{ .text = md, .options = .{ .base_font_size = 13 } })}));
+    // Opt-in blocks: borderless code with header (language / wrap / copy) and a max height,
+    // and a GFM table with horizontal rules only (the AI chat transcript look).
+    const chat =
+        \\| Time | Sensor | Event |
+        \\|---|---|---|
+        \\| 09/10 01:42:07 | PSU 2 | AC lost |
+        \\| 09/10 01:42:09 | System | Power off |
+        \\| 09/10 01:47:31 | System | Power on |
+        \\
+        \\```bash
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\for host in $(cat hosts.txt); do
+        \\  ssh -o ConnectTimeout=5 "$host" 'df -hP / | awk "NR==2 {print \$5}"' | sed "s/^/$host /"
+        \\done
+        \\```
+    ;
+    return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
+        v.box(.{ .style = demoWidth(420) }, .{W.Markdown(.{ .text = md, .options = .{ .base_font_size = 13 } })}),
+        // On a theme-following surface (the storybook page itself stays light).
+        v.attrs(.{ .test_id = "story.markdown.chat" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{W.Markdown(.{ .text = chat, .options = .{
+            .base_font_size = 13,
+            .code_font_size = 12,
+            .code_line_height = 1.55,
+            .table = .rules,
+            .code_block = .{ .frame = .borderless, .header = true, .max_height = 320, .wrap = false },
+        } })})),
+    }));
 }
 
 // ── Input ──
@@ -3782,7 +4283,7 @@ pub fn buildInput(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
         // -- Types --
         label("Types"),
-        v.attrs(.{ .test_id = "story.input.name" }, W.Input(.{ .label_text = "Name", .placeholder = "Your name", .width = 320 })),
+        v.attrs(.{ .test_id = "story.input.name", .parts = .{ .input_container = "story.input.name.input" } }, W.Input(.{ .label_text = "Name", .placeholder = "Your name", .width = 320 })),
         v.attrs(.{ .test_id = "story.input.email" }, W.Input(.{ .label_text = "Email", .input_type = .email, .placeholder = "you@example.com", .width = 320 })),
         W.Input(.{ .label_text = "Password", .input_type = .password, .placeholder = "••••••••", .width = 320 }),
 
@@ -3807,13 +4308,85 @@ pub fn buildInput(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     }));
 }
 
+// ── Input · Overflow ──
+// Values wider than the field in every structure the Input has (plain, sizes, leading icon,
+// append, readonly, error, password, CJK, long placeholder): the left/right overflow fades,
+// the text inset next to adornments and the caret-at-end padding all change geometry here.
+// Interaction states (caret at end / home / mid) are in e2e/web-parity-states.json.
+const LONG_EN = "The quick brown fox jumps over the lazy dog while the overflowing value keeps going";
+const LONG_CJK = "敏捷的棕色狐狸跳过了懒狗，溢出的内容继续向右延伸直到看不见为止";
+
+pub fn buildInputOverflow(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
+    const icons = ui.assets.common;
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        label("Long value at rest"),
+        v.attrs(.{ .test_id = "story.inputov.md", .parts = .{ .input_container = "story.inputov.md.input" } }, W.Input(.{ .label_text = "Medium", .value = LONG_EN, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.sm", .parts = .{ .input_container = "story.inputov.sm.input" } }, W.Input(.{ .size = .sm, .value = LONG_EN, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.lg", .parts = .{ .input_container = "story.inputov.lg.input" } }, W.Input(.{ .size = .lg, .value = LONG_EN, .width = 320 })),
+        label("Next to adornments"),
+        v.attrs(.{ .test_id = "story.inputov.icon", .parts = .{ .input_container = "story.inputov.icon.input" } }, W.Input(.{ .label_text = "Search", .leading_icon_asset = icons.search, .value = LONG_EN, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.append", .parts = .{ .input_container = "story.inputov.append.input" } }, W.Input(.{ .label_text = "Website", .append_text = ".com", .value = LONG_EN, .width = 320 })),
+        label("States"),
+        v.attrs(.{ .test_id = "story.inputov.readonly", .parts = .{ .input_container = "story.inputov.readonly.input" } }, W.Input(.{ .label_text = "Readonly", .readonly = true, .value = LONG_EN, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.error", .parts = .{ .input_container = "story.inputov.error.input" } }, W.Input(.{ .label_text = "With error", .error_msg = "This field is invalid", .value = LONG_EN, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.password", .parts = .{ .input_container = "story.inputov.password.input" } }, W.Input(.{ .label_text = "Password", .input_type = .password, .value = LONG_EN, .width = 320 })),
+        label("CJK and placeholder"),
+        v.attrs(.{ .test_id = "story.inputov.cjk", .parts = .{ .input_container = "story.inputov.cjk.input" } }, W.Input(.{ .label_text = "中文", .value = LONG_CJK, .width = 320 })),
+        v.attrs(.{ .test_id = "story.inputov.placeholder", .parts = .{ .input_container = "story.inputov.placeholder.input" } }, W.Input(.{ .label_text = "Long placeholder", .placeholder = LONG_EN, .width = 320 })),
+    }));
+}
+
+// ── Textarea · Overflow ──
+// Values taller than `rows` (top/bottom overflow fades, scroll), a single unbroken word, CJK
+// wrapping, readonly and the smallest size.
+const LONG_PARA =
+    \\Line one of a value that is taller than the field.
+    \\Line two keeps going so the list has to scroll.
+    \\Line three wraps because it is long enough to reach the right edge of the field and continue.
+    \\Line four.
+    \\Line five.
+    \\Line six is the last one.
+;
+const LONG_WORD = "Supercalifragilisticexpialidocious_and_an_unbroken_identifier_that_cannot_wrap_at_a_space";
+const CJK_PARA = "多行文本在中文里没有空格可以断行，浏览器和原生都必须按字符换行。这一段足够长，可以换好几行，并且超过三行的高度，从而出现上下的渐隐。";
+
+pub fn buildTextareaOverflow(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
+    return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        v.attrs(.{ .test_id = "story.textareaov.long" }, W.Textarea(.{ .label_text = "Taller than rows", .value = LONG_PARA, .rows = 3, .width = 420 })),
+        v.attrs(.{ .test_id = "story.textareaov.word" }, W.Textarea(.{ .label_text = "Unbroken word", .value = LONG_WORD, .rows = 2, .width = 420 })),
+        v.attrs(.{ .test_id = "story.textareaov.cjk" }, W.Textarea(.{ .label_text = "CJK", .value = CJK_PARA, .rows = 2, .width = 420 })),
+        v.attrs(.{ .test_id = "story.textareaov.readonly" }, W.Textarea(.{ .label_text = "Readonly", .value = LONG_PARA, .readonly = true, .rows = 2, .width = 420 })),
+        v.attrs(.{ .test_id = "story.textareaov.error" }, W.Textarea(.{ .label_text = "With error", .value = LONG_PARA, .error_msg = "Please shorten", .rows = 2, .width = 420 })),
+        v.attrs(.{ .test_id = "story.textareaov.xs" }, W.Textarea(.{ .size = .xs, .value = LONG_PARA, .rows = 2, .width = 320 })),
+    }));
+}
+
 // ── Textarea ──
 pub fn buildTextarea(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
+        label("Compound field: header (attachments) + text + footer (tool row), one focus"),
+        v.attrs(.{ .test_id = "story.textarea.composer" }, v.with(W.Card(.{ .variant = .outlined, .width = 420 }), .{
+            v.attrs(.{ .parts = .{ .input = "story.textarea.composer.input" } }, v.with(W.Textarea(.{ .value = "再结合这两个日志一起分析。", .placeholder = "Ask anything", .auto_rows = .{ .min = 1, .max = 6 } }), .{}).slots(.{
+                .header = W.Chip(.{ .label = "syslog.1", .closable = true }),
+                .footer = v.row(.{ .style = S.composerTools }, .{
+                    W.Button(.{ .variant = .ghost, .size = .sm, .icon_only = true, .icon_asset = ui.icons.paperclip, .a11y_label = "Attach" }),
+                    W.Button(.{ .variant = .ghost, .size = .sm, .icon_only = true, .icon_asset = ui.icons.hand, .a11y_label = "Permissions" }),
+                    W.Button(.{ .variant = .ghost, .size = .sm, .label = "Auto", .icon_asset = ui.icons.wand_sparkles }),
+                    v.spacer(),
+                    W.Button(.{ .variant = .ghost, .size = .sm, .label = "sonnet-4 · low" }),
+                    W.Button(.{ .variant = .primary, .size = .sm, .icon_only = true, .icon_asset = ui.icons.arrow_up, .a11y_label = "Send" }),
+                }),
+            })),
+        })),
         v.attrs(.{ .test_id = "story.textarea.box" }, W.Textarea(.{ .label_text = "Notes", .placeholder = "Write something…", .rows = 5, .width = 420 })),
         W.Textarea(.{ .label_text = "With helper", .placeholder = "Bio", .helper = "Max 500 characters", .rows = 3, .width = 420 }),
         W.Textarea(.{ .label_text = "With error", .value = "too short", .error_msg = "Please write more", .rows = 3, .width = 420 }),
         W.Textarea(.{ .label_text = "Disabled", .placeholder = "Cannot edit", .disabled = true, .rows = 3, .width = 420 }),
+        label("Field sizes / minimum two rows"),
+        W.Textarea(.{ .size = .xs, .placeholder = "XS / 44px", .rows = 2, .width = 320 }),
+        W.Textarea(.{ .size = .sm, .placeholder = "SM / 52px", .rows = 2, .width = 320 }),
+        W.Textarea(.{ .size = .md, .placeholder = "MD / 72px", .rows = 2, .width = 320 }),
+        W.Textarea(.{ .size = .lg, .placeholder = "LG / 88px", .rows = 2, .width = 320 }),
     }));
 }
 
@@ -3828,7 +4401,7 @@ const ListRowS = struct {
         return .{ .width = .{ .grow = .{} }, .padding = ui.Padding.all(8) };
     }
     fn dynText(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 13, .color = t.tokens.color.fg_primary, .wrap = .word };
+        return .{ .font_size = 13, .color = t.tokens.color.fg_primary, .wrap = .word_break };
     }
 };
 
@@ -3910,14 +4483,22 @@ fn gridCell(r: usize, col_: usize) v.Text(@TypeOf(grid_cell_props), v.Fmt("{d},{
 }
 const grid_widths = [_]f32{ 90, 90, 90, 90 };
 pub fn buildGrid(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    return v.render(scope, cx, W.Grid(.{
-        .col_count = 4,
-        .row_count = 12,
-        .col_widths = &grid_widths,
-        .cell_height = 30,
-        .width = 380,
-        .height = 320,
-    }).cells({}, gridCell));
+    return v.render(scope, cx, v.col(.{ .style = S.stack(16) }, .{
+        label("Grid: 52px cells / 8px gap"),
+        v.col(.{ .style = S.stack(8) }, .{
+            v.row(.{ .style = S.line(8) }, .{ v.box(.{ .style = LayoutPreviewS.cell }, {}), v.box(.{ .style = LayoutPreviewS.cell }, {}), v.box(.{ .style = LayoutPreviewS.cell }, {}) }),
+            v.row(.{ .style = S.line(8) }, .{ v.box(.{ .style = LayoutPreviewS.cell }, {}), v.box(.{ .style = LayoutPreviewS.cell }, {}), v.box(.{ .style = LayoutPreviewS.cell }, {}) }),
+        }),
+        label("Virtualized data grid"),
+        W.Grid(.{
+            .col_count = 4,
+            .row_count = 12,
+            .col_widths = &grid_widths,
+            .cell_height = 30,
+            .width = 380,
+            .height = 320,
+        }).cells({}, gridCell),
+    }));
 }
 
 // ── Select · Pencil puQEf component family ──
@@ -3940,7 +4521,7 @@ fn groupRow(scope: *ui.Scope, cx: *ui.Cx, orientation: W.group.GroupOrientation,
         const b = try W.Button(.{ .label = l, .variant = .secondary }).mount(scope, cx);
         if (i == 0) b.meta.ownership.meta.test_id = prefix ++ ".first";
         const pos: W.group.GroupItemPosition = if (labels.len == 1) .only else if (i == 0) .first else if (i == labels.len - 1) .last else .between;
-        try W.addGroupItem(g.container, a, b, pos, 8);
+        try W.addGroupItem(g.container, a, b, pos, cx.tokens.tokens.radius.control);
     }
     return g.container;
 }
@@ -3956,9 +4537,9 @@ pub fn buildGroup(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const g = try W.Group(.{}).mount(scope, cx);
     g.container.meta.ownership.meta.test_id = "story.group.input";
     const input = try W.Input(.{ .value = "zenit.dev/docs", .width = 220, .leading_icon_asset = ui.assets.common.link }).mountResult(scope, cx);
-    try W.addGroupItem(g.container, a, input.node, .first, 8);
+    try W.addGroupItem(g.container, a, input.node, .first, cx.tokens.tokens.radius.control);
     const copy = try W.Button(.{ .label = "Copy", .variant = .secondary }).mount(scope, cx);
-    try W.addGroupItem(g.container, a, copy, .last, 8);
+    try W.addGroupItem(g.container, a, copy, .last, cx.tokens.tokens.radius.control);
     try c.appendChild(a, g.container);
     try c.appendChild(a, try storyLabelNode(cx, "Vertical"));
     try c.appendChild(a, try groupRow(scope, cx, .vertical, &.{ "Top", "Middle", "Bottom" }, "story.group.v"));
@@ -3972,8 +4553,8 @@ pub fn buildEditableText(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const title = try scope.createText("Quarterly roadmap", .{});
     const note = try scope.createText("Click any line to edit it in place; the text reflows as you type.", .{});
     return v.render(scope, cx, v.col(.{ .style = demoWidth(420) }, .{
-        v.attrs(.{ .test_id = "story.editabletext.title" }, W.EditableText(.{ .value = title, .font_size = 22, .width = 420, .activation = .click })),
-        v.attrs(.{ .test_id = "story.editabletext.note" }, W.EditableText(.{ .value = note, .font_size = 14, .wrap_width = 420, .activation = .click })),
+        v.attrs(.{ .test_id = "story.editabletext.title" }, W.EditableText(.{ .value = title, .font_size = 20, .font_weight = 600, .width = 420, .activation = .click, .field_chrome = true })),
+        v.attrs(.{ .test_id = "story.editabletext.note" }, W.EditableText(.{ .value = note, .font_size = 13, .wrap_width = 420, .activation = .click, .field_chrome = true })),
         v.text(.{ .style = S.storyLabel, .test_id = "story.editabletext.status" }, v.fmt("title → {s}", .{title})),
     }));
 }
@@ -3981,7 +4562,7 @@ pub fn buildEditableText(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 pub fn buildNumberStepper(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
         label("0–10, step 1"),
-        v.attrs(.{ .test_id = "story.stepper.basic" }, W.NumberStepper(.{ .value = 5, .min = 0, .max = 10 })),
+        v.attrs(.{ .test_id = "story.stepper.basic", .parts = .{ .increment_button = "story.stepper.increase", .decrement_button = "story.stepper.decrease" } }, W.NumberStepper(.{ .value = 5, .min = 0, .max = 10 })),
         label("step 0.25, clamped to 0–1"),
         W.NumberStepper(.{ .value = 0.25, .step = 0.25, .min = 0, .max = 1, .width = 160 }),
         label("At the maximum"),
@@ -3994,11 +4575,12 @@ pub fn buildNumberStepper(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 // ── TagsInput ──
 pub fn buildTagsInput(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
-        v.attrs(.{ .test_id = "story.tags.wrapper", .parts = .{ .input = "story.tags.input" } }, W.TagsInput(.{
-            .tags = &[_][]const u8{ "zig", "metal" },
-            .width = 380,
+        v.attrs(.{ .test_id = "story.tags.wrapper", .parts = .{ .input = "story.tags.input", .add_button = "story.tags.add" } }, W.TagsInput(.{
+            .tags = &[_][]const u8{ "Zig", "UI" },
+            .width = 360,
+            .placeholder = "Add tag…",
         })),
-        label("Return, a trailing comma or Add commits a tag."),
+        label("Return or a trailing comma commits a tag."),
     }));
 }
 
@@ -4021,8 +4603,10 @@ pub fn buildFileUpload(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const story = try scope.createState(FileUploadStory, .{ .upload = undefined });
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
         // Drag drop zone: e2e uses dragAt to inject entered/dropped into this rectangle
-        v.attrs(.{ .test_id = "story.upload.wrapper", .parts = .{ .drop_zone = "story.upload.dropzone" } }, v.capture(&story.upload, W.FileUpload(.{
-            .width = 380,
+        v.attrs(.{ .test_id = "story.upload.wrapper", .parts = .{ .drop_zone = "story.upload.dropzone", .browse_button = "story.upload.choose" } }, v.capture(&story.upload, W.FileUpload(.{
+            .width = 320,
+            .hint = "Attachment",
+            .files = &[_][]const u8{"/tmp/design-system.pdf"},
             .on_browse = ui.on.call(story, FileUploadStory.browse),
         }))),
     }));
@@ -4078,6 +4662,8 @@ pub fn buildComboBox(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
             .width = 260,
             .on_change = ui.on.assignAs(?[]const u8, selected),
         })),
+        label("Open / selected / unavailable"),
+        W.ComboBox(.{ .options = &combo_options, .value = "ba", .open = true, .width = 260 }),
     }));
 }
 
@@ -4164,16 +4750,22 @@ const GALLERY_ICONS = [_]GalleryIcon{
 
 const GalleryS = struct {
     fn cell(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .gap = 6, .align_items = .center, .width = .{ .px = 92 }, .padding = Padding.all(8) };
+        return .{ .gap = 6, .align_items = .center, .justify = .center, .width = .{ .px = 72 }, .height = .{ .px = 72 }, .corner_radius = 4 };
+    }
+    fn hover(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .background = t.tokens.color.bg_hover };
     }
     fn icon(_: *const ui.theme.Values) ui.BoxStyle {
-        return .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } };
+        return .{ .width = .{ .px = 20 }, .height = .{ .px = 20 } };
     }
     fn iconTint(t: *const ui.theme.Values) ui.Color {
         return t.tokens.color.fg_primary;
     }
     fn name(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 11, .color = t.tokens.color.fg_tertiary };
+        return .{ .font_size = t.tokens.font_size.xs, .color = t.tokens.color.fg_tertiary };
+    }
+    fn dangerTint(t: *const ui.theme.Values) ui.Color {
+        return t.tokens.color.danger;
     }
     fn demoTint(t: *const ui.theme.Values) ui.Color {
         return t.tokens.color.fg_secondary;
@@ -4187,11 +4779,11 @@ const GalleryS = struct {
     }
 };
 
-const gallery_cell_props = .{ .style = GalleryS.cell };
+const gallery_cell_props = .{ .style = .{ GalleryS.cell, v.hover(GalleryS.hover) } };
 const gallery_icon_props = .{ .style = GalleryS.icon, .tint = GalleryS.iconTint };
 const gallery_name_props = .{ .style = GalleryS.name };
 const GalleryCellKids = @Tuple(&.{ v.Icon(@TypeOf(gallery_icon_props)), v.Text(@TypeOf(gallery_name_props), []const u8) });
-const gallery_row_props = .{ .style = S.line(8) };
+const gallery_row_props = .{ .style = S.line(0) };
 
 fn galleryCell(spec: GalleryIcon) v.Box(@TypeOf(gallery_cell_props), GalleryCellKids, .column) {
     return v.col(gallery_cell_props, GalleryCellKids{
@@ -4203,20 +4795,18 @@ fn galleryCell(spec: GalleryIcon) v.Box(@TypeOf(gallery_cell_props), GalleryCell
 pub fn buildIconGallery(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const icons = &GALLERY_ICONS;
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
-        // Wrap into multi-line grid: 6 per row.
-        v.row(gallery_row_props, v.list(icons[0..6], galleryCell)),
-        v.row(gallery_row_props, v.list(icons[6..12], galleryCell)),
-        v.row(gallery_row_props, v.list(icons[12..18], galleryCell)),
-        v.row(gallery_row_props, v.list(icons[18..20], galleryCell)),
+        // YZt6y: 20px glyphs in 72px cells, ten per row.
+        v.row(gallery_row_props, v.list(icons[0..10], galleryCell)),
+        v.row(gallery_row_props, v.list(icons[10..20], galleryCell)),
 
         // Size + tint demo row
         label("Sizes & tints"),
         v.row(.{ .style = S.line(16) }, .{
+            v.icon(.{ .style = GalleryS.sized(12), .tint = GalleryS.demoTint }, ui.system_icons.alert),
             v.icon(.{ .style = GalleryS.sized(16), .tint = GalleryS.demoTint }, ui.system_icons.alert),
-            v.icon(.{ .style = GalleryS.sized(24), .tint = GalleryS.demoTint }, ui.system_icons.alert),
-            v.icon(.{ .style = GalleryS.sized(32), .tint = GalleryS.demoTint }, ui.system_icons.alert),
-            v.icon(.{ .style = GalleryS.sized(48), .tint = GalleryS.demoTint }, ui.system_icons.alert),
-            v.icon(.{ .style = GalleryS.sized(32), .tint = ui.Color{ .r = 220, .g = 40, .b = 60, .a = 255 } }, ui.system_icons.heart),
+            v.icon(.{ .style = GalleryS.sized(20), .tint = GalleryS.demoTint }, ui.system_icons.alert),
+            v.icon(.{ .style = GalleryS.sized(28), .tint = GalleryS.demoTint }, ui.system_icons.alert),
+            v.icon(.{ .style = GalleryS.sized(32), .tint = GalleryS.dangerTint }, ui.system_icons.heart),
         }),
     }));
 }
@@ -4544,6 +5134,7 @@ pub fn buildGlassMotion(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const morph_group = try W.GlassGroup(.{ .spacing = 0 }).mountWithState(scope, cx);
     morph_group.container.style.width = .{ .grow = .{} };
     morph_group.container.style.height = .{ .grow = .{} };
+    morph_group.container.style.ensureExtPanic(a).align_self = .stretch;
     const gm = try W.GlassShape(.{ .title = "Morph", .width = 150, .height = 84, .id = "morph", .transition = .matched_geometry }).mountIn(morph_group, scope, cx);
     gm.node.style.position = .absolute;
     (try gm.node.style.ensureExtFallible(a)).inset = .{ .left = .{ .px = 12 }, .top = .{ .px = 12 } };
@@ -5199,8 +5790,12 @@ const TextJitterS = struct {
     }
     /// Constant style (applied once at mount): hook overwrites glass.backdrop_blur every
     /// frame, cannot be overridden by theme replay.
+    // Glass over the whole wrap: all four insets 0 (padding box). Without insets the static
+    // position starts at the content edge (inside the 12px padding) while grow still sizes to
+    // the padding box, so the glass sat 12px off and overflowed right/bottom.
     const overlay: ui.BoxStyle = .{
         .position = .absolute,
+        .inset = .{ .left = .{ .px = 0 }, .top = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } },
         .width = .{ .grow = .{} },
         .height = .{ .grow = .{} },
         .glass = .{ .backdrop_blur = 12, .glass_intensity = 0 },
@@ -5680,7 +6275,7 @@ pub fn buildCleanup(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     });
     return v.render(scope, cx, v.col(.{ .style = S.stack(12) }, .{
         label("on_cleanup count: unmounting a subtree with a cleanup hook must add exactly 1 (double-fire adds 2)"),
-        v.col(.{ .style = S.stack(8) }, .{
+        v.col(.{ .style = .{ S.stack(8), .{ .no_cross_stretch = false } } }, .{
             v.show(sig, .{
                 v.setup(v.box(.{ .style = CleanupS.child, .test_id = "story.cleanup.child" }, .{
                     v.text(.{ .style = regBody }, "cleanup child mounted"),
@@ -5705,7 +6300,7 @@ const HeavyTextS = struct {
         return .{ .position = .absolute, .width = .{ .px = 980 } };
     }
     fn text(t: *const ui.theme.Values) ui.TextStyle {
-        return .{ .font_size = 10, .color = t.tokens.color.fg_primary, .wrap = .word };
+        return .{ .font_size = 10, .color = t.tokens.color.fg_primary, .wrap = .word_break };
     }
 };
 
@@ -5987,12 +6582,22 @@ pub fn buildTeardownStress(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
             })),
         }),
         v.text(.{ .style = regBody, .test_id = "story.teardownstress.status" }, story.status),
-        v.col(.{ .style = S.stack(8) }, .{
+        v.col(.{ .style = .{ S.stack(8), .{ .no_cross_stretch = false } } }, .{
             v.show(visible, .{
-                v.attrs(.{ .test_id = "story.teardownstress.grid" }, v.component(buildGrid, {})),
+                v.attrs(.{ .test_id = "story.teardownstress.grid", .style = .{ .no_cross_stretch = false } }, v.component(buildGrid, {})),
             }),
         }),
     }));
 }
 
 pub const buildInteractionLifecycle = @import("interaction_lifecycle.zig").build;
+
+// Lazy aliases: the registry resolves these only when their story is selected.
+pub const buildFormComposition = @import("form_composition.zig").build;
+pub const buildScrolling = @import("scrolling_story.zig").build;
+pub const buildViewDsl = @import("view_dsl_story.zig").build;
+pub const buildComponentWall = @import("component_wall.zig").build;
+pub const buildControls = @import("controls/mod.zig").build;
+pub const buildCornerClip = @import("corner_clip/mod.zig").build;
+pub const buildPopoverText = @import("popover_text/mod.zig").build;
+pub const buildCjkWeights = @import("cjk_weights/mod.zig").build;

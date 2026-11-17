@@ -1,5 +1,7 @@
 # 设置剩余原生补验：根线程串行运行
 
+> 注意：本脚本按 `936166e1` 之前的“左侧分类 + 一长页（可折叠分组）”结构编写，且需附着到已运行的用户主窗口（`--live`），未随两级导航迁移、不在常规回归中运行。新导航的导航方式见 `e2e/settings_nav.ts` 与 `e2e/README.md`“设置窗口（两级导航）e2e”一节。
+
 脚本 `e2e/settings_remaining_native.ts` 已准备；本轮只做静态语法检查，未读取 live 实例、未启动窗口、未发送 RPC、未运行验收。实际依赖为仓库 `vendor/zenit`；控件选择与键盘 Select 行为以该源码及安装的公开 Harness client 为准。
 
 运行者独占已运行的真实主 App 窗口，先确认 live.json 的 `{pid,bundle,rpc,data}` 指向预期实例。脚本核对 owner PID，不创建/结束进程、不覆盖 config、不调用 scenario/backdoor、不操作原生 picker。输出目录必须为空。窗口已有 Local 终端和固定多行内容时，A/B/C 主窗口截图更有意义。主窗若还没有终端，由根先通过真实 UI 创建；脚本不会自动输入 shell 命令或制造收费 AI 请求。

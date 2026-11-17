@@ -1,0 +1,45 @@
+//! 数据与日志（第 7 类）面板正文（P3 3e）：位置与凭据、会话记录、导出与清理。
+//! 路径与清理按钮的可用性来自宿主（`HostStatus.data_paths` / `clear_*`）；“清除全部数据…”的确认流程仍是宿主的
+//! 旧实现（`application_data_cleanup_view.zig`，例外 S-12）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const F = m.fields.data;
+
+const location = &F.location;
+const history = &F.history;
+const actions = &F.actions;
+
+const formats = [_]W.SelectOption{ .{ .value = "txt_cast", .label = ".txt + .cast" }, .{ .value = "txt", .label = ".txt" }, .{ .value = "cast", .label = ".cast" } };
+fn formatOptions() []const W.SelectOption {
+    return &formats;
+}
+
+pub fn DataPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.data" style={S.category_panes}>
+            <R.Pane vm={vm} pane={location}>
+                <R.InfoRow vm={vm} pane={location} row={F.config_path} />
+                <R.InfoRow vm={vm} pane={location} row={F.hosts_path} />
+                <R.InfoRow vm={vm} pane={location} row={F.cache_dir} />
+                <R.InfoRow vm={vm} pane={location} row={F.logs_dir} />
+                <R.InfoRow vm={vm} pane={location} row={F.keychain} />
+                <R.ActionRow vm={vm} pane={location} row={F.credential_help} icon={ui.icons.lock} />
+                <R.InfoRow vm={vm} pane={location} row={F.permissions} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={history}>
+                <R.InputRow vm={vm} pane={history} row={F.ring_mb} />
+                <R.InputRow vm={vm} pane={history} row={F.checkpoint_sec} />
+                <R.InputRow vm={vm} pane={history} row={F.retention_days} />
+                <R.SelectRow vm={vm} pane={history} row={F.export_format} options={formatOptions()} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={actions}>
+                <R.ActionRow vm={vm} pane={actions} row={F.export_logs} icon={ui.icons.upload} />
+                <R.ActionRow vm={vm} pane={actions} row={F.clear_logs} icon={ui.icons.trash_2} />
+                <R.ActionRow vm={vm} pane={actions} row={F.clear_all} icon={ui.icons.triangle_alert} />
+            </R.Pane>
+        </box>
+    );
+}

@@ -8,8 +8,8 @@
 #import <unistd.h>
 #import "archive_abi.h"
 
-NSString *const ZWFeed = @"https://github.com/iskylite/ZeroWork/releases/latest/download/update.json";
-NSString *const ZWReleases = @"https://github.com/iskylite/ZeroWork/releases";
+NSString *const ZWFeed = @"https://github.com/version-next/ZeroWork/releases/latest/download/update.json";
+NSString *const ZWReleases = @"https://github.com/version-next/ZeroWork/releases";
 void ZWFail(NSString *message) { @throw [NSException exceptionWithName:@"ZeroWorkUpdate" reason:message userInfo:nil]; }
 static NSData *JSON(id object) {
     NSError *error = nil; NSData *data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingSortedKeys error:&error];
@@ -50,11 +50,26 @@ NSString *ZWCanonical(NSString *path) {
     if([parent isEqual:path])ZWFail(@"更新路径无法解析");
     return [ZWCanonical(parent) stringByAppendingPathComponent:path.lastPathComponent];
 }
+// The user's home for the updater area. Formal builds keep NSHomeDirectory()
+// exactly as before. Test builds take the validated private home from
+// platform/user_dirs.zig and refuse rather than fall back to the account.
+#if ZW_UPDATE_TESTING
+extern int zw_user_dirs_isolated_home(char *out, size_t capacity);
+#endif
+static NSString *ZWUserHome(void) {
+#if ZW_UPDATE_TESTING
+    char buffer[PATH_MAX];
+    if (zw_user_dirs_isolated_home(buffer, sizeof(buffer)) != 1) ZWFail(@"测试构建缺少私有 HOME，拒绝使用真实家目录");
+    return [NSString stringWithUTF8String:buffer];
+#else
+    return NSHomeDirectory();
+#endif
+}
 NSString *ZWRoot(NSString *target, NSString *data) {
     NSData *identity = [[NSString stringWithFormat:@"%@\n%@", ZWCanonical(target), ZWCanonical(data)] dataUsingEncoding:NSUTF8StringEncoding];
     unsigned char hash[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(identity.bytes, (CC_LONG)identity.length, hash);
     NSMutableString *hex = [NSMutableString string]; for (int i=0;i<16;i++) [hex appendFormat:@"%02x",hash[i]];
-    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/com.zerowork.updater"] stringByAppendingPathComponent:hex];
+    return [[ZWUserHome() stringByAppendingPathComponent:@"Library/Application Support/com.zerowork.updater"] stringByAppendingPathComponent:hex];
 }
 uint64_t ZWBirth(pid_t pid) {
     struct proc_bsdinfo info = {0}; if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) return 0;
@@ -70,7 +85,7 @@ static uint64_t Number(id value, uint64_t max) {
 BOOL ZWValidHTTPS(NSURL *url, BOOL redirects) {
     if (![url.scheme isEqual:@"https"] || url.user || url.password || url.fragment || (url.port && url.port.intValue != 443)) return NO;
     NSString *host = url.host.lowercaseString;
-    if ([host isEqual:@"github.com"]) return [url.path hasPrefix:@"/iskylite/ZeroWork/releases/"] && !url.query;
+    if ([host isEqual:@"github.com"]) return [url.path hasPrefix:@"/version-next/ZeroWork/releases/"] && !url.query;
     return redirects && ([host isEqual:@"release-assets.githubusercontent.com"] || [host isEqual:@"objects.githubusercontent.com"]);
 }
 NSDictionary *ZWManifest(NSData *envelope) {
@@ -91,7 +106,7 @@ NSDictionary *ZWManifest(NSData *envelope) {
     NSString *minimum = Text(m[@"minimum_os"],32);
     if (![minimum length] || [minimum rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789."] invertedSet]].location != NSNotFound) ZWFail(@"最低系统版本无效");
     if ([[NSProcessInfo processInfo].operatingSystemVersionString length] && [minimum compare:[NSString stringWithFormat:@"%ld.%ld.%ld", NSProcessInfo.processInfo.operatingSystemVersion.majorVersion,NSProcessInfo.processInfo.operatingSystemVersion.minorVersion,NSProcessInfo.processInfo.operatingSystemVersion.patchVersion] options:NSNumericSearch] == NSOrderedDescending) ZWFail(@"新版要求更高的 macOS 版本");
-    NSString *url = [NSString stringWithFormat:@"https://github.com/iskylite/ZeroWork/releases/download/v%@/ZeroWork-%@-arm64.zip",version,version];
+    NSString *url = [NSString stringWithFormat:@"https://github.com/version-next/ZeroWork/releases/download/v%@/ZeroWork-%@-arm64.zip",version,version];
     if (![Text(m[@"url"],1024) isEqual:url] || !ZWValidHTTPS([NSURL URLWithString:url],NO)) ZWFail(@"更新包地址与版本不匹配");
     if (![Text(m[@"release_url"],1024) isEqual:[NSString stringWithFormat:@"%@/tag/v%@",ZWReleases,version]]) ZWFail(@"发布说明地址无效");
     Number(m[@"bytes"],1024ULL*1024*1024); Number(m[@"expanded_bytes"],2ULL*1024*1024*1024);

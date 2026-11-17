@@ -23,4 +23,4 @@
 
 工具详情默认收起；连接测试／网页登录完成只更新结果，不自动展开。成功测试后可点“查看”展开对应服务行内的只读预览，按钮切换为“收起”，再次点击恢复紧凑行高。查看只读取本次进程内已有的测试结果，不重新连接服务。详情绑定服务 ID 与配置 revision；移除服务或修改配置后不显示旧详情。不在 MCP 卡片外渲染共用预览区。卡片底部仅在出错时显示具体错误；连接测试、网页登录和配置更改成功后不显示说明或成功提示。
 
-原生入口为 `src/config/ai_extensions_settings.zig`，局部样式为 `src/config/settings_mcp_styles.zig`。`e2e/mcp_reference_native.ts` 在 1280 × 900、860 × 480 窗口验证控件边界、菜单、启停、编辑及添加，并保存当前主题的原生截图；使用 `ZW_MCP_UI_ONLY=1 ZW_MCP_THEME=reference-light` 检查浅色。参考稿导出和实际截图放在仓库外的临时目录。
+原生入口为 `src/features/settings/view/ai_extensions_settings.zig`，局部样式为 `src/features/settings/view/settings_mcp_styles.zig`。`e2e/mcp_reference_native.ts` 在 1280 × 900、860 × 480 窗口验证控件边界、菜单、启停、编辑及添加，并保存当前主题的原生截图；使用 `ZW_MCP_UI_ONLY=1 ZW_MCP_THEME=reference-light` 检查浅色。参考稿导出和实际截图放在仓库外的临时目录。

@@ -1,13 +1,14 @@
 /** Native closed-source retained upload: resume, prefix tamper/cancel and active FIN recovery.
  * Own loopback peer only; public synthetic Harness input, no injected success.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, cp, mkdir, mkdtemp, open, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep, dragAt } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep, dragAt, mouseMove } from "../zig-out/share/zenit/harness/client.ts";
 const options: Record<string, string> = {};
 for (let i=2; i<process.argv.length; i+=2) { assert(["--binary","--expected-sha","--out","--python","--theme","--hold","--peer","--mode"].includes(process.argv[i])); options[process.argv[i]]=process.argv[i+1]; }
 assert(options["--out"] && options["--binary"] && /^[0-9a-f]{64}$/.test(options["--expected-sha"]));
@@ -22,7 +23,9 @@ await mkdir(dirname(binary),{recursive:true});await writeFile(join(dirname(dirna
 const sha=createHash("sha256").update(await readFile(binary)).digest("hex"); assert.equal(sha,options["--expected-sha"]); Object.assign(report,{binary,source_binary:sourceBinary,binary_sha256:sha});
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const appLog=await open(join(output,"app.log"),"w"), peerLog=await open(join(output,"peer.log"),"w"), peerOut=join(output,"peer");
-const peer=spawn(options["--python"]??"python3",[resolve(options["--peer"]??"e2e/sftp_v3_peer.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
+// Audited interpreter only (runner passes it for `python: true` entries); -I keeps cwd / user site out of sys.path.
+const python=options["--python"]??process.env.ZW_TEST_PYTHON;assert(python,"--python / ZW_TEST_PYTHON (audited Python with paramiko) is required");
+const peer=spawn(python,["-I",resolve(options["--peer"]??"e2e/sftp_v3_peer.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
 const peerEnded=new Promise<void>(done=>peer.once("close",()=>done())); let peerError:Error|undefined; peer.once("error",e=>{peerError=e;});
 let app:ReturnType<typeof spawn>|undefined, appEnded:Promise<void>|undefined, appError:Error|undefined, ready:any, failure:unknown;
 const payload=Buffer.concat([Buffer.from("ZEROWORK_MAIN_APP_UPLOAD_V1\n"),Buffer.from(Array.from({length:1024*1024},(_,i)=>i%251))]);
@@ -38,19 +41,8 @@ async function clickNode(n: any, reason: string): Promise<void> {
   assert((await clickAt(n.rect.x + n.rect.w / 2, n.rect.y + n.rect.h / 2)).ok, reason);
 }
 async function click(id: string): Promise<void> { await clickNode(await visible(id), id); }
-async function stableMenuItem(menuId: string, itemId: string): Promise<any> {
-  let previous = "", stable = 0;
-  return waitFor(async () => {
-    const menu = (await query(menuId)).find(n => shown(n) && (n.effective_opacity ?? n.opacity ?? 1) >= 0.999);
-    const item = menu && inside(menu, itemId);
-    if (!menu || !shown(item) || !item.focusable || item.rect.x < menu.rect.x || item.rect.y < menu.rect.y || item.rect.x + item.rect.w > menu.rect.x + menu.rect.w + 1 || item.rect.y + item.rect.h > menu.rect.y + menu.rect.h + 1) { stable = 0; return null; }
-    const current = JSON.stringify([menu.id, menu.rect, item.id, item.rect]);
-    stable = current === previous ? stable + 1 : 0;
-    previous = current;
-    await sleep(80);
-    return stable >= 2 ? item : null;
-  }, 15000);
-}
+/** The task's state word: transfer.task.status reads "<state> <percent>" (e.g. "已完成 100%", transfer_manager_view.zig). */
+async function taskStatus(): Promise<string> { return text((await query("transfer.task.status")).find(shown)).split(" ")[0]; }
 async function tabs(): Promise<any[]> { return nodes(await visible("tabs.strip")).filter(n => /^tabs\.tab\.\d+$/.test(n.test_id ?? "")); }
 const evidenceIds = ["tabs.strip", "sidebar.host", "auth.challenge.modal", "connection.progress", "files.presentation", "transfer.confirmation", "transfer.conflict", "transfer.manager", "workspace.statusbar", "files.context.menu", "files.history.menu", "files.drag.preview", "files.drag.target", "files.copy.confirmation", "files.workspace", "transfer.session.tray", "files.toolbar", "files.footer", "plugin.challenge.title", "notifications.local", "session.close.confirm"];
 async function capture(name: string): Promise<void> {
@@ -122,24 +114,23 @@ async function settleSftp(): Promise<void> {
   throw new Error("Actual loopback file workspace did not attach within 75 seconds");
 }
 
-async function settleRetainedAuth(){
- for(let i=0;i<80;i++){
-  const title=(await query("plugin.challenge.title")).find(shown);
-  if(title){
-   if(text(title)==="核对主机密钥"){const material=await visible("plugin.challenge.material");assert(text(material).includes(ready.fingerprint));await click("plugin.challenge.choice.0")}
-   else if(text(title)==="SSH 密码认证"){const input=(await query("plugin.challenge.answer.0")).find(shown)??(await query("plugin.challenge.secret")).find(shown);await clickNode(input,"Authenticate only exact retained peer");await type_(ready.password);await click("plugin.challenge.submit")}
-   else throw new Error("Unexpected retained auth: "+text(title));
-  }
-  await sleep(100);
- }
+/** Answers at most one visible authentication prompt of the retained transfer's new binding (only this exact owned peer). */
+async function answerRetainedChallenge():Promise<void>{
+ const title=(await query("plugin.challenge.title")).find(shown),modal=(await query("plugin.challenge.modal")).find(shown);if(!title||!modal||(modal.effective_opacity??1)<0.999)return;
+ if(text(title)==="核对主机密钥"){const material=await visible("plugin.challenge.material");assert(text(material).includes(ready.fingerprint));await click("plugin.challenge.choice.0");report.retained_decisions=(report.retained_decisions??0)+1;}
+ else if(text(title)==="SSH 密码认证"){const input=(await query("plugin.challenge.answer.0")).find(shown)??(await query("plugin.challenge.secret")).find(shown);await clickNode(input,"Authenticate only exact retained peer");await type_(ready.password);await click("plugin.challenge.submit");report.retained_decisions=(report.retained_decisions??0)+1;}
+ else throw new Error("Unexpected retained auth: "+text(title));
+ assert((report.retained_decisions??0)<=12,"Bound retained trust/password decisions");
 }
+/** Time-bounded wait for `cond` that answers the retained binding's prompts while waiting. */
+async function waitWithAuth<T>(cond:()=>Promise<T|null>,ms:number):Promise<T>{return waitFor(async()=>{await answerRetainedChallenge();return await cond();},ms);}
 try {
  ready=await waitFor(async()=>{try{return JSON.parse(await readFile(join(peerOut,"ready.json"),"utf8"))}catch{return null}},15000);
  await writeFile(join(data,"hosts.toml"),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="sftp"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Owned retained SFTP"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`);
  await writeFile(join(data,"config.toml"),'[ui]\ntheme="dark"\n[transfer]\ndedicated_connection=true\nwindow_chunks=1\nchunk_kb=32\nmax_tasks=1\nresume=true\nverify_md5=false\n');
  report.peer={...ready,password:undefined};
  app=spawn(binary,[],{cwd:process.cwd(),env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:"1",ZENIT_E2E_ISOLATE_POINTER:"1",ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:"0",ZEROWORK_FILE_TRACE:"1"},stdio:["ignore",appLog.fd,appLog.fd]});report.pid=app.pid;
- await waitForServerReady();await resizeWindow(1440,900);await click("sidebar.host");await settleSftp();
+ await waitForServerReady();await resizeWindow(1440,900);await click("sidebar.host");await click("sidebar.host.connect_button");/* design-r3 A2 (fe28ab5b): row click selects, the selected row's native “连接” connects */await settleSftp();
  const tab=(await tabs()).at(-1);report.source_tab=tab.test_id;
  const remote=await visible("files.remote"),x=remote.rect.x+remote.rect.w/2,y=remote.rect.y+remote.rect.h-65;
  await dragAt(x,y,0);await dragAt(x,y,3,"file://"+encodeURI(join(local,filename)));await visible("files.copy.confirmation");await click("files.copy.submit");
@@ -149,11 +140,16 @@ try {
  await click("toolbar.transfers");await visible("transfer.manager");
  let manager=await visible("transfer.manager");await clickNode(inside(manager,"transfer.task.primary"),"Pause real upload after peer wrote nonzero bytes");
  await waitFor(async()=>text(await visible("transfer.manager")).includes("已暂停")||null,15000);await capture("02-paused");
- await clickNode(inside(await visible("transfer.manager"),"transfer.window.close"),"Close manager before source tab");await sleep(300);
- const close=(await query(tab.test_id.replace("tabs.tab.","tabs.close."))).find(shown);await clickNode(close,"Close original SFTP source tab while transfer is paused");
- // Existing close confirmation must explicitly retain its independent transfer owner.
- await visible("session.close.confirm");await click("session.close.accept");
- await waitFor(async()=>!(await query("session.close.confirm")).some(shown)||null,15000);await sleep(1000);await capture("03-close-source");
+ await clickNode(inside(await visible("transfer.manager"),"transfer.window.close"),"Close manager before source tab");await waitFor(async()=>!(await query("transfer.manager")).some(shown)||null,10000);
+ // The tab close button appears on hover (4811ee5a): point at the source tab first, then wait for its close button.
+ {const t=await visible(tab.test_id);assert((await mouseMove(t.rect.x+t.rect.w/2,t.rect.y+t.rect.h/2)).ok);}
+ const close=await visible(tab.test_id.replace("tabs.tab.","tabs.close."));await clickNode(close,"Close original SFTP source tab while transfer is paused");
+ // The native session-close confirmation (session.close.confirm) must name the retained transfer before it is accepted.
+ const confirmation=await waitFor(async()=>{const c=(await query("session.close.confirm")).find(shown);return c&&text(inside(c,"session.close.accept"))==="关闭页签"?c:null;},10000);
+ assert(text(confirmation).includes("尚有未完成任务，关闭将暂停并保留续传数据"),"Session close names the retained transfer: "+text(confirmation));
+ await clickNode(inside(confirmation,"session.close.accept"),"Confirm closing only the original SFTP tab");
+ await waitFor(async()=>!(await query("session.close.confirm")).some(shown)&&!(await query(tab.test_id)).some(shown)||null,15000);
+ await waitFor(async()=>(await traces()).some((v:any)=>v.event==="closed"&&v.cleanup==="released")||null,15000);await capture("03-close-source");
  await click("toolbar.transfers");await visible("transfer.manager");await capture("04-retained-manager");
  report.retained_tree=await query("transfer.manager");report.traces_before=await traces();
  assert(text(await visible("transfer.manager")).includes("原会话已关闭"));
@@ -164,15 +160,13 @@ try {
   await waitFor(async()=>JSON.parse(await readFile(join(peerOut,"state.json"),"utf8")).calls.some((v:any)=>v.op==="TAMPER_PREFIX")||null,5000);
  }
 
- await sleep(600);
- const primary=await waitFor(async()=>{const n=inside(await visible("transfer.manager"),"transfer.task.primary");return n?.focusable?n:null},15000);await clickNode(primary,"Resume retained transfer after owned peer fault");
- await settleRetainedAuth();
+ const primary=await waitFor(async()=>{const n=inside(await visible("transfer.manager"),"transfer.task.primary");return n?.focusable&&n.disabled!==true?n:null},15000);await clickNode(primary,"Resume retained transfer after owned peer fault");
  if(mode==="fin"){
-  await waitFor(async()=>JSON.parse(await readFile(join(peerOut,"state.json"),"utf8")).files[destination].bytes>report.partial.bytes||null,20000);
+  await waitWithAuth(async()=>JSON.parse(await readFile(join(peerOut,"state.json"),"utf8")).files[destination].bytes>report.partial.bytes||null,30000);
   await writeFile(join(peerOut,"control.json"),JSON.stringify({disconnect_all:true}));
  }
- await waitFor(async()=>{
-  const status=text((await query("transfer.task.status")).find(shown));
+ await waitWithAuth(async()=>{
+  const status=await taskStatus();
   return (mode==="resume"?status==="已完成":status==="已暂停"||status==="失败"||status==="传输失败")?status:null;
  },180000);await capture("05-disconnected-retained");
  report.final_tree=await query("transfer.manager");report.final_traces=await traces();report.peer_state=JSON.parse(await readFile(join(peerOut,"state.json"),"utf8"));
@@ -193,12 +187,11 @@ try {
   report.checks.push("Remote prefix tamper remains rejected without any resumed write; retained job cancels");
  }else{
   assert(report.peer_state.calls.some((v:any)=>v.op==="DISCONNECT_ALL"));
-  assert.equal(text((await query("transfer.task.status")).find(shown)),"已暂停");
+  assert.equal(await taskStatus(),"已暂停");
   report.checks.push("Actual retained active transport FIN pauses original retained task and never reports successful completion");
   const failedBytes=report.peer_state.files[destination].bytes;
   await clickNode(inside(await visible("transfer.manager"),"transfer.task.primary"),"Explicitly resume retained task after actual transport FIN");
-  await settleRetainedAuth();
-  await waitFor(async()=>text((await query("transfer.task.status")).find(shown))==="已完成"||(await query("transfer.conflict")).some(shown)||null,180000);
+  await waitWithAuth(async()=>await taskStatus()==="已完成"||(await query("transfer.conflict")).some(shown)||null,180000);
   if((await query("transfer.conflict")).some(shown)){
    await capture("06-fin-recovery-conflict");
    await click("transfer.conflict.overwrite");
@@ -206,7 +199,7 @@ try {
    await click("transfer.conflict.apply");
    report.checks.push("Post-FIN uncertain partial shows exact targets and requires one explicit overwrite confirmation before fresh transfer");
   }
-  await waitFor(async()=>text((await query("transfer.task.status")).find(shown))==="已完成"||null,180000);
+  await waitFor(async()=>await taskStatus()==="已完成"||null,180000);
   report.recovered_peer=JSON.parse(await readFile(join(peerOut,"state.json"),"utf8"));
   assert.equal(report.recovered_peer.files[destination].bytes,payload.length);
   assert.equal(report.recovered_peer.files[destination].sha256,createHash("sha256").update(payload).digest("hex"));

@@ -1,0 +1,223 @@
+old_path	new_path	layer	mixed	note
+src/auxiliary_appearance_tests.zig	src/shared/ui/tests/auxiliary_appearance_tests.zig	tests	no	只 import auxiliary_appearance；目标目录 shared/ui/tests/ 不在 §5.1，需主 agent 确认
+src/chrome_policy_tests.zig	src/shared/ui/tests/chrome_policy_tests.zig	tests	no	只 import app_theme+focus_fill；目标目录 shared/ui/tests/ 不在 §5.1，需确认
+src/floating_input_tests.zig	src/shared/ui/tests/floating_input_tests.zig	tests	no	主要测 floating_input(另 import plugins/bmc_ikvm/styles 与 file_workspace_styles)；目标目录 shared/ui/tests/ 不在 §5.1，需确认
+src/shared/testing/ui_kit.zig	src/shared/testing/ui_kit.zig	shared_testing	no	已在目标位置，old=new；import ui/app_theme、ui/shell_styles、config/theme_registry(这些 import 路径在 P1 需随搬迁改写)
+src/testing/data_directory.zig	src/shared/testing/data_directory.zig	shared_testing	no	被 core import: src/config/paths.zig(tools/arch/baseline.txt 已记 core->shared_testing)；import platform/runtime_mode；共 1 个 importer
+src/ui/ai_brand_assets.zig	src/shared/ui/assets/ai_brand_assets.zig	shared_ui	no	生成物，仅被 ai_brand.zig/ai 测试使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；@embedFile("assets/ai-brands/...") 搬后需改；assets/ai-brands/README.md 含 zig fmt src/ui/ai_brand_assets.zig
+src/ui/app_theme.zig	src/shared/ui/theme/app_theme.zig	shared_ui	no	被约 227 个文件 import(ai/terminal/connection/transfer/socks/notification 等 77 个前缀，另有 config/settings_* 10 个、plugins 2 个、update/app_host 1 个，后三者随各自 feature 搬迁)；违反 shared/ui 不依赖 core/feature：import config/theme_presets、config/theme_registry(core) 及 ai_tool_approval_styles/notification_history_styles/notification_styles/shell_styles(feature 样式)，已在 baseline；core 目录无人 import；tools/arch/baseline.txt 记作 legacy_shared_ui
+src/ui/assets/ai-brands/LICENSE	src/shared/ui/assets/ai-brands/LICENSE	shared_ui	no	
+src/ui/assets/ai-brands/README.md	src/shared/ui/assets/ai-brands/README.md	shared_ui	no	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/ai-brands/anthropic.svg	src/shared/ui/assets/ai-brands/anthropic.svg	shared_ui	no	
+src/ui/assets/ai-brands/deepseek.svg	src/shared/ui/assets/ai-brands/deepseek.svg	shared_ui	no	
+src/ui/assets/ai-brands/gemini.svg	src/shared/ui/assets/ai-brands/gemini.svg	shared_ui	no	
+src/ui/assets/ai-brands/grok.svg	src/shared/ui/assets/ai-brands/grok.svg	shared_ui	no	
+src/ui/assets/ai-brands/kimi.svg	src/shared/ui/assets/ai-brands/kimi.svg	shared_ui	no	
+src/ui/assets/ai-brands/meta.svg	src/shared/ui/assets/ai-brands/meta.svg	shared_ui	no	
+src/ui/assets/ai-brands/minimax.svg	src/shared/ui/assets/ai-brands/minimax.svg	shared_ui	no	
+src/ui/assets/ai-brands/mistral.svg	src/shared/ui/assets/ai-brands/mistral.svg	shared_ui	no	
+src/ui/assets/ai-brands/moonshot.svg	src/shared/ui/assets/ai-brands/moonshot.svg	shared_ui	no	
+src/ui/assets/ai-brands/ollama.svg	src/shared/ui/assets/ai-brands/ollama.svg	shared_ui	no	
+src/ui/assets/ai-brands/openai.svg	src/shared/ui/assets/ai-brands/openai.svg	shared_ui	no	
+src/ui/assets/ai-brands/qwen.svg	src/shared/ui/assets/ai-brands/qwen.svg	shared_ui	no	
+src/ui/assets/ai-brands/zhipu.svg	src/shared/ui/assets/ai-brands/zhipu.svg	shared_ui	no	
+src/ui/assets/donation-qr.txt	src/shared/ui/assets/donation-qr.txt	shared_ui	no	
+src/ui/assets/host-os/LICENSE	src/shared/ui/assets/host-os/LICENSE	shared_ui	no	
+src/ui/assets/host-os/LICENSE-DISTRIBUTION-LOGOS	src/shared/ui/assets/host-os/LICENSE-DISTRIBUTION-LOGOS	shared_ui	no	
+src/ui/assets/host-os/LICENSE-UKUI	src/shared/ui/assets/host-os/LICENSE-UKUI	shared_ui	no	
+src/ui/assets/host-os/README.md	src/shared/ui/assets/host-os/README.md	shared_ui	no	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/host-os/SOURCES.md	src/shared/ui/assets/host-os/SOURCES.md	shared_ui	no	
+src/ui/assets/host-os/alinux.rgba	src/shared/ui/assets/host-os/alinux.rgba	shared_ui	no	
+src/ui/assets/host-os/alinux.svg	src/shared/ui/assets/host-os/alinux.svg	shared_ui	no	
+src/ui/assets/host-os/almalinux.rgba	src/shared/ui/assets/host-os/almalinux.rgba	shared_ui	no	
+src/ui/assets/host-os/almalinux.svg	src/shared/ui/assets/host-os/almalinux.svg	shared_ui	no	
+src/ui/assets/host-os/alpine-contrast.rgba	src/shared/ui/assets/host-os/alpine-contrast.rgba	shared_ui	no	
+src/ui/assets/host-os/alpine.rgba	src/shared/ui/assets/host-os/alpine.rgba	shared_ui	no	
+src/ui/assets/host-os/alpine.svg	src/shared/ui/assets/host-os/alpine.svg	shared_ui	no	
+src/ui/assets/host-os/amazonlinux.rgba	src/shared/ui/assets/host-os/amazonlinux.rgba	shared_ui	no	
+src/ui/assets/host-os/amazonlinux.svg	src/shared/ui/assets/host-os/amazonlinux.svg	shared_ui	no	
+src/ui/assets/host-os/anolis.rgba	src/shared/ui/assets/host-os/anolis.rgba	shared_ui	no	
+src/ui/assets/host-os/anolis.svg	src/shared/ui/assets/host-os/anolis.svg	shared_ui	no	
+src/ui/assets/host-os/aosc.rgba	src/shared/ui/assets/host-os/aosc.rgba	shared_ui	no	
+src/ui/assets/host-os/aosc.svg	src/shared/ui/assets/host-os/aosc.svg	shared_ui	no	
+src/ui/assets/host-os/archlinux.rgba	src/shared/ui/assets/host-os/archlinux.rgba	shared_ui	no	
+src/ui/assets/host-os/archlinux.svg	src/shared/ui/assets/host-os/archlinux.svg	shared_ui	no	
+src/ui/assets/host-os/bclinux-contrast.rgba	src/shared/ui/assets/host-os/bclinux-contrast.rgba	shared_ui	no	
+src/ui/assets/host-os/bclinux.rgba	src/shared/ui/assets/host-os/bclinux.rgba	shared_ui	no	
+src/ui/assets/host-os/bclinux.svg	src/shared/ui/assets/host-os/bclinux.svg	shared_ui	no	
+src/ui/assets/host-os/centos.rgba	src/shared/ui/assets/host-os/centos.rgba	shared_ui	no	
+src/ui/assets/host-os/centos.svg	src/shared/ui/assets/host-os/centos.svg	shared_ui	no	
+src/ui/assets/host-os/debian.rgba	src/shared/ui/assets/host-os/debian.rgba	shared_ui	no	
+src/ui/assets/host-os/debian.svg	src/shared/ui/assets/host-os/debian.svg	shared_ui	no	
+src/ui/assets/host-os/deepin-status.rgba	src/shared/ui/assets/host-os/deepin-status.rgba	shared_ui	no	
+src/ui/assets/host-os/deepin.rgba	src/shared/ui/assets/host-os/deepin.rgba	shared_ui	no	
+src/ui/assets/host-os/deepin.svg	src/shared/ui/assets/host-os/deepin.svg	shared_ui	no	
+src/ui/assets/host-os/euleros.rgba	src/shared/ui/assets/host-os/euleros.rgba	shared_ui	no	
+src/ui/assets/host-os/euleros.svg	src/shared/ui/assets/host-os/euleros.svg	shared_ui	no	
+src/ui/assets/host-os/fedora.rgba	src/shared/ui/assets/host-os/fedora.rgba	shared_ui	no	
+src/ui/assets/host-os/fedora.svg	src/shared/ui/assets/host-os/fedora.svg	shared_ui	no	
+src/ui/assets/host-os/freebsd.rgba	src/shared/ui/assets/host-os/freebsd.rgba	shared_ui	no	
+src/ui/assets/host-os/freebsd.svg	src/shared/ui/assets/host-os/freebsd.svg	shared_ui	no	
+src/ui/assets/host-os/gentoo.rgba	src/shared/ui/assets/host-os/gentoo.rgba	shared_ui	no	
+src/ui/assets/host-os/gentoo.svg	src/shared/ui/assets/host-os/gentoo.svg	shared_ui	no	
+src/ui/assets/host-os/isoft.rgba	src/shared/ui/assets/host-os/isoft.rgba	shared_ui	no	
+src/ui/assets/host-os/isoft.svg	src/shared/ui/assets/host-os/isoft.svg	shared_ui	no	
+src/ui/assets/host-os/kali.rgba	src/shared/ui/assets/host-os/kali.rgba	shared_ui	no	
+src/ui/assets/host-os/kali.svg	src/shared/ui/assets/host-os/kali.svg	shared_ui	no	
+src/ui/assets/host-os/kylin.rgba	src/shared/ui/assets/host-os/kylin.rgba	shared_ui	no	
+src/ui/assets/host-os/kylin.svg	src/shared/ui/assets/host-os/kylin.svg	shared_ui	no	
+src/ui/assets/host-os/kylinsec.rgba	src/shared/ui/assets/host-os/kylinsec.rgba	shared_ui	no	
+src/ui/assets/host-os/kylinsec.svg	src/shared/ui/assets/host-os/kylinsec.svg	shared_ui	no	
+src/ui/assets/host-os/linux.rgba	src/shared/ui/assets/host-os/linux.rgba	shared_ui	no	
+src/ui/assets/host-os/linux.svg	src/shared/ui/assets/host-os/linux.svg	shared_ui	no	
+src/ui/assets/host-os/linuxmint.rgba	src/shared/ui/assets/host-os/linuxmint.rgba	shared_ui	no	
+src/ui/assets/host-os/linuxmint.svg	src/shared/ui/assets/host-os/linuxmint.svg	shared_ui	no	
+src/ui/assets/host-os/linx.rgba	src/shared/ui/assets/host-os/linx.rgba	shared_ui	no	
+src/ui/assets/host-os/linx.svg	src/shared/ui/assets/host-os/linx.svg	shared_ui	no	
+src/ui/assets/host-os/loongnix.rgba	src/shared/ui/assets/host-os/loongnix.rgba	shared_ui	no	
+src/ui/assets/host-os/loongnix.svg	src/shared/ui/assets/host-os/loongnix.svg	shared_ui	no	
+src/ui/assets/host-os/manjaro.rgba	src/shared/ui/assets/host-os/manjaro.rgba	shared_ui	no	
+src/ui/assets/host-os/manjaro.svg	src/shared/ui/assets/host-os/manjaro.svg	shared_ui	no	
+src/ui/assets/host-os/neokylin.rgba	src/shared/ui/assets/host-os/neokylin.rgba	shared_ui	no	
+src/ui/assets/host-os/neokylin.svg	src/shared/ui/assets/host-os/neokylin.svg	shared_ui	no	
+src/ui/assets/host-os/netbsd.rgba	src/shared/ui/assets/host-os/netbsd.rgba	shared_ui	no	
+src/ui/assets/host-os/netbsd.svg	src/shared/ui/assets/host-os/netbsd.svg	shared_ui	no	
+src/ui/assets/host-os/nfs.rgba	src/shared/ui/assets/host-os/nfs.rgba	shared_ui	no	
+src/ui/assets/host-os/nfs.svg	src/shared/ui/assets/host-os/nfs.svg	shared_ui	no	
+src/ui/assets/host-os/nixos.rgba	src/shared/ui/assets/host-os/nixos.rgba	shared_ui	no	
+src/ui/assets/host-os/nixos.svg	src/shared/ui/assets/host-os/nixos.svg	shared_ui	no	
+src/ui/assets/host-os/openbsd.rgba	src/shared/ui/assets/host-os/openbsd.rgba	shared_ui	no	
+src/ui/assets/host-os/openbsd.svg	src/shared/ui/assets/host-os/openbsd.svg	shared_ui	no	
+src/ui/assets/host-os/opencloudos.rgba	src/shared/ui/assets/host-os/opencloudos.rgba	shared_ui	no	
+src/ui/assets/host-os/opencloudos.svg	src/shared/ui/assets/host-os/opencloudos.svg	shared_ui	no	
+src/ui/assets/host-os/openeuler.rgba	src/shared/ui/assets/host-os/openeuler.rgba	shared_ui	no	
+src/ui/assets/host-os/openeuler.svg	src/shared/ui/assets/host-os/openeuler.svg	shared_ui	no	
+src/ui/assets/host-os/openkylin.rgba	src/shared/ui/assets/host-os/openkylin.rgba	shared_ui	no	
+src/ui/assets/host-os/openkylin.svg	src/shared/ui/assets/host-os/openkylin.svg	shared_ui	no	
+src/ui/assets/host-os/opensuse.rgba	src/shared/ui/assets/host-os/opensuse.rgba	shared_ui	no	
+src/ui/assets/host-os/opensuse.svg	src/shared/ui/assets/host-os/opensuse.svg	shared_ui	no	
+src/ui/assets/host-os/oraclelinux.rgba	src/shared/ui/assets/host-os/oraclelinux.rgba	shared_ui	no	
+src/ui/assets/host-os/oraclelinux.svg	src/shared/ui/assets/host-os/oraclelinux.svg	shared_ui	no	
+src/ui/assets/host-os/redflag-contrast.rgba	src/shared/ui/assets/host-os/redflag-contrast.rgba	shared_ui	no	
+src/ui/assets/host-os/redflag.rgba	src/shared/ui/assets/host-os/redflag.rgba	shared_ui	no	
+src/ui/assets/host-os/redflag.svg	src/shared/ui/assets/host-os/redflag.svg	shared_ui	no	
+src/ui/assets/host-os/rhel.rgba	src/shared/ui/assets/host-os/rhel.rgba	shared_ui	no	
+src/ui/assets/host-os/rhel.svg	src/shared/ui/assets/host-os/rhel.svg	shared_ui	no	
+src/ui/assets/host-os/rocky.rgba	src/shared/ui/assets/host-os/rocky.rgba	shared_ui	no	
+src/ui/assets/host-os/rocky.svg	src/shared/ui/assets/host-os/rocky.svg	shared_ui	no	
+src/ui/assets/host-os/sles.rgba	src/shared/ui/assets/host-os/sles.rgba	shared_ui	no	
+src/ui/assets/host-os/sles.svg	src/shared/ui/assets/host-os/sles.svg	shared_ui	no	
+src/ui/assets/host-os/sugon-status.rgba	src/shared/ui/assets/host-os/sugon-status.rgba	shared_ui	no	
+src/ui/assets/host-os/sugon.rgba	src/shared/ui/assets/host-os/sugon.rgba	shared_ui	no	
+src/ui/assets/host-os/sugon.svg	src/shared/ui/assets/host-os/sugon.svg	shared_ui	no	
+src/ui/assets/host-os/tencentos.rgba	src/shared/ui/assets/host-os/tencentos.rgba	shared_ui	no	
+src/ui/assets/host-os/tencentos.svg	src/shared/ui/assets/host-os/tencentos.svg	shared_ui	no	
+src/ui/assets/host-os/ubuntu-status.rgba	src/shared/ui/assets/host-os/ubuntu-status.rgba	shared_ui	no	
+src/ui/assets/host-os/ubuntu.rgba	src/shared/ui/assets/host-os/ubuntu.rgba	shared_ui	no	
+src/ui/assets/host-os/ubuntu.svg	src/shared/ui/assets/host-os/ubuntu.svg	shared_ui	no	
+src/ui/assets/host-os/ubuntukylin.rgba	src/shared/ui/assets/host-os/ubuntukylin.rgba	shared_ui	no	
+src/ui/assets/host-os/ubuntukylin.svg	src/shared/ui/assets/host-os/ubuntukylin.svg	shared_ui	no	
+src/ui/assets/host-os/uos.rgba	src/shared/ui/assets/host-os/uos.rgba	shared_ui	no	
+src/ui/assets/host-os/uos.svg	src/shared/ui/assets/host-os/uos.svg	shared_ui	no	
+src/ui/assets/host-os/windows.rgba	src/shared/ui/assets/host-os/windows.rgba	shared_ui	no	
+src/ui/assets/host-os/windows.svg	src/shared/ui/assets/host-os/windows.svg	shared_ui	no	
+src/ui/assets/local_apple.svg	src/shared/ui/assets/local_apple.svg	shared_ui	no	
+src/ui/assets/os/linux.svg	src/shared/ui/assets/os/linux.svg	shared_ui	no	
+src/ui/assets/os/rocky.svg	src/shared/ui/assets/os/rocky.svg	shared_ui	no	
+src/ui/assets/os/ubuntu.svg	src/shared/ui/assets/os/ubuntu.svg	shared_ui	no	
+src/ui/assets/os/windows.svg	src/shared/ui/assets/os/windows.svg	shared_ui	no	
+src/ui/assets/shell/README.md	src/shared/ui/assets/shell/README.md	shared_ui	no	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/shell/tab-ear-left.svg	src/shared/ui/assets/shell/tab-ear-left.svg	shared_ui	no	
+src/ui/assets/shell/tab-ear-right.svg	src/shared/ui/assets/shell/tab-ear-right.svg	shared_ui	no	
+src/ui/assets/sidebar_footer_frame.svg	src/shared/ui/assets/sidebar_footer_frame.svg	shared_ui	no	
+src/ui/assets_generated.zig	src/shared/ui/assets/assets_generated.zig	shared_ui	no	生成物(gen_svg_assets)；仅 session_icon.zig 使用；含 @embedFile("assets/local_apple.svg") 与 sidebar_footer_frame.svg，搬到 shared/ui/assets/ 后相对路径需改为同目录
+src/ui/aux_window.zig	src/shared/ui/window/aux_window.zig	shared_ui	no	被 wizard_*、main.zig、config/settings_shell 共 3 个文件 import；窗口外壳辅助
+src/ui/auxiliary_appearance.zig	src/shared/ui/theme/auxiliary_appearance.zig	shared_ui	no	仅 src/auxiliary_appearance_tests.zig import；import config/background_asset(core)、background_layers/shell_styles(shell feature)；辅助窗口外观
+src/ui/color_palette.zig	src/shared/ui/components/color_palette/color_palette.zig	shared_ui	no	被 tab_color_picker(shell/workspace)与 asset_* (connections)import；预设色按钮通用件，不是设置页界面；import app_theme+color_palette_styles
+src/ui/color_palette_styles.zig	src/shared/ui/components/color_palette/color_palette_styles.zig	shared_ui	no	color_palette 的样式，被 color_palette 与 asset_* import；跟随 color_palette
+src/ui/compact_overlay_layout.zig	src/shared/ui/components/compact_overlay_layout/compact_overlay_layout.zig	shared_ui	no	被 auth/connection×2/group/broadcast 共 5 个文件 import(跨 connections+workspace)；38 行纯布局辅助
+src/ui/control_hint.zig	src/shared/ui/components/control_hint/control_hint.zig	shared_ui	no	被约 25 个文件 import(ai 8、transfer 2、connection、status、tab、file、history、broadcast、quick_connect、local、config/settings、plugins/bmc_ikvm 等)
+src/ui/copy_button.zig	src/shared/ui/components/copy_button/copy_button.zig	shared_ui	no	被 18 个文件 import(ai 6、connection 3、socks、status、transfer、plugins/bmc、根测试)；import shell_styles(feature)+config/theme_registry(core) 已在 baseline
+src/ui/design.zig	src/shared/ui/theme/design.zig	shared_ui	no	被 terminal_view/workspace/main 共 3 个文件 import；按 design* 规则归 theme；import ui+app_theme
+src/ui/design_tokens.zig	src/shared/ui/theme/design_tokens.zig	shared_ui	no	被 config/settings_content_view(随 settings 搬)、command_* 以及 build.zig:311 作为独立 module 根引用；build.zig 硬编码
+src/ui/feedback_message.zig	src/shared/base/feedback_message.zig	shared_base	no	不 import ui；被 main、workspace、status、file×3 共 6 个文件 import(3 个 feature)；用户可见错误文案
+src/ui/file_workspace_icons_assets.zig	src/shared/ui/assets/file_workspace_icons_assets.zig	shared_ui	no	生成物，仅被 file_workspace_icons.zig 使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；有 file_ 前缀，可能与 files 包撞车，请去重
+src/ui/floating_input.zig	src/shared/ui/components/floating_input/floating_input.zig	shared_ui	no	被 12 个文件 import(terminal/workspace/command/notification/transfer/background/history/layer_materials/config settings_picker 等)；floating_input_tests 同包认领
+src/ui/focus_fill.zig	src/shared/ui/zenit_ext/focus_fill.zig	shared_ui	no	zenit 公开扩展点 Cx.setFocusIndicator 的适配；被 shell_styles(ThemePublication)、chrome_policy_tests 等 import；vendor/DEPENDENCIES.md 引用
+src/ui/host_os_assets.zig	src/shared/ui/assets/host_os_assets.zig	shared_ui	no	import ui+session_os_assets；@embedFile("assets/host-os/...") 搬后需改为 host-os/...；被 main、workspace、session_icon 使用；e2e/domestic_os_native.ts、e2e/tab_icon_states_native.ts 硬编码读取此路径
+src/ui/icon_button_feedback.zig	src/shared/ui/components/icon_button_feedback/icon_button_feedback.zig	shared_ui	no	被 workspace/sidebar/file_workspace/transfer 测试 共 4 个 feature 前缀文件 import
+src/ui/layer_materials.zig	src/shared/ui/styles/layer_materials.zig	shared_ui	no	被 39 个文件 import(ai 12、terminal、connection、notification、file、transfer、plugins/bmc_ikvm、config/settings_controls 及多个根测试)；import floating_input/material_geometry/theme_states/app_theme
+src/ui/layout_motion.zig	src/shared/ui/styles/layout_motion.zig	shared_ui	no	被 ai×4、connection、sidebar、transfer 测试、config/settings_accordion、plugins/remote/editor 共 9 个文件 import；tools/arch/baseline.txt 有 legacy_plugin 条目
+src/ui/log_typography.zig	src/shared/ui/styles/log_typography.zig	shared_ui	no	被 connection_*×2、transfer_* 共 3 个文件 import；日志排版共用，仅 2 个 feature 前缀，通用 typography 故认领
+src/ui/material_geometry.zig	src/shared/ui/styles/material_geometry.zig	shared_ui	no	被 layer_materials、ai×3、command_*、theme/command 根测试共 7 个文件 import
+src/ui/rocky_os_asset.zig	src/shared/ui/assets/rocky_os_asset.zig	shared_ui	no	生成物，无 import 者(仅 assets/host-os/README.md 提及)；@embedFile 路径需同步改
+src/ui/session_os_assets.zig	src/shared/ui/assets/session_os_assets.zig	shared_ui	no	生成物，仅被 host_os_assets 与 session_icon 使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；有 session_ 前缀，可能与 workspace 包撞车，请去重
+src/ui/shell_assets.zig	src/shared/ui/assets/shell_assets.zig	shared_ui	no	生成物，仅被 workspace 系列使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；有 shell_ 前缀，可能与 shell 包撞车；@embedFile("assets/shell/...") 需改；assets/shell/README.md 含 zig fmt src/ui/shell_assets.zig
+src/ui/theme.zig	src/shared/ui/theme/theme.zig	shared_ui	no	旧版终端主题结构(Theme.sauber)，仅 src/root.zig:91 以 zerowork.theme 导出，无其它使用者；与 src/vt/theme.zig 不是同一文件(host/vt import 的是后者)；无 ui import，也可视为纯数据
+src/ui/theme/zerowork.tokens.json	src/shared/ui/theme/zerowork.tokens.json	shared_ui	no	build.zig:33/37 generateThemeLayers 硬编码此路径；另 vendor/DEPENDENCIES.md 引用
+src/ui/theme_states.zig	src/shared/ui/theme/theme_states.zig	shared_ui	no	被 app_theme/layer_materials/sidebar/settings/bmc 等 8 个文件 import；只依赖 ui
+src/ui_theme_test_support.zig	src/shared/testing/ui_theme_test_support.zig	shared_testing	no	被 8 个根测试 import；import ui+ui/shell_styles+ui/app_theme
+# CONTESTED src/ui/ai_brand.zig ai 前缀 ai_，仅 ai/settings 使用的品牌标识视图(import ui+app_theme+ai_brand_assets)；ai_brand_assets.zig 已由本包认领
+# CONTESTED src/ui/application_data_cleanup_styles.zig settings 应用数据清理确认界面，配套 application_data_cleanup_ui_tests；§5.2 示例 settings 含 cleanup_host
+# CONTESTED src/ui/application_data_cleanup_view.zig settings 同上；仅 main 与 application_host import
+# CONTESTED src/ui/application_host.zig connections 4456 行混合巨型 host(SSH/Local 运行时桥)，被 ai×15、ssh_*测试×6 等 44 个文件 import；也可能是 app，需主 agent 裁决
+# CONTESTED src/ui/challenge_window_host.zig connections 认证挑战邮箱/呈现器，被 plugin_*、connection_*、probe_*、auth/ai 测试 import(auth 域)
+# CONTESTED src/ui/plugin_challenge_presenter.zig connections 认证挑战呈现器(528 行)，被 plugin_*、connection_*、probe_*、challenge_window_host import
+# CONTESTED src/ui/plugin_content_host.zig plugins §5.2 未点名 plugin_ 前缀；插件内容宿主，被 plugin_*、bmc_ikvm 测试 import
+# CONTESTED src/ui/plugin_editor_host.zig plugins 插件编辑器宿主，被 wizard_* 与 main import；也可能是 connections
+# CONTESTED src/ui/plugin_window_host.zig plugins 1160 行插件窗口宿主，被 terminal/ai/main/bmc 测试 import；也可能是 app
+# CONTESTED src/ui/probe_connection_host.zig connections 离线探测连接宿主，被 wizard_probe_tests、main、totp_autofill_tests import
+# CONTESTED src/ui/ssh_status_host.zig connections 或 shell SSH 状态宿主，被 main、connection_*、ssh_*测试、bmc 测试 import
+# CONTESTED src/ui/reconnect_bridge.zig workspace import vt/reconnect 与 session_tombstone；仅 root.zig 暴露
+# CONTESTED src/ui/remote_session_notice.zig workspace 窗格级远端会话提示，用 local_session_styles，被 workspace、button_policy_tests、transfer 测试 import
+# CONTESTED src/ui/shortcut_dispatch.zig workspace import pane_manager.Manager；仅 root.zig import
+# CONTESTED src/ui/shortcut_router.zig workspace 纯函数，被 shortcut_dispatch 与 root.zig import；与 shortcut_dispatch 同目录
+# CONTESTED src/ui/overlay_anchor.zig workspace 无 ui import 的纯锚点计算，被 context_menu/group/status×2/overlay_model import(workspace+shell)；若主 agent 认为跨 feature 可入 shared/base
+# CONTESTED src/ui/overlay_model.zig workspace import host/identity(core)，被 application_host 与 root.zig import；popover 栈模型
+# CONTESTED src/ui/retained_panel.zig shell 窗口持有面板挂载辅助(设置/助手面板)，仅被 main 与 theme/background 测试 import
+# CONTESTED src/ui/startup_styles.zig shell 启动覆盖层样式(startup_*)
+# CONTESTED src/ui/startup_transition.zig shell 无 ui import 的一次性启动计时，被 startup_view 与 appearance_tests import
+# CONTESTED src/ui/startup_view.zig shell 启动覆盖层视图，仅 main import
+# CONTESTED src/ui/empty_saved_connections.zig workspace 空工作区“已保存的连接”，用 sidebar_styles+config/hosts(core)，被 workspace 与 transfer 测试 import；也可能是 connections
+# CONTESTED src/ui/donation_qr.zig terminal 无 ui import 的捐赠二维码矩阵，被 builtin_records 等 terminal 文件和 main import；含 @embedFile("assets/donation-qr.txt")，资源 src/ui/assets/donation-qr.txt 已由本包认领到 shared/ui/assets/，搬后 embedFile 路径要改为相对跨目录
+# CONTESTED src/ui/donation_qr_view.zig terminal 捐赠二维码视图，用 builtin_records_styles，仅 terminal_* import
+# CONTESTED src/ui/formatted_output.zig ai 无 ui import 的工具输出展示投影，仅 ai 文件(ai_* 与 ai 测试)import
+# CONTESTED src/ui/glyph_atlas.zig terminal 无 ui import，import vt/cell；仅 root.zig import(渲染字形缓存键)；也可能是 core vt
+# CONTESTED src/ui/multiwindow_test_routes.zig app 测试 RPC 路由，import zenit_app+application_host+plugin_window_host；仅 main 与 transfer 测试 import
+# CONTESTED src/ui/files/_styles.yss.zig files src/ui/files/styles.yss 的生成孪生，§5.2 未点名 ui/files/
+# CONTESTED src/ui/files/styles.yss files 孪生文件须与 _styles.yss.zig 同目录
+# CONTESTED src/ui/settings/_styles.yss.zig settings §5.2 明确 ui/settings/*
+# CONTESTED src/ui/settings/styles.yss settings §5.2 明确 ui/settings/*
+# CONTESTED src/ui/shell/_styles.yss.zig shell ui/shell/ 目录下 yss 生成孪生
+# CONTESTED src/ui/shell/styles.yss shell ui/shell/ 目录下 yss
+# CONTESTED src/ui/shell_styles.zig shell 前缀 shell_ 归 shell，但被约 33 个前缀(各 feature、testing/ui_kit、ui_theme_test_support、app_theme、copy_button、auxiliary_appearance)import，实质是共享 styles；若放 shell 会令 shared/ui 反向依赖 feature，建议主 agent 评估是否改入 shared/ui/styles
+# CONTESTED src/ui/session_icon.zig workspace 前缀 session_；被 8 个前缀 import，import assets_generated/host_os_assets，是共享图标选择器候选
+# CONTESTED src/theme_layer_tests.zig shared-ui 跨 feature 的主题/材质总测(import ai/file/sidebar/terminal/transfer 等)，聚合 auxiliary_appearance_tests、material_performance_tests
+# CONTESTED src/material_performance_tests.zig shared-ui 测 layer_materials，但 import ai_step_view/ai_strip_view/sidebar_view
+# CONTESTED src/material_popup_tests.zig shared-ui 测 layer_materials 弹层，跨 ai/auth/status/tab 等
+# CONTESTED src/ui_constraint_tests.zig shared-ui 跨 feature 的样式约束扫描(settings/ai/connection/transfer/wizard 等)
+# CONTESTED src/button_policy_tests.zig shared-ui 测 copy_button 等按钮策略，跨 ai/notification/remote_session_notice/transfer
+# CONTESTED src/button_policy_preview_runner.zig shared-ui 同上预览 runner，import zenit_app 与 ai/transfer styles
+# CONTESTED src/fullscreen_titlebar_tests.zig shell 全屏标题栏，import app_theme+shell_styles
+# CONTESTED src/incremental_ui_tests.zig ai 实际测 ai_message_view+layer_materials
+# CONTESTED src/background_surface_tests.zig shell 背景层/保留面板，import background_layers/retained_panel/terminal_view 等
+# CONTESTED src/theme_installation_tests.zig settings 只 import config/imported_theme、runtime_config、theme_registry
+# E2E build.zig 引用了 src/ui/design_tokens.zig, src/ui/theme/zerowork.tokens.json
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/ui/app_theme.zig, src/ui/layer_materials.zig
+# E2E docs/DESIGN/V0.1.2_LOCAL_TERMINAL.md 引用了 src/ui/app_theme.zig
+# E2E e2e/domestic_os_native.ts 引用了 host_os_assets.zig, src/ui/host_os_assets.zig
+# E2E e2e/tab_icon_states_native.ts 引用了 host_os_assets.zig, src/ui/host_os_assets.zig
+# E2E scripts/generate_domestic_os_assets.py 引用了 src/ui/assets, ui/assets/
+# E2E scripts/generate_international_os_assets.py 引用了 src/ui/assets, ui/assets/
+# E2E scripts/generate_os_badge_assets.py 引用了 src/ui/assets, ui/assets/
+# E2E scripts/generate_os_contrast_assets.py 引用了 src/ui/assets, ui/assets/
+# E2E scripts/os_logo_extract.py 引用了 src/ui/assets, ui/assets/
+# E2E tools/arch/baseline.txt 引用了 src/shared/testing/ui_kit.zig, src/testing/data_directory.zig, src/ui/app_theme.zig, src/ui/copy_button.zig, src/ui/layer_materials.zig, src/ui/layout_motion.zig
+# E2E tools/arch/rules.zon 引用了 src/ui/app_theme.zig, src/ui/assets, src/ui/aux_window.zig, src/ui/control_hint.zig, src/ui/copy_button.zig, src/ui/icon_button_feedback.zig, ui/assets/
+# E2E vendor/DEPENDENCIES.md 引用了 src/ui/app_theme.zig, src/ui/focus_fill.zig, src/ui/layer_materials.zig, src/ui/theme/zerowork.tokens.json
+# E2E src/ui/assets/ai-brands/README.md 引用了 src/ui/ai_brand_assets.zig(文档，随资源搬迁时改文字)
+# E2E src/ui/assets/host-os/README.md 引用了 src/ui/host_os_assets.zig, src/ui/rocky_os_asset.zig(文档，随资源搬迁时改文字)
+# E2E src/ui/assets/shell/README.md 引用了 src/ui/shell_assets.zig(文档，随资源搬迁时改文字)
+# TESTID appearance.*(layer_materials 的 appearance.background/appearance.material.compensation，auxiliary_appearance 的 appearance.auxiliary)
+# TESTID <prefix>.palette 与 <prefix>.<label>(color_palette 由调用方传入前缀，归调用方 tab/asset feature)
+# TESTID control_hint 的 id 由调用方传入，无自有前缀

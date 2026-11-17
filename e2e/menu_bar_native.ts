@@ -1,5 +1,6 @@
 /** Isolated product check. Native left/right clicks and activation are verified
  * with CUA while this runner keeps its own bundle/data/RPC alive. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,mkdir,copyFile,writeFile,readFile,open,access,realpath} from 'node:fs/promises';
@@ -43,7 +44,7 @@ try{
  assert.deepEqual(menu.rows.map((r:any)=>r.title),['Menu Beta','Menu Alpha']);checks.push('native menu follows actual Tab drag reorder');
  ts=await tabs();await h.clickAt(ts[0].rect.x+ts[0].rect.w/2,ts[0].rect.y+16);
  await h.type_('exit');await h.key('return');
- menu=await h.waitFor(async()=>{const m=await native();return m.rows?.find((r:any)=>r.title==='Menu Beta')?.status==='离线'?m:null;});
+ menu=await h.waitFor(async()=>{const m=await native();return m.rows?.find((r:any)=>r.title==='Menu Beta')?.status==='已结束'?m:null;/* copy-terms: connection_presenter wording (已结束, not 离线) */});
  checks.push('real Local process exit refreshes native menu status');
  await writeFile(join(out,'native-menu.json'),JSON.stringify(menu,null,2));
  await h.screenshot(join(out,'native-window.png'));

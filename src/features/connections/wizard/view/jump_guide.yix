@@ -1,0 +1,66 @@
+//! 跳板引导（design-r3 稿 4，Pencil RDiob › Li7pX）：连接向导第 2 步“经 SSH 跳板连接”的空态，与在向导内新建跳板主机的子流程。
+//! 只用 zenit 原生组件，外观全是默认：
+//!
+//! - `JumpEmpty`：选中“经 SSH 跳板连接”但没有可用主机时，在路径位置显示空态——图标、“还没有可以作跳板的主机”、一句说明、
+//!   主按钮“新建跳板主机”（primary，前置 + 图标）与次按钮“改为直连”（ghost）。同一个组件里挂右下角的原生通知栈：子流程保存后
+//!   弹“已保存 {名称} / 已作为第 1 跳加入，也已出现在侧栏。”。
+//! - `JumpChildBanner`：子流程（标题“新建连接 › 新建跳板主机”）表单顶部的原生 `W.Alert`（info）：“保存后会自动作为 {目标} 的第 1 跳”。
+//! - `JumpChildFooter`：子流程底栏——左“返回连接路径”（secondary）+ 提示“保存后回到“连接路径””，右“取消”（ghost）、
+//!   “保存并加为跳板”（primary）。“返回”与“取消”都不保存，主流程已填写的内容全部保留。
+//! 状态都在 `jump_guide_view.zig`（宿主是 `plugins/remote/editor.zig` 的 RemoteEditor）；这里不做判断。
+const ui = @import("ui");
+const W = ui.widgets;
+const C = @import("jump_guide_view.zig");
+const S = @import("jump_guide.yss");
+
+pub const ids = struct {
+    pub const empty = "wizard.route.jump_empty";
+    pub const new_host = "wizard.route.jump_empty.new";
+    pub const direct = "wizard.route.jump_empty.direct";
+    pub const toasts = "wizard.route.jump_toasts";
+    pub const banner = "wizard.jump_child.banner";
+    pub const footer = "wizard.jump_child.footer";
+    pub const back = "wizard.jump_child.back";
+    pub const cancel = "wizard.jump_child.cancel";
+    pub const save = "wizard.jump_child.save";
+};
+
+fn send(vm: *C.JumpGuide, action: C.Action) void {
+    vm.act(action);
+}
+
+pub fn JumpEmpty(vm: *C.JumpGuide) View {
+    return (
+        <box style={S.holder}>
+            <col testId={ids.empty} style={S.empty} visible={vm.emptyShown()} a11y={.{ .role = .group, .label = "还没有可以作跳板的主机" }}>
+                <box style={S.badge}><icon style={S.badge_icon} src={ui.icons.waypoints} /></box>
+                <text style={S.title}>还没有可以作跳板的主机</text>
+                <text style={S.detail} box={S.detail_box}>跳板主机需要先保存为一条 SSH 连接。新建后自动加为第 1 跳，并回到这一步。</text>
+                <row style={S.actions}>
+                    <W.Button testId={ids.new_host} label="新建跳板主机" variant={.primary} size={.sm} iconAsset={ui.icons.plus} disabled={vm.locked()} onClick={send(vm, .new_host)} />
+                    <W.Button testId={ids.direct} label="改为直连" variant={.ghost} size={.sm} disabled={vm.locked()} onClick={send(vm, .direct)} />
+                </row>
+            </col>
+            <W.NotificationHost testId={ids.toasts} post={vm.toast()} position={.bottom_right} />
+        </box>
+    );
+}
+
+pub fn JumpChildBanner(vm: *C.JumpGuide) View {
+    return (
+        <box style={S.banner} visible={vm.childShown()}>
+            <W.Alert testId={ids.banner} variant={.info} title={vm.bannerTitle()} message="这台主机也会出现在侧栏，之后可以单独连接或给别的主机当跳板。" />
+        </box>
+    );
+}
+
+pub fn JumpChildFooter(vm: *C.JumpGuide) View {
+    return (
+        <row testId={ids.footer} style={S.footer} visible={vm.childShown()}>
+            <W.Button testId={ids.back} label="返回连接路径" variant={.secondary} size={.sm} disabled={vm.saving()} onClick={send(vm, .back)} />
+            <text style={S.hint} box={S.hint_box}>保存后回到“连接路径”</text>
+            <W.Button testId={ids.cancel} label="取消" variant={.ghost} size={.sm} disabled={vm.saving()} onClick={send(vm, .cancel)} />
+            <W.Button testId={ids.save} label="保存并加为跳板" variant={.primary} size={.sm} disabled={vm.saveDisabled()} loading={vm.saving()} onClick={send(vm, .save)} />
+        </row>
+    );
+}

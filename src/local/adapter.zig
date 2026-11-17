@@ -84,6 +84,7 @@ const Entry = struct {
     handle: identity.SessionHandle,
     key: operations.OperationKey,
     options: Options,
+    metadata_revision: *std.atomic.Value(u64),
     cwd: ?[]u8,
     term: []u8,
     mutex: Mutex = .{},
@@ -159,7 +160,7 @@ const Entry = struct {
     metadata_display_arena: std.heap.ArenaAllocator,
     metadata_display: manifest.Display = .{},
 
-    fn init(allocator: std.mem.Allocator, request: host.CreateRequest, options: Options) !*Entry {
+    fn init(allocator: std.mem.Allocator, request: host.CreateRequest, options: Options, metadata_revision: *std.atomic.Value(u64)) !*Entry {
         const self = try allocator.create(Entry);
         errdefer allocator.destroy(self);
         const cwd = if (request.spec.local.initial_cwd) |value| try allocator.dupe(u8, value) else null;
@@ -179,7 +180,7 @@ const Entry = struct {
         errdefer output.deinit(allocator);
         var text = try TextSlot.init(allocator, TextSlot.default_capacity);
         errdefer text.deinit(allocator);
-        self.* = .{ .metadata_identity = archive_mod.MetadataIdentity.generate(), .metadata_started_ms = @import("../platform/realtime.zig").milliseconds(undefined), .metadata_display_arena = std.heap.ArenaAllocator.init(allocator), .wakeup = wakeup, .allocator = allocator, .handle = request.handle, .key = request.key, .options = frozen_options, .recording_retention_days = .init(if (options.recording) |recording| recording.log.retention_days else 14), .cwd = cwd, .term = term, .output = output, .text = text, .geometry = .{ .revision = 1, .cols = options.cols, .rows = options.rows } };
+        self.* = .{ .metadata_identity = archive_mod.MetadataIdentity.generate(), .metadata_started_ms = @import("../platform/realtime.zig").milliseconds(undefined), .metadata_display_arena = std.heap.ArenaAllocator.init(allocator), .wakeup = wakeup, .allocator = allocator, .handle = request.handle, .key = request.key, .options = frozen_options, .metadata_revision = metadata_revision, .recording_retention_days = .init(if (options.recording) |recording| recording.log.retention_days else 14), .cwd = cwd, .term = term, .output = output, .text = text, .geometry = .{ .revision = 1, .cols = options.cols, .rows = options.rows } };
         self.text.producer_wakeup = &self.wakeup;
         self.text.structured_supported = false;
         errdefer self.writes.deinit(allocator);
@@ -259,6 +260,7 @@ pub const LocalAdapter = struct {
     session_host: ?*host.SessionHost = null,
     recording_config_revision: ?u64 = null,
     recording_retention_target: ?u16 = null,
+    metadata_revision: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !*LocalAdapter {
         if (options.cols == 0 or options.rows == 0 or options.output_capacity < 4096 or options.term.len == 0 or options.term.len > 128) return error.InvalidOptions;
@@ -393,7 +395,7 @@ pub const LocalAdapter = struct {
         } else if (request.spec != .local) return error.WrongPlugin;
         if (self.find(request.handle) != null) return error.DuplicateSession;
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        const entry = try Entry.init(self.allocator, adapted, self.options);
+        const entry = try Entry.init(self.allocator, adapted, self.options, &self.metadata_revision);
         entry.engine_spec_bound = request.spec != .plugin;
         errdefer entry.destroy();
         entry.thread = try std.Thread.spawn(.{}, run, .{entry});
@@ -531,6 +533,9 @@ pub const LocalAdapter = struct {
     pub fn terminalService(self: *LocalAdapter, binding: host.ServiceHandle) !terminal.Service {
         _ = try self.resolve(binding, .terminal, true);
         return .{ .binding = binding, .context = self, .vtable = &service_vtable };
+    }
+    pub fn metadataRevision(self: *const LocalAdapter) u64 {
+        return self.metadata_revision.load(.acquire);
     }
     pub fn processSnapshot(self: *LocalAdapter, handle: identity.SessionHandle) !ProcessSnapshot {
         const entry = self.find(handle) orelse return error.StaleSession;
@@ -818,7 +823,8 @@ pub const LocalAdapter = struct {
     }
     fn serviceTrustedOutcome(raw: *anyopaque, binding: host.ServiceHandle) !?terminal.trusted_edit.Outcome {
         const self: *LocalAdapter = @ptrCast(@alignCast(raw));
-        const entry = try self.resolve(binding, .terminal, true);
+        // The retained surface drains input outcomes while painting the EOF frame.
+        const entry = try self.resolve(binding, .terminal, false);
         if (!entry.mutex.tryLock()) return error.WorkerBusy;
         defer entry.mutex.unlock();
         const bridge = if (entry.trusted) |*value| value else return null;
@@ -828,7 +834,8 @@ pub const LocalAdapter = struct {
     }
     fn serviceTrustedCancel(raw: *anyopaque, binding: host.ServiceHandle) !void {
         const self: *LocalAdapter = @ptrCast(@alignCast(raw));
-        const entry = try self.resolve(binding, .terminal, true);
+        // The bridge may already have been revoked and released during PTY shutdown.
+        const entry = try self.resolve(binding, .terminal, false);
         if (!entry.mutex.tryLock()) return error.WorkerBusy;
         defer entry.mutex.unlock();
         if (entry.trusted) |*bridge| bridge.revoke(.integration_lost);
@@ -1444,7 +1451,10 @@ fn run(entry: *Entry) void {
                 }
                 // A silent cd/foreground change does not publish a text frame.
                 // Sampling timestamps alone must not keep an idle UI awake.
-                if (metadata_changed) @import("../platform/presentation_wakeup.zig").notify();
+                if (metadata_changed) {
+                    _ = entry.metadata_revision.fetchAdd(1, .release);
+                    @import("../platform/presentation_wakeup.zig").notify();
+                }
                 metadata_at = native.zw_local_monotonic_ms() + 250;
             }
         }

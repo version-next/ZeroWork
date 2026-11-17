@@ -1,5 +1,6 @@
 #include "window.h"
 #include "../../window_chrome.h"
+#include "../../automation_environment.h"
 #include "../../../vendor/libdecor/libdecor.h"
 #include <wayland-client.h>
 #include <wayland-cursor.h>
@@ -301,7 +302,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, "wl_shm") == 0 && !w->shm) {
         type = &wl_shm_interface;
     } else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0 && !w->cursor_manager &&
-        (!getenv("ZENIT_WAYLAND_CURSOR_BACKEND") || strcmp(getenv("ZENIT_WAYLAND_CURSOR_BACKEND"), "theme") != 0)) {
+        (!zenitAutomationEnvironment("ZENIT_WAYLAND_CURSOR_BACKEND") || strcmp(zenitAutomationEnvironment("ZENIT_WAYLAND_CURSOR_BACKEND"), "theme") != 0)) {
         type = &wp_cursor_shape_manager_v1_interface;
     } else if (strcmp(interface, "wl_seat") == 0 && !w->seat) {
         type = &wl_seat_interface; bind_version = version < 8 ? version : 8;
@@ -480,6 +481,14 @@ float zenit_wayland_refresh_rate(const ZenitWaylandWindow *w) {
 }
 
 int zenit_wayland_poll(ZenitWaylandWindow *w, int timeout_ms) {
+    return zenit_wayland_poll_wake(w, timeout_ms, -1);
+}
+
+/* The application pump's wait: `wake_fd` (the process-wide eventfd behind
+ * postEmptyEvent, or -1) ends the wait when another thread posts, and is
+ * drained here. Internal waits (initial configure, clipboard reads) pass -1:
+ * they never consume a wake meant for the pump. */
+int zenit_wayland_poll_wake(ZenitWaylandWindow *w, int timeout_ms, int wake_fd) {
     if (!w || w->closed || timeout_ms < 0) return 0;
     clipboard_io(w);
     if (w->decor && w->decor_api.dispatch(w->decor, 0) < 0) { w->closed = 1; return -1; }
@@ -491,15 +500,21 @@ int zenit_wayland_poll(ZenitWaylandWindow *w, int timeout_ms) {
     if (w->event_count || w->button_count || w->scroll_x != 0 || w->scroll_y != 0) timeout_ms = 0;
     int flush = w->api.flush(w->display);
     if (flush < 0 && errno != EAGAIN) { w->api.cancel_read(w->display); w->closed = 1; return -1; }
-    struct pollfd fds[11] = {{ .fd = w->api.get_fd(w->display), .events = POLLIN | (flush < 0 ? POLLOUT : 0) }};
+    struct pollfd fds[12] = {{ .fd = w->api.get_fd(w->display), .events = POLLIN | (flush < 0 ? POLLOUT : 0) }};
     size_t fd_count = 1 + clipboard_pollfds(w, fds + 1);
     if (w->decor) fds[fd_count++] = (struct pollfd){ .fd = w->decor_api.get_fd(w->decor), .events = POLLIN };
     if (fd_count > 1 && timeout_ms > 100) timeout_ms = 100;
+    size_t wake_index = fd_count;
+    if (wake_fd >= 0) fds[fd_count++] = (struct pollfd){ .fd = wake_fd, .events = POLLIN };
     int result;
     timeout_ms = cursor_poll_timeout(w, keyboard_poll_timeout(w, timeout_ms));
     do { result = poll(fds, fd_count, timeout_ms); } while (result < 0 && errno == EINTR);
     if (result < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
         w->api.cancel_read(w->display); w->closed = 1; return -1;
+    }
+    if (wake_fd >= 0 && (fds[wake_index].revents & POLLIN)) {
+        uint64_t posts;
+        if (read(wake_fd, &posts, sizeof posts) < 0) { /* EAGAIN: another pump drained it */ }
     }
     if (fds[0].revents & POLLIN) {
         if (w->api.read_events(w->display) < 0) { w->closed = 1; return -1; }

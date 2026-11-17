@@ -1,0 +1,15 @@
+{
+  "$version": 1,
+  "$schema": "../../docs/design-system/theme.schema.json",
+  "$modes": {
+    "dim": {"scheme": "dark", "fallback": "dark"}
+  },
+  "semantic": {
+    "color": {
+      "zw_island_ground": {"$light": "#f4f1ecff", "$dark": "#1b1a19ff", "$dim": "#141312ff"},
+      "zw_island_edge": "{semantic.color.border}",
+      "accent": {"$override": true, "$description": "App brand accent", "$value": {"$light": "#a23010ff", "$dark": "#e07050ff"}}
+    },
+    "size": {"zw_rail": 44}
+  }
+}

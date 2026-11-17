@@ -18,6 +18,8 @@ const JsonWriter = @import("json_writer.zig").JsonWriter;
 // Bounded observation on the UI thread. Keep IDs, never pointers to removable nodes.
 const FrameSample = struct { ms: f64, x: f32, y: f32, w: f32, h: f32, opacity: f32, effective_opacity: f32 };
 var frame_target: ?command_queue.TestIdPayload = null;
+/// Active /scroll_stream: next event index and due time.
+var stream: ?struct { spec: command_queue.ScrollStream, sent: u32 = 0, next_ns: i128 } = null;
 var frame_samples: [128]FrameSample = undefined;
 var frame_count: usize = 0;
 var frame_missing: usize = 0;
@@ -132,6 +134,40 @@ pub const CaretRejections = struct {
     other: u64 = 0,
 };
 
+/// Per-stage sums since the last timing reset (renderer.StageTotals mirror;
+/// field names match so the app copies them generically). Divide by frames.
+pub const StageTotals = struct {
+    frames: u64 = 0,
+    layout_us: u64 = 0,
+    render_gen_us: u64 = 0,
+    gpu_encode_us: u64 = 0,
+    wait_for_frame_us: u64 = 0,
+    acquire_texture_us: u64 = 0,
+    cpu_frame_us: u64 = 0,
+    total_frame_us: u64 = 0,
+    encode_us: u64 = 0,
+    flush_us: u64 = 0,
+    submit_us: u64 = 0,
+    present_us: u64 = 0,
+    prep_us: u64 = 0,
+    setup_us: u64 = 0,
+    teardown_us: u64 = 0,
+    thread_kcycles_period: u64 = 0,
+    thread_kcycles_frame: u64 = 0,
+    thread_kcycles_present: u64 = 0,
+    glass_us: u64 = 0,
+    pass_native_us: u64 = 0,
+    render_passes: u64 = 0,
+    draw_calls: u64 = 0,
+    backend_draws: u64 = 0,
+    backend_draw_us: u64 = 0,
+    backend_bind_us: u64 = 0,
+    backend_native_draw_us: u64 = 0,
+    backend_uniform_snapshots: u64 = 0,
+    backend_texture_views: u64 = 0,
+    backend_bind_groups: u64 = 0,
+    gpu_execute_us: u64 = 0,
+};
 pub const FrameStatsSnapshot = struct {
     renderer_backend: ?[]const u8 = null,
     gpu_validation_errors: ?u32 = null,
@@ -144,6 +180,13 @@ pub const FrameStatsSnapshot = struct {
     retained_hits: u32 = 0,
     retained_misses: u32 = 0,
     retained_partial_repaints: u32 = 0,
+    /// Anchor-transition picture textures (cumulative): frames whose cached texture was reused
+    /// (composite only), rasterized (first frame / content changed), or not cacheable (drawn
+    /// from its commands every frame); and genie mesh cells drawn.
+    transition_texture_hits: u64 = 0,
+    transition_texture_rasters: u64 = 0,
+    transition_texture_uncached: u64 = 0,
+    genie_mesh_cells: u64 = 0,
     /// Cumulative count of complete offscreen texture pool acquire failures. > 0 = silent
     /// degradation appeared on screen (blur fewer levels / composite layer not drawn),
     /// direct indicator of 'multiple glass islands flickering together'.
@@ -170,6 +213,8 @@ pub const FrameStatsSnapshot = struct {
     caret_admission_next_ns: i128 = 0,
     caret_flips: u64 = 0,
     caret_last_flip_ms: i64 = 0,
+    /// Frames dropped because the drawable no longer matched the live view size.
+    stale_drawable_discards: u64 = 0,
     /// Backdrop brightness auto-adapt measured value; -1 = absent (disabled/no glass).
     backdrop_luminance: f32 = -1,
     /// Render invariant: cumulative repeated fill rect count (same node one frame emits identical
@@ -177,6 +222,8 @@ pub const FrameStatsSnapshot = struct {
     paint_duplicate_fills: u64 = 0,
     /// Last double-emit node id (0 = never).
     paint_duplicate_node: u32 = 0,
+    /// ZENIT_VERIFY_INCREMENTAL: cumulative cached-vs-full lowered item mismatches (0 = equal).
+    incremental_verify_mismatches: u64 = 0,
 
     // -- Timing (microseconds) --
     // These fields were absent: real GPU time always in renderer.FrameStats, never projected to
@@ -205,6 +252,10 @@ pub const FrameStatsSnapshot = struct {
     pass_native_us: u64 = 0,
     /// Previous frame total time.
     total_frame_us: u64 = 0,
+    stage_totals: ?StageTotals = null,
+    /// Work counters of the harness-bound window (`cx.work_counters.report()`): deterministic
+    /// per-frame work since the last /stats/reset. null = the host does not publish them.
+    work: ?ui.devtools.work_counters.Sampler.Report = null,
 
     // **Cross-frame P95** (gate assertion anti-noise statistic; ~120 recent render frames):
     gpu_p95_us: u64 = 0,
@@ -277,6 +328,29 @@ pub fn recordingStatus() RecordingState {
 }
 pub fn stopRecording() RecordingState {
     return if (g_stop_recording_fn) |f| f() else .{};
+}
+
+/// CPU patch control: mode 0 query, 1 enable, 2 disable; false = unsupported.
+pub const CpuPatchStatus = struct {
+    enabled: bool = false,
+    cpu_frames: u64 = 0,
+    gpu_frames: u64 = 0,
+    shown: u32 = 0,
+    unchanged_frames: u64 = 0,
+    rects: [24][4]u32 = undefined,
+    rect_count: usize = 0,
+};
+pub const CpuPatchFn = *const fn (mode: u8, out: *CpuPatchStatus) bool;
+var g_cpu_patch_fn: ?CpuPatchFn = null;
+pub fn setCpuPatchFn(f: CpuPatchFn) void {
+    g_cpu_patch_fn = f;
+}
+
+/// Writes the WindowServer image of the key window to a PNG; 1 = written.
+pub const CompositedCaptureFn = *const fn (path: [*:0]const u8) callconv(.c) c_int;
+var g_composited_capture_fn: ?CompositedCaptureFn = null;
+pub fn setCompositedCaptureFn(f: CompositedCaptureFn) void {
+    g_composited_capture_fn = f;
 }
 
 pub fn setGetFrameStatsFn(f: GetFrameStatsFn) void {
@@ -367,6 +441,16 @@ fn writeTrackSamples(w: *std.Io.Writer, samples: []const TrackSample, truncated:
     try w.writeAll("]}");
 }
 
+/// Bring layout and paint-derived state (rects, hit index, a11y) up to date
+/// for a query or a harness mutation. This paint is never presented, so it
+/// cannot satisfy a redraw request: one pending before it still asks the host
+/// for a frame (a click before a query, a scroll command's own request).
+fn flushUnpresented(ctx: *ui.Cx) void {
+    const pending = ctx.needs_redraw;
+    _ = ctx.render();
+    if (pending) ctx.needs_redraw = true;
+}
+
 test "逐帧追踪：样本序列化带 truncated 标记，缓冲写不下时返回错误而不是半截 JSON" {
     const samples = [_]TrackSample{
         .{ .t_ms = 0, .x = 1, .y = 2, .w = 3, .h = 4, .found = true },
@@ -434,7 +518,43 @@ pub fn drainCommands(queue: *CommandQueue) void {
 
 /// Returns a one-shot submission request for the commands consumed in this
 /// batch. Polling/query wakes alone must not add another animation drawable.
+/// Time until the next scroll stream event is due (0: due now); null when no
+/// stream runs. The run loop sleeps until then, as it would until a real
+/// wheel event arrived.
+pub fn streamNextDelayNs(io: anytype) ?u64 {
+    const s = stream orelse return null;
+    const now = @import("zenit_time").monotonicTimestamp(io);
+    return if (s.next_ns <= now) 0 else @intCast(s.next_ns - now);
+}
+
+/// Inject every stream event due by now (a high-rate wheel coalesced per
+/// loop iteration, as AppKit delivers it).
+fn pumpStream(queue: *CommandQueue) void {
+    const s = &(stream orelse return);
+    const now = @import("zenit_time").monotonicTimestamp(queue.io);
+    const ctx = getCtx() orelse {
+        stream = null;
+        return;
+    };
+    while (s.sent < s.spec.count and now >= s.next_ns) {
+        const span = @max(s.spec.span, 1);
+        const forward = (s.sent / span) % 2 == 0;
+        const in_span = s.sent % span;
+        const phase: ui.events.ScrollPhase = if (!s.spec.phased) .none else if (in_span == 0) .began else .changed;
+        ctx.handleScroll(.{ .x = s.spec.x, .y = s.spec.y, .dx = 0, .dy = if (forward) s.spec.step else -s.spec.step, .phase = phase });
+        if (s.spec.phased and (in_span + 1 == span or s.sent + 1 == s.spec.count)) {
+            ctx.handleScroll(.{ .x = s.spec.x, .y = s.spec.y, .dx = 0, .dy = 0, .phase = .ended });
+        }
+        s.sent += 1;
+        s.next_ns += @intFromFloat(s.spec.interval_ms * std.time.ns_per_ms);
+    }
+    if (s.sent >= s.spec.count) stream = null;
+}
+
 pub fn drainCommandsRequestFrame(queue: *CommandQueue) bool {
+    // Injected wheel events request frames as platform wheel events do: through what they
+    // change (Cx.handleScroll), never by themselves.
+    pumpStream(queue);
     var request_frame = false;
     while (queue.dequeue()) |cmd| {
         request_frame = commandRequestsFrame(cmd) or request_frame;
@@ -447,6 +567,9 @@ pub fn drainCommandsRequestFrame(queue: *CommandQueue) bool {
         };
         if (handled) {
             queue.signalDone();
+            // The callback may already have told the host to exit. Keep the
+            // main loop alive until File RPC completes its response write.
+            if (cmd == .quit_app_after_reply) queue.waitForQuitReply();
         }
     }
     return request_frame;
@@ -459,6 +582,7 @@ fn commandRequestsFrame(cmd: TestCommand) bool {
         .health,
         .windows,
         .query_tree,
+        .query_tree_scoped,
         .query_selector,
         .get_focused,
         .screen_pos,
@@ -468,7 +592,11 @@ fn commandRequestsFrame(cmd: TestCommand) bool {
         .reset_timing,
         .console_query,
         .quit_app,
+        .quit_app_after_reply,
         => false,
+        // A wheel event requests a frame through what it changes (Cx.handleScroll), as a
+        // platform wheel event does: a wheel against a pinned end renders nothing.
+        .scroll => false,
         // Input, resize, screenshots and recording/control mutations request
         // one immediate frame. Custom routes have no readonly declaration, so
         // they conservatively follow the same contract, even with an empty body.
@@ -481,6 +609,12 @@ fn commandRequestsFrame(cmd: TestCommand) bool {
 pub const AppRouteFn = *const fn (path: []const u8, body: []const u8, out: []u8) ?[]const u8;
 var g_app_route_fn: ?AppRouteFn = null;
 
+/// Runtime-owned routes (e.g. the Windows /perf/ switches), tried before the
+/// application's handler so neither replaces the other.
+var g_runtime_route_fn: ?AppRouteFn = null;
+pub fn setRuntimeRouteFn(f: ?AppRouteFn) void {
+    g_runtime_route_fn = f;
+}
 pub fn setAppRouteFn(f: AppRouteFn) void {
     g_app_route_fn = f;
 }
@@ -520,7 +654,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 // breaks.
                 for (0..c.count) |_| {
                     if (ctx.close_requested) break;
-                    ctx.handleMouseDown(c.x, c.y, c.modifiers());
+                    ctx.handleMouseDownEx(c.x, c.y, c.button, c.modifiers());
                     if (ctx.close_requested) break;
                     ctx.updateAutomationCursor(c.x, c.y, true);
                     ctx.handleMouseUpEx(c.x, c.y, c.button, c.modifiers());
@@ -588,6 +722,13 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             return true;
         },
         .app_route => |c| {
+            if (g_runtime_route_fn) |runtime| {
+                var runtime_buf: [command_queue.AppRoutePayload.BODY_CAP * 2]u8 = undefined;
+                if (runtime(c.getPath(), c.getBody(), &runtime_buf)) |written| {
+                    queue.result.setJson(written);
+                    return true;
+                }
+            }
             const handler = g_app_route_fn orelse {
                 queue.result.setError("no app route handler");
                 return true;
@@ -620,6 +761,25 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .pointer_leave => {
+            if (getCtx()) |ctx| {
+                ctx.handlePointerLeave();
+                queue.result.setJson("{\"ok\":true}");
+            } else queue.result.setError("no context");
+            return true;
+        },
+        .window_active => |active| {
+            if (getCtx()) |ctx| {
+                if (ctx.window_active != active) {
+                    ctx.window_active = active;
+                    // Same follow-up as the runtimes: inactive glass material re-resolves.
+                    if (ctx.root) |root| root.markSubtreeBeforeRenderHook();
+                }
+                ctx.needs_redraw = true;
+                queue.result.setJson("{\"ok\":true}");
+            } else queue.result.setError("no context");
+            return true;
+        },
         .mouse_up => |c| {
             if (getCtx()) |ctx| {
                 // Must use Ex with modifiers: handleMouseUp hardcodes `.{}`, e2e can never cover
@@ -646,6 +806,15 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 queue.result.setJson("{\"ok\":true}");
             } else {
                 queue.result.setError("no context");
+            }
+            return true;
+        },
+        .scroll_stream => |c| {
+            if (getCtx() != null and c.count > 0 and c.interval_ms >= 1) {
+                stream = .{ .spec = c, .next_ns = @import("zenit_time").monotonicTimestamp(queue.io) };
+                queue.result.setJson("{\"ok\":true}");
+            } else {
+                queue.result.setError("invalid scroll stream");
             }
             return true;
         },
@@ -726,7 +895,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             if (getCtx()) |ctx| {
                 // Force frame flush: preceding mutating commands (imeCommit / text_input /
                 // key_down) complete before_render hook + layout, rect/world up-to-date.
-                _ = ctx.render();
+                flushUnpresented(ctx);
                 if (ctx.root) |root| {
                     // Write direct to result buffer (no 128KB stack intermediate then truncate);
                     // fail explicit if doesn't fit, never return partial JSON.
@@ -744,9 +913,34 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .query_tree_scoped => |payload| {
+            if (getCtx()) |ctx| {
+                flushUnpresented(ctx);
+                if (ctx.root) |root| {
+                    const id = payload.root.getText();
+                    const json = tree_serializer.serializeTreeQuery(root, &ctx.overlay_stack, .{
+                        .root_test_id = if (id.len == 0) null else id,
+                        .visible_only = payload.visible_only,
+                    }, &queue.result.buf) catch |err| {
+                        queue.result.setError(switch (err) {
+                            error.TreeTooLarge => "tree too large for RESULT_BUF_SIZE",
+                            error.NotFound => "tree root test_id not found",
+                        });
+                        return true;
+                    };
+                    queue.result.len = json.len;
+                    queue.result.success = true;
+                } else {
+                    queue.result.setError("no root");
+                }
+            } else {
+                queue.result.setError("no context");
+            }
+            return true;
+        },
         .query_selector => |payload| {
             if (getCtx()) |ctx| {
-                _ = ctx.render();
+                flushUnpresented(ctx);
                 if (ctx.root) |root| {
                     const json = tree_serializer.queryByTestId(root, &ctx.overlay_stack, payload.getText(), &queue.result.buf) catch {
                         queue.result.setError("query result too large for RESULT_BUF_SIZE");
@@ -766,8 +960,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             if (g_get_frame_stats_fn) |f| {
                 const st = f();
                 // 16 numeric fields, 512B insufficient (JsonWriter silent truncate produces invalid
-                // JSON, client sees parse error not clear failure).
-                var buf: [2048]u8 = undefined;
+                // JSON, client sees parse error not clear failure). `work` adds six counter sets.
+                var buf: [16384]u8 = undefined;
                 var jw = JsonWriter.init(&buf);
                 jw.beginObject();
                 jw.key("retained_hits");
@@ -776,6 +970,10 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.retained_misses));
                 jw.key("retained_partial_repaints");
                 jw.numberValue(@intCast(st.retained_partial_repaints));
+                inline for (.{ "transition_texture_hits", "transition_texture_rasters", "transition_texture_uncached", "genie_mesh_cells" }) |field| {
+                    jw.key(field);
+                    jw.numberValue(@intCast(@field(st, field)));
+                }
                 jw.key("offscreen_pool_exhausted");
                 jw.numberValue(@intCast(st.offscreen_pool_exhausted));
                 jw.key("text_uniform_overflow");
@@ -788,7 +986,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.booleanValue(st.caret_flipping);
                 jw.key("caret_visible");
                 jw.booleanValue(st.caret_visible);
-                inline for (.{ "graphics_footprint_bytes", "caret_rect_count", "caret_entries", "caret_flips", "caret_last_flip_ms", "caret_attempts", "caret_gate_blocked", "caret_admission_failures", "caret_admission_next_ns" }) |field| {
+                inline for (.{ "graphics_footprint_bytes", "caret_rect_count", "caret_entries", "caret_flips", "caret_last_flip_ms", "caret_attempts", "caret_gate_blocked", "caret_admission_failures", "caret_admission_next_ns", "stale_drawable_discards" }) |field| {
                     jw.key(field);
                     jw.numberValue(@intCast(@field(st, field)));
                 }
@@ -830,12 +1028,52 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                     jw.numberValue(@intCast(ps.max_frames));
                     jw.endObject();
                 } else jw.nullValue();
+                // Hover state: nearest test_id on the hovered path and stationary-pointer
+                // re-resolution counters (core/cx_hover.zig).
+                // Anchor transitions (ui.fx.anchor_transition.flight_stats, cumulative; subtree
+                // counters with ZENIT_ANCHOR_FLIGHT_PROBE=1).
+                jw.key("anchor_flight");
+                {
+                    const fs = ui.fx.anchor_transition.flight_stats;
+                    jw.beginObject();
+                    inline for (@import("zenit_reflection").fields(@TypeOf(fs))) |field| {
+                        jw.key(field.name);
+                        jw.numberValue(@intCast(@field(fs, field.name)));
+                    }
+                    jw.endObject();
+                }
+                jw.key("hover");
+                if (getCtx()) |ctx| {
+                    jw.beginObject();
+                    jw.key("test_id");
+                    var hovered_test_id: ?[]const u8 = null;
+                    var cur = ctx.hovered_node;
+                    while (cur) |n| : (cur = n.parent) {
+                        if (n.meta.ownership.meta.test_id) |tid| {
+                            hovered_test_id = tid;
+                            break;
+                        }
+                    }
+                    if (hovered_test_id) |tid| jw.stringValue(tid) else jw.nullValue();
+                    jw.key("reconcile_hit_tests");
+                    jw.numberValue(@intCast(ctx.hover_sync.reconcile_hit_tests));
+                    jw.key("reconcile_changes");
+                    jw.numberValue(@intCast(ctx.hover_sync.reconcile_changes));
+                    // Platform presence (cleared by pointer_left) and the resulting liveness.
+                    jw.key("pointer_over_content");
+                    jw.booleanValue(ctx.hover_sync.pointer_over_content);
+                    jw.key("pointer_live");
+                    jw.booleanValue(ctx.pointerLive());
+                    jw.endObject();
+                } else jw.nullValue();
                 jw.key("backdrop_luminance_milli");
                 jw.numberValue(@intFromFloat(st.backdrop_luminance * 1000));
                 jw.key("paint_duplicate_fills");
                 jw.numberValue(@intCast(st.paint_duplicate_fills));
                 jw.key("paint_duplicate_node");
                 jw.numberValue(@intCast(st.paint_duplicate_node));
+                jw.key("incremental_verify_mismatches");
+                jw.numberValue(@intCast(st.incremental_verify_mismatches));
                 jw.key("gpu_execute_us");
                 jw.numberValue(@intCast(st.gpu_execute_us));
                 jw.key("cpu_frame_us");
@@ -856,6 +1094,15 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 }
                 jw.key("total_frame_us");
                 jw.numberValue(@intCast(st.total_frame_us));
+                if (st.stage_totals) |totals| {
+                    jw.key("stage_totals");
+                    jw.beginObject();
+                    inline for (@typeInfo(StageTotals).@"struct".field_names) |name| {
+                        jw.key(name);
+                        jw.numberValue(@intCast(@field(totals, name)));
+                    }
+                    jw.endObject();
+                }
                 jw.key("gpu_p95_us");
                 jw.numberValue(@intCast(st.gpu_p95_us));
                 jw.key("cpu_p95_us");
@@ -874,11 +1121,92 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.gpu_timing_pending_queries));
                 jw.key("gpu_timing_query_supported");
                 if (st.gpu_timing_query_supported) |supported| jw.booleanValue(supported) else jw.nullValue();
+                jw.key("work");
+                if (st.work) |w| writeWorkReport(&jw, w) else jw.nullValue();
                 jw.endObject();
-                queue.result.setJson(jw.getWritten());
+                if (jw.hasOverflowed()) queue.result.setError("frame_stats JSON exceeds its buffer") else queue.result.setJson(jw.getWritten());
             } else {
                 queue.result.setError("frame_stats not supported");
             }
+            return true;
+        },
+        .sprites => |command| {
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            switch (command) {
+                .query => {},
+                .debug => ctx.sprites.setDebug(true),
+                .enable, .disable => {
+                    ctx.sprites.enabled = command == .enable;
+                    ctx.needs_redraw = true;
+                    if (ctx.root) |root| root.markRenderDirty();
+                },
+            }
+            var active: u32 = 0;
+            for (ctx.sprites.sources.items) |source| {
+                if (source.active) active += 1;
+            }
+            var buf: [4096]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.print("{{\"enabled\":{},\"sources\":{d},\"active\":{d},\"placements\":{d},\"frame_time_ms\":{d},\"atlas_bytes\":{d},\"building\":{d},\"host_error\":\"{s}\",\"rects\":[", .{
+                ctx.sprites.enabled, ctx.sprites.sources.items.len, active, ctx.sprites.placements.items.len, ctx.frame_time_ms, ctx.sprites.host_atlas_bytes, ctx.sprites.host_building, ctx.sprites.host_error,
+            }) catch {};
+            var first = true;
+            for (ctx.sprites.placements.items) |p| {
+                if (p.exiting) continue;
+                w.print("{s}[{d},{d},{d},{d}]", .{ if (first) "" else ",", p.origin_px[0], p.origin_px[1], p.cell_px[0], p.cell_px[1] }) catch {};
+                first = false;
+            }
+            w.writeAll("],\"reasons\":[") catch {};
+            for (ctx.sprites.sources.items, 0..) |source, i| {
+                w.print("{s}\"{s}\"", .{ if (i == 0) "" else ",", if (source.active) "active" else source.last_reject }) catch {};
+            }
+            w.writeAll("]}") catch {
+                queue.result.setError("sprites status overflow");
+                return true;
+            };
+            queue.result.setJson(w.buffered());
+            return true;
+        },
+        .cpu_patches => |command| {
+            const control = g_cpu_patch_fn orelse {
+                queue.result.setError("cpu patches not supported");
+                return true;
+            };
+            var out: CpuPatchStatus = .{};
+            const mode: u8 = switch (command) {
+                .query, .debug => 0,
+                .enable => 1,
+                .disable => 2,
+            };
+            if (!control(mode, &out)) {
+                queue.result.setError("cpu patches not supported");
+                return true;
+            }
+            if (command != .query) if (getCtx()) |ctx| {
+                ctx.needs_redraw = true;
+                if (ctx.root) |root| root.markRenderDirty();
+            };
+            var buf: [2048]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.print("{{\"enabled\":{},\"cpu_frames\":{d},\"gpu_frames\":{d},\"shown\":{d},\"unchanged_frames\":{d},\"rects\":[", .{ out.enabled, out.cpu_frames, out.gpu_frames, out.shown, out.unchanged_frames }) catch unreachable;
+            for (out.rects[0..out.rect_count], 0..) |r, i| w.print("{s}[{d},{d},{d},{d}]", .{ if (i == 0) "" else ",", r[0], r[1], r[2], r[3] }) catch unreachable;
+            w.writeAll("]}") catch unreachable;
+            queue.result.setJson(w.buffered());
+            return true;
+        },
+        .composited_screenshot => |payload| {
+            const capture = g_composited_capture_fn orelse {
+                queue.result.setError("composited screenshots not supported");
+                return true;
+            };
+            var path: [@import("command_queue.zig").RecordingStartPayload.PATH_CAP + 1]u8 = undefined;
+            @memcpy(path[0..payload.path_len], payload.getPath());
+            path[payload.path_len] = 0;
+            const status = capture(@ptrCast(&path));
+            queue.result.setJson(if (status == 1) "{\"ok\":true}" else "{\"ok\":false}");
             return true;
         },
         .force_frames => |on| {
@@ -954,7 +1282,9 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 queue.result.setError("no root");
                 return true;
             };
-            if (tree_serializer.findByTestId(root, payload.target.getText()) == null) {
+            // A target the click creates (a page it navigates to) may appear later; frames
+            // before it exists count as missing.
+            if (payload.click_target == null and tree_serializer.findByTestId(root, payload.target.getText()) == null) {
                 queue.result.setError("test_id not found");
                 return true;
             }
@@ -1186,7 +1516,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .screen_pos => |payload| {
             if (getCtx()) |ctx| {
-                _ = ctx.render();
+                flushUnpresented(ctx);
                 if (ctx.root) |root| {
                     if (tree_serializer.findByTestId(root, payload.getText())) |node| {
                         scrollNodeIntoView(ctx, node, false);
@@ -1225,7 +1555,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         .input_state => |payload| {
             // Query input/textarea internal state (event_context is *TextInputState).
             if (getCtx()) |ctx| {
-                _ = ctx.render();
+                flushUnpresented(ctx);
                 if (ctx.root) |root| {
                     if (tree_serializer.findByTestId(root, payload.getText())) |node| {
                         // Find input_container with inputEventHandler in wrapper subtree.
@@ -1233,23 +1563,16 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             queue.result.setError("no input_container under test_id");
                             return true;
                         };
-                        const ctx_ptr = ic.behavior.events.event_context orelse {
-                            queue.result.setError("no event_context on input_container");
+                        // textarea / single-line are different state structs: the input module
+                        // tells them apart (editStateOf), never a blind cast here.
+                        const edit = ui.widgets.input.editStateOf(ic) orelse {
+                            queue.result.setError("unknown on_event handler — not input or textarea");
                             return true;
                         };
-                        // textarea / single-line are different state structs, can't blind-cast to
-                        // TextInputState (layout difference -> buffer_len lands on pointer field ->
-                        // read ~10^18 garbage -> @intCast(i64) panic). Discriminate via on_event
-                        // function ptr: inputEventHandler vs textareaEventHandler.
-                        const TextInputState = ui.widgets.input.TextInputState;
-                        const TextareaState = ui.widgets.input.TextareaState;
-                        const inputEventHandler = ui.widgets.input.inputEventHandler;
-                        const textareaEventHandler = ui.widgets.input.textareaEventHandler;
                         var buf: [4096]u8 = undefined;
                         var jw = JsonWriter.init(&buf);
-                        const on_event = ic.behavior.events.on_event;
-                        if (on_event == inputEventHandler or ui.widgets.input.isEditableTextClickHandler(on_event)) {
-                            const state: *TextInputState = @ptrCast(@alignCast(ctx_ptr));
+                        if (edit == .input) {
+                            const state = edit.input;
                             // EditableText deliberately reuses inputEventHandler for both
                             // storage modes.  Its multiline variant keeps the canonical
                             // bytes in TextareaDocument, so reading buffer/buffer_len here
@@ -1309,8 +1632,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             jw.key("scroll_x");
                             jw.floatValue(state.scroll_x);
                             jw.endObject();
-                        } else if (on_event == textareaEventHandler) {
-                            const state: *TextareaState = @ptrCast(@alignCast(ctx_ptr));
+                        } else {
+                            const state = edit.textarea;
                             const text = state.getText();
                             jw.beginObject();
                             jw.key("buffer_len");
@@ -1329,6 +1652,12 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             jw.stringValue(@tagName(state.cursor_affinity));
                             jw.key("display_line_count");
                             jw.numberValue(@intCast(state.wrap_map.displayLineCount()));
+                            jw.key("line_height");
+                            jw.floatValue(state.line_height);
+                            jw.key("padding_h");
+                            jw.floatValue(state.padding_h);
+                            jw.key("padding_v");
+                            jw.floatValue(state.padding_v);
                             jw.key("cursor_rect");
                             if (state.cursor_node) |cursor_node| {
                                 const rect = cursor_node.globalRect();
@@ -1388,9 +1717,6 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             jw.key("scroll_y");
                             jw.floatValue(if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0);
                             jw.endObject();
-                        } else {
-                            queue.result.setError("unknown on_event handler — not input or textarea");
-                            return true;
                         }
                         queue.result.setJson(jw.getWritten());
                     } else {
@@ -1454,7 +1780,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             } else queue.result.setError("native window operations unsupported");
             return true;
         },
-        .quit_app => {
+        .quit_app, .quit_app_after_reply => {
             if (g_quit_app_fn) |f| {
                 queue.result.setJson(if (f()) "{\"ok\":true}" else "{\"ok\":false}");
             } else queue.result.setError("quit callback unavailable");
@@ -1564,7 +1890,7 @@ fn scrollNodeIntoView(ctx: *Cx, node: *Node, align_top: bool) void {
     const scroll_rect = scroll.globalRect();
     const node_rect = node.globalRect();
     const content_rect = content.globalRect();
-    const view_h = scroll_rect.h - scroll.style.padding.vertical();
+    const view_h = scroll_rect.h - scroll.style.contentInsets().vertical();
 
     // Node top in content coords (independent of current scroll: content and node shift together).
     const offset_in_content = node_rect.y - content_rect.y;
@@ -1602,7 +1928,7 @@ fn scrollNodeIntoView(ctx: *Cx, node: *Node, align_top: bool) void {
         content.markRenderDirty();
         ctx.needs_redraw = true;
         ctx.layout();
-        _ = ctx.render();
+        flushUnpresented(ctx);
     }
 }
 
@@ -1622,6 +1948,7 @@ fn parseKeyName(name: []const u8) KeyCode {
     if (std.mem.eql(u8, name, "down")) return .down;
     if (std.mem.eql(u8, name, "home")) return .home;
     if (std.mem.eql(u8, name, "end")) return .end;
+    // Any other KeyCode tag (f1..f12, page_up, forward_delete, ...) by name.
     if (std.meta.stringToEnum(KeyCode, name)) |code| return code;
     // Character key.
     if (name.len == 1) {
@@ -1755,6 +2082,105 @@ test "test-id click rejects an occluding sibling without dispatching to it" {
     try std.testing.expect(executeCommand(&queue, .{ .click_test_id = payload }));
     try std.testing.expect(queue.result.success);
     try std.testing.expect(target_clicked and !cover_clicked);
+}
+
+test "harness queries leave the host's pending frame request in place" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(200, 200, 1);
+    const root = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    root.meta.ownership.meta.test_id = "query-root";
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(!cx.wantsFrame());
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var payload = command_queue.TestIdPayload{ .len = "query-root".len };
+    @memcpy(payload.buf[0..payload.len], "query-root");
+    var text = try command_queue.TextPayload.initFromText(std.testing.allocator, "query-root");
+    defer text.deinit(std.testing.allocator);
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    // A click (or any event) asks the host for a frame; a query that flushes
+    // state before the host paints must not consume that request.
+    cx.requestRedraw();
+    try std.testing.expect(executeCommand(&queue, .{ .query_selector = text }));
+    try std.testing.expect(queue.result.success);
+    try std.testing.expect(cx.wantsFrame());
+    try std.testing.expect(executeCommand(&queue, .{ .screen_pos = payload }));
+    try std.testing.expect(cx.wantsFrame());
+    // Without a pending request the flush leaves the host idle.
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(!cx.wantsFrame());
+    try std.testing.expect(executeCommand(&queue, .{ .query_selector = text }));
+    try std.testing.expect(!cx.wantsFrame());
+}
+
+test "key names resolve function and editing keys through KeyCode" {
+    try std.testing.expectEqual(KeyCode.f1, parseKeyName("f1"));
+    try std.testing.expectEqual(KeyCode.f12, parseKeyName("f12"));
+    try std.testing.expectEqual(KeyCode.page_up, parseKeyName("page_up"));
+    try std.testing.expectEqual(KeyCode.page_down, parseKeyName("page_down"));
+    try std.testing.expectEqual(KeyCode.forward_delete, parseKeyName("forward_delete"));
+    try std.testing.expectEqual(KeyCode.insert, parseKeyName("insert"));
+    // Existing aliases keep their meaning.
+    try std.testing.expectEqual(KeyCode.delete, parseKeyName("backspace"));
+    try std.testing.expectEqual(KeyCode.@"return", parseKeyName("enter"));
+    try std.testing.expectEqual(KeyCode.a, parseKeyName("a"));
+    try std.testing.expectEqual(KeyCode.unknown, parseKeyName("no_such_key"));
+}
+
+test "mouse commands dispatch the requested button on down, up and click" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(200, 200, 1);
+    const root = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const Seen = struct {
+        down: ?ui.events.MouseButton = null,
+        up: ?ui.events.MouseButton = null,
+        downs: u32 = 0,
+        fn onEvent(event: ui.events.Event, context: ?*anyopaque) ui.events.EventResult {
+            const seen: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .mouse_down => |e| {
+                    seen.down = e.button;
+                    seen.downs += 1;
+                },
+                .mouse_up => |e| seen.up = e.button,
+                else => {},
+            }
+            return .ignored;
+        }
+    };
+    var seen: Seen = .{};
+    root.behavior.events.event_context = &seen;
+    root.behavior.events.on_event = Seen.onEvent;
+    cx.layout();
+    _ = cx.render();
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    try std.testing.expect(executeCommand(&queue, .{ .mouse_down = .{ .x = 10, .y = 10, .button = .right } }));
+    try std.testing.expectEqual(ui.events.MouseButton.right, seen.down.?);
+    try std.testing.expect(executeCommand(&queue, .{ .mouse_up = .{ .x = 10, .y = 10, .button = .right } }));
+    try std.testing.expectEqual(ui.events.MouseButton.right, seen.up.?);
+    seen = .{};
+    try std.testing.expect(executeCommand(&queue, .{ .click = .{ .x = 10, .y = 10, .button = .middle } }));
+    try std.testing.expectEqual(ui.events.MouseButton.middle, seen.down.?);
+    try std.testing.expectEqual(ui.events.MouseButton.middle, seen.up.?);
+    try std.testing.expectEqual(@as(u32, 1), seen.downs);
 }
 
 test "recording state serialization exposes cadence and artifact metadata" {
@@ -2030,6 +2456,80 @@ test "timed capture reads one submitted frame after deadline and disarms on read
     try std.testing.expect(frame_capture_path == null);
 }
 
+/// `/stats` `work`: scope, frames, window, then one object per statistic keyed by counter name
+/// (docs/design/streaming-content.md §5.8). The counters are process-wide: with several windows a
+/// frame value includes the other windows' work.
+fn writeWorkReport(jw: *JsonWriter, report: ui.devtools.work_counters.Sampler.Report) void {
+    jw.beginObject();
+    jw.key("scope");
+    jw.stringValue("process");
+    jw.key("frames");
+    jw.numberValue(@intCast(report.intervals));
+    jw.key("window");
+    jw.numberValue(@intCast(report.window));
+    inline for (.{ "totals", "last", "p50", "p95", "max" }) |name| {
+        jw.key(name);
+        jw.beginObject();
+        const counts: ui.devtools.work_counters.Counts = @field(report, name);
+        for (ui.devtools.work_counters.counters) |counter| {
+            jw.key(@tagName(counter));
+            jw.numberValue(@intCast(counts.get(counter)));
+        }
+        jw.endObject();
+    }
+    jw.endObject();
+}
+
+test "frame_stats serializes the work counters of the bound window" {
+    const wc = ui.devtools.work_counters;
+    const Fake = struct {
+        var sampler: wc.Sampler = .{};
+        fn stats() FrameStatsSnapshot {
+            return .{ .work = sampler.report() };
+        }
+    };
+    Fake.sampler = wc.Sampler.init();
+    wc.add(.text_layout_bytes, 4096);
+    wc.bump(.after_layout_rounds);
+    Fake.sampler.commit();
+    const previous = g_get_frame_stats_fn;
+    defer g_get_frame_stats_fn = previous;
+    setGetFrameStatsFn(Fake.stats);
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    try std.testing.expect(executeCommand(&queue, .{ .frame_stats = {} }));
+    try std.testing.expect(queue.result.success);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, queue.result.getData(), .{});
+    defer parsed.deinit();
+    const work = parsed.value.object.get("work").?.object;
+    try std.testing.expectEqualStrings("process", work.get("scope").?.string);
+    try std.testing.expectEqual(@as(i64, 1), work.get("frames").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), work.get("window").?.integer);
+    inline for (.{ "totals", "last", "p50", "p95", "max" }) |name| {
+        const set = work.get(name).?.object;
+        // Every counter is present by name, untouched ones as 0.
+        for (wc.counters) |counter| try std.testing.expect(set.get(@tagName(counter)) != null);
+        try std.testing.expectEqual(@as(i64, 4096), set.get("text_layout_bytes").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), set.get("after_layout_rounds").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), set.get("md_scanned_bytes").?.integer);
+    }
+}
+
+test "frame_stats reports work as null when the host does not publish it" {
+    const Fake = struct {
+        fn stats() FrameStatsSnapshot {
+            return .{};
+        }
+    };
+    const previous = g_get_frame_stats_fn;
+    defer g_get_frame_stats_fn = previous;
+    setGetFrameStatsFn(Fake.stats);
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    try std.testing.expect(executeCommand(&queue, .{ .frame_stats = {} }));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, queue.result.getData(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("work").? == .null);
+}
+
 pub const VisualQualityCommand = @import("command_queue.zig").VisualQualityCommand;
 pub const VisualQualityFn = *const fn (VisualQualityCommand) ?[]const u8;
 var g_visual_quality_fn: ?VisualQualityFn = null;
@@ -2040,6 +2540,7 @@ pub fn setVisualQualityFn(f: VisualQualityFn) void {
 test "harness pacing: readonly queries do not force an animation submission" {
     const commands = [_]TestCommand{
         .{ .health = {} },         .{ .query_tree = {} },  .{ .query_selector = .{} },
+        .{ .query_tree_scoped = .{} },
         .{ .get_focused = {} },    .{ .screen_pos = .{} }, .{ .recording_status = {} },
         .{ .input_state = .{} },   .{ .frame_stats = {} }, .{ .reset_timing = {} },
         .{ .console_query = .{} },
@@ -2075,6 +2576,12 @@ test "harness pacing: input screenshots and opaque routes require an immediate f
     try std.testing.expect(commandRequestsFrame(.{ .resize_window = .{ .width = 640, .height = 480 } }));
     try std.testing.expect(commandRequestsFrame(.{ .screenshot = .{} }));
     try std.testing.expect(commandRequestsFrame(.{ .app_route = command_queue.AppRoutePayload.init("/custom", "").? }));
+}
+
+test "harness pacing: a wheel event requests a frame only through what it changes" {
+    // Like a platform wheel event (pointer_isolation.eventForcesFrame): Cx.handleScroll asks
+    // for the frame when a handler moved something.
+    try std.testing.expect(!commandRequestsFrame(.{ .scroll = .{ .x = 1, .y = 2, .dx = 0, .dy = 12 } }));
 }
 
 test "harness pacing: a consumed batch requests a frame once without a persistent wake" {

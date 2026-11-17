@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_DIR="$(mktemp -d -t zenit-clipboard)"
 trap 'rm -rf "$TEST_DIR"' EXIT
-xcrun clang -fobjc-arc -Wno-deprecated-declarations \
+xcrun clang -fobjc-arc -DZENIT_AUTOMATION_ENVIRONMENT=1 -Wno-deprecated-declarations \
   "$ROOT/native/macos/tests/clipboard_test.m" \
-  -framework Cocoa -framework Metal -framework IOSurface -framework QuartzCore -framework CoreVideo \
+  -framework Cocoa -framework IOSurface -framework Metal -framework QuartzCore -framework CoreVideo \
   -framework UniformTypeIdentifiers -o "$TEST_DIR/clipboard-test"
 "$TEST_DIR/clipboard-test"

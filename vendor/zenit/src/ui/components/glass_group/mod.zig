@@ -234,6 +234,9 @@ pub fn transact(group: GlassGroupMount, tx: GlassTransaction) void {
             }
         }
     }
+    // Inserted / removed members enter or leave the hierarchy: their content goes with the glass.
+    for (tx.inserts) |ins| ins.entry.state.content_follows_presence = true;
+    for (tx.removes) |r| r.state.content_follows_presence = true;
     for (tx.moves) |m| glass_box.glassMorphTo(m.entry.state, .{ .x = m.rect[0], .y = m.rect[1], .w = m.rect[2], .h = m.rect[3], .duration_ms = tx.duration_ms, .easing = .spring_smooth, .liquid = .none });
     for (tx.removes, 0..) |r, ri| {
         if (ri < max_shapes) if (rsrc[ri]) |src| {
@@ -264,6 +267,12 @@ pub fn transact(group: GlassGroupMount, tx: GlassTransaction) void {
         glass_box.glassPlace(ins.entry.state, ins.rect);
         glass_box.glassSetEnabled(ins.entry.state, true);
     }
+}
+
+/// Mount-time presence of a member that later transactions insert / remove: absent hides its glass
+/// and its content until a transaction inserts it.
+pub fn setMemberPresent(entry: GlassShapeEntry, present: bool) void {
+    glass_box.glassSetPresentImmediate(entry.state, present);
 }
 
 /// Retained element with group_index == index (matched source reverse-lookup).
@@ -488,6 +497,125 @@ test "GlassGroup: container teardown before member cleanup leaves no dangling li
     // member cleanup just releases link, last one frees it (testing allocator catches leak/UAF).
     root.removeChild(group.container);
     ctx.freeNode(group.container);
+}
+
+test "GlassGroup: the displayed frame keeps its own shape table (a snapshot outlives the group)" {
+    // The container surface's glass names the group's shape table. The frame that displayed it
+    // and anything frozen from that frame hold the table as it was shown: the group may be
+    // destroyed before the next paint (content replaced under a transition) and its picture is
+    // still drawn for the length of the flight.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(800, 300);
+    const card = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 300 } }, .{card});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const group = try GlassGroup(.{ .spacing = 16, .width = 300, .height = 60 }).mountWithState(scope, ctx);
+    try card.appendChild(std.testing.allocator, group.container);
+    // Two shapes written the way members write them (no member nodes: nothing else in the
+    // subtree, so the card's displayed items are exactly the surface's).
+    group.state.table.count = 2;
+    group.state.table.shapes[0] = .{ .node_id = 71, .x = 0, .y = 0, .w = 120, .h = 44, .radius = 22 };
+    group.state.table.shapes[1] = .{ .node_id = 72, .x = 132, .y = 0, .w = 44, .h = 44, .radius = 22 };
+    group.state.table.version += 1;
+    group.state.surface.markRenderDirty();
+    ctx.layout();
+    _ = ctx.render();
+    const shown = group.state.table;
+
+    const expectShown = struct {
+        fn f(expected: *const types.GlassGroupShapes, live: *const types.GlassGroupShapes, table: *const types.GlassGroupShapes) !void {
+            try std.testing.expect(table != live);
+            try std.testing.expectEqual(expected.count, table.count);
+            try std.testing.expectEqual(expected.version, table.version);
+            for (expected.shapes[0..expected.count], table.shapes[0..expected.count]) |want, got| {
+                try std.testing.expectEqual(want.node_id, got.node_id);
+                try std.testing.expectEqual([4]f32{ want.x, want.y, want.w, want.h }, [4]f32{ got.x, got.y, got.w, got.h });
+                try std.testing.expectEqual(want.radius, got.radius);
+            }
+        }
+    }.f;
+    const live = &group.state.table;
+
+    card.removeChild(group.container);
+    ctx.freeNode(group.container);
+    ctx.layout();
+
+    // The displayed frame's layer plan.
+    var planned: usize = 0;
+    for (0..ctx.layer_tree.frame_layer_ids.items.len) |plan_id| {
+        const layer = ctx.layer_tree.planCompositedAt(@intCast(plan_id)).?;
+        if (layer.effect_kind != .backdrop_blur) continue;
+        try expectShown(&shown, live, layer.glass.group.?);
+        planned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), planned);
+
+    // What a capture of that frame freezes, and keeps after the frame is gone.
+    const snap = (try core.Snapshot.captureDisplayed(ctx, card)).?;
+    defer snap.deinit();
+    _ = ctx.render();
+    var layers: usize = 0;
+    for (snap.commands.commands) |item| {
+        if (item != .begin_blur_layer) continue;
+        try expectShown(&shown, live, item.begin_blur_layer.glass.group.?);
+        layers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), layers);
+}
+
+fn expectSamePicture(want: []const core.display_list.DisplayItem, got: []const core.display_list.DisplayItem) !void {
+    errdefer {
+        std.debug.print("want ({d}):", .{want.len});
+        for (want) |item| std.debug.print(" {s}", .{@tagName(item)});
+        std.debug.print("\ngot  ({d}):", .{got.len});
+        for (got) |item| std.debug.print(" {s}", .{@tagName(item)});
+        std.debug.print("\n", .{});
+    }
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |a, b| {
+        try std.testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+        // Content, not frame-local ids: the fingerprint follows payloads and skips headers.
+        try std.testing.expectEqual(core.display_list.contentFingerprint(&a), core.display_list.contentFingerprint(&b));
+    }
+}
+
+test "GlassGroup: a capture of the displayed frame holds the whole card, glass surface included" {
+    // The members' before_render hooks end the prebuild prefix after the group's surface: the
+    // card's displayed items are the surface (in the prefix) and the members (appended by the
+    // paint pass). What is frozen from the displayed frame is all of it, in paint order, the
+    // same picture a fresh capture of the unchanged card records.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(800, 300);
+    const card = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 }, .background = Color.rgb(20, 30, 40) }, .{});
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 300 } }, .{card});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const group = try GlassGroup(.{ .spacing = 16 }).mountWithState(scope, ctx);
+    try card.appendChild(std.testing.allocator, group.container);
+    const a = try GlassShape(.{ .width = 120, .height = 44, .id = "a" }).mountIn(group, scope, ctx);
+    const b = try GlassShape(.{ .width = 44, .height = 44, .shape = .circle, .id = "b" }).mountIn(group, scope, ctx);
+    ctx.layout();
+    glass_box.runBeforeRenderHooks(a.node);
+    glass_box.runBeforeRenderHooks(b.node);
+    _ = ctx.render();
+    _ = ctx.render();
+
+    const displayed = (try core.Snapshot.captureDisplayed(ctx, card)).?;
+    defer displayed.deinit();
+    var blur_layers: usize = 0;
+    for (displayed.commands.commands) |item| {
+        if (item == .begin_blur_layer and item.begin_blur_layer.glass.group != null) blur_layers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), blur_layers);
+
+    const fresh = (try core.Snapshot.capture(ctx, card)).?;
+    defer fresh.deinit();
+    try expectSamePicture(fresh.commands.commands, displayed.commands.commands);
 }
 
 test "GlassGroup: a member dissolves to identity and materializes back (container surface regains its blur)" {
@@ -962,4 +1090,61 @@ test "GlassGroup.transact: card expand / collapse reverses mid-way from the curr
         .max_dw = 40,
         .max_dh = 25,
     });
+}
+
+test "GlassGroup: absent / inserted / removed members take their content with them; isEnabled keeps it" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const group = try GlassGroup(.{ .spacing = 12, .width = 600, .height = 44 }).mountWithState(scope, ctx);
+    try root.appendChild(std.testing.allocator, group.container);
+    var es: [4]GlassShapeEntry = undefined;
+    for (&es) |*e| {
+        e.* = try GlassShape(.{ .width = 44, .height = 44, .shape = .circle, .padding = Padding.all(0) }).mountIn(group, scope, ctx);
+        e.node.style.position = .absolute;
+        try e.body.appendChild(std.testing.allocator, try box(ctx, .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } }, .{}));
+    }
+    const a = es[0];
+    const near = es[1]; // within spacing of a: grows out of it (matched)
+    const far = es[2]; // beyond spacing: materializes in place
+    const off = es[3]; // glassEffect(isEnabled: false): glass off, content stays
+    glass_box.glassPlace(a.state, .{ 500, 0, 44, 44 });
+    setMemberPresent(near, false);
+    setMemberPresent(far, false);
+    glass_box.glassSetEnabledImmediate(off.state, false);
+    ctx.layout();
+    ctx.frame_time_ms = 1000;
+    ctx.frame_dt_ms = 16;
+    const step = struct {
+        fn run(cx: *Cx, list: []const GlassShapeEntry, n: usize) void {
+            for (0..n) |_| {
+                cx.frame_time_ms += 16;
+                for (list) |e| glass_box.runBeforeRenderHooks(e.node);
+                cx.layout();
+            }
+        }
+    }.run;
+    step(ctx, &es, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), near.state.content.getOpacity(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), far.state.content.getOpacity(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), off.state.content.getOpacity(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), a.state.content.getOpacity(), 1e-3);
+
+    transact(group, .{ .inserts = &.{ .{ .entry = near, .rect = .{ 444, 0, 44, 44 } }, .{ .entry = far, .rect = .{ 0, 0, 44, 44 } } } });
+    step(ctx, &es, 1);
+    // matched: the member is whole from the first frame (its geometry grows out of the source)
+    try std.testing.expectApproxEqAbs(@as(f32, 1), near.state.content.getOpacity(), 1e-3);
+    const mid = far.state.content.getOpacity();
+    try std.testing.expect(mid > 0 and mid < 1);
+    step(ctx, &es, 60);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), far.state.content.getOpacity(), 1e-3);
+
+    transact(group, .{ .removes = &.{ near, far } });
+    step(ctx, &es, 60);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), near.state.content.getOpacity(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), far.state.content.getOpacity(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), a.state.content.getOpacity(), 1e-3);
 }

@@ -1,4 +1,5 @@
 /** Whole production wizard flow, isolated config and own delayed SSH handshake peer. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -46,6 +47,8 @@ const flatten=(n:any):any[]=>[n,...(n.children??[]).flatMap(flatten)];
 const text=(n:any)=>flatten(n).map(x=>x.text??'').join(' ');
 async function current(id:string){
  if(id==='wizard.dialog'){
+  // Production opens the editor in its own native window (`wizard.window`); the in-window Modal is the fallback.
+  const win=(await query('wizard.window')).find(shown);if(win)return win;
   if(!(await query('wizard.close')).some(shown))return null;
   return {rect:await screenPos(id)};
  }
@@ -54,17 +57,21 @@ async function current(id:string){
 async function visible(id:string){return waitFor(()=>current(id));}
 async function click(id:string){let prior='';let repeats=0;const n=await waitFor(async()=>{const n=await current(id);if(!n)return null;const at=JSON.stringify(n.rect);repeats=at===prior?repeats+1:0;prior=at;await sleep(80);return repeats>=2?n:null;});assert((await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok);}
 async function fill(id:string,value:string){await click(id);await key('a',{cmd:true});await type_(value);await waitFor(async()=>{const n=await current(id);return n&&text(n).includes(value)?true:null});}
-async function closed(){await waitFor(async()=>!(await query('wizard.close')).some(shown)||null);}
+// 稿 2 ③: at 860 × 480 the header and footer stay put and only the middle scrolls; the step's primary action is inside the window and clickable.
+async function footerReachable(primary:string,height:number){const foot=(await visible('wizard.footer')).rect,next=(await visible(primary)).rect,back=(await visible('wizard.back')).rect;assert(foot.y+foot.h<=height+0.5,'footer inside window');assert(next.y+next.h<=height&&back.y+back.h<=height,'back/next inside window');const title=(await visible('wizard.title')).rect;assert(title.y>=0,'title bar stays');report.checks.push(`${primary} visible and clickable at ${height}`);}
+const any=async(id:string)=>{const r=await query(id).catch(()=>[]);return Array.isArray(r)&&r.some(shown);};
+async function closed(){await waitFor(async()=>!((await any('wizard.close'))||(await any('wizard.window')))||null);}
 async function capture(name:string){await sleep(500);const dialog=await visible('wizard.dialog');await writeFile(join(out,name+'.json'),JSON.stringify(dialog,null,2));assert((await screenshot(join(out,name+'.png'))).ok);report.stages.push({name,rect:dialog.rect});}
 async function scrollBottom(){const area=await visible('wizard.scroll.identity');await scrollAt(area.rect.x+area.rect.w-20,area.rect.y+area.rect.h/2,0,-1800);await sleep(300);}
 async function scrollTop(){const area=await visible('wizard.scroll.identity');await scrollAt(area.rect.x+area.rect.w-20,area.rect.y+area.rect.h/2,0,2200);await sleep(300);}
 async function editStartup(value:string){await scrollBottom();await click('wizard.startup');await key('a',{cmd:true});await type_(value);await sleep(200);}
 try{
  await waitForServerReady(30000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),child.pid);
- await resizeWindow(1440,900);await click('sidebar.new');await click('sidebar.new.host');
+ await resizeWindow(1440,900);await click('sidebar.footer.new');
  await fill('wizard.name','V3 revision target');await fill('wizard.host','127.0.0.1');await fill('wizard.user','fixture');
  assert(!(await current('wizard.strict_host_key')),'Host key policy is hidden with Advanced');
- const remember=await visible('wizard.password.remember'); const boxes=flatten(remember).filter(n=>n.rect?.w===14&&n.rect?.h===14);assert(boxes.length,'Password checkbox is 14px');
+ // The remember checkbox is the native zenit Checkbox at its default size (no 14px override since the native-widget rule).
+ await visible('wizard.password.remember');
  await click('wizard.password.remember');await click('wizard.password.remember');await capture('01-identity-standard');await click('wizard.advanced.toggle');await scrollBottom();
  await click('wizard.strict_host_key');await click('wizard.strict.enabled');await capture('02-advanced-standard');
  const advanced=await visible('wizard.advanced.body');await writeFile(join(out,'advanced-tree.json'),JSON.stringify(advanced,null,2));
@@ -72,16 +79,16 @@ try{
  await click('wizard.compression');await editStartup('echo first');await key('return');await type_('echo second');
  await resizeWindow(860,480);await scrollBottom();await capture('03-advanced-compact');const foot=(await visible('wizard.footer')).rect;assert(foot.y+foot.h<=480);
  await click('wizard.next.identity');await click('wizard.access.jump');await click('wizard.route.hop.0');await key('home');await key('return');
- await click('wizard.route.add');await click('wizard.route.hop.1');await key('end');await key('return');await capture('04-route-compact');
+ await click('wizard.route.add');await click('wizard.route.hop.1');await key('end');await key('return');await capture('04-route-compact');await footerReachable('wizard.next.route',480);
  assert.match(text(await visible('wizard.route.hop.0')),/Jump A/);assert.match(text(await visible('wizard.route.hop.1')),/Jump B/);
- const row=(await visible('wizard.route.hop.0')).rect;assert.equal(row.h,34);
+ const row=(await visible('wizard.route.hop.0')).rect;assert(row.h>=32,'route selector keeps the native control height');
  await click('wizard.route.up.1');assert.match(text(await visible('wizard.route.hop.0')),/Jump B/);assert.match(text(await visible('wizard.route.hop.1')),/Jump A/);
  await click('wizard.route.down.0');assert.match(text(await visible('wizard.route.hop.0')),/Jump A/);await click('wizard.route.up.1');await click('wizard.route.hop.1');await capture('05-duplicate-disabled');await key('escape');
  await click('wizard.route.remove.0');assert.match(text(await visible('wizard.route.hop.0')),/Jump A/);assert(!(await current('wizard.route.hop.1')));
- await resizeWindow(1440,900);await capture('06-route-standard');await click('wizard.next.route');await capture('07-review-standard');
- assert.match(text(await visible('wizard.review.options')),/2/);await resizeWindow(860,480);await capture('08-review-compact');
+ await resizeWindow(860,480);await footerReachable('wizard.next.route',480);await click('wizard.next.route');await visible('wizard.scroll.review');await click('wizard.back');await resizeWindow(1440,900);await capture('06-route-standard');await click('wizard.next.route');await capture('07-review-standard');
+ assert.match(text(await visible('wizard.review.options')),/2/);await resizeWindow(860,480);await capture('08-review-compact');await footerReachable('wizard.save',480);
  await click('wizard.cancel');await closed();
- report.checks=['14px password checkbox toggles through native widget','Host key policy is exclusively inside Advanced','Host key selector opens and retains strict policy','Compression and multiline startup survive review','Standard and compact form footer and scroll verified','Independent jump selectors and unavailable duplicate option','Up/down reorders actual selected identities','Remove shifts remaining hop','Per-node review opens in both window sizes'];report.status='passed';
+ report.checks.push(...['Password checkbox toggles through native widget','Host key policy is exclusively inside Advanced','Host key selector opens and retains strict policy','Compression and multiline startup survive review','Standard and compact form footer and scroll verified','Independent jump selectors and unavailable duplicate option','Up/down reorders actual selected identities','Remove shifts remaining hop','Per-node review opens in both window sizes']);report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await screenshot(join(out,'failure.png')).catch(()=>{});throw e;}
 finally{await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));child.kill('SIGTERM');await ended;await log.close();await rm(isolated,{recursive:true,force:true});}
 console.log(JSON.stringify(report));

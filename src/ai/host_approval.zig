@@ -80,6 +80,9 @@ pub const Broker = struct {
     stopped: bool = false,
     entry: ?Entry = null,
     permission_policy: ?permission.Engine = null,
+    /// The UI that shows the pending request (its owner binds it): a request appearing or going
+    /// away publishes to it (LIFECYCLE.md §5.3).
+    wake: ?*const @import("publication.zig").Wake = null,
     /// Tests may inject a monotonic clock; production uses the native clock.
     clock_context: ?*anyopaque = null,
     clock: *const fn (?*anyopaque) i64 = monotonicMs,
@@ -123,7 +126,7 @@ pub const Broker = struct {
             .terminal_command => blk: {
                 const tool = saved.tool.text();
                 if (!std.mem.eql(u8, tool, "host.run_in_terminal") and !std.mem.eql(u8, tool, "run_command") and !std.mem.eql(u8, tool, "host.send_execution_input") and !std.mem.eql(u8, tool, "host.attach_shell")) break :blk false;
-                break :blk permission.classifyTerminal(policy, saved.detail.text(), saved.context.binding == .group) == .allow_auto;
+                break :blk permission.classifyTerminal(policy, saved.detail.text(), saved.context.contentOf() == .group) == .allow_auto;
             },
         };
         if (automatic) {
@@ -200,6 +203,8 @@ pub const Broker = struct {
             .created_at_ms = 0,
             .expires_at_ms = 0,
         };
+        // After the unlock below (defers run last-in first-out).
+        defer @import("publication.zig").publish(self.wake);
         self.lock();
         defer self.mutex.unlock();
         if (self.stopped) return error.CancelledBeforeDispatch;
@@ -326,6 +331,7 @@ pub const Broker = struct {
         return entry.policy_approved;
     }
     pub fn finish(self: *Broker, permit: Permit) void {
+        defer @import("publication.zig").publish(self.wake);
         self.lock();
         defer self.mutex.unlock();
         if (self.entry) |entry| if (matches(entry.snapshot, permit)) {

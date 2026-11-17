@@ -1,0 +1,21 @@
+//! 侧栏主机行的“连接”按钮（design-r3 A2，Pencil YbvR2，用户已拍板）：单击主机行只选中；**选中行**的行尾显示原生
+//! `W.Button` secondary / sm “连接”，悬停提示是原生 `W.Tooltip`“连接 · Return”。未选中行悬停时仍是行尾固定槽位的 ▶。
+//! 外观全部是 zenit 默认（不传颜色 / 圆角 / 尺寸覆盖）；显隐由宿主（`sidebar_view.HostRow`）按选中状态切换挂载点。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("sidebar_host_connect.yss");
+
+pub const ids = struct {
+    pub const slot = "sidebar.host.connect_slot";
+    pub const button = "sidebar.host.connect_button";
+};
+
+pub fn HostConnect(onConnect: ?Handler(void) = null) View {
+    return (
+        <box testId={ids.slot} style={S.slot}>
+            <W.Tooltip text="连接 · Return" position={.right}>
+                <W.Button testId={ids.button} label="连接" a11yLabel="连接到此主机（Return）" variant={.secondary} size={.sm} onClick={onConnect} />
+            </W.Tooltip>
+        </box>
+    );
+}

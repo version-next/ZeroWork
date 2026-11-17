@@ -1,0 +1,249 @@
+//! The composer tool row (Pencil Kaf7E A3 / ⑤): attachment, permission, run mode | usage, model,
+//! then the host's send / stop. All native: ghost sm Buttons (label + leading icon + chevron),
+//! icon-only ghost sm Buttons in native Tooltips on narrow rows, native Menus (menus package
+//! `ContextMenu`) for the three selection-only choices, native Popovers for model + effort (O4)
+//! and for usage (O6). Escape and outside clicks are the native overlay stack's alone (it closes
+//! the topmost layer, also while focus is still on the control that opened it), and so is focus
+//! (`trapFocus`: in on open, Tab kept inside, back on close). The view-model only names the
+//! controls (`focusId`) and says which name a popover opens on (`initialFocus`) and returns to
+//! (`returnFocus`), and hears of a close through `onOpenChange` for its own bookkeeping. State, captures, the shrink rule and the actions live in the view-model
+//! (`ai_composer_controls_view.zig`); this file is the view only.
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("ai_composer_controls.yss");
+const M = @import("ai_composer_controls_view.zig");
+
+fn keepRow(m: *M.View, root: *ui.view.Ref(*ui.Node), trailing: *ui.view.Ref(*ui.Node), spacer: *ui.view.Ref(*ui.Node)) void {
+    m.keepRow(root.get(), trailing.get(), spacer.get());
+}
+fn keepButtons(m: *M.View, attachment: *ui.view.Ref(*ui.Node), permission: *ui.view.Ref(*ui.Node), model: *ui.view.Ref(*ui.Node), effort: *ui.view.Ref(*ui.Node), usage: *ui.view.Ref(*ui.Node), execution: *ui.view.Ref(*ui.Node)) void {
+    m.keepButtons(.{ attachment.get(), permission.get(), model.get(), effort.get(), usage.get(), execution.get() });
+}
+fn keepCompact(m: *M.View, slot: usize, tip: *ui.view.Ref(W.tooltip.TooltipResult), button: *ui.view.Ref(*ui.Node)) void {
+    m.keepCompact(slot, tip.get().?.wrapper, button.get());
+}
+fn keepPopup(m: *M.View, index: usize, popup: *ui.view.Ref(W.popover.PopoverResult)) void {
+    m.keepPopup(index, popup.get());
+}
+fn sliderKey(m: *M.View, e: ui.view.KeyPress) void {
+    if (m.sliderKey(e.key)) e.stop();
+}
+
+/// Narrow rows: permission / run mode as an icon-only native ghost Button in a native Tooltip
+/// ("名称 · 当前值").
+fn Compact(m: *M.View, slot: usize) View {
+    const tip = ref(W.tooltip.TooltipResult);
+    const button = ref();
+    onMount(keepCompact(m, slot, tip, button));
+    return (
+        <W.Tooltip ref={tip} text={M.compactText(m, slot)} position={.top} style={S.no_shrink} visible={M.compactShown(m, slot)} parts={.{ .content = M.compactTooltipId(m, slot) }}>
+            <W.Button ref={button} testId={M.compactId(m, slot)} variant={.ghost} size={.sm} iconOnly={true} iconAsset={M.compactIcon(m, slot)} a11yLabel={M.compactText(m, slot)} disabled={M.disabled(m, M.compactKind(slot))} onClick={M.toggle(m, M.compactKind(slot))} />
+        </W.Tooltip>
+    );
+}
+
+pub fn ToolRow(m: *M.View) View {
+    const root = ref();
+    const trailing = ref();
+    const spacer = ref();
+    const attachment = ref();
+    const permission = ref();
+    const model = ref();
+    const effort = ref();
+    const usage = ref();
+    const execution = ref();
+    onMount(keepRow(m, root, trailing, spacer));
+    onMount(keepButtons(m, attachment, permission, model, effort, usage, execution));
+    return (
+        <row ref={root} testId={m.space.id("ai.composer.controls")} style={S.row}>
+            <W.Tooltip text="添加附件" position={.top} style={S.no_shrink}>
+                <W.Button ref={attachment} testId={m.space.id("ai.composer.attachment")} variant={.ghost} size={.sm} iconOnly={true} iconAsset={M.glyph(m, .attachment)} a11yLabel="添加附件" disabled={M.disabled(m, .attachment)} onClick={M.toggle(m, .attachment)} />
+            </W.Tooltip>
+            <W.Button ref={permission} testId={M.buttonId(m, .permission)} variant={.ghost} size={.sm} label={M.text(m, .permission)} iconAsset={M.glyph(m, .permission)} chevron={true} a11yLabel={M.chipA11y(m, .permission, "执行权限")} disabled={M.disabled(m, .permission)} visible={M.chipShown(m, .permission)} onClick={M.toggle(m, .permission)} />
+            <Compact m={m} slot={0} />
+            <W.Button ref={execution} testId={M.buttonId(m, .execution)} variant={.ghost} size={.sm} label={M.text(m, .execution)} iconAsset={M.glyph(m, .execution)} chevron={true} a11yLabel={M.chipA11y(m, .execution, "当前对话运行方式")} disabled={M.disabled(m, .execution)} visible={M.chipShown(m, .execution)} onClick={M.toggle(m, .execution)} />
+            <Compact m={m} slot={1} />
+            <spacer ref={spacer} />
+            <W.Button ref={usage} testId={m.space.id("ai.composer.usage")} focusId={M.focusName(m, .usage_anchor)} variant={.ghost} size={.sm} label={M.text(m, .usage)} a11yLabel="上下文与来源" disabled={M.disabled(m, .usage)} onClick={M.toggle(m, .usage)} progress={M.ringValue(m)} iconSize={M.ring_size} />
+            <W.Tooltip text={M.modelHint(m)} width={320} wrap={.char} position={.top} style={S.no_shrink} parts={.{ .content = m.space.id("ai.composer.model.tooltip") }}>
+                <W.Button ref={model} testId={M.buttonId(m, .model)} focusId={M.focusName(m, .model_anchor)} variant={.ghost} size={.sm} label={M.text(m, .model)} iconAsset={M.glyph(m, .model)} chevron={true} a11yLabel={M.chipA11y(m, .model, "选择模型")} disabled={M.disabled(m, .model)} visible={M.chipShown(m, .model)} onClick={M.toggle(m, .model)} />
+            </W.Tooltip>
+            <W.Button ref={effort} testId={M.buttonId(m, .effort)} variant={.ghost} size={.sm} label={M.text(m, .effort)} iconAsset={M.glyph(m, .effort)} chevron={false} a11yLabel={M.chipA11y(m, .effort, "推理档位")} disabled={M.disabled(m, .effort)} visible={M.chipShown(m, .effort)} onClick={M.toggle(m, .effort)} />
+            <row ref={trailing} testId={m.space.id("ai.composer.trailing")} style={S.trailing}>
+                {if (M.hasActions(m)) <Actions m={m} />}
+            </row>
+            <ModelPopover m={m} />
+            <UsagePopover m={m} />
+            <M.ContextMenu open={M.menuOpen(m, 0)} items={M.menuRows(m, 0)} anchor={M.menuAnchor(m, 0)} panelTestId={m.space.id("ai.attachment.menu")} width={M.width(.attachment)} maxHeight={null} position={.top_start} onOpenChange={|o| M.menuOpenChanged(m, 0, o)} onSelect={|id| M.menuSelected(m, 0, id)} />
+            <M.ContextMenu open={M.menuOpen(m, 1)} items={M.menuRows(m, 1)} anchor={M.menuAnchor(m, 1)} panelTestId={m.space.id("ai.permission.menu")} width={M.width(.permission)} maxHeight={null} position={.top_start} onOpenChange={|o| M.menuOpenChanged(m, 1, o)} onSelect={|id| M.menuSelected(m, 1, id)} />
+            <M.ContextMenu open={M.menuOpen(m, 2)} items={M.menuRows(m, 2)} anchor={M.menuAnchor(m, 2)} panelTestId={m.space.id("ai.execution.menu")} width={M.width(.execution)} maxHeight={null} position={.top_start} onOpenChange={|o| M.menuOpenChanged(m, 2, o)} onSelect={|id| M.menuSelected(m, 2, id)} />
+        </row>
+    );
+}
+
+/// Send / Stop (Pencil Kaf7E A8): native primary sm icon Buttons with native Tooltips. Stop while
+/// a turn runs; Send for a draft (it steers or queues, the hint says which).
+fn Actions(m: *M.View) View {
+    return (
+        <row style={S.trailing}>
+            <box style={S.no_shrink} visible={M.stopShown(m)}>
+                <W.Tooltip text="停止生成" position={.top}>
+                    <W.Button testId={m.space.id("ai.stop")} a11yLabel="停止生成" variant={.primary} size={.sm} iconOnly={true} iconAsset={M.glyphNamed("square")} onClick={M.stop(m)} />
+                </W.Tooltip>
+            </box>
+            <box style={S.no_shrink} visible={M.sendShown(m)}>
+                <W.Tooltip testId={m.space.id("ai.send.hint")} text={M.sendHint(m)} position={.top} parts={.{ .content = m.space.id("ai.send.tooltip") }}>
+                    <W.Button testId={m.space.id("ai.send")} a11yLabel={M.sendLabel(m)} variant={.primary} size={.sm} iconOnly={true} iconAsset={M.glyphNamed("arrow-up")} disabled={M.sendDisabled(m)} onClick={M.send(m)} />
+                </W.Tooltip>
+            </box>
+        </row>
+    );
+}
+
+/// O4: the model list (provider groups, rows with brand, context window and capabilities), then
+/// the reasoning control (native Slider with one mark per supported step), then a failure line.
+fn ModelPopover(m: *M.View) View {
+    const popup = ref(W.popover.PopoverResult);
+    onMount(keepPopup(m, 0, popup));
+    return (
+        <W.Popover ref={popup} open={M.popupOpen(m, 0)} trigger={.manual} position={.top_end} anchor={M.popupAnchor(m, 0)} offset={.{ .static = 6 }} width={M.width(.model)} maxHeight={M.height(.model)} closeOnEscape={true} closeOnOutsideClick={true} trapFocus={true} initialFocus={M.initialFocus(m, 0)} returnFocus={M.focusName(m, .model_anchor)} constrainWidthToViewport={true} flip={true} shiftMainAxis={true} viewportPadding={8} style={S.wrapper} parts={.{ .chrome = m.space.id("ai.model.menu") }} onOpenChange={|o| M.popupOpenChanged(m, 0, o)}>
+            <col style={S.model_body}>
+                <col testId={m.space.id("ai.model.card")} style={S.model_card}>
+                    <text style={S.empty_text} box={S.empty_box} visible={M.modelsEmpty(m)}>暂无已配置模型</text>
+                    <W.Button testId={m.space.id("ai.model.settings")} label="打开 AI 设置" variant={.secondary} size={.sm} visible={M.settingsShown(m)} onClick={M.openSettings(m)} />
+                    <M.ModelList m={m} testId={m.space.id("ai.model.list")} style={S.models} visible={!M.modelsEmpty(m)} />
+                </col>
+                <W.Divider />
+                <col testId={m.space.id("ai.model.reasoning_card")} style={S.reasoning_card}>
+                    <row style={S.reasoning_header}>
+                        <text testId={m.space.id("ai.effort.title")} style={S.effort_title} box={S.effort_title_box} visible={M.effortShown(m)}>推理强度</text>
+                        <text testId={m.space.id("ai.effort.value")} style={S.effort_name} box={S.effort_name_box}>{M.effortName(m)}</text>
+                    </row>
+                    <col testId={m.space.id("ai.effort.area")} style={S.slider_area} visible={M.effortShown(m)}>
+                        <box testId={m.space.id("ai.effort.slider")} style={S.slider_box}>
+                            <W.Slider focusId={M.focusName(m, .slider)} labelText="推理档位" min={0} max={4} step={0} width={308} trackHeight={3} thumbSize={12} value={M.sliderValue(m)} onChange={|v| M.effortProposed(m, v)} disabled={M.disabled(m, .effort)} testId={m.space.id("ai.effort.slider.track")} marks={M.marks(m)} thumbVisible={M.thumbShown(m)} look={.stepped} style={S.slider} onKeyDown={|e| sliderKey(m, e)} />
+                        </box>
+                    </col>
+                </col>
+                <text testId={m.space.id("ai.model.error")} style={S.error_text} box={S.error_box} visible={M.modelError(m)}>无法更新，请重试</text>
+            </col>
+        </W.Popover>
+    );
+}
+
+/// A model-list row: a provider header or a model.
+pub fn ListRow(m: *M.View, index: usize) View {
+    return (
+        <box style={S.list_row}>
+            {if (M.isHeader(m, index)) <ProviderRow m={m} index={index} /> else <ModelRow m={m} index={index} />}
+        </box>
+    );
+}
+
+/// A provider group header (O4): chevron, brand, name; a press folds the group.
+pub fn ProviderRow(m: *M.View, index: usize) View {
+    // Rows outlive the projection they were built from (unchanged rows are kept): own the text.
+    var name: []const u8 = signal(M.providerName(m, index));
+    return (
+        <W.Pressable testId={m.space.id("ai.model.provider")} a11yLabel={name} onClick={M.toggleProvider(m, index)} style={S.group_row}>
+            <icon src={M.providerChevron(m, index)} style={S.group_chevron} />
+            <BrandMark brand={M.providerBrand(m, index)} name={name} />
+            <text style={S.group_name} box={S.group_name_box}>{name}</text>
+        </W.Pressable>
+    );
+}
+
+/// A model row (O4): marker (› for the current model), brand, ID, context window, reasoning and
+/// vision capabilities, each with its native Tooltip; the row's details in a 284 native Tooltip.
+pub fn ModelRow(m: *M.View, index: usize) View {
+    const row = computed(M.modelRow(m, index));
+    // Rows outlive the projection they were built from (unchanged rows are kept): own the text.
+    var id: []const u8 = signal(M.modelRow(m, index).id);
+    var base: []const u8 = signal(M.modelRow(m, index).basename);
+    var details: []const u8 = signal(M.modelRow(m, index).description);
+    var context: []const u8 = signal(M.modelRow(m, index).context);
+    return (
+        <W.Tooltip text={details} width={284} wrap={.word} position={.right} offset={8} closeOnEscape={false} style={S.row_hint} parts={.{ .trigger = .{ .style = S.row_trigger }, .content = m.space.id("ai.model.details") }}>
+            <W.Pressable focusId={M.rowFocusId(m, index)} testId={m.space.id("ai.model.option")} a11yLabel={details} a11yDescription={details} selected={row.selected} disabled={!row.choosable} onClick={M.chooseModel(m, index)} style={S.ModelRow.of(.{ .selected = row.selected })}>
+                <box testId={M.markerId(m, row.selected)} style={S.marker}>
+                    {if (row.selected) <text style={S.marker_text} box={S.marker_text_box}>›</text> else <box style={S.marker_dot} />}
+                </box>
+                <BrandMark testId={m.space.id("ai.model.logo")} brand={row.brand} name={base} />
+                <text testId={m.space.id("ai.model.name")} style={S.ModelName.of(.{ .off = !row.enabled })} box={S.model_name_box}>{id}</text>
+                <text testId={m.space.id("ai.model.context")} style={S.ModelContext.of(.{ .off = !row.enabled })} box={S.context_box.of(.{ .w = M.contextWidth(m) })}>{context}</text>
+                <W.Tooltip text={M.reasoningHint(row.reasoning)} style={S.capability} parts={.{ .trigger = m.space.id("ai.model.reasoning"), .content = m.space.id("ai.model.reasoning.tooltip") }}>
+                    <icon src={M.glyphNamed("brain")} style={S.CapabilityIcon.of(.{ .on = row.enabled and row.reasoning })} />
+                </W.Tooltip>
+                <W.Tooltip text={M.visionHint(row.vision)} style={S.capability} parts={.{ .trigger = m.space.id("ai.model.vision") }}>
+                    <icon src={M.visionGlyph(row.vision)} style={S.CapabilityIcon.of(.{ .on = row.enabled and row.vision })} />
+                </W.Tooltip>
+            </W.Pressable>
+        </W.Tooltip>
+    );
+}
+
+/// Brand mark (16): the brand glyph on a rounded tile, or the name's first character.
+pub fn BrandMark(brand: ?ui.SvgAsset, name: []const u8) View {
+    return (
+        <box style={S.brand_tile}>
+            {if (brand != null) <icon src={brand} style={S.brand_glyph} /> else <text style={S.brand_initial}>{M.initial(name)}</text>}
+        </box>
+    );
+}
+
+/// O6: head (label · used / limit), the native segmented bar, a legend row per source, a separator
+/// and the native secondary sm compaction Button (with its reason in a native Tooltip).
+fn UsagePopover(m: *M.View) View {
+    const popup = ref(W.popover.PopoverResult);
+    onMount(keepPopup(m, 1, popup));
+    return (
+        <W.Popover ref={popup} open={M.popupOpen(m, 1)} trigger={.manual} position={.top_start} anchor={M.popupAnchor(m, 1)} offset={.{ .static = 6 }} width={M.width(.usage)} maxHeight={M.height(.usage)} closeOnEscape={true} closeOnOutsideClick={true} trapFocus={true} initialFocus={M.initialFocus(m, 1)} returnFocus={M.focusName(m, .usage_anchor)} constrainWidthToViewport={true} flip={true} shiftMainAxis={true} viewportPadding={8} style={S.wrapper} parts={.{ .chrome = m.space.id("ai.usage.menu") }} onOpenChange={|o| M.popupOpenChanged(m, 1, o)}>
+            <col style={S.usage_body}>
+                <W.ScrollArea style={S.usage_scroll} parts={.{ .content = .{ .style = S.usage_content } }}>
+                    {if (M.usageShown(m)) <UsageBody m={m} />}
+                </W.ScrollArea>
+            </col>
+        </W.Popover>
+    );
+}
+
+fn UsageBody(m: *M.View) View {
+    return (
+        <col>
+            <row testId={m.space.id("ai.usage.summary")} style={S.usage_head}>
+                <text style={S.usage_caption} box={S.usage_caption_box}>{M.usageCaption(m)}</text>
+                <text style={S.usage_total} box={S.usage_total_box}>{M.usageTotal(m)}</text>
+            </row>
+            <W.ProgressSegments testId={m.space.id("ai.usage.track")} segments={M.usageSegments(m)} />
+            <col style={S.usage_legend}>
+                {for (M.usageParts(m)) |part| <row key={part.index} style={S.usage_row}>
+                    <box style={S.UsageSwatch.of(.{ .tone = part.tone })} />
+                    <text style={S.usage_name} box={S.usage_name_box}>{M.usagePartName(part)}</text>
+                    <text testId={m.space.id("ai.usage.part.value")} style={S.usage_value} box={S.usage_value_box}>{M.usagePartValue(part)}</text>
+                </row>}
+            </col>
+            <W.Divider />
+            <row style={S.usage_action}>
+                {if (M.compactionRunning(m)) <CompactionCancel m={m} /> else <CompactionStart m={m} />}
+            </row>
+        </col>
+    );
+}
+
+/// The usage popover's action. Both forms carry the same focusId: it is the popover's first focus
+/// (`initialFocus`) while it can act. Its reason Tooltip is a passive hint and stays out of the Escape order,
+/// so one Escape closes the popover also while the focused action shows its hint.
+fn CompactionCancel(m: *M.View) View {
+    return (
+        <W.Tooltip text={M.compactionReason(m)} closeOnEscape={false}>
+            <W.Button focusId={M.focusName(m, .usage_action)} testId={m.space.id("ai.usage.compaction.cancel")} label="取消压缩" a11yLabel={M.compactionReason(m)} iconAsset={ui.icons.x} variant={.secondary} size={.sm} onClick={M.cancelCompaction(m)} />
+        </W.Tooltip>
+    );
+}
+fn CompactionStart(m: *M.View) View {
+    return (
+        <W.Tooltip text={M.compactionReason(m)} closeOnEscape={false}>
+            <W.Button focusId={M.focusName(m, .usage_action)} testId={m.space.id("ai.usage.compaction.start")} label="压缩上下文" a11yLabel={M.compactionReason(m)} iconAsset={M.glyphNamed("fold-vertical")} variant={.secondary} size={.sm} disabled={!M.canCompact(m)} onClick={M.startCompaction(m)} />
+        </W.Tooltip>
+    );
+}

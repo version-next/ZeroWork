@@ -196,7 +196,7 @@ test "execution driver settles released command while next SSH prompt or human d
         }
         driver.finish() catch unreachable;
     }
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const raw = "{\"session_ref\":\"0\",\"command\":\"true\",\"request_key\":\"prompt-release\"}";
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
@@ -272,7 +272,7 @@ test "execution driver precise input takeover preserves Task and read-only obser
         }
         driver.finish() catch unreachable;
     }
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1001 }, .content = .{ .group = 1 }, .binding_revision = 1, .grant_revision = 1 };
     var other_task = context;
     other_task.task_id = .generate();
     var other_conversation = context;
@@ -418,7 +418,7 @@ test "execution driver saved interval settles control without RPC uncertainty or
         }
         driver.finish() catch unreachable;
     }
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1001 }, .content = .{ .group = 1 }, .binding_revision = 1, .grant_revision = 1 };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -516,7 +516,7 @@ test "execution driver exact stop rejects stale handed-off and foreign cards wit
         }
         driver.finish() catch unreachable;
     }
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 2 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1002 }, .content = .{ .group = 2 }, .binding_revision = 1, .grant_revision = 1 };
     var other_task = context;
     other_task.task_id = .generate();
     var other_conversation = context;
@@ -722,7 +722,7 @@ test "execution deadline native queued authorization is interruptible and releas
             }
             driver.finish() catch unreachable;
         }
-        const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+        const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
         const wire = "{\"session_ref\":\"0\",\"command\":\"true\",\"request_key\":\"cancelled-admission\"}";
         var parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
         defer parsed.deinit();

@@ -29,6 +29,25 @@ const app_theme = zenit.generateTheme(b, dep, b.path("theme.json"), .{
 zenit.attachWithOptions(dep, exe, .{ .theme_provider = app_theme });
 ```
 
+### 应用主题分层
+
+以 zenit 默认主题为底，只追加 / 覆盖少量自己的 token 时，用分层生成而不是复制 `default.json`：
+
+```zig
+const app_theme = zenit.generateThemeLayers(b, dep, &.{
+    zenit.defaultThemePath(dep), // 包内 src/tokens/default.json
+    b.path("src/ui/theme/app.tokens.json"),
+}, .{ .target = target, .optimize = optimize });
+zenit.attachWithOptions(dep, exe, .{ .theme_provider = app_theme });
+```
+
+```sh
+zig build tokens -- check src/tokens/default.json tests/tokens/app_overlay.json
+zig build tokens -- explain src/tokens/default.json tests/tokens/app_overlay.json color.switch_track_on --mode dim
+```
+
+overlay 新增的路径直接加入；覆盖下层路径需写 `{"$override": true, "$value": ...}`（模式写 `"$override": true`），否则报错并给出两处 `文件#Pointer`。单层调用与 `generateTheme` 相同。规则详见 [DESIGN_SYSTEM_TOKENS.md 10.1](../DESIGN_SYSTEM_TOKENS.md)；`tests/tokens/app_overlay.json` 与 `tests/tokens/layer_ui_tests.zig` 是可运行示例（Zig 字段、`.yss` 名称、内置组件都读到 overlay 的值）。
+
 生成器使用 host target，产出的模块使用应用 target；生成物留在 Zig 构建缓存。helper 共用依赖包导出的 `zenit_style_values` 模块实例，避免相同结构的 Color 被视为不同类型。
 
 当前实际可用的生成接口：
@@ -44,8 +63,8 @@ const heading_size = theme.modes.dark.tokens.font_size.title;
 
 - `refs` 和 `modes.*.tokens` 都是基础与 semantic 合并后的类别树。
 - `Token(category)` 是该类别的引用枚举；错误类别不能传给 resolve。
-- `Values` 只有模式信息和统一 `tokens`；没有 system、bindings 或默认角色回退。
-- `metadata` 提供统一路径、声明来源和 JSON Pointer；引用链解释由 CLI 读取原声明完成。
+- `Values` 只有模式信息和统一 `tokens`；没有 system 或 bindings。主题缺少的组件角色 token 由解析器按 `src/tokens/roles.zig` 补成默认别名（见 DESIGN_SYSTEM_TOKENS.md 8.0）。
+- `metadata` 提供统一路径、声明来源和 JSON Pointer（分层时为 `文件#Pointer`）；引用链解释由 CLI 读取原声明完成。
 - 空类别、空 tokens、数字名称、关键字、连字符和嵌套分组都可生成实际能编译的 Zig。
 
 ## 样式消费
@@ -76,3 +95,4 @@ cx.setTheme(&ui.theme.modes.dark);
 ## 验收
 
 `test-tokens` 运行解析/生成/默认材料测试，实际编译四份生成 provider，并要求错误类别的引用编译失败。覆盖包含 OOM 扫描、模式回退穿透引用、跨模式并集假环、1,024 条引用链、类型/范围/重复声明、源码诊断及确定性生成。默认 JSON 与测试专用快照逐值比较；该快照不进入生产模块；`test-yix` 另验证应用自定义 token、typography 覆盖顺序、sva 的模式/hover/variant 联动，以及独立 overlay/portal 通知。`test-css-errors` 验证类别不匹配和 box 使用 typography 的编译错误。
+

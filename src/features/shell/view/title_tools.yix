@@ -1,0 +1,85 @@
+//! 标题栏工具组（design-r3 稿 5，Pencil `qSGtA`）：全部是 zenit 原生组件，默认外观，不覆盖任何样式。
+//!
+//! - 7 个按钮（会话组页签下连接组追加“组广播”）：原生 `W.Button` ghost / md / icon only（32 × 32，图标 16），
+//!   每个包一层原生 `W.Tooltip`（600 ms，“名称 · 快捷键”，有状态写状态，不可用写原因）。
+//! - 只响应点击：悬停只出这层 Tooltip；点击打开宿主的原生弹层（Popover / Menu / Modal），再点一次、Esc、点外部关闭。
+//! - 分组：通信链路 · 端口转发 · 传输管理 ｜ 命令历史 · 回看日志 · 通知 ｜ 设置；组间原生 `W.Divider`（竖线）。
+//!   主题不在标题栏（不是高频操作）：设置 › 外观与主题，菜单栏“显示 › 外观…”。
+//! - 折叠：页签放不下时按级收进“⋯”（原生 `W.Menu`，图标 + 名称 + 快捷键，与 Tooltip 文案一致）。收起的按钮不卸载：
+//!   它们叠在“⋯”下方、透明且不可命中，菜单选中后由宿主触发这颗按钮自己的点击，弹层因此从“⋯”处弹出。
+//!   收起的槽位 `inert`（zenit 上游）：Tab / Shift+Tab 跳过、辅助技术不读，只改我们自己的布局 box，不碰原生按钮（W-4）。
+//!   第 3 级有未读通知时“⋯”上显示原生 `W.Badge` 圆点。
+//! - 按钮的点击、可用性与弹层归各自的宿主（连接详情、端口转发、传输、命令历史、回看日志、通知、设置）；
+//!   宿主经 `title_tools_view.zig` 拿到这些原生按钮节点。级别、Tooltip、菜单项都是那里的信号。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/title_tools.zig");
+const vmod = @import("title_tools_view.zig");
+const S = @import("title_tools.yss");
+
+pub const ids = struct {
+    pub const root = "toolbar.tools";
+    pub const more = "toolbar.expand";
+    pub const more_slot = "toolbar.compact";
+    pub const more_menu = "toolbar.more";
+    pub const more_dot = "toolbar.more.dot";
+    pub const extra = "toolbar.slot.extra";
+    pub const divider_records = "toolbar.divider.records";
+    pub const divider_application = "toolbar.divider.application";
+};
+
+/// 宿主拿原生按钮节点：挂载后写进 view-model。
+fn keep(vm: *vmod.ViewModel, tool: m.Tool, button: *ui.view.Ref(*ui.Node)) void {
+    vm.nodes[@intFromEnum(tool)] = button.get();
+}
+fn keepMore(vm: *vmod.ViewModel, more: *ui.view.Ref(*ui.Node), extra: *ui.view.Ref(*ui.Node)) void {
+    vm.more = more.get();
+    vm.extra_slot = extra.get();
+}
+
+fn Slot(vm: *vmod.ViewModel, tool: m.Tool) View {
+    const button = ref();
+    onMount(keep(vm, tool, button));
+    return (
+        <box style={S.Slot.of(.{ .folded = vm.folded(tool) })} visible={vm.present(tool)} inert={vm.folded(tool)}>
+            <W.Tooltip text={vm.tip(tool)} position={.bottom} parts={.{ .content = m.tooltipId(tool) }}>
+                <W.Button ref={button} testId={m.buttonId(tool)} variant={.ghost} size={.md} iconOnly={true} iconAsset={vm.icon(tool)} iconSize={16} a11yLabel={m.label(tool)} disabled={vm.disabled(tool)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+pub fn TitleTools(vm: *vmod.ViewModel) View {
+    const more = ref();
+    const extra = ref();
+    onMount(keepMore(vm, more, extra));
+    return (
+        <row testId={ids.root} style={S.tools}>
+            <Slot vm={vm} tool={.chain} />
+            <Slot vm={vm} tool={.forward} />
+            <Slot vm={vm} tool={.transfers} />
+            <Slot vm={vm} tool={.broadcast} />
+            <box ref={extra} testId={ids.extra} style={S.extra} visible={vm.extraShown()} />
+            <box testId={ids.divider_records} style={S.divider} visible={vm.dividerShown(0)}>
+                <W.Divider orientation={.vertical} spacing={.none} />
+            </box>
+            <Slot vm={vm} tool={.command_history} />
+            <Slot vm={vm} tool={.history} />
+            <Slot vm={vm} tool={.notifications} />
+            <box testId={ids.divider_application} style={S.divider} visible={vm.dividerShown(1)}>
+                <W.Divider orientation={.vertical} spacing={.none} />
+            </box>
+            <Slot vm={vm} tool={.settings} />
+            <box testId={ids.more_slot} style={S.more} visible={vm.moreShown()}>
+                <W.Menu items={vm.menuItems()} panelTestId={ids.more_menu} width={220} position={.bottom_end} onSelect={|id| vm.select(id)}>
+                    <W.Tooltip text="更多工具" position={.bottom}>
+                        <W.Button ref={more} testId={ids.more} variant={.ghost} size={.md} iconOnly={true} iconAsset={ui.icons.ellipsis} iconSize={16} a11yLabel="更多工具" />
+                    </W.Tooltip>
+                </W.Menu>
+                <box style={S.dot} hitTest={false} visible={vm.dotShown()}>
+                    <W.Badge testId={ids.more_dot} dot={true} />
+                </box>
+            </box>
+        </row>
+    );
+}

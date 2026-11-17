@@ -31,6 +31,13 @@ pub const CoreTextLineMetrics = extern struct {
 pub extern fn coretext_create_font_from_path(path: [*:0]const u8, size: f32) ?*anyopaque;
 pub extern fn coretext_create_font_from_path_weighted(path: [*:0]const u8, size: f32, weight: c_int, italic: c_int) ?*anyopaque;
 pub extern fn coretext_find_font(family: [*:0]const u8, size: f32, weight: c_int, italic: c_int) ?*anyopaque;
+/// Opt-in exact numeric weight: same face lookup as coretext_find_font, then pins the 'wght'
+/// coordinate on variable faces (non-variable faces: the nearest-tier face unchanged).
+pub extern fn coretext_find_font_exact_weight(family: [*:0]const u8, size: f32, weight: c_int, italic: c_int) ?*anyopaque;
+/// Read-only: CSS-numeric 'wght' range of a family's variable face. 1 = filled, 0 = not variable.
+pub extern fn coretext_font_weight_range(family: [*:0]const u8, minimum: *c_int, maximum: *c_int, default_value: *c_int) c_int;
+/// Read-only: a font's actual CSS-numeric 'wght' coordinate, -1 for non-variable faces.
+pub extern fn coretext_font_weight_value(font: *anyopaque) f64;
 pub extern fn coretext_release_font(font: *anyopaque) void;
 pub extern fn coretext_retain_font(font: *anyopaque) void;
 /// Derive new font size from existing CTFont, preserving all variation axes (weight/italic).

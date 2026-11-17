@@ -49,12 +49,32 @@ pub const UndoSnapshot = editable_block.UndoSnapshot;
 pub const InputType = editable_block.InputType;
 pub const InputSize = control_shell.ControlSize;
 pub const TextareaState = textarea_mod.TextareaState;
+pub const TextDecoration = textarea_mod.TextDecoration;
 pub const inputEventHandler = events_mod.inputEventHandler;
 pub const EditableText = editable_text_mod.EditableText;
 pub const EditableTextResult = editable_text_mod.EditableTextResult;
 pub const EditableTextProps = editable_text_mod.EditableTextProps;
 pub const isEditableTextClickHandler = editable_text_mod.isClickActivationHandler;
 pub const textareaEventHandler = textarea_mod.textareaEventHandler;
+
+/// The edit state behind a field node (its on_event context), told apart by the handler the
+/// input module installed. Tools that inspect a field (test harness, devtools) go through this
+/// instead of comparing handler identities themselves.
+pub const EditState = union(enum) { input: *TextInputState, textarea: *TextareaState };
+
+/// Escape routing helper for hosts (see `Cx.input_escape`): revert the focused field to its
+/// focus-time text; true when it did.
+pub const revertFocused = events_mod.revertFocused;
+
+pub fn editStateOf(node: *const Node) ?EditState {
+    const context = node.behavior.events.event_context orelse return null;
+    const handler = node.behavior.events.on_event orelse return null;
+    if (handler == events_mod.inputEventHandler or handler == events_mod.inputFieldEventHandler or editable_text_mod.isClickActivationHandler(handler))
+        return .{ .input = @ptrCast(@alignCast(context)) };
+    if (handler == textarea_mod.textareaEventHandler or handler == textarea_mod.textareaFieldEventHandler)
+        return .{ .textarea = @ptrCast(@alignCast(context)) };
+    return null;
+}
 
 // Re-export text_utils for external consumers
 pub const text_utils = @import("text_utils.zig");
@@ -67,15 +87,29 @@ pub const InputProps = struct {
     /// External write: same content doesn't move the cursor, else replace all, cursor to end, undo
     /// history cleared; during composition it is deferred until complete (commit discards it - user
     /// input wins, cancel applies); bypasses input_type filter, doesn't fire on_change.
+    /// A read-only source plus `on_change` (Yix `value={query(vm)} onChange={…}`) becomes
+    /// `ui.split(source, on_change)`: the owner (view-model) writes its state synchronously in the
+    /// handler and the edit lands in place; an owner write (e.g. clearing) is an external write.
     /// Non-growable buffer limit 2048 bytes, excess truncated.
     value: Model([]const u8) = .{ .local = "" },
     growable: bool = false,
     /// Placeholder ("" = none; can pass signal)
     placeholder: Source([]const u8) = .{ .value = "" },
-    /// Placeholder text color override
+    /// Placeholder text color override: a fixed color that does not follow theme publications.
+    /// Null (default) paints the placeholder with the current tokens' `fg_secondary`.
     placeholder_color: ?Color = null,
-    /// Input type
-    input_type: InputType = .text,
+    /// Input type. A source is followed: the text keeps its content, cursor, selection and undo
+    /// history; the mask, the clipboard policy, the secure flag of the native text client and the
+    /// accessibility exposure (secure flag, value, editable range) switch with it, and a composition
+    /// in progress is cancelled. Switching to `.number` / `.email` / `.tel` does not rewrite the text
+    /// already there (the filter applies to what is typed next). To show a password's characters, use
+    /// `revealed` rather than switching to `.text` (see docs/design/text-field-live-behavior-props.md).
+    input_type: Source(InputType) = .{ .value = .text },
+    /// A `.password` field shows its characters instead of the mask (a show / hide control). Only the
+    /// display follows it: the field stays a password field for text services (no IME, no surrounding
+    /// text), the clipboard (no copy / cut) and accessibility (value not exported). Ignored for other
+    /// types. A source is followed.
+    revealed: Source(bool) = .{ .value = false },
     /// Size (unified ControlSize, default md; outer height = padding_y*2 + font_size*line_height,
     /// default theme xs=20/sm=24/md=32/lg=40)
     size: InputSize = .md,
@@ -85,10 +119,14 @@ pub const InputProps = struct {
     helper: Source([]const u8) = .{ .value = "" },
     /// Error message ("" = no error; non-empty enters error state, replaces helper)
     error_msg: Source([]const u8) = .{ .value = "" },
-    /// Required
-    required: bool = false,
-    /// Readonly
-    readonly: bool = false,
+    /// Validation supplied by a form wrapper that owns its helper/error message.
+    invalid: Source(bool) = .{ .value = false },
+    /// Required: the label row's required mark and accessibility `required`. A source is followed.
+    required: Source(bool) = .{ .value = false },
+    /// Read-only: the value can be focused, selected and copied, not edited (no native text
+    /// client, no IME). A source is followed: turning it on cancels a composition in progress;
+    /// focus and selection are kept.
+    readonly: Source(bool) = .{ .value = false },
     /// Disabled (can pass signal)
     disabled: Source(bool) = .{ .value = false },
     /// Width
@@ -102,10 +140,75 @@ pub const InputProps = struct {
     /// When embedded in compound control, keep only text editing, parent draws unified shell.
     /// Select/ComboBox use to avoid double border/focus ring.
     embedded: bool = false,
+    /// Value text in the monospace face (paths, patterns, JSON); measured and caret-placed as
+    /// painted.
+    monospace: bool = false,
+    /// Compound field expanded state (e.g. ComboBox popup), retains accent border while open.
+    expanded: Source(bool) = .{ .value = false },
+    /// Raised field contact shadow; regular text inputs remain flat.
+    raised: bool = false,
+    /// The caller's overrides on the field (the framed node, `InputResult.input_container`):
+    /// e.g. a toolbar field's height, corner radius or fixed border color. Merged over the size
+    /// recipe and over every frame state (hover / focus / invalid / disabled), like
+    /// `Button.base_style` on a button. Writing those fields on the field node after mount
+    /// does not stick: the frame states re-apply on their next change.
+    field_style: core.StyleOverride = .{},
+    /// Per-state overrides of the field frame (hover / focus / invalid / disabled / expanded),
+    /// merged state by state over the field tone (ControlShell `root_style`), e.g. a transparent
+    /// border with a fill color per state. Unlike `field_style` (one override over every state)
+    /// each state keeps its own look. Default: none (the tone alone).
+    field_state_style: Source(core.ConditionalStyle) = .{ .value = .{} },
     /// Called after user edit committed (committed value; slice valid during callback only)
     on_change: ?Handler([]const u8) = null,
     /// Single-line Enter (non-composition): current text. Unset, Enter bubbles to parent
     on_submit: ?Handler([]const u8) = null,
+};
+
+/// The one rule for a field's native text client (IME, dictation, text services): attached exactly
+/// when the field is editable — not statically disabled (no handlers at all) and not read-only. Built
+/// from the current type (its `secure` flag). A focused field's text input session is refreshed at
+/// once, so a change from a timer or another window's event reaches the IME without waiting for the
+/// next event in this one.
+fn syncTextClient(cx: *Cx, state: *TextInputState, node: *Node, static_disabled: bool) void {
+    const editable = !static_disabled and !state.readonly;
+    node.behavior.interaction.text_input_client = if (editable) render_mod.textInputClient(state) else null;
+    if (cx.focus_manager.getFocused() == node) cx.refreshTextInputSession();
+}
+
+/// Follows a non-static `InputProps.input_type` / `revealed`: the edit state's type and reveal,
+/// the secure flag of the accessibility node and of the text input client, the exported value /
+/// range, then the display (mask or text) and the horizontal scroll that keeps the caret visible.
+const InputTypeFollow = struct {
+    cx: *Cx,
+    state: *TextInputState,
+    container: *Node,
+    input_type: Source(InputType),
+    revealed: Source(bool),
+    static_disabled: bool,
+
+    fn effect(self: *InputTypeFollow) void {
+        const next_type = self.input_type.get();
+        const next_revealed = self.revealed.get();
+        const state = self.state;
+        if (state.input_type == next_type and state.revealed == next_revealed) return;
+        // Mask and text have different display coordinates; a composition (and its underline)
+        // cannot carry over, and a field turning secure must not keep plain text in the IME.
+        if (state.imeIsComposing()) state.cancelImeComposition();
+        const type_changed = state.input_type != next_type;
+        state.input_type = next_type;
+        state.revealed = next_revealed;
+        if (type_changed) {
+            if (self.container.behavior.interaction.a11y) |*a11y| a11y.secure = next_type == .password;
+            syncTextClient(self.cx, state, self.container, self.static_disabled);
+            render_mod.syncAccessibilityProps(state, self.container);
+        }
+        state.updateScrollX();
+    }
+
+    fn destroy(raw: *anyopaque, alloc: Allocator) void {
+        const self: *InputTypeFollow = @ptrCast(@alignCast(raw));
+        alloc.destroy(self);
+    }
 };
 
 /// Create input: `W.Input(.{ .value = name, .placeholder = "Your name", .on_submit = cx.on(S, s,
@@ -122,8 +225,6 @@ pub const InputBinding = binding_mod.TextBinding(TextInputState);
 pub const InputChrome = struct {
     state: *TextInputState,
     cx: *Cx,
-    tokens: *const core.ThemeTokens,
-    shell_config: control_shell.ControlShellConfig,
     label: Source([]const u8),
     helper: Source([]const u8),
     error_msg: Source([]const u8),
@@ -138,7 +239,17 @@ pub const InputChrome = struct {
     append_icon: ?*Node = null,
     /// Owned copy of dynamic placeholder (state.placeholder_text / a11y borrows)
     placeholder_copy: []u8 = &.{},
+    invalid: Source(bool),
+    /// Frame invalid state (the shell's :invalid) = invalid prop or a non-empty error message.
+    invalid_frame: *Signal(bool),
+    /// Leading / append icon tone (disabled > invalid > normal).
+    icon_tone: *Signal(styles.IconTone),
     shown_disabled: bool = false,
+    readonly: Source(bool),
+    shown_readonly: bool,
+    required: Source(bool),
+    /// No handlers were installed (statically disabled): the field never gets a text client.
+    static_disabled: bool,
 
     fn effect(self: *InputChrome) void {
         self.apply(true) catch |err| std.log.err("[Input] updating chrome failed: {}", .{err});
@@ -166,34 +277,31 @@ pub const InputChrome = struct {
         }
         const err_text = self.error_msg.read(tracked);
         const help_text = self.helper.read(tracked);
-        const has_error = err_text.len > 0;
+        const has_error = self.invalid.read(tracked) or err_text.len > 0;
         if (has_error != self.state.has_error) {
             self.state.has_error = has_error;
-            const t = self.tokens;
-            if (!self.state.focused and !self.state.embedded_chrome) self.input_container.setBorderColor(self.state.restingBorderColor());
-            if (self.leading_icon) |n| _ = n.setTint(styles.iconTintColor(t, has_error));
-            if (self.append_icon) |n| _ = n.setTint(styles.iconTintColor(t, has_error));
+            self.invalid_frame.set(has_error);
             if (self.input_container.behavior.interaction.a11y) |*attrs| attrs.invalid = has_error;
             self.state.dirty = true;
-            self.input_container.markRenderDirty();
         }
         if (self.helper_node) |hn| {
             const shown = if (has_error) err_text else help_text;
-            var txt = hn.getText().?;
-            if (!std.mem.eql(u8, txt.content, shown)) {
-                try hn.setTextContent(a, shown);
-                txt = hn.getText().?;
-            }
-            txt.color = styles.helperTextStyle(self.tokens, has_error).color;
-            hn.setText(txt);
+            // Color: the node's style follows `invalid_frame` and the theme (styles.helperText).
+            if (!std.mem.eql(u8, hn.getText().?.content, shown)) try hn.setTextContent(a, shown);
             hn.setDisplay(if (shown.len > 0) .flex else .none);
             hn.markRenderDirty();
         }
         const disabled = self.disabled.read(tracked);
         if (disabled != self.shown_disabled) self.applyDisabled(disabled);
+        const readonly = self.readonly.read(tracked);
+        if (readonly != self.shown_readonly) self.applyReadonly(readonly);
+        const required = self.required.read(tracked);
+        if (self.input_container.behavior.interaction.a11y) |*attrs| attrs.required = required;
+        self.icon_tone.set(if (disabled) .disabled else if (has_error) .invalid else .normal);
     }
 
-    /// Dynamic disable: style outer per recipe, event entry gated by state.disabled, revoke focus
+    /// Dynamic disable: the frame follows the shell's :disabled; here only behavior (event entry
+    /// gated by state.disabled, focus revoked, a11y).
     fn applyDisabled(self: *InputChrome, disabled: bool) void {
         self.shown_disabled = disabled;
         self.state.disabled = disabled;
@@ -203,12 +311,22 @@ pub const InputChrome = struct {
             self.state.cancelImeComposition();
             if (self.cx.focus_manager.getFocused() == node) self.cx.clearFocus();
         }
-        const resolved = self.shell_config.resolvedConditionalStyle(self.tokens).resolve(.{ .is_disabled = disabled });
-        if (resolved.background) |bg| node.setBackground(bg);
-        node.setBorderColor(if (disabled) (resolved.border_color orelse self.state.restingBorderColor()) else self.state.restingBorderColor());
-        node.style.cursor = if (disabled) .default else .text;
         node.setFocusable(!disabled);
         if (node.behavior.interaction.a11y) |*attrs| attrs.disabled = disabled;
+        self.state.dirty = true;
+        node.markRenderDirty();
+    }
+
+    /// Dynamic read-only: editing entries are gated by state.readonly (events.zig); here the
+    /// native text client (IME / text services) is detached or restored and a11y follows.
+    fn applyReadonly(self: *InputChrome, readonly: bool) void {
+        self.shown_readonly = readonly;
+        const node = self.input_container;
+        if (readonly) self.state.cancelImeComposition();
+        self.state.readonly = readonly;
+        syncTextClient(self.cx, self.state, node, self.static_disabled);
+        if (node.behavior.interaction.a11y) |*attrs| attrs.readonly = readonly;
+        self.state.dirty = true;
         node.markRenderDirty();
     }
 
@@ -267,80 +385,9 @@ pub const InputResult = struct {
     }
 };
 
-fn updateGroupedFieldShellOutline(state: *TextInputState, active: bool) void {
-    const host = state.focus_ring_host orelse return;
-    if (active and state.tokens.tokens.color.border_focus.a != 0) {
-        host.style.ensureExtPanic(state.allocator).z_index = 1;
-        host.setStyle(state.allocator, .outline, .{
-            .color = state.tokens.tokens.color.border_focus,
-            .width = 1,
-            .offset = 0,
-        });
-    } else {
-        host.style.ensureExtPanic(state.allocator).z_index = 0;
-        host.setStyle(state.allocator, .outline, null);
-    }
-    host.markRenderDirty();
-}
-
-fn syncGroupedCornerRadiusFromWrapper(wrapper: *Node, state: *TextInputState) void {
-    const wrapper_corner = wrapper.style.corner_radius() orelse return;
-    state.grouped_attached = true;
-    const grouped_radii = wrapper_corner.resolve4();
-    const grouped_corner: core.CornerRadius = .{ .each = grouped_radii };
-    const grouped_is_uniform = grouped_radii[0] == grouped_radii[1] and
-        grouped_radii[1] == grouped_radii[2] and
-        grouped_radii[2] == grouped_radii[3];
-    const wrapper_side_colors = wrapper.style.border_side_colors();
-
-    // Group scenario: wrapper shouldn't clip input border highlight
-    wrapper.style.ensureExtPanic(state.allocator).clip_shape = .none;
-
-    if (state.focus_ring_host) |field_shell| {
-        field_shell.style.border.radius = 0;
-        field_shell.style.ensureExtPanic(state.allocator).corner_radius = grouped_corner;
-    }
-
-    if (state.input_container_node) |input_container| {
-        input_container.style.border.radius = 0;
-        // Current render clip for overflow_hidden supports only uniform radius (max of four
-        // corners).
-        // Group first/last is asymmetric corners (e.g. 8,0,0,8); overflow_hidden clips right to 8,
-        // border looks cut, right corner nonzero. Text clipping stays with editable_surface.
-        input_container.style.overflow_hidden = grouped_is_uniform;
-        const ic_ext = input_container.style.ensureExtPanic(state.allocator);
-        ic_ext.corner_radius = grouped_corner;
-        ic_ext.hit_shape = .auto;
-        ic_ext.clip_shape = .auto;
-        ic_ext.border_side_colors = wrapper_side_colors;
-        // Group seam now held by previous child's trailing border. input_container no longer
-        // elevates z-index, else covers next child's leading seam.
-        ic_ext.z_index = 0;
-    }
-}
-
-fn inputWrapperBeforeRender(node: *Node) void {
-    const ctx = node.behavior.events.event_context orelse return;
-    const state: *TextInputState = @ptrCast(@alignCast(ctx));
-    syncGroupedCornerRadiusFromWrapper(node, state);
-}
-
-/// Input builder. `embedded`: shell (border/background/h-padding) drawn by parent, Input only
-/// editable text. Previously each consumer wrote finish (Select stripSearchInput, storybook
-/// stripEmbeddedInputChrome), semantics only in docs.
-fn applyEmbeddedChrome(wrapper: *Node, field_shell: *Node, input_container: *Node, state: *TextInputState) !void {
-    const a = state.allocator;
-    inline for (.{ wrapper, field_shell, input_container }) |n| {
-        n.style.width = .{ .grow = .{ .min = 0 } };
-        n.style.flex_shrink = 1;
-        (try n.style.ensureExtFallible(a)).min_width = 0;
-    }
-    wrapper.style.gap = 0;
-    field_shell.style.border.width = 0;
-    input_container.style.height = .{ .fit = .{} };
-    input_container.style.padding = core.Padding.ZERO;
-    input_container.style.border.width = 0;
-    input_container.setBackgroundRaw(Color.TRANSPARENT);
+/// Embedded Input: the compound control draws the frame and its padding; the text starts at the
+/// frame's content edge.
+fn applyEmbeddedEditing(state: *TextInputState) void {
     state.padding_h = 0;
     if (state.text_display_node) |text| text.style.padding.left = -state.scroll_x;
 }
@@ -367,13 +414,22 @@ pub const InputBuilder = struct {
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
-        const has_error = p.error_msg.peek().len > 0;
+        reactive.checkBorrow(my_scope, p.expanded);
+        reactive.checkBorrow(my_scope, p.readonly);
+        reactive.checkBorrow(my_scope, p.required);
+        reactive.checkBorrow(my_scope, p.input_type);
+        reactive.checkBorrow(my_scope, p.revealed);
+        reactive.checkBorrow(my_scope, p.invalid);
+        reactive.checkBorrow(my_scope, p.field_state_style);
+        const has_error = p.invalid.peek() or p.error_msg.peek().len > 0;
         const disabled0 = p.disabled.peek();
         // Static disabled: shell draws disabled, no event handlers; dynamic disabled: InputChrome
         // gates
         const static_disabled = p.disabled.isStatic() and disabled0;
         const chrome_dynamic = !p.label_text.isStatic() or !p.helper.isStatic() or !p.error_msg.isStatic() or
-            !p.placeholder.isStatic() or !p.disabled.isStatic();
+            !p.placeholder.isStatic() or !p.disabled.isStatic() or !p.expanded.isStatic() or !p.invalid.isStatic() or
+            !p.readonly.isStatic() or !p.required.isStatic();
+        const readonly0 = p.readonly.peek();
         const value = try reactive.resolveTextModel(my_scope, p.value);
         const initial_value = value.peek();
 
@@ -421,8 +477,9 @@ pub const InputBuilder = struct {
             _ = try state.setTextChecked(initial_value);
             state.clearUndoHistory();
         }
-        state.input_type = p.input_type;
-        state.readonly = p.readonly;
+        state.input_type = p.input_type.peek();
+        state.revealed = p.revealed.peek();
+        state.readonly = readonly0;
         // Value binding: edit exit / composition cancel / Enter submit all via it
         const binding = try my_scope.allocator.create(InputBinding);
         binding.* = .{ .state = state, .value = value, .on_change = p.on_change, .on_submit = p.on_submit };
@@ -430,21 +487,23 @@ pub const InputBuilder = struct {
         binding.install();
         if (p.on_submit != null) state.on_submit = Cx.strHandlerFrom(InputBinding, binding, InputBinding.onSubmit);
         state.allocator = allocator;
-        state.embedded_chrome = p.embedded;
         // Inject cx weak ref, route utf8MeasuredAdvance through cx.shapeText, replace old
         // measureTextWidthByFontKind. state.cx_ref alive until scope dispose.
         state.cx_ref = cx;
 
         // Read unified size from ControlSize (via theme token)
         const sz = p.size;
-        const metrics = control_shell.metrics(t, sz);
+        const metrics = styles.fieldMetrics(t, sz);
         const input_font_size = metrics.font_size;
         // Line height from Button/Select (control metrics), don't ceil self, else md 1px tall
         const input_line_height = metrics.lineHeightPx();
         const input_text_line_height = metrics.line_height;
         const input_icon_size = metrics.icon_size;
-        const inline_padding_in_content = p.leading_icon_asset == null and p.append_text == null and p.append_icon_asset == null;
-        const content_padding_h: f32 = if (inline_padding_in_content) metrics.padding_h else 0;
+        // Box model as CSS: the frame owns the inline padding (styles.Frame) and the text
+        // scrolls inside the content box, clipped at its edges where the overflow fades sit.
+        // (The padding used to sink into the text as `padding - scroll_x`, so scrolled text
+        // ran into the padding and the fades needed a solid band at the frame edge.)
+        const content_padding_h: f32 = 0;
 
         // Label (dynamic always built, hidden when empty); helper/error (dynamic always built,
         // hidden).
@@ -476,9 +535,11 @@ pub const InputBuilder = struct {
             .props = .{
                 .content = if (initial_display.len > 0) initial_display else "",
                 .owned = retain_display,
-                .color = styles.displayTextColor(t, has_error, has_content, p.placeholder_color),
+                .color = if (disabled0) t.tokens.color.fg_disabled else styles.displayTextColor(t, has_error, has_content, p.placeholder_color),
+                .color_set = true,
                 .font_size = input_font_size,
                 .line_height = input_text_line_height,
+                .use_monospace_font = p.monospace,
                 .spans = state.text_spans_buf[0..0],
                 .spans_owned = false,
                 // selection / IME highlight purely visual, doesn't affect text layout size.
@@ -495,8 +556,7 @@ pub const InputBuilder = struct {
         const Parts = struct {
             label_row: ?*Node = null,
             label: ?*Node = null,
-            field_shell: *Node = undefined,
-            shell: control_shell.ControlShellResult = undefined,
+            shell: core.ViewParts = undefined,
             leading_icon: ?*Node = null,
             editable_surface: *Node = undefined,
             text: *Node = undefined,
@@ -505,12 +565,18 @@ pub const InputBuilder = struct {
             helper: ?*Node = null,
         };
         var parts: Parts = .{};
-        const shell_config = control_shell.ControlShellConfig{ .size = sz, .variant = .field };
         const icon_size: core.Sizing = .{ .px = input_icon_size };
+        // Frame states the shell resolves declaratively (signals: InputChrome updates them).
+        const invalid_frame = try my_scope.createSignal(bool, has_error);
+        const icon_tone = try my_scope.createSignal(styles.IconTone, if (disabled0) .disabled else if (has_error) .invalid else .normal);
+        // A field's value is scrolled inside it and never sets its minimum width (opt out of the
+        // CSS automatic minimum): typing must not widen a width-less Input in a row.
         const wrapper = try view.render(my_scope, cx, view.col(.{ .style = core.BoxStyle{
-            .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
+            .width = if (p.embedded) .{ .grow = .{ .min = 0 } } else if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
+            .flex_shrink = if (p.embedded) 1 else null,
+            .min_width = if (p.embedded or p.width == null) 0 else null,
             .height = .{ .fit = .{} },
-            .gap = 4,
+            .gap = if (p.embedded) 0 else 4,
         } }, .{
             if (has_label_row) view.capture(&parts.label_row, view.row(.{ .style = .{
                 .width = .{ .grow = .{} },
@@ -518,36 +584,40 @@ pub const InputBuilder = struct {
                 .align_items = .center,
                 .gap = 4,
             } }, .{
-                view.capture(&parts.label, view.text(.{ .style = styles.labelTextStyle(t) }, p.label_text.peek())),
-                if (p.required) view.text(.{ .style = styles.requiredMarkStyle(t) }, "*") else null,
+                view.capture(&parts.label, view.text(.{ .style = view.styleBy(styles.Themed{}, styles.labelText) }, p.label_text.peek())),
+                // Built when it can show: a dynamic `required` toggles it (static false builds nothing).
+                if (!p.required.isStatic() or p.required.peek()) view.text(.{ .style = view.styleBy(styles.Themed{}, styles.requiredMark), .visible = p.required }, "*") else null,
             })) else null,
-            // Input ring outer > ControlShell (input with actual border)
-            view.capture(&parts.field_shell, view.col(.{ .style = core.BoxStyle{
-                .width = .{ .grow = .{} },
-                .height = .{ .fit = .{} },
-                .border = .{ .radius = metrics.radius },
-            } }, view.capture(&parts.shell, control_shell.ControlShell(.{
+            // The field: ControlShell(.field) draws the frame and every frame state (hover / focus
+            // from the node, disabled / invalid / expanded from parameters); Input adds its
+            // geometry as an overlay and puts the editing surface in the content slot.
+            view.attrs(.{ .style = view.styleBy(styles.Frame{
                 .size = sz,
+                .width = p.width,
+                .raised = p.raised,
+                .embedded = p.embedded,
+                .field = p.field_style,
+            }, styles.frame) }, view.with(control_shell.ControlShell(.{
                 .variant = .field,
-                .disabled = static_disabled,
+                .size = sz,
                 .leading_icon = p.leading_icon_asset != null,
+                .disabled = p.disabled,
+                .invalid = invalid_frame,
+                .expanded = p.expanded,
+                .embedded = p.embedded,
+                .cursor = .text,
+                .disabled_cursor = .default,
                 .tag = .input,
-                .style = .{
-                    .width = if (p.width) |w| .{ .px = w } else null,
-                    // Regular Input: sink h-padding to editable_surface (same layer as overflow
-                    // shadow)
-                    .padding = if (inline_padding_in_content)
-                        Padding{ .top = metrics.padding_y, .right = 0, .bottom = metrics.padding_y, .left = 0 }
-                    else
-                        null,
-                },
-                .interactive = false,
-                .focus_ring = false,
-                .cursor = if (static_disabled) .default else .text,
-            }, .{
+                .root_style = p.field_state_style,
+                // The content slot must shrink with the shell, otherwise its
+                // automatic text minimum also expands the clipping surface.
+                .content_style = core.BoxStyle{ .height = .{ .grow = .{} }, .align_self = .stretch, .min_width = 0, .min_height = input_line_height },
+                .icon_style = core.BoxStyle{ .min_height = input_line_height },
+                .append_style = core.BoxStyle{ .min_height = input_line_height },
+            }), .{}).capture(&parts.shell).slots(.{
                 .icon = if (p.leading_icon_asset) |asset| view.capture(&parts.leading_icon, view.icon(.{
                     .style = .{ .width = icon_size, .height = icon_size },
-                    .tint = styles.iconTintColor(t, has_error),
+                    .tint = view.tintBy(icon_tone, styles.iconTint),
                 }, asset)) else null,
                 .content = .{
                     // Center the single text line in the available height, just like the caret.
@@ -555,11 +625,14 @@ pub const InputBuilder = struct {
                     view.capture(&parts.editable_surface, view.box(.{ .style = core.BoxStyle{
                         .width = .{ .grow = .{} },
                         .height = .{ .grow = .{} },
+                        .align_self = .stretch,
                         .justify = .center,
                         .overflow_hidden = true,
                         .min_width = 0,
+                        // At the content-box edges (the frame's padding outside is the solid
+                        // field colour): 24px, about two glyphs at 13px.
                         .overflow_fade = .{
-                            .size = 12,
+                            .size = 24,
                             .color = styles.overflowFadeColor(t),
                             .edges = .{ .top = false, .bottom = false, .left = true, .right = true },
                         },
@@ -584,8 +657,6 @@ pub const InputBuilder = struct {
                     // not text attr).
                     view.capture(&parts.cursor, view.box(.{ .style = .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } } }, {})),
                 },
-                // content slot also grow height, let editable_surface fill
-                .content_style = core.BoxStyle{ .height = .{ .grow = .{} } },
                 // No append_text/append_icon, don't build append slot
                 .append = if (p.append_text != null or p.append_icon_asset != null) view.row(.{ .style = .{
                     .width = .{ .fit = .{} },
@@ -593,15 +664,15 @@ pub const InputBuilder = struct {
                     .align_items = .center,
                     .gap = metrics.gap,
                 } }, .{
-                    if (p.append_text) |append_text_val| view.text(.{ .style = styles.appendTextStyle(t, input_font_size) }, append_text_val) else null,
+                    if (p.append_text) |append_text_val| view.text(.{ .style = view.styleBy(input_font_size, styles.appendText) }, append_text_val) else null,
                     if (p.append_icon_asset) |asset| view.capture(&parts.append_icon, view.icon(.{
                         .style = .{ .width = icon_size, .height = icon_size },
-                        .tint = styles.iconTintColor(t, has_error),
+                        .tint = view.tintBy(icon_tone, styles.iconTint),
                     }, asset)) else null,
                 }) else null,
-            })))),
+            })),
             if (has_helper) view.capture(&parts.helper, view.text(.{
-                .style = styles.helperTextStyle(t, has_error),
+                .style = view.styleBy(invalid_frame, styles.helperText),
                 .visible = helper0.len > 0,
             }, helper0)) else null,
         }));
@@ -612,12 +683,10 @@ pub const InputBuilder = struct {
         scope_bound = true;
         wrapper.addDebugState(@ptrCast(state));
         wrapper.behavior.events.event_context = state;
-        wrapper.meta.per_frame.hooks.before_render.main = inputWrapperBeforeRender;
 
         const label_row_node = parts.label_row;
         const label_text_node = parts.label;
-        const field_shell = parts.field_shell;
-        const input_container = parts.shell.node;
+        const input_container = parts.shell.root.?;
         const leading_icon_node = parts.leading_icon;
         const append_icon_node = parts.append_icon;
         const editable_surface = parts.editable_surface;
@@ -631,34 +700,20 @@ pub const InputBuilder = struct {
             .label = if (label_text_node) |ln| ln.getText().?.content else "",
             .placeholder = if (p.placeholder.peek().len > 0) p.placeholder.peek() else null,
             .disabled = disabled0,
-            .required = p.required,
-            .readonly = p.readonly,
+            .required = p.required.peek(),
+            .readonly = readonly0,
             .invalid = has_error,
-            .secure = p.input_type == .password,
+            .secure = p.input_type.peek() == .password,
         };
-        input_container.style.overflow_hidden = false;
-        const input_radius = input_container.style.border.radius;
-        const input_hit_ext = try input_container.style.ensureExtFallible(allocator);
-        input_hit_ext.hit_shape = .{ .rounded_rect = input_radius };
-        input_hit_ext.clip_shape = .none;
-        state.focus_ring_host = field_shell;
         state.input_container_node = input_container;
         render_mod.syncAccessibilityProps(state, input_container);
-        if (!static_disabled and !p.readonly) {
+        if (!static_disabled and !readonly0) {
             input_container.behavior.interaction.text_input_client = render_mod.textInputClient(state);
         }
         state.has_error = has_error;
         wrapper.setInteractionDelegate(input_container);
-        field_shell.setInteractionDelegate(input_container);
-
-        // border animation unified to Transition system
-        input_container.applyTransition(allocator, &comptime recipe_mod.transition("border-color 150ms"));
-
-        // mount initial border: error/has-value explicit color; empty+no-error keeps shell field
-        // default
-        if (has_error or state.hasVisualValue()) {
-            input_container.setBorderColor(styles.restingBorderColor(t, has_error, state.hasVisualValue()));
-        }
+        // Group attaches this Input by its field (corner radii, shared edge), not the label column.
+        wrapper.setFrameDelegate(input_container);
 
         editable_surface.behavior.events.event_context = state;
         state.editable_surface_node = editable_surface;
@@ -672,94 +727,8 @@ pub const InputBuilder = struct {
         // Readonly also attached: select/copy/focus work, edit entry gated by state.readonly.
         state.disabled = disabled0;
         if (!static_disabled) {
-            input_container.behavior.events.on_event = events_mod.inputEventHandler;
+            input_container.behavior.events.on_event = events_mod.inputFieldEventHandler;
             input_container.behavior.events.event_context = state;
-
-            const state_opaque: *anyopaque = state;
-            input_container.behavior.events.on_focus = .{
-                .callback = struct {
-                    fn handler(c: *anyopaque) void {
-                        const s: *TextInputState = @ptrCast(@alignCast(c));
-                        s.focused = true;
-                        // Note: don't set dirty=true, focus doesn't change text. multiline dirty
-                        // triggers
-                        // rebuildTextareaTextNodes -> markRuntimeIndexDirty -> node detach from
-                        // registry -> focus lost.
-                        // Update border style: focus -> focus-state color (keep 1px, avoid seam
-                        // jitter)
-                        if (!s.has_error and !s.embedded_chrome) {
-                            if (s.input_container_node) |container| {
-                                container.setBorderColor(styles.borderColor(s.tokens, s.restingBorderColor(), false, true, false));
-                                // Focus only changes color, doesn't enlarge border width.
-                                container.style.border.width = 1;
-                                container.markRenderDirty();
-                            }
-                        }
-                        if (s.grouped_attached) updateGroupedFieldShellOutline(s, true);
-                        if (s.focus_ring_host) |host| {
-                            if (host.behavior.events.on_focus) |h| h.invoke();
-                        }
-                    }
-                }.handler,
-                .context = state_opaque,
-            };
-            input_container.behavior.events.on_blur = .{
-                .callback = struct {
-                    fn handler(c: *anyopaque) void {
-                        const s: *TextInputState = @ptrCast(@alignCast(c));
-                        s.focused = false;
-                        s.cancelImeComposition();
-                        s.selection_anchor = null;
-                        s.syncDocFromCursor();
-                        s.is_dragging = false;
-                        s.drag_pointer = null;
-                        s.suspend_drag_until_mouse_up = false;
-                        s.consecutive_mouse_downs = 0;
-                        s.last_mouse_down_instant = null;
-                        // Note: don't set dirty=true (same as on_focus). Reset border style: blur
-                        // parses border
-                        // color per hover state
-                        if (!s.has_error and !s.embedded_chrome) {
-                            const still_hovered = if (s.hover_signal) |hs| hs.get() else false;
-                            if (s.input_container_node) |container| {
-                                container.setBorderColor(styles.borderColor(s.tokens, s.restingBorderColor(), still_hovered, false, false));
-                                container.style.border.width = 1;
-                                container.markRenderDirty();
-                            }
-                            if (s.grouped_attached) updateGroupedFieldShellOutline(s, still_hovered);
-                        }
-                        if (s.focus_ring_host) |host| {
-                            if (host.behavior.events.on_blur) |h| h.invoke();
-                        }
-                    }
-                }.handler,
-                .context = state_opaque,
-            };
-
-            // Scope-version hover Signal
-            const is_hovered = try hooks.useHover(my_scope, input_container);
-            state.hover_signal = is_hovered;
-
-            // Effect: highlight input border on hover (only when not focused, no error)
-            try my_scope.createEffect(.{
-                .input_container = input_container,
-                .is_hovered = is_hovered,
-                .has_error = has_error,
-                .state = state,
-                .tokens = t,
-                .embedded = p.embedded,
-            }, struct {
-                fn update(c: anytype) void {
-                    const hovered = c.is_hovered.get();
-                    if (!c.embedded and !c.state.disabled and styles.hoverBorderApplies(c.state.focused, c.state.has_error)) {
-                        c.input_container.setBorderColor(styles.borderColor(c.tokens, c.state.restingBorderColor(), hovered, false, false));
-                        if (c.state.grouped_attached) updateGroupedFieldShellOutline(c.state, hovered);
-                    }
-                }
-            }.update);
-
-            // Focus ring (Scope version)
-            if (!p.embedded) try hooks.useFocusRing(my_scope, cx, if (t.tokens.color.focus_ring.a == 0) input_container else field_shell, .{ .offset = 0 });
         }
 
         const helper_text_node = parts.helper;
@@ -769,8 +738,6 @@ pub const InputBuilder = struct {
             chrome.* = .{
                 .state = state,
                 .cx = cx,
-                .tokens = t,
-                .shell_config = shell_config,
                 .label = p.label_text,
                 .helper = p.helper,
                 .error_msg = p.error_msg,
@@ -783,7 +750,14 @@ pub const InputBuilder = struct {
                 .helper_node = helper_text_node,
                 .leading_icon = leading_icon_node,
                 .append_icon = append_icon_node,
+                .invalid = p.invalid,
+                .invalid_frame = invalid_frame,
+                .icon_tone = icon_tone,
                 .shown_disabled = false,
+                .readonly = p.readonly,
+                .shown_readonly = readonly0,
+                .required = p.required,
+                .static_disabled = static_disabled,
             };
             try my_scope.adoptResource(@ptrCast(chrome), InputChrome.destroy);
             // First sync apply (fail returns), then effect follows
@@ -791,12 +765,19 @@ pub const InputBuilder = struct {
             try my_scope.createEffect(chrome, InputChrome.effect);
         }
 
+        if (!p.input_type.isStatic() or !p.revealed.isStatic()) {
+            const follow = try my_scope.allocator.create(InputTypeFollow);
+            follow.* = .{ .cx = cx, .state = state, .container = input_container, .input_type = p.input_type, .revealed = p.revealed, .static_disabled = static_disabled };
+            try my_scope.adoptResource(@ptrCast(follow), InputTypeFollow.destroy);
+            try my_scope.createEffect(follow, InputTypeFollow.effect);
+        }
+
         // value is Model: external write via effect into buffer (first run same as init,
         // short-circuit)
         try my_scope.createEffect(binding, InputBinding.valueEffect);
 
         state.visual_sync_hook = render_mod.inputBeforeRender;
-        if (p.embedded) try applyEmbeddedChrome(wrapper, field_shell, input_container, state);
+        if (p.embedded) applyEmbeddedEditing(state);
 
         return .{ .node = wrapper, .input_container = input_container, .state = state, .value = value.asSignal() };
     }
@@ -823,6 +804,7 @@ pub const TextareaBuilder = textarea_mod.TextareaBuilder;
 
 pub const Textarea = textarea_mod.Textarea;
 pub const TextareaResult = textarea_mod.TextareaResult;
+pub const TextareaAutoRows = textarea_mod.AutoRows;
 
 // ========== Tests ==========
 
@@ -835,6 +817,8 @@ test "Input: accessibility value setter scrolls and publishes before paint" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const mounted = try Input(.{ .value = "initial", .width = 120 }).mountResult(scope, ctx);
+    // An unfocused field shows its start; these checks scroll a focused one.
+    mounted.state.focused = true;
     try root.appendChild(std.testing.allocator, mounted.node);
     try std.testing.expectEqualStrings("initial", mounted.input_container.behavior.interaction.a11y.?.value_text.?);
     ctx.layout();
@@ -846,6 +830,42 @@ test "Input: accessibility value setter scrolls and publishes before paint" {
     try std.testing.expect(editable.set_value.?(editable.context, ""));
     try std.testing.expectEqual(@as(f32, 0), mounted.state.scroll_x);
     try std.testing.expectEqualStrings("", mounted.input_container.behavior.interaction.a11y.?.value_text.?);
+}
+
+test "Input: caret and hit testing measure with the painted font" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    var fonts = try core.FontSystem.init(t.allocator, std.testing.io);
+    defer fonts.deinit();
+    cx.text.setFontSystem(&fonts);
+    defer cx.text.clearFontSystem();
+    cx.setViewport(400, 200);
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .value = "Wide WWW text", .width = 360 }).mountResult(scope, cx);
+    const host = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{mounted.node});
+    cx.root = host;
+    // An enclosing typography that the display text does not declare reaches paint.
+    host.setStyleInline(cx.allocator, .{ .font_size = 20, .font_weight = 700 });
+    _ = cx.render();
+    const state = mounted.state;
+    const display = state.text_display_node.?;
+    const painted = display.resolveTextProps().?;
+    try t.expectEqual(painted.font_size, state.font_size);
+    try t.expectEqual(painted.font_weight, state.font_weight);
+    state.cursor_pos = state.getText().len;
+    const expected = text_utils.visualCaretXWithFont(cx, state.getText(), .{ .byte = .{ .value = state.cursor_pos }, .affinity = .downstream }, painted.font_size, painted.font_weight, .{}).?;
+    try t.expectApproxEqAbs(expected, state.visualCursorAdvance(), 0.01);
+
+    // A monospace face selected on the display text is measured as painted.
+    var text = display.getText().?;
+    text.use_monospace_font = true;
+    display.setText(text);
+    render_mod.inputBeforeRender(state.editable_surface_node.?);
+    try t.expect(state.measured_font.monospace);
+    const mono = text_utils.visualCaretXWithFont(cx, state.getText(), .{ .byte = .{ .value = state.cursor_pos }, .affinity = .downstream }, state.font_size, state.font_weight, .{ .monospace = true }).?;
+    try t.expectApproxEqAbs(mono, state.visualCursorAdvance(), 0.01);
 }
 
 test "Input: basic creation" {
@@ -866,6 +886,102 @@ test "Input: basic creation" {
     try std.testing.expectEqual(@as(usize, 2), input_node.children.items.len);
 }
 
+test "Input viewport stays inside its shell through long-text Home and End" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(600, 300, 1);
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .width = 320, .label_text = "Name" }).mountResult(scope, cx);
+    cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{mounted.node});
+    _ = cx.render();
+    const state = mounted.state;
+    _ = events_mod.inputFieldEventHandler(.{ .focus = .{} }, state);
+    var value: [520]u8 = undefined;
+    for (0..20) |i| @memcpy(value[i * 26 ..][0..26], "abcdefghijklmnopqrstuvwxyz");
+    _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = &value } }, state);
+    _ = cx.render();
+    const surface = state.editable_surface_node.?;
+    const slot = surface.parent.?;
+    for (0..4) |_| {
+        inline for (.{ core.KeyCode.home, core.KeyCode.end }) |key_value| {
+            _ = events_mod.inputEventHandler(.{ .key_down = .{ .key = key_value, .modifiers = .{} } }, state);
+            for (0..3) |_| {
+                _ = cx.render();
+                const shell_width = mounted.input_container.rectFromWorldOrFallback().w;
+                try t.expect(slot.rectFromWorldOrFallback().w <= shell_width + 0.01);
+                try t.expect(surface.rectFromWorldOrFallback().w <= shell_width + 0.01);
+                try t.expectApproxEqAbs(surface.rectFromWorldOrFallback().w - 2 * state.padding_h, state.input_inner_w, 0.01);
+                if (key_value == .home) try t.expectEqual(@as(f32, 0), state.scroll_x) else try t.expect(state.scroll_x > 100);
+            }
+        }
+    }
+}
+
+test "Input overflow fade follows the field paint without darkening blank pixels" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(600, 300, 1);
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const input = try Input(.{ .width = 240, .value = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" }).mountResult(scope, cx);
+    // An unfocused field shows its start; these checks scroll a focused one.
+    input.state.focused = true;
+    cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{input.node});
+    _ = cx.render();
+    const state = input.state;
+    const surface = state.editable_surface_node.?;
+    // Cover a light field, a dark/custom field, and a transparent embedded field.
+    // Opaque overlays must match the resolved paint, including theme/disabled
+    // transitions; a translucent field cannot be faked by painting its tint twice.
+    for ([_]Color{ Color.rgb(255, 255, 255), Color.rgb(31, 47, 63), Color.rgba(80, 90, 100, 128), Color.TRANSPARENT }) |background| {
+        input.input_container.setBackgroundRaw(background);
+        inline for (.{ core.KeyCode.home, core.KeyCode.end }) |key_value| {
+            _ = events_mod.inputEventHandler(.{ .key_down = .{ .key = key_value, .modifiers = .{} } }, state);
+            _ = cx.render();
+            const fade = surface.style.overflow_fade().?;
+            try t.expect(Color.eql(background, fade.color.?));
+            try t.expectEqual(background.a == 255 and key_value == .end, fade.edges.left);
+            try t.expectEqual(background.a == 255 and key_value == .home, fade.edges.right);
+        }
+    }
+}
+
+test "Input clip and overflow fade sit at the field content box; the text keeps its position" {
+    const t = std.testing;
+    // A caller border wider than the recipe's 1px must be honoured too.
+    inline for (.{ core.StyleOverride{}, core.StyleOverride{ .border_width = 2 } }) |field_style| {
+        var cx = try Cx.init(t.allocator, std.testing.io);
+        defer cx.deinit();
+        cx.setWindowMetrics(600, 300, 1);
+        const scope = try Scope.init(t.allocator, null, cx.owner);
+        defer scope.dispose();
+        const input = try Input(.{ .width = 240, .field_style = field_style, .value = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" }).mountResult(scope, cx);
+        cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{input.node});
+        _ = cx.render();
+        const state = input.state;
+        const shell = input.input_container.globalRect();
+        const border = input.input_container.style.border.width;
+        try t.expect(border > 0);
+        try t.expectApproxEqAbs(styles.fieldBorderWidth(field_style), border, 0.001);
+        const surface = state.editable_surface_node.?.globalRect();
+        // Box model as CSS: the frame owns the inline padding, the surface (its clip and
+        // fade) is the content box, inside the overlay border whatever its width.
+        const pad = input.input_container.style.padding;
+        try t.expect(pad.left >= border and pad.right >= border);
+        try t.expectApproxEqAbs(shell.x + pad.left, surface.x, 0.01);
+        try t.expectApproxEqAbs(shell.x + shell.w - pad.right, surface.x + surface.w, 0.01);
+        // The first glyph still starts the size's padding in from the field edge.
+        _ = events_mod.inputEventHandler(.{ .key_down = .{ .key = .home, .modifiers = .{} } }, state);
+        _ = cx.render();
+        const metrics = styles.fieldMetrics(cx.tokens, .md);
+        try t.expectEqual(@as(f32, 0), state.scroll_x);
+        try t.expectApproxEqAbs(shell.x + metrics.padding_h, state.text_display_node.?.globalRect().x + state.text_display_node.?.style.padding.left, 0.01);
+    }
+}
+
 test "Input long text moves paint origin and publishes selection in one update" {
     const t = std.testing;
     var cx = try Cx.init(t.allocator, std.testing.io);
@@ -874,6 +990,8 @@ test "Input long text moves paint origin and publishes selection in one update" 
     const scope = try Scope.init(t.allocator, null, cx.owner);
     defer scope.dispose();
     const mounted = try Input(.{ .width = 360, .placeholder = "Type here" }).mountResult(scope, cx);
+    // An unfocused field shows its start; these checks scroll a focused one.
+    mounted.state.focused = true;
     cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{mounted.node});
     _ = cx.render();
 
@@ -897,6 +1015,84 @@ test "Input long text moves paint origin and publishes selection in one update" 
     try t.expectEqual(@as(u32, 0), spans[0].start);
     try t.expectEqual(@as(u32, value.len), spans[0].end);
     try t.expect(spans[0].bg_color != null);
+}
+
+// The editing viewport is the field's content box whatever the text is: a long value or the
+// caret at Home (text at its unscrolled origin) must not widen the frame's content slot, so
+// End restores the exact viewport it had after typing (CSS automatic minimum regression).
+test "Input long value keeps the viewport at the field width so End restores the scroll" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(600, 300, 1);
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .width = 320 }).mountResult(scope, cx);
+    // An unfocused field shows its start; these checks scroll a focused one.
+    mounted.state.focused = true;
+    cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{mounted.node});
+    cx.layout();
+    _ = cx.render();
+    const surface = mounted.state.text_display_node.?.parent.?;
+    const field_inner_w = mounted.input_container.globalRect().w - mounted.input_container.style.padding.horizontal();
+
+    const value = (@as([("abcdefghijklmnopqrstuvwxyz").len * (4)]u8, @bitCast(@as([4][("abcdefghijklmnopqrstuvwxyz").len]u8, @splat(("abcdefghijklmnopqrstuvwxyz").*)))) ++ "");
+    _ = mounted.state.setText(value);
+    mounted.state.updateScrollX();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, value.len), mounted.state.cursor_pos);
+    const typed_scroll = mounted.state.scroll_x;
+    try t.expect(typed_scroll > 100);
+
+    try t.expect(mounted.state.handleKeyDown(.home, .{}));
+    mounted.state.updateScrollX();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(f32, 0), mounted.state.scroll_x);
+    // Unscrolled long text is the widest the content gets; the viewport stays the field's.
+    try t.expectApproxEqAbs(@as(f32, 320), mounted.input_container.globalRect().w, 0.01);
+    try t.expectApproxEqAbs(field_inner_w, surface.globalRect().w, 0.01);
+
+    try t.expect(mounted.state.handleKeyDown(.end, .{}));
+    mounted.state.updateScrollX();
+    cx.layout();
+    _ = cx.render();
+    try t.expectApproxEqAbs(field_inner_w, surface.globalRect().w, 0.01);
+    try t.expectApproxEqAbs(typed_scroll, mounted.state.scroll_x, 0.01);
+}
+
+// A width-less Input in a row may take its share of the row but never sets the row's minimum:
+// a long value is scrolled inside the field, so typing cannot push the field or its siblings
+// past the row (CSS automatic minimum opted out with min-width: 0).
+test "Input in a row never overflows the row with its value" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(600, 300, 1);
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{}).mountResult(scope, cx);
+    const sibling = try box(cx, .{ .width = .{ .px = 100 }, .min_width = 100, .height = .{ .px = 20 } }, .{});
+    const row = try box(cx, .{ .direction = .row, .width = .{ .px = 300 }, .height = .{ .fit = .{} } }, .{ mounted.node, sibling });
+    cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 300 } }, .{row});
+    cx.layout();
+    _ = cx.render();
+    try t.expectApproxEqAbs(@as(f32, 200), mounted.node.globalRect().w, 0.01);
+
+    const value = (@as([("abcdefghijklmnopqrstuvwxyz").len * (4)]u8, @bitCast(@as([4][("abcdefghijklmnopqrstuvwxyz").len]u8, @splat(("abcdefghijklmnopqrstuvwxyz").*)))) ++ "");
+    _ = mounted.state.setText(value);
+    try t.expect(mounted.state.handleKeyDown(.home, .{}));
+    mounted.state.updateScrollX();
+    cx.layout();
+    _ = cx.render();
+    const field = mounted.input_container.globalRect();
+    const surface = mounted.state.text_display_node.?.parent.?.globalRect();
+    try t.expectApproxEqAbs(@as(f32, 200), mounted.node.globalRect().w, 0.01);
+    try t.expectApproxEqAbs(@as(f32, 200), field.w, 0.01);
+    try t.expect(surface.x + surface.w <= field.x + field.w + 0.01);
+    try t.expectApproxEqAbs(@as(f32, 200), sibling.globalRect().x, 0.01);
+    try t.expect(mounted.state.scroll_x == 0 and mounted.state.input_inner_w <= field.w);
 }
 
 test "Input accessibility publishes value and writable selection but password fails closed" {
@@ -1086,82 +1282,132 @@ test "Input: grouped wrapper propagates trailing seam border side colors to fiel
     try std.testing.expectEqual(@as(i32, 0), mounted.input_container.style.z_index());
 }
 
-test "Input: grouped focus shows outline on field shell" {
-    const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc, std.testing.io);
-    defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 520 }, .height = .{ .px = 120 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(alloc, null, ctx.owner);
-    defer scope.dispose();
-
-    const group_mod = @import("../group/mod.zig");
-    const grp = try group_mod.Group(.{}).mount(scope, ctx);
-    try root.appendChild(alloc, grp.container);
-
-    const mounted = try Input(.{
-        .value = "example.com/page",
-        .width = 240,
-        .leading_icon_asset = svg_assets.common.link,
-    }).mountResult(scope, ctx);
-    try group_mod.addGroupItem(grp.container, alloc, mounted.node, .first, 8);
-
-    if (mounted.node.meta.per_frame.hooks.before_render.main) |hook| hook(mounted.node);
-
-    const state: *TextInputState = @ptrCast(@alignCast(mounted.input_container.behavior.events.event_context.?));
-    try std.testing.expect(state.grouped_attached);
-    try std.testing.expect(state.focus_ring_host != null);
-    try std.testing.expectEqual(@as(i32, 0), mounted.input_container.style.z_index());
-    try std.testing.expect(state.focus_ring_host.?.style.outline() == null);
-
-    if (mounted.input_container.behavior.events.on_focus) |handler| handler.invoke();
-    try std.testing.expectEqual(@as(i32, 0), mounted.input_container.style.z_index());
-    try std.testing.expectEqual(@as(i32, 1), state.focus_ring_host.?.style.z_index());
-    try std.testing.expect(state.focus_ring_host.?.style.outline() != null);
-
-    if (mounted.input_container.behavior.events.on_blur) |handler| handler.invoke();
-    try std.testing.expectEqual(@as(i32, 0), state.focus_ring_host.?.style.z_index());
-    try std.testing.expect(state.focus_ring_host.?.style.outline() == null);
+/// Settled border color (transition target while easing).
+fn borderTarget(n: *Node) Color {
+    if (n.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(.border_color)) |slot| if (slot.active) return slot.to_color;
+    return n.style.border.color;
 }
 
-test "Input: grouped hover shows outline on field shell" {
+test "Input: 聚焦时框是 accent（外壳 :focus），失焦回到静止色；Input 的焦点处理不顶掉外壳的焦点钩子" {
     const alloc = std.testing.allocator;
     var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 520 }, .height = .{ .px = 120 } }, .{});
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
     ctx.root = root;
-
     const scope = try Scope.init(alloc, null, ctx.owner);
     defer scope.dispose();
+    const mounted = try Input(.{ .placeholder = "Your name" }).mountResult(scope, ctx);
+    try root.appendChild(alloc, mounted.node);
+    ctx.layout();
+    _ = ctx.render();
+    const t = ctx.tokens.tokens.color;
+    try std.testing.expect(Color.eql(t.border_strong, borderTarget(mounted.input_container)));
+    ctx.focus_manager.setFocus(mounted.input_container);
+    try std.testing.expect(mounted.state.focused);
+    try std.testing.expect(Color.eql(t.accent, borderTarget(mounted.input_container)));
+    ctx.focus_manager.setFocus(null);
+    try std.testing.expect(!mounted.state.focused);
+    try std.testing.expect(Color.eql(t.border_strong, borderTarget(mounted.input_container)));
+}
 
-    const group_mod = @import("../group/mod.zig");
-    const grp = try group_mod.Group(.{}).mount(scope, ctx);
-    try root.appendChild(alloc, grp.container);
+test "Input: Tab from a clicked field drops its :focus frame; the accent border left is :hover" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 200);
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 }, .direction = .column, .gap = 8 }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const a = try Input(.{ .width = 180 }).mountResult(scope, ctx);
+    try root.appendChild(alloc, a.node);
+    const b = try Input(.{ .width = 180 }).mountResult(scope, ctx);
+    try root.appendChild(alloc, b.node);
+    ctx.layout();
+    _ = ctx.render();
+    const t = ctx.tokens.tokens.color;
+    const halo = struct {
+        fn on(n: *Node, c: Color) bool {
+            const sh = n.style.shadow() orelse return false;
+            return sh.blur == 5 and sh.color.r == c.r and sh.color.g == c.g and sh.color.b == c.b;
+        }
+    }.on;
+    const ra = a.input_container.globalRect();
+    ctx.handleClick(ra.x + 20, ra.y + ra.h / 2);
+    _ = ctx.render();
+    try std.testing.expect(Color.eql(t.accent, borderTarget(a.input_container)));
+    try std.testing.expect(halo(a.input_container, t.focus_halo));
+    ctx.handleKeyDown(.tab, .{});
+    _ = ctx.render();
+    // Focus moved: b has the :focus frame (border + halo), a lost its halo. a's border is still
+    // accent only because the pointer that clicked it still hovers it (the field tone's :hover).
+    try std.testing.expect(!a.state.focused and b.state.focused);
+    try std.testing.expect(halo(b.input_container, t.focus_halo));
+    try std.testing.expect(!halo(a.input_container, t.focus_halo));
+    try std.testing.expect(Color.eql(t.accent, borderTarget(a.input_container)));
+    ctx.handleMouseMove(390, 190);
+    _ = ctx.render();
+    try std.testing.expect(Color.eql(t.border_strong, borderTarget(a.input_container)));
+    try std.testing.expect(Color.eql(t.accent, borderTarget(b.input_container)));
+    // Back with Shift+Tab (pointer away): only a shows the focus frame.
+    ctx.handleKeyDown(.tab, .{ .shift = true });
+    _ = ctx.render();
+    try std.testing.expect(halo(a.input_container, t.focus_halo) and !halo(b.input_container, t.focus_halo));
+    try std.testing.expect(Color.eql(t.border_strong, borderTarget(b.input_container)));
+}
 
+test "Input: field_style overrides the field over the size recipe and every frame state" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const fixed = Color.hex(0x2944A8);
     const mounted = try Input(.{
-        .value = "example.com/page",
-        .width = 240,
-        .leading_icon_asset = svg_assets.common.link,
+        .placeholder = "https://",
+        .size = .sm,
+        .width = 236,
+        .field_style = .{ .height = .{ .px = 28 }, .corner_radius = 6, .border_color = fixed },
     }).mountResult(scope, ctx);
-    try group_mod.addGroupItem(grp.container, alloc, mounted.node, .first, 8);
+    try root.appendChild(alloc, mounted.node);
+    ctx.layout();
+    _ = ctx.render();
+    const field = mounted.input_container;
+    const expectField = struct {
+        fn check(n: *Node, c: Color) !void {
+            try std.testing.expectEqual(@as(f32, 28), n.style.height.px);
+            try std.testing.expectApproxEqAbs(@as(f32, 6), n.style.effectiveRadii()[0], 0.001);
+            try std.testing.expect(Color.eql(c, borderTarget(n)));
+        }
+    }.check;
+    try expectField(field, fixed);
+    try std.testing.expectApproxEqAbs(@as(f32, 28), field.rectFromWorldOrFallback().h, 0.01);
+    // Focus and blur recompute the frame states; the caller's field stays.
+    ctx.focus_manager.setFocus(field);
+    try expectField(field, fixed);
+    ctx.focus_manager.setFocus(null);
+    try expectField(field, fixed);
+    // The size recipe's other geometry still applies (only the declared fields are replaced).
+    try std.testing.expectEqual(@as(f32, 236), field.style.width.px);
+}
 
-    if (mounted.node.meta.per_frame.hooks.before_render.main) |hook| hook(mounted.node);
-
-    const state: *TextInputState = @ptrCast(@alignCast(mounted.input_container.behavior.events.event_context.?));
-    try std.testing.expect(state.hover_signal != null);
-    try std.testing.expect(state.focus_ring_host != null);
-    try std.testing.expect(state.focus_ring_host.?.style.outline() == null);
-
-    state.hover_signal.?.set(true);
-    try std.testing.expectEqual(@as(i32, 1), state.focus_ring_host.?.style.z_index());
-    try std.testing.expect(state.focus_ring_host.?.style.outline() != null);
-
-    state.hover_signal.?.set(false);
-    try std.testing.expectEqual(@as(i32, 0), state.focus_ring_host.?.style.z_index());
-    try std.testing.expect(state.focus_ring_host.?.style.outline() == null);
+test "Input: 占位符在渲染时保持占位符颜色，不继承外壳的前景色" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .placeholder = "Your name" }).mountResult(scope, ctx);
+    try root.appendChild(alloc, mounted.node);
+    ctx.layout();
+    _ = ctx.render();
+    const painted = @import("../../core/render_engine/text_render.zig").resolveNodeLogicalTextProps;
+    const text = mounted.state.text_display_node.?;
+    try std.testing.expect(Color.eql(styles.displayTextColor(ctx.tokens, false, false, null), painted(text).?.color));
 }
 
 test "TextInputState: insert in middle" {
@@ -1598,6 +1844,19 @@ test "sanitizeInputText: filters escape sequences" {
     var buf: [256]u8 = undefined;
     const filtered = state_mod.sanitizeInputText(&state, "\x1b[D", buf[0..]);
     try std.testing.expectEqual(@as(usize, 0), filtered.len);
+}
+
+test "sanitizeInputText: keeps join controls but drops zero-width space" {
+    var state = TextInputState{
+        .io = std.testing.io,
+    };
+    state.input_type = .text;
+    var buf: [256]u8 = undefined;
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    try std.testing.expectEqualStrings(family, state_mod.sanitizeInputText(&state, family, buf[0..]));
+    const conjunct = "\u{0915}\u{094D}\u{200C}\u{0937}";
+    try std.testing.expectEqualStrings(conjunct, state_mod.sanitizeInputText(&state, conjunct, buf[0..]));
+    try std.testing.expectEqualStrings("ab", state_mod.sanitizeInputText(&state, "a\u{200B}b\u{FEFF}", buf[0..]));
 }
 
 test "sanitizeInputText: newline is gated by accept_newline" {
@@ -2103,6 +2362,7 @@ test "mounted input reconversion cancels before commands blur and explicit repla
         const input = if (independent) mounted.input else mounted.input_container;
         const state = if (independent) mounted.state else @as(*TextInputState, @ptrCast(@alignCast(input.behavior.events.event_context.?)));
         const handler = if (independent) ta.textareaEventHandler else events_mod.inputEventHandler;
+        cx.setFocus(input);
         if (independent) {
             state.cursor.offset = 8;
             state.cursor.anchor = 7;
@@ -2126,7 +2386,7 @@ test "mounted input reconversion cancels before commands blur and explicit repla
         try t.expectEqual(@as(usize, 8), if (independent) state.cursor.offset else state.cursor_pos);
         try t.expectEqual(@as(?usize, 7), if (independent) state.cursor.anchor else state.selection_anchor);
         _ = handler(.{ .ime_preedit = .{ .text = "候", .cursor_utf8_offset = 3, .replace_start_utf8 = 1, .replace_end_utf8 = 7 } }, state);
-        input.behavior.events.on_blur.?.invoke();
+        cx.clearFocus();
         try t.expectEqualStrings("x漢字y", state.getText());
         try t.expectEqual(@as(?usize, null), if (independent) state.cursor.anchor else state.selection_anchor);
         try t.expect(!state.imeIsComposing());
@@ -2157,6 +2417,35 @@ test "Input: 带 leading_icon / placeholder / helper 的 mountResult 在任意�
     }.m);
 }
 
+// Reference-checked OOM sweep (see oom_sweep.zig): a mount that reports success must look exactly
+// like the uninjected mount; `check` also pins the states the reference was given.
+test "input(invalid+icon): mount 成功即外观完整，任意分配点失败不假成功（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMountVerified("input(invalid+icon)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const invalid = try scope.createSignal(bool, true);
+            const disabled = try scope.createSignal(bool, false);
+            return (try Input(.{ .placeholder = "Search", .leading_icon_asset = svg_assets.common.search, .invalid = invalid, .disabled = disabled, .width = 200 }).mountResult(scope, cx)).node;
+        }
+    }.m, struct {
+        fn field(n: *Node) ?*Node {
+            if (n.tag == .input) return n;
+            for (n.children.items) |c| if (field(c)) |f| return f;
+            return null;
+        }
+        fn check(root: *Node) anyerror!void {
+            const t = &core.theme.dark;
+            const f = field(root) orelse return error.NoField;
+            // the invalid frame (shell :invalid) landed at mount, over a laid-out field
+            try std.testing.expect(Color.eql(t.tokens.color.danger, f.style.border.color));
+            try std.testing.expect(f.style.border.width > 0);
+            try std.testing.expect(f.style.effectiveRadii()[0] > 0);
+            try std.testing.expect(f.style.padding.left > 0);
+            try std.testing.expect(f.frame_state.frame_local.runtime.transitions != null);
+        }
+    }.check);
+}
+
 test "Input: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("input", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
@@ -2176,8 +2465,7 @@ test "Input centers its text line for every control size and field height" {
         cx.root = input.node;
         for (0..2) |frame| {
             if (frame == 1) {
-                input.input_container.style.height = .{ .px = 56 };
-                input.input_container.markLayoutDirty();
+                input.input_container.setStyleInline(cx.allocator, .{ .height = .{ .px = 56 } });
                 _ = try input.state.setTextChecked("example.com");
             }
             cx.layout();
@@ -2275,6 +2563,42 @@ test "Input: 聚焦时先 dispose scope 再摘节点，blur 不碰已释放的 s
     ctx.detachChildRetained(root, mounted.node);
     ctx.freeNode(mounted.node);
     try std.testing.expect(ctx.focus_manager.getFocused() == null);
+}
+
+test "Input: an IME composition and the caret survive Cx.moveChildRetained; detach + append ends them" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 520 }, .height = .{ .px = 240 } }, .{});
+    ctx.root = root;
+    const home = try box(ctx, .{}, .{});
+    const away = try box(ctx, .{}, .{});
+    try root.appendChild(alloc, home);
+    try root.appendChild(alloc, away);
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .value = "hello" }).mountResult(scope, ctx);
+    try home.appendChild(alloc, mounted.node);
+    ctx.focus_manager.setFocus(mounted.input_container);
+    mounted.state.cursor_pos = 2;
+    const ctx_ptr = mounted.input_container.behavior.events.event_context;
+    _ = events_mod.inputEventHandler(.{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } }, ctx_ptr);
+    try std.testing.expect(mounted.state.imeIsComposing());
+
+    try ctx.moveChildRetained(mounted.node, away, null);
+    try std.testing.expect(ctx.focus_manager.getFocused() == mounted.input_container);
+    try std.testing.expect(mounted.state.imeIsComposing());
+    try std.testing.expectEqual(@as(usize, 2), mounted.state.ime_preedit_len);
+    _ = events_mod.inputEventHandler(.{ .ime_commit = .{ .text = "你" } }, ctx_ptr);
+    try std.testing.expectEqualStrings("he你llo", mounted.state.getText());
+
+    // The old way: the same node, but input sees it removed.
+    _ = events_mod.inputEventHandler(.{ .ime_preedit = .{ .text = "hao", .cursor_utf8_offset = 3 } }, ctx_ptr);
+    try std.testing.expect(mounted.state.imeIsComposing());
+    ctx.detachChildRetained(away, mounted.node);
+    try home.appendChild(alloc, mounted.node);
+    try std.testing.expect(ctx.focus_manager.getFocused() == null);
+    try std.testing.expect(!mounted.state.imeIsComposing());
 }
 
 // ========== Value binding (value: Model, docs/SIGNAL_API_DESIGN.md section 4.8) ==========
@@ -2957,6 +3281,45 @@ test "input(dynamic chrome): mount 在任意分配点失败时不泄漏（sweep�
     }.m);
 }
 
+test "Input: readonly follows a source — editing, the native text client and a11y switch live" {
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const locked = try scope.createSignal(bool, false);
+    const mounted = try Input(.{ .readonly = locked, .value = "draft" }).mountResult(scope, cx);
+    cx.root = mounted.node;
+    const field = mounted.input_container;
+    try std.testing.expect(!mounted.state.readonly);
+    try std.testing.expect(field.behavior.interaction.text_input_client != null);
+    try std.testing.expect(!field.behavior.interaction.a11y.?.readonly);
+    cx.setFocus(field);
+    // Editable: text lands; a composition is in progress when the source turns read-only.
+    _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "!" } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getText());
+    mounted.state.handleImePreeditEvent("zhong", 5);
+    try std.testing.expect(mounted.state.imeIsComposing());
+    locked.set(true);
+    try std.testing.expect(mounted.state.readonly);
+    try std.testing.expect(!mounted.state.imeIsComposing());
+    try std.testing.expect(field.behavior.interaction.text_input_client == null);
+    try std.testing.expect(field.behavior.interaction.a11y.?.readonly);
+    // Read-only keeps focus and selection, fences editing.
+    try std.testing.expect(mounted.state.focused);
+    _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "x" } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getText());
+    _ = events_mod.inputEventHandler(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getSelectedText().?);
+    // Back to editable: the text client returns and typing lands again.
+    locked.set(false);
+    try std.testing.expect(!mounted.state.readonly);
+    try std.testing.expect(field.behavior.interaction.text_input_client != null);
+    try std.testing.expect(!field.behavior.interaction.a11y.?.readonly);
+    _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "y" } }, mounted.state);
+    try std.testing.expectEqualStrings("y", mounted.state.getText());
+    cx.clearFocus();
+}
+
 test "readonly Input mount routes selection and focus without a native text client" {
     const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
@@ -2965,7 +3328,7 @@ test "readonly Input mount routes selection and focus without a native text clie
     const mounted = try Input(.{ .readonly = true, .value = "中文 🧪" }).mountResult(scope, cx);
     cx.root = mounted.node;
     try std.testing.expect(mounted.state.readonly);
-    try std.testing.expect(mounted.input_container.behavior.events.on_event == events_mod.inputEventHandler);
+    try std.testing.expect(mounted.input_container.behavior.events.on_event == events_mod.inputFieldEventHandler);
     try std.testing.expect(mounted.input_container.behavior.interaction.text_input_client == null);
     cx.setFocus(mounted.input_container);
     try std.testing.expect(mounted.state.focused);
@@ -2975,4 +3338,570 @@ test "readonly Input mount routes selection and focus without a native text clie
     try std.testing.expectEqualStrings("中文 🧪", mounted.state.getText());
     cx.clearFocus();
     try std.testing.expect(!mounted.state.focused);
+}
+
+test "review regression 4: static disabled border wins over populated and invalid" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    var custom = core.theme.high_contrast;
+    custom.tokens.color.border = Color.hex(0x123456);
+    custom.tokens.color.border_strong = Color.hex(0x654321);
+    cx.setTheme(&custom);
+    for ([_][]const u8{ "", "error" }) |error_msg| {
+        const r = try Input(.{ .disabled = true, .value = "text", .error_msg = error_msg }).mountResult(scope, cx);
+        defer cx.freeNode(r.node);
+        const slot = r.input_container.frame_state.frame_local.runtime.transitions.?.find(.border_color).?;
+        try std.testing.expectEqual(cx.tokens.tokens.color.border, if (slot.active) slot.to_color else r.input_container.style.border.color);
+    }
+}
+
+test "review regression 7: textarea one row is shorter than two" {
+    const t = &core.theme.light;
+    try std.testing.expect(styles.textareaMetrics(t, null, 1).height < styles.textareaMetrics(t, null, 2).height);
+    inline for (.{ .xs, .sm, .md, .lg }) |size| {
+        try std.testing.expect(styles.textareaMetrics(t, size, 1).height < styles.textareaMetrics(t, size, 2).height);
+    }
+    try std.testing.expectEqual(@as(f32, 100), styles.textareaMetrics(t, null, 4).height);
+}
+
+/// A field color's resting value (the transition target while one runs).
+fn settledFieldColor(n: *Node, prop: @import("../../core/types.zig").TransitionProp) Color {
+    if (n.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(prop)) |slot| if (slot.active) return slot.to_color;
+    return if (prop == .background) n.getBackground() else n.style.border.color;
+}
+
+test "Input: field_state_style default keeps the tone's focus / invalid frame" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const t = cx.tokens;
+    const invalid = try scope.createSignal(bool, false);
+    const r = try Input(.{ .invalid = invalid, .width = 200 }).mountResult(scope, cx);
+    cx.root = r.node;
+    const field = r.input_container;
+    const rest_bg = settledFieldColor(field, .background);
+    cx.setFocus(field);
+    try std.testing.expect(Color.eql(t.tokens.color.accent, settledFieldColor(field, .border_color)));
+    try std.testing.expect(Color.eql(rest_bg, settledFieldColor(field, .background)));
+    invalid.set(true);
+    try std.testing.expect(Color.eql(t.tokens.color.danger, settledFieldColor(field, .border_color)));
+}
+
+test "Input: field_state_style overrides the frame per state" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const rest = Color.hex(0x202020);
+    const focus = Color.hex(0x303030);
+    const bad = Color.hex(0x402020);
+    const invalid = try scope.createSignal(bool, false);
+    const r = try Input(.{ .invalid = invalid, .width = 200, .field_state_style = core.ConditionalStyle{
+        .base = .{ .background = rest, .border_color = Color.TRANSPARENT },
+        .hover = .{ .border_color = Color.TRANSPARENT },
+        .focus = .{ .background = focus, .border_color = Color.TRANSPARENT },
+        .invalid = .{ .background = bad, .border_color = Color.TRANSPARENT },
+    } }).mountResult(scope, cx);
+    cx.root = r.node;
+    const field = r.input_container;
+    try std.testing.expect(Color.eql(rest, settledFieldColor(field, .background)));
+    try std.testing.expect(Color.eql(Color.TRANSPARENT, settledFieldColor(field, .border_color)));
+    cx.setFocus(field);
+    try std.testing.expect(Color.eql(focus, settledFieldColor(field, .background)));
+    try std.testing.expect(Color.eql(Color.TRANSPARENT, settledFieldColor(field, .border_color)));
+    invalid.set(true);
+    try std.testing.expect(Color.eql(bad, settledFieldColor(field, .background)));
+    try std.testing.expect(Color.eql(Color.TRANSPARENT, settledFieldColor(field, .border_color)));
+    cx.clearFocus();
+    invalid.set(false);
+    try std.testing.expect(Color.eql(rest, settledFieldColor(field, .background)));
+}
+
+test "Textarea: field_state_style default unchanged; set, it overrides focus / invalid" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const t = cx.tokens;
+    const focus = Color.hex(0x303030);
+    const bad = Color.hex(0x402020);
+    const errs = try scope.createSignal([]const u8, "");
+    const plain = try Textarea(.{ .error_msg = errs, .width = 200 }).mountResult(scope, cx);
+    const styled = try Textarea(.{ .error_msg = errs, .width = 200, .field_state_style = core.ConditionalStyle{
+        .focus = .{ .background = focus, .border_color = Color.TRANSPARENT },
+        .invalid = .{ .background = bad, .border_color = Color.TRANSPARENT },
+    } }).mountResult(scope, cx);
+    cx.root = try core.box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 }, .direction = .column }, .{});
+    try cx.root.?.appendChild(cx.allocator, plain.wrapper);
+    try cx.root.?.appendChild(cx.allocator, styled.wrapper);
+    const plain_field = plain.input;
+    const field = styled.input;
+    const rest_bg = settledFieldColor(plain_field, .background);
+    try std.testing.expect(Color.eql(rest_bg, settledFieldColor(field, .background)));
+    cx.setFocus(plain_field);
+    try std.testing.expect(Color.eql(t.tokens.color.accent, settledFieldColor(plain_field, .border_color)));
+    cx.setFocus(field);
+    try std.testing.expect(Color.eql(focus, settledFieldColor(field, .background)));
+    try std.testing.expect(Color.eql(Color.TRANSPARENT, settledFieldColor(field, .border_color)));
+    errs.set("bad");
+    try std.testing.expect(Color.eql(t.tokens.color.danger, settledFieldColor(plain_field, .border_color)));
+    try std.testing.expect(Color.eql(bad, settledFieldColor(field, .background)));
+    try std.testing.expect(Color.eql(Color.TRANSPARENT, settledFieldColor(field, .border_color)));
+}
+
+// ---------- View-model owned value (Yix `value={query(vm)} onChange={|q| send(vm, …)}`) ----------
+// A template passes a read-only source (a derived value or memo over view-model state) plus the
+// change handler; `props.coerce` turns the pair into `ui.split(source, handler)`. The view-model
+// is the single truth: typing proposes through the handler, the view-model writes its state, and
+// a view-model write (e.g. clearing the query on navigation) replaces the field's text. No
+// InputResult handle is involved.
+
+const QueryVm = struct {
+    query: *Signal([]const u8),
+    writes: usize = 0,
+    fn searchFor(self: *QueryVm, q: []const u8) void {
+        self.writes += 1;
+        self.query.set(q);
+    }
+    fn shown(c: anytype) []const u8 {
+        return c.q.get();
+    }
+};
+
+fn mountVmInput(env: BindEnv, vm: *QueryVm) !InputResult {
+    const shown = try env.scope.createMemo([]const u8, .{ .q = vm.query }, QueryVm.shown);
+    return Input(.{ .value = shown, .on_change = env.cx.on(QueryVm, vm, QueryVm.searchFor) }).mountResult(env.scope, env.cx);
+}
+
+test "Input value: view-model owned query — typing lands through the handler, the caret stays, a view-model clear empties the field (batch in / out)" {
+    inline for (.{ false, true }) |batched| {
+        const env = try BindEnv.init();
+        defer env.deinit();
+        var vm = QueryVm{ .query = try env.scope.createText("", .{}) };
+        const r = try mountVmInput(env, &vm);
+        defer env.cx.freeNode(r.node);
+        // A read-only source never exposes a writable signal (no handle to write through).
+        try std.testing.expect(r.value == null);
+
+        for ([_][]const u8{ "k", "e", "p" }) |ch| {
+            if (batched) env.cx.owner.beginBatch();
+            BindEnv.send(r, .{ .text_input = .{ .text = ch } });
+            if (batched) env.cx.owner.endBatch();
+        }
+        try std.testing.expectEqualStrings("kep", vm.query.peek());
+        try std.testing.expectEqual(@as(usize, 3), vm.writes);
+        // Insert in the middle: the view-model accepts the same text synchronously, so the edit
+        // settles in place (caret after the insertion, undo restores the previous text).
+        r.state.cursor_pos = 2;
+        if (batched) env.cx.owner.beginBatch();
+        BindEnv.send(r, .{ .text_input = .{ .text = "e" } });
+        if (batched) env.cx.owner.endBatch();
+        try expectCaret(r, "keep", 3, null);
+        try std.testing.expectEqualStrings("keep", vm.query.peek());
+        if (batched) env.cx.owner.beginBatch();
+        BindEnv.send(r, undo_key);
+        if (batched) env.cx.owner.endBatch();
+        try std.testing.expectEqualStrings("kep", r.state.getText());
+        try std.testing.expectEqualStrings("kep", vm.query.peek());
+
+        // The view-model clears its query (navigation): the field empties, the caret goes to 0,
+        // undo history is cleared and the handler is not called back.
+        const writes = vm.writes;
+        if (batched) env.cx.owner.beginBatch();
+        vm.query.set("");
+        if (batched) env.cx.owner.endBatch();
+        try expectCaret(r, "", 0, null);
+        try std.testing.expectEqual(writes, vm.writes);
+        BindEnv.send(r, undo_key);
+        try std.testing.expectEqualStrings("", r.state.getText());
+        try std.testing.expectEqualStrings("", vm.query.peek());
+    }
+}
+
+test "Input value: a view-model clear during IME composition keeps the composition; cancel applies it, commit wins over it" {
+    const env = try BindEnv.init();
+    defer env.deinit();
+    var vm = QueryVm{ .query = try env.scope.createText("", .{}) };
+    const r = try mountVmInput(env, &vm);
+    defer env.cx.freeNode(r.node);
+    BindEnv.send(r, .{ .text_input = .{ .text = "ab" } });
+    try std.testing.expectEqualStrings("ab", vm.query.peek());
+
+    // Composing "ni": the clear must neither end the composition nor drop its preedit.
+    BindEnv.send(r, .{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } });
+    const cursor = r.state.cursor_pos;
+    vm.query.set("");
+    try std.testing.expect(r.state.imeIsComposing());
+    try std.testing.expectEqualStrings("ab", r.state.getText());
+    try std.testing.expectEqual(cursor, r.state.cursor_pos);
+    try std.testing.expectEqualStrings("ni", r.state.preeditText());
+    // Cancel: the deferred clear applies now.
+    BindEnv.send(r, .{ .ime_preedit = .{ .text = "", .cursor_utf8_offset = 0 } });
+    try std.testing.expect(!r.state.imeIsComposing());
+    try std.testing.expectEqualStrings("", r.state.getText());
+    try std.testing.expectEqualStrings("", vm.query.peek());
+
+    // Clear during a composition that is then committed: the user's input wins and is proposed
+    // to the view-model (the deferred clear is discarded).
+    BindEnv.send(r, .{ .text_input = .{ .text = "x" } });
+    BindEnv.send(r, .{ .ime_preedit = .{ .text = "hao", .cursor_utf8_offset = 3 } });
+    vm.query.set("");
+    try std.testing.expectEqualStrings("x", r.state.getText());
+    BindEnv.send(r, .{ .ime_commit = .{ .text = "好" } });
+    try std.testing.expectEqualStrings("x好", r.state.getText());
+    try std.testing.expectEqualStrings("x好", vm.query.peek());
+}
+
+test "Input: a theme publication repaints a focused, composing field without touching its edit state" {
+    const render_engine = @import("../../core/render_engine/mod.zig");
+    const env = try BindEnv.init();
+    defer env.deinit();
+    env.cx.setViewport(400, 200);
+    env.cx.setTheme(&core.theme.dark);
+    var vm = QueryVm{ .query = try env.scope.createText("", .{}) };
+    const r = try mountVmInput(env, &vm);
+    try env.cx.root.?.appendChild(env.cx.allocator, r.node);
+    env.cx.setFocus(r.input_container);
+    BindEnv.send(r, .{ .text_input = .{ .text = "ab" } });
+    BindEnv.send(r, .{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } });
+    env.cx.layout();
+    _ = env.cx.render();
+    const cursor = r.state.cursor_pos;
+    const anchor = r.state.selection_anchor;
+    const container_id = r.input_container.id;
+
+    env.cx.setTheme(&core.theme.light);
+    for (0..20) |_| {
+        render_engine.current_frame_time_ms += 16.0;
+        env.cx.frame_time_ms = render_engine.current_frame_time_ms;
+        env.cx.layout();
+        _ = env.cx.render();
+    }
+    // Repainted from the published tokens (no owner repaint call) ...
+    try std.testing.expect(r.state.tokens == &core.theme.light);
+    try std.testing.expect(Color.eql(core.theme.light.tokens.color.fg_primary, r.state.text_display_node.?.getText().?.color));
+    // ... while the buffer, caret, selection, composition, focus and node identity are kept.
+    try std.testing.expectEqualStrings("ab", r.state.getText());
+    try std.testing.expectEqualStrings("ab", vm.query.peek());
+    try std.testing.expectEqual(cursor, r.state.cursor_pos);
+    try std.testing.expectEqual(anchor, r.state.selection_anchor);
+    try std.testing.expect(r.state.imeIsComposing());
+    try std.testing.expectEqualStrings("ni", r.state.preeditText());
+    try std.testing.expect(env.cx.focus_manager.getFocused() == r.input_container);
+    try std.testing.expectEqual(container_id, r.input_container.id);
+}
+
+test "Input value: a view-model that updates asynchronously rejects the edit; its later write lands as an external write" {
+    const env = try BindEnv.init();
+    defer env.deinit();
+    const LazyVm = struct {
+        query: *Signal([]const u8),
+        pending: [16]u8 = undefined,
+        pending_len: usize = 0,
+        fn searchFor(self: *@This(), q: []const u8) void {
+            // Queues the query for a later tick instead of writing it now.
+            self.pending_len = @min(q.len, self.pending.len);
+            @memcpy(self.pending[0..self.pending_len], q[0..self.pending_len]);
+        }
+        fn flush(self: *@This()) void {
+            self.query.set(self.pending[0..self.pending_len]);
+        }
+        fn shown(c: anytype) []const u8 {
+            return c.q.get();
+        }
+    };
+    var vm = LazyVm{ .query = try env.scope.createText("", .{}) };
+    const shown = try env.scope.createMemo([]const u8, .{ .q = vm.query }, LazyVm.shown);
+    const r = try Input(.{ .value = shown, .on_change = env.cx.on(LazyVm, &vm, LazyVm.searchFor) }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.node);
+    BindEnv.send(r, .{ .text_input = .{ .text = "a" } });
+    // Not landed synchronously: the field shows the view-model's value, not the draft.
+    try expectCaret(r, "", 0, null);
+    vm.flush();
+    try expectCaret(r, "a", 1, null);
+}
+
+const EscapeRevertProbe = struct {
+    changes: usize = 0,
+    last: [32]u8 = undefined,
+    len: usize = 0,
+    fn changed(self: *EscapeRevertProbe, text: []const u8) void {
+        self.changes += 1;
+        @memcpy(self.last[0..text.len], text);
+        self.len = text.len;
+    }
+};
+
+test "Input: under Cx.input_escape = .revert_to_focus_value Escape puts back the focus-time text" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |reverting| {
+        var ctx = try Cx.init(alloc, std.testing.io);
+        defer ctx.deinit();
+        if (reverting) ctx.input_escape = .revert_to_focus_value;
+        const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+        ctx.root = root;
+        const scope = try Scope.init(alloc, null, ctx.owner);
+        defer scope.dispose();
+        var probe = EscapeRevertProbe{};
+        const mounted = try Input(.{ .value = "draft", .on_change = ctx.on(EscapeRevertProbe, &probe, EscapeRevertProbe.changed) }).mountResult(scope, ctx);
+        try root.appendChild(alloc, mounted.node);
+        ctx.layout();
+        _ = ctx.render();
+        ctx.focus_manager.setFocus(mounted.input_container);
+        ctx.handleTextInput("1");
+        ctx.handleTextInput("2");
+        try std.testing.expectEqualStrings("draft12", mounted.state.getText());
+        const changes = probe.changes;
+        ctx.handleKeyDown(.escape, .{});
+        if (reverting) {
+            // The text the field had when it gained focus, not an intermediate value; on_change saw it.
+            try std.testing.expectEqualStrings("draft", mounted.state.getText());
+            try std.testing.expectEqual(changes + 1, probe.changes);
+            try std.testing.expectEqualStrings("draft", probe.last[0..probe.len]);
+            // Unchanged text leaves Escape alone.
+            try std.testing.expect(!events_mod.revertFocused(ctx));
+            // One undoable edit.
+            _ = ctx.handleKeyDown(.z, .{ .super = true });
+            try std.testing.expectEqualStrings("draft12", mounted.state.getText());
+        } else {
+            try std.testing.expectEqualStrings("draft12", mounted.state.getText());
+        }
+        // A new focus takes a new snapshot.
+        ctx.focus_manager.setFocus(null);
+        ctx.focus_manager.setFocus(mounted.input_container);
+        ctx.handleTextInput("3");
+        _ = ctx.handleKeyDown(.escape, .{});
+        try std.testing.expectEqualStrings(if (reverting) "draft12" else "draft123", mounted.state.getText());
+    }
+}
+
+test "Input: a value the app writes right after focusing counts as the focus-time value" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    ctx.input_escape = .revert_to_focus_value;
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const mounted = try Input(.{ .value = "old query" }).mountResult(scope, ctx);
+    try root.appendChild(alloc, mounted.node);
+    ctx.layout();
+    _ = ctx.render();
+    // The app focuses the field, then clears it (a bound value arriving after the focus event).
+    ctx.focus_manager.setFocus(mounted.input_container);
+    _ = mounted.state.setText("");
+    ctx.handleTextInput("abc");
+    ctx.handleKeyDown(.escape, .{});
+    try std.testing.expectEqualStrings("", mounted.state.getText());
+}
+
+test "Input: input_type follows its source; a shown password masks again and stays out of the accessibility value" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 80 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const kind = try scope.createSignal(InputType, .password);
+    const field = try Input(.{ .value = "secret", .input_type = kind, .width = 200 }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, field.node);
+    const container = field.input_container;
+    try std.testing.expectEqual(InputType.password, field.state.input_type);
+    try std.testing.expect(container.behavior.interaction.a11y.?.secure);
+    try std.testing.expect(container.behavior.interaction.a11y.?.value_text == null);
+    try std.testing.expect(container.behavior.interaction.text_input_client.?.secure);
+    field.state.cursor_pos = 3;
+
+    kind.set(.text);
+    try std.testing.expectEqual(InputType.text, field.state.input_type);
+    try std.testing.expect(!container.behavior.interaction.a11y.?.secure);
+    try std.testing.expectEqualStrings("secret", container.behavior.interaction.a11y.?.value_text.?);
+    try std.testing.expect(!container.behavior.interaction.text_input_client.?.secure);
+    try std.testing.expectEqualStrings("secret", field.state.getText());
+    try std.testing.expectEqual(@as(usize, 3), field.state.cursor_pos);
+
+    kind.set(.password);
+    try std.testing.expectEqual(InputType.password, field.state.input_type);
+    try std.testing.expect(container.behavior.interaction.a11y.?.secure);
+    try std.testing.expect(container.behavior.interaction.a11y.?.value_text == null);
+    try std.testing.expect(container.behavior.interaction.a11y.?.editable_text == null);
+    try std.testing.expect(container.behavior.interaction.text_input_client.?.secure);
+    try std.testing.expectEqualStrings("secret", field.state.getText());
+}
+
+test "Input: input_type and readonly sources together — a read-only field stays without a text client while its type changes" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 80 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const kind = try scope.createSignal(InputType, .password);
+    const locked = try scope.createSignal(bool, true);
+    const field = try Input(.{ .value = "secret", .input_type = kind, .readonly = locked, .width = 200 }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, field.node);
+    const container = field.input_container;
+    try std.testing.expect(container.behavior.interaction.text_input_client == null);
+
+    // Showing the password while read-only does not attach an editing client.
+    kind.set(.text);
+    try std.testing.expectEqual(InputType.text, field.state.input_type);
+    try std.testing.expect(!container.behavior.interaction.a11y.?.secure);
+    try std.testing.expect(container.behavior.interaction.text_input_client == null);
+
+    // Unlocking attaches a client built from the current type.
+    locked.set(false);
+    try std.testing.expect(!container.behavior.interaction.text_input_client.?.secure);
+    kind.set(.password);
+    try std.testing.expect(container.behavior.interaction.text_input_client.?.secure);
+
+    // Locking again detaches it; the type keeps following.
+    locked.set(true);
+    try std.testing.expect(container.behavior.interaction.text_input_client == null);
+    kind.set(.text);
+    try std.testing.expect(container.behavior.interaction.text_input_client == null);
+    try std.testing.expectEqualStrings("secret", field.state.getText());
+}
+
+test "Input: revealed shows a password's characters; it stays secure for text services, accessibility and the clipboard" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 80 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const shown = try scope.createSignal(bool, false);
+    const field = try Input(.{ .value = "secret", .input_type = .password, .revealed = shown, .width = 200 }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, field.node);
+    const container = field.input_container;
+    try std.testing.expectEqualStrings("******", try field.state.buildDisplayTextChecked(null));
+
+    shown.set(true);
+    try std.testing.expect(field.state.revealed);
+    try std.testing.expect(!field.state.masked());
+    try std.testing.expectEqualStrings("secret", try field.state.buildDisplayTextChecked(null));
+    // Still a password field everywhere but on screen.
+    try std.testing.expectEqual(InputType.password, field.state.input_type);
+    try std.testing.expect(container.behavior.interaction.a11y.?.secure);
+    try std.testing.expect(container.behavior.interaction.a11y.?.value_text == null);
+    try std.testing.expect(container.behavior.interaction.text_input_client.?.secure);
+
+    shown.set(false);
+    try std.testing.expectEqualStrings("******", try field.state.buildDisplayTextChecked(null));
+    try std.testing.expectEqualStrings("secret", field.state.getText());
+}
+
+test "Input: switching input_type or revealed during a composition cancels it" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 80 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const kind = try scope.createSignal(InputType, .text);
+    const shown = try scope.createSignal(bool, false);
+    const field = try Input(.{ .value = "ab", .input_type = kind, .revealed = shown, .width = 200 }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, field.node);
+    cx.setFocus(field.input_container);
+    field.state.handleImePreeditEvent("zhong", 5);
+    try std.testing.expect(field.state.imeIsComposing());
+    kind.set(.password);
+    try std.testing.expect(!field.state.imeIsComposing());
+    try std.testing.expectEqualStrings("ab", field.state.getText());
+    field.state.handleImePreeditEvent("x", 1);
+    try std.testing.expect(field.state.imeIsComposing());
+    shown.set(true);
+    try std.testing.expect(!field.state.imeIsComposing());
+    cx.clearFocus();
+}
+
+test "Input: after a type switch the caret of a long focused value stays in view" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const kind = try scope.createSignal(InputType, .password);
+    const field = try Input(.{ .value = "a long passphrase that is much wider than the field", .input_type = kind, .width = 120 }).mountResult(scope, cx);
+    try root.appendChild(alloc, field.node);
+    cx.layout();
+    _ = cx.render();
+    cx.focus_manager.setFocus(field.input_container);
+    field.state.cursor_pos = field.state.getText().len;
+    field.state.updateScrollX();
+    for ([_]InputType{ .text, .password, .text }) |next| {
+        kind.set(next);
+        const caret = field.state.visualCursorAdvance() - field.state.scroll_x;
+        try std.testing.expect(caret >= -0.5);
+        try std.testing.expect(caret <= field.state.input_inner_w + 0.5);
+    }
+}
+
+test "Input: a statically disabled field gets no text client when its readonly source turns off" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const locked = try scope.createSignal(bool, true);
+    const mounted = try Input(.{ .readonly = locked, .disabled = true, .value = "x" }).mountResult(scope, cx);
+    cx.root = mounted.node;
+    try std.testing.expect(mounted.input_container.behavior.interaction.text_input_client == null);
+    locked.set(false);
+    try std.testing.expect(!mounted.state.readonly);
+    try std.testing.expect(mounted.input_container.behavior.interaction.text_input_client == null);
+}
+
+test "Input: a readonly change outside any event reaches the focused field's text input session at once" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 120 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const locked = try scope.createSignal(bool, false);
+    const mounted = try Input(.{ .readonly = locked, .value = "draft" }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.node);
+    cx.layout();
+    _ = cx.render();
+    cx.focus_manager.setFocus(mounted.input_container);
+    // A timer / another window's event, not an event of this field.
+    locked.set(true);
+    try std.testing.expect(cx.text_input_session.active_node == null);
+    locked.set(false);
+    try std.testing.expect(cx.text_input_session.active_context == @as(?*anyopaque, @ptrCast(mounted.state)));
+    cx.focus_manager.setFocus(null);
+}
+
+test "Input: required follows a source — the label's required mark and accessibility" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const needed = try scope.createSignal(bool, false);
+    const mounted = try Input(.{ .label_text = "Name", .required = needed, .value = "" }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, mounted.node);
+    const label_row = mounted.node.children.items[0];
+    try std.testing.expectEqual(@as(usize, 2), label_row.children.items.len);
+    const mark = label_row.children.items[1];
+    try std.testing.expectEqual(core.Display.none, mark.style.display);
+    try std.testing.expect(!mounted.input_container.behavior.interaction.a11y.?.required);
+    needed.set(true);
+    try std.testing.expect(mark.style.display != .none);
+    try std.testing.expect(mounted.input_container.behavior.interaction.a11y.?.required);
+    needed.set(false);
+    try std.testing.expectEqual(core.Display.none, mark.style.display);
+    try std.testing.expect(!mounted.input_container.behavior.interaction.a11y.?.required);
+    // Static: no mark node unless required.
+    const plain = try Input(.{ .label_text = "Name" }).mountResult(scope, cx);
+    try root.appendChild(std.testing.allocator, plain.node);
+    try std.testing.expectEqual(@as(usize, 1), plain.node.children.items[0].children.items.len);
 }

@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <stdlib.h>
+#include "../automation_environment.h"
 #include <limits.h>
 
 // Caller owns the UTF-8 output buffer. Zero means cancellation; negative
@@ -13,7 +14,7 @@ extern "C" int zenit_win_file_dialog(void *owner, unsigned kind,
     HWND hwnd=(HWND)owner;
     if (!IsWindow(hwnd) || kind>2) return -4;
     if (GetWindowThreadProcessId(hwnd,nullptr)!=GetCurrentThreadId()) return -3;
-    const char *background=getenv("ZENIT_E2E_BACKGROUND");
+    const char *background=zenitAutomationEnvironment("ZENIT_E2E_BACKGROUND");
     if (background && !strcmp(background,"1")) return -4;
     HRESULT initialized=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
     if (FAILED(initialized)) return initialized==RPC_E_CHANGED_MODE ? -3 : -1;

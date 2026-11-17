@@ -478,7 +478,7 @@ test "execution interval projection validates typed recovered journal receipt wi
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     const call: host.Receipt = .{ .conversation_id = context.conversation_id, .task_id = context.task_id, .operation_id = 1, .binding_revision = 1 };
     const id: identity.ExecutionId = .generate();
     var record: JournalRecord = .{

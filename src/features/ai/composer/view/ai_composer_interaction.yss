@@ -1,0 +1,40 @@
+//! Decision panel layout (Pencil Kaf7E A7 / A11, ③ “审批面板”): content padding 12 12 10 12, gap 10;
+//! heading icon 16 + title 13/600 over the target 12 secondary; command well bg-secondary radius 6,
+//! mono 12; impact note info 12 + 12 secondary. The surface (outlined Card) and every control are
+//! native (view: ai_composer_interaction.yix).
+const ui = @import("ui");
+
+/// Card body: the scrolling decision content, then the action row.
+style body { width: fill; height: fit; direction: column; gap: 10; padding: 12 12 10 12; flex-shrink: 0; }
+/// The decision content viewport: scrolls past `$max` (≤ 180; short panels 40 %), actions stay put.
+style viewport($max: f32) { width: fill; height: {.{ .fit = .{ .max = $max } }}; max-height: $max; min-height: 0; flex-shrink: 0; }
+style content { width: fill; height: fit; direction: column; gap: 10; flex-shrink: 0; }
+
+style heading { width: fill; direction: row; align-items: start; gap: 8; flex-shrink: 0; }
+style warn_glyph { width: 16; height: 16; flex-shrink: 0; icon-color: warning; }
+style ask_glyph { width: 16; height: 16; flex-shrink: 0; icon-color: accent; }
+style title_block { width: fill; flex: 1; min-width: 0; direction: column; gap: 2; }
+
+/// Text tiers: `word-break` (CSS overflow-wrap: break-word) keeps long paths inside the panel.
+style title { font-size: 13; line-height: 1.5; font-weight: 600; color: fg-primary; wrap: word-break; }
+style secondary { font-size: 12; line-height: 1.5; font-weight: 400; color: fg-secondary; wrap: word-break; }
+style reason { font-size: 11; line-height: {16.0 / 11.0}; font-weight: 400; color: fg-secondary; wrap: word-break; }
+style failure { font-size: 11; line-height: {16.0 / 11.0}; font-weight: 400; color: danger; wrap: word-break; }
+/// A text that fills its row and may shrink below its longest word.
+style fill_text { width: fill; height: fit; min-width: 0; flex: 1; flex-shrink: 0; }
+/// A text beside an icon in a row: it gives way to the row's width and wraps (never runs past it).
+style row_text { width: fill; height: fit; min-width: 0; flex: 1; flex-shrink: 1; }
+
+style command_row { width: fill; direction: row; align-items: start; gap: 4; flex-shrink: 0; }
+/// Command well (a functional surface: bg-secondary, radius 6, padding 6 10).
+style command { font-size: 12; line-height: 1.5; font-weight: 400; color: fg-primary; wrap: word-break; use-monospace-font: true; }
+style command_well { width: fill; min-width: 0; flex: 1; flex-shrink: 1; padding: 6 10; background: bg-secondary; corner-radius: 6; }
+
+style impact_row { width: fill; height: fit; direction: row; align-items: center; gap: 6; flex-shrink: 0; }
+style info_glyph { width: 12; height: 12; flex-shrink: 0; icon-color: fg-tertiary; }
+
+style options { width: fill; height: fit; direction: column; flex-shrink: 0; }
+/// The custom answer Input sits under the radio list, aligned with the option labels.
+style custom_row { width: fill; height: fit; direction: row; align-items: center; padding: 0 0 0 22; flex-shrink: 0; }
+
+style actions { width: fill; height: fit; direction: row; align-items: center; gap: 6; flex-shrink: 0; }

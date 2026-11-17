@@ -69,6 +69,8 @@ pub const keys = [_]ConfigKey{
     .{ .page = "AI 辅助", .section = "ai", .key = "follow_up_mode" },
     .{ .page = "AI 辅助", .section = "ai", .key = "child_context_mode" },
     .{ .page = "AI 辅助", .section = "ai", .key = "child_reuse_policy" },
+    .{ .page = "外观与主题", .section = "ui", .key = "terminal_right_click" },
+    .{ .page = "外观与主题", .section = "ui", .key = "float_card_transition" },
 };
 pub const sections = [_][]const u8{ "ui", "ui.materials", "ui.materials.background", "completion", "transfer", "ssh", "ai", "log", "notify", "updates" };
 
@@ -111,7 +113,9 @@ test "settings page map covers nine documented pages" {
     var buffer: [1024]u8 = undefined;
     const text = try formatPages(&buffer);
     try std.testing.expect(std.mem.indexOf(u8, text, "AI 辅助 [ai]") != null);
-    try std.testing.expectEqual(@as(usize, 66), keys.len);
+    try std.testing.expectEqual(@as(usize, 68), keys.len);
+    try std.testing.expect(keyExists("ui", "float_card_transition"));
+    try std.testing.expect(keyExists("ui", "terminal_right_click"));
     try std.testing.expect(keyExists("ai", "child_context_mode"));
     try std.testing.expect(keyExists("ai", "child_reuse_policy"));
     try std.testing.expect(keyExists("ai", "step_display"));

@@ -1,4 +1,11 @@
-import { clickTestId, inputState, key, query, request, screenshot, waitFor, waitForServerReady } from "./client";
+import { clickAt, clickTestId, inputState, key, query, request, screenPos, screenshot, waitFor, waitForServerReady } from "./client";
+
+/// Opens / closes a multi-select from its chevron: its centre can land on a tag's remove button
+/// (tag widths follow the system UI font).
+async function clickSelectChevron(id: string): Promise<void> {
+  const r = await screenPos(id);
+  await clickAt(r.x + r.w - 20, r.y + r.h / 2);
+}
 import { assert, getSessionDir, run, test } from "./runner";
 async function controls() {
   const result=await request("POST","/windows/native-input",{action:"uia-tree"});
@@ -72,7 +79,7 @@ test("Windows Tree Selection replaces, adds and removes independently of pointer
 });
 test("Windows Select single and multiple publish List selection and committed Add/Remove events",async()=>{
   const before=await request("POST","/windows/native-input",{action:"status"});
-  await clickTestId("nav.select"); await clickTestId("story.select.multiple-lg");
+  await clickTestId("nav.select"); await clickSelectChevron("story.select.multiple-lg");
   await waitFor(async()=> (await controls()).some((n:any)=>n.selection?.multiple && n.role===50008)?true:null,4000,50);
   let nodes=await controls(); const group=nodes.find((n:any)=>n.selection?.multiple && n.role===50008);
   const items=nodes.filter((n:any)=>n.selection_item?.container===group.automation_id);
@@ -83,7 +90,7 @@ test("Windows Select single and multiple publish List selection and committed Ad
   await setItem(one,"remove"); assert((await selectedNames(group.automation_id)).length===0,"Select empty selection not committed");
   await setItem(three,"add");
   assert((await screenshot(`${getSessionDir()}/windows-uia-selection-list.png`)).ok,"List screenshot failed");
-  await clickTestId("story.select.multiple-lg");
+  await clickSelectChevron("story.select.multiple-lg");
   await clickTestId("story.select.clearable");
   await waitFor(async()=> (await controls()).some((n:any)=>n.role===50008 && n.selection && !n.selection.multiple)?true:null,4000,50);
   nodes=await controls(); const single=nodes.find((n:any)=>n.role===50008 && n.selection && !n.selection.multiple);
@@ -192,14 +199,22 @@ test("Windows ExpandCollapse commits ComboBox popup and Tree visibility with nat
     const updated=(await controls()).find((n:any)=>n.automation_id===node.automation_id);
     assert(updated?.expand_state===(expanded?1:0),"ExpandCollapse snapshot state disagrees");
   }
-  await clickTestId("nav.combobox");
-  const combo=(await controls()).find((n:any)=>n.role===50003 && n.name==="Fruit");
-  assert(combo?.expand_available && combo.expand_state===0,"closed ComboBox expansion missing");
+  // The previous selection case leaves the ComboBox story mounted. Remount
+  // it so this case starts from the component's documented closed state.
+  assert((await clickTestId("nav.button")).ok,"failed to leave ComboBox story");
+  await waitFor(async()=> (await query("story.combobox")).length===0?true:null,4000,50);
+  assert((await clickTestId("nav.combobox")).ok,"failed to mount ComboBox story");
+  const combo=await waitFor(async()=> (await controls()).find((n:any)=>n.role===50003 && n.name==="Fruit")??null,4000,50);
+  assert(combo.expand_available && combo.expand_state===0,"closed ComboBox expansion missing");
+  const bananaOptions=async()=> (await controls()).filter((n:any)=>n.name==="Banana" && n.selection_item);
+  // A second, already-open demonstration uses the same option names.
+  const existing=new Set((await bananaOptions()).map((n:any)=>n.automation_id));
   await expand(combo,true);
-  assert((await controls()).some((n:any)=>n.name==="Banana" && n.selection_item),"expanded ComboBox options missing");
+  const opened=(await bananaOptions()).filter((n:any)=>!existing.has(n.automation_id));
+  assert(opened.length===1,"expanded ComboBox must expose its own Banana option");
   await expand(combo,true);
   await expand(combo,false);
-  assert(!(await controls()).some((n:any)=>n.name==="Banana" && n.selection_item),"collapsed ComboBox options stayed visible to UIA");
+  assert(!(await bananaOptions()).some((n:any)=>n.automation_id===opened[0].automation_id),"collapsed ComboBox option stayed visible to UIA");
   await expand(combo,false); await expand(combo,true);
   assert((await screenshot(`${getSessionDir()}/windows-uia-expanded-combobox.png`)).ok,"expanded ComboBox screenshot failed");
   await expand(combo,false);

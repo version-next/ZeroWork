@@ -5,7 +5,7 @@ const session = @import("../../host/session_host.zig");
 const terminal = @import("../../host/terminal_service.zig");
 const OperationKey = @import("../../host/operation.zig").OperationKey;
 const service = @import("../../host/runtime_service.zig");
-const Native = @import("../../ui/session_runtime.zig").SessionRuntime;
+const Native = @import("../../features/workspace/host/session_runtime.zig").SessionRuntime;
 const NotificationPublication = service.NotificationPublication;
 pub fn borrow(native: *Native) service.Runtime {
     return .{ .context = native, .vtable = &vtable, .torn_down = native.torn_down };
@@ -72,14 +72,14 @@ fn attachShell(raw: *anyopaque, request: @import("../../host/terminal_execution.
 fn requestCurrentDirectory(raw: *anyopaque) anyerror!void {
     try get(raw).workerPtr().requestCurrentDirectory();
 }
-fn completeRemotePath(raw: *anyopaque, path: []const u8) anyerror!@import("../../ui/builtin_completion.zig").Call {
+fn completeRemotePath(raw: *anyopaque, path: []const u8) anyerror!@import("../../host/builtin_completion.zig").Call {
     const runtime = get(raw);
     if (runtime.torn_down) return error.SessionClosed;
     const worker = runtime.workerPtr();
     const a = worker.allocator;
     const cwd = (try worker.vt.tryCopyCwd(a)) orelse return error.CurrentDirectoryUnavailable;
     defer a.free(cwd);
-    const command = try @import("../../ui/builtin_completion.zig").command(a, cwd, path);
+    const command = try @import("../../host/builtin_completion.zig").command(a, cwd, path);
     defer a.free(command);
     const handle = try worker.exec_bridge.pathDiagnostic(command, .{ .timeout_ms = 5000, .capture_cap = 64 * 1024 });
     return .{ .bridge = worker.exec_bridge.asBridge(), .handle = handle };

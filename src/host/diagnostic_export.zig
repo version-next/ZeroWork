@@ -1,6 +1,7 @@
 //! Explicit application-diagnostic export. Session/AI/terminal content never
 //! enters the archive. Capture runs before the caller opens its native picker.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 
 pub const redaction_revision: u32 = 1;
 pub const max_files: usize = 128;
@@ -165,10 +166,10 @@ pub const Plan = struct {
             if (value.kind != .file) return error.DiagnosticTargetNotRegular;
             for (self.files.items) |source| if (source.identity.inode == value.inode) return error.DiagnosticTargetIsSource;
         }
-        var atomic = try std.Io.Dir.cwd().createFileAtomic(self.io, target_absolute_path, .{ .replace = true, .permissions = @fromBackingInt(@intCast(0o600)) });
-        defer atomic.deinit(self.io);
+        var atomic = try persist.AtomicWriter.begin(self.io, std.Io.Dir.cwd(), target_absolute_path, .{});
+        defer atomic.deinit();
         var output_buffer: [8192]u8 = undefined;
-        var output = atomic.file.writer(self.io, &output_buffer);
+        var output = atomic.writer(&output_buffer);
         var compression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
         var gzip = try std.compress.flate.Compress.init(&output.interface, &compression_buffer, .gzip, .fastest);
         var tar: std.tar.Writer = .{ .underlying_writer = &gzip.writer };
@@ -186,10 +187,10 @@ pub const Plan = struct {
         try tar.finishPedantically();
         try gzip.finish();
         try output.interface.flush();
-        try atomic.file.sync(self.io);
+        try atomic.syncData();
         self.failure.stage = .publish;
         try cancel.check();
-        try atomic.replace(self.io);
+        try atomic.commit();
     }
 
     fn manifest(self: *const Plan) ![]u8 {

@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Theme paint coverage using the production file View with bounded UI fixture data. */
 import assert from 'node:assert/strict';

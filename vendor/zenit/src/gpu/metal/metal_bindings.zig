@@ -81,6 +81,8 @@ pub const MTLStorageMode = enum(c_uint) {
 
 /// MTLResourceOptions - resource options (simplified, storage mode only)
 pub const MTLResourceOptions = c_uint;
+/// MTLResourceCPUCacheModeWriteCombined (MTLCPUCacheModeWriteCombined in bits 0-3).
+pub const MTLResourceCPUCacheModeWriteCombined: MTLResourceOptions = 1;
 
 /// Convenience function: create ResourceOptions from storage mode.
 pub fn resourceOptionsFromStorageMode(mode: MTLStorageMode) MTLResourceOptions {
@@ -178,7 +180,9 @@ pub const MTLTextureUsage = enum(c_ulong) {
     ShaderRead = 0x0001,
     ShaderWrite = 0x0002,
     RenderTarget = 0x0004,
-    PixelFormatView = 0x0008,
+    /// MTLTextureUsagePixelFormatView is bit 4 (0x10). 0x08 is not a Metal
+    /// usage bit and the driver silently drops it.
+    PixelFormatView = 0x0010,
 };
 
 /// MTLSamplerMinMagFilter - sampler min/mag filter mode
@@ -378,7 +382,14 @@ pub extern "c" fn metal_texture_descriptor_set_sample_count(desc: *MTLTextureDes
 pub extern "c" fn metal_texture_descriptor_set_texture_type(desc: *MTLTextureDescriptor, texture_type: c_ulong) void;
 pub extern "c" fn metal_texture_descriptor_set_usage(desc: *MTLTextureDescriptor, usage: c_ulong) void;
 pub extern "c" fn metal_texture_descriptor_set_storage_mode(desc: *MTLTextureDescriptor, mode: c_ulong) void;
+pub extern "c" fn metal_texture_descriptor_set_cpu_cache_write_combined(desc: *MTLTextureDescriptor) void;
+/// MTLCPUCacheMode of a buffer or texture (0 = default cache, 1 = write-combined).
+pub extern "c" fn metal_resource_cpu_cache_mode(resource: *anyopaque) c_ulong;
 pub extern "c" fn metal_device_new_texture(device: *MTLDevice, desc: *MTLTextureDescriptor) ?*MTLTexture;
+pub extern "c" fn metal_inventory_enabled() c_int;
+pub extern "c" fn metal_resource_set_volatile(resource: *anyopaque, make_volatile: c_int) c_int;
+pub extern "c" fn metal_inventory_note(resource: ?*anyopaque, site: ?*anyopaque) void;
+pub extern "c" fn metal_inventory_dump(device: *MTLDevice, tag: [*:0]const u8) void;
 pub extern "c" fn metal_sampler_descriptor_new() ?*MTLSamplerDescriptor;
 pub extern "c" fn metal_sampler_descriptor_set_min_filter(desc: *MTLSamplerDescriptor, filter: c_ulong) void;
 pub extern "c" fn metal_sampler_descriptor_set_mag_filter(desc: *MTLSamplerDescriptor, filter: c_ulong) void;
@@ -392,6 +403,8 @@ pub extern "c" fn metal_sampler_descriptor_set_lod_max_clamp(desc: *MTLSamplerDe
 pub extern "c" fn metal_sampler_descriptor_set_max_anisotropy(desc: *MTLSamplerDescriptor, value: c_ulong) void;
 pub extern "c" fn metal_sampler_descriptor_set_label(desc: *MTLSamplerDescriptor, label: [*:0]const u8) void;
 pub extern "c" fn metal_device_new_sampler(device: *MTLDevice, desc: *MTLSamplerDescriptor) ?*MTLSamplerState;
+pub extern "c" fn metal_texture_pixel_format(texture: *MTLTexture) c_ulong;
+pub extern "c" fn metal_texture_usage(texture: *MTLTexture) c_ulong;
 pub extern "c" fn metal_device_create_texture(device: *MTLDevice, width: c_uint, height: c_uint, pixelFormat: c_ulong, usage: c_ulong, storageMode: c_ulong) ?*MTLTexture;
 pub extern "c" fn metal_device_create_texture_mipmapped(device: *MTLDevice, width: c_uint, height: c_uint, pixelFormat: c_ulong, usage: c_ulong, storageMode: c_ulong, mipmapped: c_int) ?*MTLTexture;
 pub extern "c" fn metal_device_create_sampler(device: *MTLDevice, minFilter: c_ulong, magFilter: c_ulong, sAddressMode: c_ulong, tAddressMode: c_ulong) ?*MTLSamplerState;
@@ -422,6 +435,7 @@ pub extern "c" fn metal_command_buffer_gpu_end_time(buffer: *MTLCommandBuffer) f
 
 /// Non-blocking query: has command buffer reached terminal state (completed/error)?
 pub extern "c" fn metal_command_buffer_is_completed(buffer: *MTLCommandBuffer) bool;
+pub extern "c" fn metal_command_buffer_completed_successfully(buffer: *MTLCommandBuffer) bool;
 
 // Reference Counting
 pub extern "c" fn metal_release(obj: *anyopaque) void;
@@ -437,6 +451,7 @@ pub extern "c" fn metal_layer_set_allows_next_drawable_timeout(layer: *CAMetalLa
 pub extern "c" fn metal_layer_set_opaque(layer: *CAMetalLayer, is_opaque: c_int) void;
 pub extern "c" fn metal_layer_set_wants_edr(layer: *CAMetalLayer, wants: c_int) void;
 pub extern "c" fn metal_layer_set_drawable_size(layer: *CAMetalLayer, width: c_uint, height: c_uint) void;
+pub extern "c" fn metal_layer_purge_drawables(layer: *CAMetalLayer) void;
 pub extern "c" fn metal_layer_next_drawable(layer: *CAMetalLayer) ?*CAMetalDrawable;
 pub extern "c" fn metal_drawable_get_texture(drawable: *CAMetalDrawable) *MTLTexture;
 pub extern "c" fn metal_drawable_present(drawable: *CAMetalDrawable) void;
@@ -580,6 +595,7 @@ pub extern "c" fn metal_render_encoder_draw_indexed_primitives_full(encoder: *MT
 // Compute Command Encoder
 // ============================================================================
 
+pub extern "c" fn metal_command_buffer_create_attachmentless_render_encoder(buffer: *MTLCommandBuffer, width: c_uint, height: c_uint) ?*MTLRenderCommandEncoder;
 pub extern "c" fn metal_command_buffer_create_compute_encoder(buffer: *MTLCommandBuffer) ?*MTLComputeCommandEncoder;
 pub extern "c" fn metal_compute_encoder_end_encoding(encoder: *MTLComputeCommandEncoder) void;
 pub extern "c" fn metal_compute_encoder_set_compute_pipeline_state(encoder: *MTLComputeCommandEncoder, pipeline: *MTLComputePipelineState) void;
@@ -701,3 +717,12 @@ pub extern "c" fn metal_render_pipeline_color_attachment_set_write_mask(desc: *M
 pub extern "c" fn metal_command_buffer_copy_texture_region_render(buffer: *MTLCommandBuffer, source: *MTLTexture, sx: u32, sy: u32, width: u32, height: u32, destination: *MTLTexture, dx: u32, dy: u32, clear: c_int) c_int;
 
 pub extern "c" fn metal_device_supports_framebuffer_fetch(device: *MTLDevice) bool;
+
+// Glass pass trace (glass_trace.zig).
+pub extern "c" fn metal_trace_snapshot(command_buffer: *MTLCommandBuffer, texture: *MTLTexture) ?*MTLTexture;
+pub extern "c" fn metal_trace_read(texture: *MTLTexture, out: [*]u8, bytes_per_row: c_uint) c_int;
+pub extern "c" fn metal_trace_write_file(path: [*:0]const u8, bytes: [*]const u8, len: usize) c_int;
+pub extern "c" fn metal_trace_file_exists(path: [*:0]const u8) c_int;
+pub extern "c" fn metal_trace_remove_file(path: [*:0]const u8) void;
+pub extern "c" fn metal_trace_texture_width(texture: *MTLTexture) c_uint;
+pub extern "c" fn metal_trace_texture_height(texture: *MTLTexture) c_uint;

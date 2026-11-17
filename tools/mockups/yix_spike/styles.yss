@@ -1,0 +1,11 @@
+//! yix_spike 样式（只求可读，不追设计稿）。
+const ui = @import("ui");
+
+style root { width: fill; height: fill; direction: column; gap: space200; padding: space400; background: bg-primary; }
+style section { direction: column; gap: space100; padding: space200; border: thin border; corner-radius: md; background: bg-secondary; }
+style section_row { direction: row; gap: space200; align-items: center; }
+style heading { font-size: sm; font-weight: semibold; color: fg-primary; }
+style body_text { font-size: sm; color: fg-primary; }
+style muted { font-size: sm; color: fg-secondary; }
+style header { width: fill; height: 40; direction: row; gap: space200; align-items: center; padding: 0 space400 0 80; background: bg-tertiary; }
+style chip { padding: space100 space200; corner-radius: sm; border: thin border; }

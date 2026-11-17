@@ -1,12 +1,16 @@
 /** Single-connection AI binding, restore and copy regression in the real app.
  * Uses one owned Local PTY, isolated data and a loopback model.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, open, readFile, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? 'zig-out');
 const out = resolve(process.argv[2] ?? '/tmp/zw-ai-single-connection');
 const legacyMode = process.argv.includes('--legacy');
@@ -19,9 +23,7 @@ const frame = (content: string) => 'data: ' + JSON.stringify({choices: [{index: 
 const requests: any[] = [];
 const server = createServer(async (req, res) => {
     if (req.method !== 'POST') { res.end('{"data":[{"id":"single-fixture"}]}'); return; }
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (!body.tools?.length) { res.end(frame('单连接恢复检查')); return; }
     requests.push(body);
@@ -57,7 +59,7 @@ if (legacyMode) {
         agent: index === 3 ? 'a'.repeat(32) : null,
         presentation: index === 2 ? JSON.stringify({schema: 1, messages: []}) : null,
     }, messages: [{role: 'user', content: `LEGACY_${index} 旧问题`}, {role: 'assistant', content: `LEGACY_ANSWER_${index} 旧答案`}]}));
-    await writeFile(join(data, 'ai-sessions.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+    await writeFile(join(data, 'ai-sessions.v4.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
 }
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
 const log = await open(join(out, 'app.log'), 'w');
@@ -89,14 +91,29 @@ async function send(question: string, expected: string[]) {
     const users = requests.at(-1).messages.filter((message: any) => message.role === 'user').map((message: any) => message.content);
     for (const value of expected) assert(users.some((content: string) => content.includes(value)), 'model context: ' + value);
 }
+// The welcome page's recent list reuses the session row view (src/features/ai/sessions/view/ai_empty_view.zig → ai_session_row.zig),
+// so ai.session.* ids exist twice while the welcome page is shown; list checks and actions must target the copy inside ai.sessions.menu.
+const inMenu = (id: string) => h.waitFor(async () => { assert(alive(), 'native app exited'); return (await h.query('ai.sessions.menu')).filter(shown).flatMap(flat).find((node: any) => node.test_id === id && shown(node)) ?? null; }, 15000);
+// With five history rows the popover list scrolls; a row below the fold still reports a rect, and clicking there hits the
+// transcript behind the popover (outside click dismisses it), so scroll the row into the menu's bounds first.
+const menuClick = async (id: string) => {
+    report.last_action = 'ai.sessions.menu>' + id;
+    let node = await inMenu(id);
+    for (let i = 0; i < 30; i++) {
+        const box = (await h.query('ai.sessions.menu')).find(shown).rect, cy = node.rect.y + node.rect.h / 2;
+        if (cy > box.y + 4 && cy < box.y + box.h - 4) break;
+        await h.scrollAt(box.x + box.w / 2, box.y + box.h / 2, 0, cy >= box.y + box.h - 4 ? -40 : 40); await h.sleep(60); node = await inMenu(id);
+    }
+    assert((await h.clickAt(node.rect.x + node.rect.w / 2, node.rect.y + node.rect.h / 2)).ok, id);
+};
 async function menu() { await click('ai.sessions'); await visible('ai.sessions.menu'); }
 async function binding(id: number, bound: boolean) {
-    const row = await visible('ai.session.row.' + id);
+    const row = await inMenu('ai.session.row.' + id);
     assert(flat(row).some(node => node.test_id === (bound ? 'ai.session.bound' : 'ai.session.unbound')), 'binding for row ' + id);
 }
 async function journal() {
     const records = new Map<string, any>();
-    for (const line of (await readFile(join(data, 'ai-sessions.jsonl'), 'utf8')).trim().split('\n')) {
+    for (const line of (await readFile(join(data, 'ai-sessions.v4.jsonl'), 'utf8')).trim().split('\n')) {
         const row = JSON.parse(line), event = row.event;
         if (!event) continue;
         const record = records.get(event.conversation) ?? {id: event.conversation};
@@ -114,20 +131,20 @@ async function boundCount(count: number) {
 try {
     await h.waitForServerReady(60000); await h.resizeWindow(1280, 960);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
     if (legacyMode) {
         async function legacyHistory(index: number) {
             await h.waitFor(async () => text((await h.query('ai.message.user.text')).filter(shown)).includes('LEGACY_' + index) || null, 10000);
             assert(text((await h.query('ai.conversation')).filter(shown)).includes('LEGACY_ANSWER_' + index), 'legacy assistant answer');
             await boundCount(1);
         }
-        await menu(); await binding(3, false); await click('ai.session.restore.1'); await confirm();
+        await menu(); await binding(3, false); await menuClick('ai.session.restore.1'); await confirm();
         await legacyHistory(1); await h.screenshot(join(out, '01-legacy-restored.png'));
         report.checks.push('History without a presentation restores visible questions and answers on one connection');
-        await menu(); await click('ai.session.copy_use.2'); await confirm(); await legacyHistory(2);
+        await menu(); await menuClick('ai.session.copy_use.2'); await confirm(); await legacyHistory(2);
         await h.screenshot(join(out, '02-legacy-copy.png'));
         report.checks.push('Copy-and-use repairs an empty saved presentation using the retained canonical history');
-        await menu(); await click('ai.session.restore.3'); await confirm(); await legacyHistory(3);
+        await menu(); await menuClick('ai.session.restore.3'); await confirm(); await legacyHistory(3);
         await click('ai.prompt'); await h.type_('LEGACY_FOLLOWUP'); await click('ai.send');
         await h.waitFor(async () => requests.length === 1 && text((await h.query('ai.response')).filter(shown)).includes('LEGACY_FOLLOWUP') || null, 15000);
         assert(requests[0].messages.some((message: any) => message.content.includes('LEGACY_3')));
@@ -137,28 +154,28 @@ try {
     await send('ORIGINAL 单连接原问题', ['ORIGINAL']);
     await menu(); await binding(1, true); await boundCount(1);
     // Copy the current conversation onto its own attached Agent.
-    await click('ai.session.copy_use.1'); await confirm(); await full(['ORIGINAL']);
+    await menuClick('ai.session.copy_use.1'); await confirm(); await full(['ORIGINAL']);
     await send('COPY_FOLLOWUP 副本继续', ['ORIGINAL', 'COPY_FOLLOWUP']);
     await menu(); await binding(1, false); await binding(2, true); await boundCount(1);
     await h.screenshot(join(out, '01-single-copy.png')); await click('ai.sessions.close');
     report.checks.push('Copy-and-use on the same single connection switches history and model context, releases the original binding and permits a follow-up');
     // A fresh welcome must leave the old conversation recoverable.
     await click('ai.session.new'); await confirm(); await menu();
-    await binding(2, false); await boundCount(0); await visible('ai.session.restore.2');
-    await click('ai.session.restore.1'); await confirm(); await full(['ORIGINAL']);
+    await binding(2, false); await boundCount(0); await inMenu('ai.session.restore.2');
+    await menuClick('ai.session.restore.1'); await confirm(); await full(['ORIGINAL']);
     await send('RESTORE_FOLLOWUP 原会话恢复后继续', ['ORIGINAL', 'RESTORE_FOLLOWUP']);
     await menu(); await binding(1, true); await binding(2, false); await boundCount(1);
     await h.screenshot(join(out, '02-single-restored.png')); await click('ai.sessions.close');
     report.checks.push('New unbinds the prior conversation; restoring the original restores its own history and context, without the copy follow-up');
     // Close the AI window, reopen its welcome, and restore the other history.
     await click('ai.close'); await visible('ai.close.confirmation'); await click('ai.close.confirmation.confirm');
-    await absent('ai.panel'); await click('toolbar.ai'); await menu(); await boundCount(0);
-    await click('ai.session.restore.2'); await confirm(); await full(['ORIGINAL', 'COPY_FOLLOWUP']);
+    await absent('ai.panel'); await click(await aiToggleId()); await menu(); await boundCount(0);
+    await menuClick('ai.session.restore.2'); await confirm(); await full(['ORIGINAL', 'COPY_FOLLOWUP']);
     await send('REOPEN_FOLLOWUP 重新打开后继续', ['ORIGINAL', 'COPY_FOLLOWUP', 'REOPEN_FOLLOWUP']);
     report.checks.push('Closing and reopening the AI window releases its old binding; another history restores and continues on the same connection');
     // Plain copy from the read-only dialog must publish a real unbound copy.
     const beforeCopy = await journal();
-    await menu(); await click('ai.session.jump.1'); await visible('ai.history');
+    await menu(); await menuClick('ai.session.jump.1'); await visible('ai.history');
     await click('ai.history.copy'); await absent('ai.history');
     await visible('ai.sessions.menu'); await boundCount(1);
     const afterCopy = await journal(); assert.equal(afterCopy.length, beforeCopy.length + 1);
@@ -167,7 +184,7 @@ try {
     await h.screenshot(join(out, '03-copy-history.png'));
     const copiedRow = (await h.query('ai.sessions.menu')).flatMap(flat).filter((node: any) => /^ai.session.row.\d+$/.test(node.test_id ?? '')).at(-1);
     const copiedId = copiedRow.test_id.split('.').at(-1);
-    await click('ai.session.restore.' + copiedId); await confirm(); await full(['ORIGINAL', 'RESTORE_FOLLOWUP']);
+    await menuClick('ai.session.restore.' + copiedId); await confirm(); await full(['ORIGINAL', 'RESTORE_FOLLOWUP']);
     await send('PLAIN_COPY_FOLLOWUP 普通副本继续', ['ORIGINAL', 'RESTORE_FOLLOWUP', 'PLAIN_COPY_FOLLOWUP']);
     report.checks.push('Copy without use publishes a distinct unbound history; using it later restores the copied context and permits a follow-up');
     report.status = 'passed';
@@ -183,7 +200,7 @@ try {
         if (alive()) await Promise.race([h.request('POST', '/zerowork/windows', {action: 'quit'}), exited]);
         const deadline = performance.now() + 15000;
         while (alive() && performance.now() < deadline) {
-            for (const id of ['settings.close.discard', 'local.close.accept', 'session.close.accept']) {
+            for (const id of ['settings.confirmation.discard', 'local.close.accept', 'session.close.accept']) {
                 if (!alive()) break;
                 const nodes = await h.query(id).catch(() => []);
                 if (Array.isArray(nodes) && nodes.some(shown)) await h.clickTestId(id);

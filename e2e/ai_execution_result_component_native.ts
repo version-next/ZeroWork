@@ -1,7 +1,8 @@
 /** Dedicated production host execution card. Synthetic trusted receipts; no PTY/network. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
-import {spawn,execFile} from 'node:child_process';
-import {promisify} from 'node:util';
+import {spawn} from 'node:child_process';
+import {writePasteboardText,readPasteboardText} from './private_pasteboard.ts';
 import {mkdtemp,mkdir,writeFile,readFile,open} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -11,9 +12,15 @@ const out=resolve(process.argv[3]??'/tmp/zw-execution-result-native');await mkdi
 const shown=(n:any)=>n&&n.visible!==false&&n.hidden!==true&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const text=(n:any):string=>n.text??(n.children??[]).map(text).join('');
 const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,10000);
-const clipboard=async()=>(await promisify(execFile)('/usr/bin/pbpaste',[],{encoding:'utf8'})).stdout;
-const click=async(id:string)=>{const node=await visible(id);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id)};
+// The preview copies through zenit to the run's private pasteboard (ZENIT_E2E_PASTEBOARD, inherited by the spawned preview),
+// never the person's clipboard. A sentinel is written first so the assertion sees what this click copied, not an earlier copy.
+const copied=async(id:string)=>{const sentinel=`zw-e2e-sentinel-${Date.now()}`;await writePasteboardText(sentinel);await click(id);return await h.waitFor(async()=>{const value=await readPasteboardText();return value!==null&&value!==sentinel?value:null},5000).catch((error:any)=>{throw new Error(`${id}: the click did not put anything on the run's pasteboard (${error})`)})};
+// The card's disclosure animates its height (rows below slide while it opens / closes); click a control only once its
+// rectangle has stopped moving, otherwise the click lands where the control was a frame ago.
+const settled=(id:string)=>{let last='';return h.waitFor(async()=>{const node=(await h.query(id)).find(shown);const now=node?JSON.stringify(node.rect):'';const same=now!==''&&now===last;last=now;return same?node:null},5000)};
+const click=async(id:string)=>{const node=await settled(id);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id)};
 const labels:any={running:'运行中',sealed:'命令已结束',failed:'命令执行失败',interval_recorded:'命令已结束',interval_unverified:'命令已结束',interval_concurrent:'命令已结束',interval_failed:'命令执行失败',interval_shell:'命令已结束',interval_background:'命令已结束',interval_signal:'命令执行失败',interval_no_exit:'命令已结束 · 退出状态未知',recording_failed:'命令已结束',unknown:'结果待核实',handed_off:'用户已接管',sealing:'正在处理执行结果',cancelled:'已取消',missing:'调用失败',refused:'已拒绝'};
+const mode=process.argv[4]??'matrix';assert(['matrix','interval-only','running-only','collapsed-only','refused-only'].includes(mode),`unknown mode ${mode}`);
 const intervalOnly=process.argv[4]==='interval-only',runningOnly=process.argv[4]==='running-only',collapsedOnly=process.argv[4]==='collapsed-only';
 const report:any={status:'running',binary,matrix:{themes:intervalOnly||runningOnly||collapsedOnly?['dark']:['dark','light','sauber'],width:[600,360],states:collapsedOnly?['running','interval_shell']:runningOnly?['running']:intervalOnly?['interval_recorded','interval_unverified','interval_concurrent','interval_failed','interval_shell','interval_background','interval_signal','interval_no_exit','recording_failed','handed_off']:process.argv[4]==='refused-only'?['refused']:['running','sealed','failed','unknown','handed_off','sealing','cancelled','missing']},checks:[],shutdown:[],sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),limitations:['Uses production Snapshot JSON, Store.capture, typed projection and native view with synthetic immutable receipts.','Callback payloads are verified here; actual Driver stop/takeover and terminal navigation require application integration acceptance.','A saved session_interval is an observed same-PTY range, never proof of complete command output or exclusive writer attribution.','RecordingId is copied as a real stable ID; no unresolved history jump is presented.']};
 try{
@@ -26,17 +33,20 @@ for(const theme of report.matrix.themes)for(const width of report.matrix.width)f
  try{
   await h.waitForServerReady(10000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),child.pid);await h.resizeWindow(width,358);await h.waitFor(async()=>Math.abs((await visible('execution_result.preview')).rect.w-width)<.1||null,10000);
   const collapsed=await visible('execution_result.preview.card');
-  assert.equal(collapsed.rect.h,32);
+  assert.equal(collapsed.rect.h,24);
   for(const id of ['details','footer','elapsed','collection_details'])assert(!(await h.query(`ai.execution.result.${id}`)).some(shown),`${id} must be hidden on a new card`);
   assert(text(await visible('ai.execution.result.summary')).includes(labels[state]));
   assert((await h.screenshot(join(out,`${name}-collapsed.png`))).ok);
   await click('ai.execution.result.header');
   await h.waitFor(async()=>{
    const card=await visible('execution_result.preview.card'),body=await visible('ai.execution.result.details'),footer=await visible('ai.execution.result.footer');
-   return card.rect.h>32&&Math.abs(card.rect.h-32-body.rect.h-footer.rect.h)<.1||null;
+   // Kaf7E A6 (ai_execution_result_styles.zig header comment; card = ai_tool_results_styles.zig card(): a column with no gap and
+   // no plate since 143c4c7b): the 24 row, the bounded body and the footer stack edge to edge, and the card encloses exactly them.
+   const header=await visible('ai.execution.result.header');
+   return card.rect.h>24&&Math.abs(body.rect.y-header.rect.y-header.rect.h)<.6&&Math.abs(footer.rect.y-body.rect.y-body.rect.h)<.6&&Math.abs(card.rect.h-24-body.rect.h-footer.rect.h)<.6||null;
   },5000);
-  const card=await visible('execution_result.preview.card'),header=await visible('ai.execution.result.header'),title=await visible('ai.execution.result.title'),icon=await visible('ai.execution.result.disclosure');
-  assert.equal(header.rect.h,32);assert(Math.abs(icon.rect.y+icon.rect.h/2-title.rect.y-title.rect.h/2)<.5);assert(icon.rect.x+icon.rect.w<title.rect.x);
+  const card=await visible('execution_result.preview.card'),header=await visible('ai.execution.result.header'),title=await visible('ai.execution.result.title'),icon=await visible('ai.execution.result.icon');
+  assert.equal(header.rect.h,24);assert(Math.abs(icon.rect.y+icon.rect.h/2-title.rect.y-title.rect.h/2)<.5);assert(icon.rect.x+icon.rect.w<title.rect.x);
   const summary=text(await visible('ai.execution.result.summary'));assert(summary.includes(labels[state]),summary);assert(!summary.includes('观测')&&!summary.includes('保存')&&!summary.includes('封存'));
   const details=await visible('ai.execution.result.details');assert(details.rect.h<=150.1);
   if(state==='missing'||state==='refused'){
@@ -73,7 +83,7 @@ for(const theme of report.matrix.themes)for(const width of report.matrix.width)f
    await visible('ai.execution.result.collection_details');
    await h.waitFor(async()=>{
     const card=await visible('execution_result.preview.card'),body=await visible('ai.execution.result.details'),collection=await visible('ai.execution.result.collection_details'),footer=await visible('ai.execution.result.footer');
-    return Math.abs(card.rect.h-32-body.rect.h-collection.rect.h-footer.rect.h)<.1||null;
+    return Math.abs(collection.rect.y-body.rect.y-body.rect.h)<.6&&Math.abs(footer.rect.y-collection.rect.y-collection.rect.h)<.6&&Math.abs(card.rect.h-24-body.rect.h-collection.rect.h-footer.rect.h)<.6||null;
    },5000);
    await click('ai.execution.result.details_toggle');
    await h.waitFor(async()=>!(await h.query('ai.execution.result.collection_details')).some(shown)||null,5000);
@@ -85,9 +95,12 @@ for(const theme of report.matrix.themes)for(const width of report.matrix.width)f
     const metadata=await visible('ai.execution.result.collection_details');
     await h.scrollAt(metadata.rect.x+20,metadata.rect.y+metadata.rect.h/2,0,-100000);
     const recording=await visible('ai.execution.result.recording_id');
-    await click('ai.execution.result.copy_recording');assert.equal((await clipboard()).trim(),text(recording).split('·').slice(1).join('·').trim());
+    // Hover first, exercising the scrollbar's expanded hit area near the edge.
+    const copyRecording=await settled('ai.execution.result.copy_recording');
+    await h.mouseMove(copyRecording.rect.x+copyRecording.rect.w/2,copyRecording.rect.y+copyRecording.rect.h/2);
+    assert.equal((await copied('ai.execution.result.copy_recording')).trim(),text(recording).split('·').slice(1).join('·').trim());
     await click('ai.execution.result.details_toggle');await h.resizeWindow(width,358);
-    await click('ai.execution.result.copy_output');assert((await clipboard()).includes('ACTUAL_TERMINAL_OUTPUT'));
+    assert((await copied('ai.execution.result.copy_output')).includes('ACTUAL_TERMINAL_OUTPUT'));
     const expected=text(await visible('execution_result.preview.execution_ref'));
     await click('ai.execution.result.view_terminal');let action=text(await visible('execution_result.preview.action'));assert(action.includes('view_terminal')&&action.includes(expected)&&action.includes('#101/g9'),action);
     const control=width===360?'takeover':'stop';await click(`ai.execution.result.${control}`);action=text(await visible('execution_result.preview.action'));assert(action.includes(control)&&action.includes(expected)&&action.includes('#101/g9')&&action.includes('request 2'),action);
@@ -99,7 +112,7 @@ for(const theme of report.matrix.themes)for(const width of report.matrix.width)f
      await click('ai.execution.result.view_terminal');
      const action=text(await visible('execution_result.preview.action'));
      assert(action.includes('view_terminal')&&action.includes(expected)&&action.includes('#101/g9')&&action.includes('request 1'),action);
-     await click('ai.execution.result.copy_output');assert((await clipboard()).includes('ACTUAL_TERMINAL_OUTPUT'));
+     assert((await copied('ai.execution.result.copy_output')).includes('ACTUAL_TERMINAL_OUTPUT'));
      assert.equal(text(await visible('ai.execution.result.summary')),summary);
      assert(!(await h.query('ai.execution.result.action_feedback')).some(shown));
      (report.actions??=[]).push({state,view_terminal:action,copy_output:'ACTUAL_TERMINAL_OUTPUT',stop:0,takeover:0});
@@ -110,7 +123,14 @@ for(const theme of report.matrix.themes)for(const width of report.matrix.width)f
   report.checks.push(`${name}: typed real target/state/output/RecordingId, header alignment and bounded body passed`);
  }catch(error){report.primaryError??=String(error);throw error}finally{
   const shutdown:any={name,method:'already_exited'};
-  if(child.exitCode===null&&child.signalCode===null){try{await h.request('POST','/quit');shutdown.method='POST /quit';await h.waitFor(async()=>child.exitCode!==null||child.signalCode!==null||null,10000)}catch(error){shutdown.method='SIGTERM fallback';shutdown.error=String(error);child.kill('SIGTERM')}}
+  if(child.exitCode===null&&child.signalCode===null){
+   try{
+    const acknowledgement=await h.request('POST','/quit');
+    assert.equal(acknowledgement.ok,true,'preview acknowledged the quit request');
+    shutdown.method='POST /quit';
+    await h.waitFor(async()=>child.exitCode!==null||child.signalCode!==null||null,10000);
+   }catch(error){shutdown.method='SIGTERM fallback';shutdown.error=String(error);child.kill('SIGTERM')}
+  }
   Object.assign(shutdown,await ended);report.shutdown.push(shutdown);await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));
   assert.equal(shutdown.method,'POST /quit');assert.equal(shutdown.code,0);assert.equal(shutdown.signal,null);
  }

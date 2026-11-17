@@ -17,6 +17,11 @@ import time
 import paramiko
 from fixed_forward import Connection, Echo, Peer, remote_listen
 from shared_forward import recv_exact, wait_file
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 RESPONSE = bytes(range(256)) * 4096 + b'response-after-fin'
 PAYLOAD = bytes(range(256)) * 513 + b'request-before-fin'
@@ -214,6 +219,7 @@ def main():
     modes = ('local-half-close', 'remote-half-close', 'local-recovery', 'remote-recovery', 'remote-cancel', 'remote-timeout')
     parser.add_argument('--mode', choices=modes)
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     args.out.mkdir(parents=True, exist_ok=False)
     results = []
     try:

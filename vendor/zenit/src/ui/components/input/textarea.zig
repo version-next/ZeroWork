@@ -32,6 +32,8 @@ const hooks = @import("../../hooks.zig");
 const recipe_mod = @import("../../recipe.zig");
 const editable_block = @import("../editable_block/mod.zig");
 const styles = @import("styles.zig");
+const control_shell = @import("../control_shell/mod.zig");
+const shell_styles = @import("../control_shell/_styles.yss.zig");
 const virtual_list = @import("../virtual_list/mod.zig");
 const VirtualListState = virtual_list.VirtualListState;
 const scroll_area_event = @import("../scroll_area/event.zig");
@@ -62,13 +64,72 @@ const HistoryStash = @import("history_stash.zig").HistoryStash;
 // ============================================================================
 
 const UndoEntry = struct {
+    const page_size = 16 * 1024;
+    const paged_threshold = 128 * 1024;
+    const Page = struct {
+        bytes: []const u8,
+        refs: usize = 1,
+
+        fn create(allocator: Allocator, bytes: []const u8) !*Page {
+            const page = try allocator.create(Page);
+            errdefer allocator.destroy(page);
+            page.* = .{ .bytes = try allocator.dupe(u8, bytes) };
+            return page;
+        }
+
+        fn release(self: *Page, allocator: Allocator) void {
+            self.refs -= 1;
+            if (self.refs != 0) return;
+            allocator.free(self.bytes);
+            allocator.destroy(self);
+        }
+    };
+
     text: ?[]const u8 = null,
+    pages: []*Page = &.{},
     cursor_offset: usize = 0,
     anchor: ?usize = null,
 
+    // Share equal pages with the adjacent snapshot. Each entry owns its
+    // references independently, so eviction and rejected edits can drop
+    // or restore entries without keeping a chain of older snapshots alive.
+    fn capture(allocator: Allocator, bytes: []const u8, cursor: DocCursor(TextareaDocument), adjacent: ?*const UndoEntry) !UndoEntry {
+        var entry = UndoEntry{ .cursor_offset = cursor.offset, .anchor = cursor.anchor };
+        if (bytes.len < paged_threshold) {
+            entry.text = try allocator.dupe(u8, bytes);
+            return entry;
+        }
+        const pages = try allocator.alloc(*Page, std.math.divCeil(usize, bytes.len, page_size) catch unreachable);
+        errdefer allocator.free(pages);
+        var filled: usize = 0;
+        errdefer for (pages[0..filled]) |page| page.release(allocator);
+        const previous_pages = if (adjacent) |previous| previous.pages else &.{};
+        for (pages, 0..) |*out, i| {
+            const start = i * page_size;
+            const part = bytes[start..][0..@min(page_size, bytes.len - start)];
+            out.* = if (i < previous_pages.len and std.mem.eql(u8, previous_pages[i].bytes, part)) blk: {
+                const shared = previous_pages[i];
+                shared.refs += 1;
+                break :blk shared;
+            } else try Page.create(allocator, part);
+            filled += 1;
+        }
+        entry.pages = pages;
+        return entry;
+    }
+
+    fn join(self: *const UndoEntry, allocator: Allocator) ![]u8 {
+        const last = self.pages[self.pages.len - 1];
+        const bytes = try allocator.alloc(u8, (self.pages.len - 1) * page_size + last.bytes.len);
+        for (self.pages, 0..) |page, i| @memcpy(bytes[i * page_size ..][0..page.bytes.len], page.bytes);
+        return bytes;
+    }
+
     pub fn deinit(self: *UndoEntry, allocator: Allocator) void {
         if (self.text) |t| allocator.free(t);
-        self.text = null;
+        for (self.pages) |page| page.release(allocator);
+        allocator.free(self.pages);
+        self.* = .{};
     }
 };
 
@@ -122,11 +183,14 @@ pub const TextareaState = struct {
     /// Selection underlay (must draw under text, else selection color blocks glyphs)
     selection_underlay_node: ?*Node = null,
     input_container_node: ?*Node = null,
-    focus_ring_host: ?*Node = null,
     /// Mixed bidi selections can produce several rectangles per display line,
     /// so this storage must not impose a line/run-count ceiling.
     extra_sel_nodes: std.ArrayListUnmanaged(*Node) = .empty,
     extra_preedit_nodes: std.ArrayListUnmanaged(*Node) = .empty,
+    /// Highlighted ranges drawn under the text (`setDecorations`): mention chips, search hits.
+    decorations: std.ArrayListUnmanaged(TextDecoration) = .empty,
+    deco_nodes: std.ArrayListUnmanaged(*Node) = .empty,
+    deco_icons: std.ArrayListUnmanaged(DecoIcon) = .empty,
 
     // ===== VirtualList =====
     vl_state: ?*VirtualListState = null,
@@ -143,26 +207,35 @@ pub const TextareaState = struct {
     last_mouse_down_instant: ?@import("zenit_time").Instant = null,
     last_mouse_down_pos: [2]f32 = .{ 0, 0 },
     consecutive_mouse_downs: u8 = 0,
-    hover_signal: ?*Signal(bool) = null,
     has_error: bool = false,
-    borderless: bool = false,
     dirty: bool = false,
 
     // ===== Metrics =====
     measure_fn: ?MeasureFn = null,
     char_width: f32 = 7.8,
     font_size: f32 = 13.0,
+    /// Monospace face for the text rows (TextareaProps.monospace).
+    monospace: bool = false,
     font_weight: u16 = 400,
     padding_h: f32 = 8.0,
     padding_v: f32 = 8.0,
     line_height: f32 = 20.0,
     input_inner_w: f32 = 0,
+    /// `TextareaProps.auto_rows`: the field's height follows the display line count (see
+    /// `autoRowsHeight`); `auto_frame` is the field frame style's source, written by
+    /// textareaBeforeRender when the height changes. null = the fixed `rows` height.
+    auto_rows: ?AutoRows = null,
+    auto_frame: ?*Signal(styles.TextareaFrame) = null,
     container_x: f32 = 0,
     container_y: f32 = 0,
 
     // ===== External refs =====
     cx_ref: ?*Cx = null,
     tokens: *const ThemeTokens = &theme.dark,
+    /// Label / helper text boxes (null when not built): recolored when `tokens` follows a theme
+    /// publication (textareaBeforeRender).
+    label_text_node: ?*Node = null,
+    helper_text_node: ?*Node = null,
     placeholder_text: ?[]const u8 = null,
 
     // ===== Callbacks =====
@@ -171,6 +244,8 @@ pub const TextareaState = struct {
     on_ime_cancelled: ?core_ui.HandlerRef = null,
     /// Dynamic disable: true makes event handler ignore all input
     disabled: bool = false,
+    /// Read-only: the text can be focused, selected and copied, not edited (see `readonlyGate`).
+    readonly: bool = false,
 
     const blink_half_period_ns: i128 = 500 * std.time.ns_per_ms;
 
@@ -229,6 +304,7 @@ pub const TextareaState = struct {
             .font_family = "system",
             .font_size = self.font_size,
             .font_weight = self.font_weight,
+            .use_monospace = self.monospace,
         }) catch return null;
         return .{ .start = start, .end = end, .display_line = display_line, .line = line };
     }
@@ -739,11 +815,24 @@ pub const TextareaState = struct {
         self.ime_render_buffer.deinit(self.allocator);
         self.extra_sel_nodes.deinit(self.allocator);
         self.extra_preedit_nodes.deinit(self.allocator);
+        self.decorations.deinit(self.allocator);
+        self.deco_nodes.deinit(self.allocator);
+        self.deco_icons.deinit(self.allocator);
+    }
+
+    /// Replace the highlighted ranges (UTF-8 byte offsets into the current text). Each is drawn
+    /// as a rounded rectangle under the glyphs, split across soft-wrapped lines like a selection;
+    /// a range that no longer fits the text (stale offsets) is skipped. The text itself is not
+    /// changed: the caller keeps the ranges in step with its edits.
+    pub fn setDecorations(self: *TextareaState, items: []const TextDecoration) void {
+        self.decorations.clearRetainingCapacity();
+        self.decorations.appendSlice(self.allocator, items) catch {};
+        self.markDirty();
     }
 
     fn pushUndoChecked(self: *TextareaState) !void {
-        const txt = try self.allocator.dupe(u8, self.doc.getText());
-        const entry = UndoEntry{ .text = txt, .cursor_offset = self.cursor.offset, .anchor = self.cursor.anchor };
+        const previous = if (self.undo_count > 0) &self.undo_stack[self.undo_count - 1] else null;
+        const entry = try UndoEntry.capture(self.allocator, self.doc.getText(), self.cursor, previous);
         const in_txn = self.user_edit.depth > 0;
         if (self.undo_count < 32) {
             self.undo_stack[self.undo_count] = entry;
@@ -874,10 +963,12 @@ pub const TextareaState = struct {
         const target_count = if (redo_direction) &self.undo_count else &self.redo_count;
         if (source_count.* == 0) return;
         const snapshot = &source[source_count.* - 1];
-        var prepared = try self.doc.prepareReplace(0, self.doc.totalLength(), snapshot.text orelse "");
+        const joined = if (snapshot.pages.len > 0) try snapshot.join(self.allocator) else null;
+        defer if (joined) |bytes| self.allocator.free(bytes);
+        const snapshot_text = if (joined) |bytes| bytes else snapshot.text orelse "";
+        var prepared = try self.doc.prepareReplace(0, self.doc.totalLength(), snapshot_text);
         defer prepared.deinit();
-        const current_text = try self.allocator.dupe(u8, self.doc.getText());
-        const current: UndoEntry = .{ .text = current_text, .cursor_offset = self.cursor.offset, .anchor = self.cursor.anchor };
+        const current = try UndoEntry.capture(self.allocator, self.doc.getText(), self.cursor, snapshot);
         if (target_count.* == target.len) {
             target[0].deinit(self.allocator);
             for (0..target.len - 1) |i| target[i] = target[i + 1];
@@ -1035,6 +1126,7 @@ pub const TextareaState = struct {
         if (elapsed == 0) return true;
         const speed = 200 + @min(@abs(distance), 200) * 4;
         const step = speed * @as(f32, @floatCast(elapsed / 1000));
+        if (core_ui.host_native_text_fields) return false; // the native <textarea> scrolls itself
         @import("../scroll_area/mod.zig").setScrollY(vl.scroll_state, vl.content_node, scroll + (if (distance < 0) -step else step));
         self.cursor.offset = self.hitTestAt(pointer.x, if (distance < 0) top else @max(top, bottom - 1));
         self.markDirty();
@@ -1058,7 +1150,18 @@ pub const TextareaState = struct {
         if (self.visualLineForSegment(seg.start, seg.end, dl)) |geometry| {
             const position = geometry.line.xToPosition(.{ .value = target_x });
             self.cursor_affinity = position.affinity;
-            return seg.start + position.byte.value;
+            const byte = seg.start + position.byte.value;
+            // Shaping affinity disambiguates bidi caret stops within one row. At a
+            // soft-wrap endpoint the same byte also belongs to the adjacent row:
+            // preserve the row selected by y before resolving the rendered caret.
+            if (byte == seg.end and dl + 1 < self.wrap_map.displayLineCount()) {
+                const next = safeSegRange(self.doc, self.wrap_map.displayLineInfo(dl + 1, self.doc));
+                if (next.start == byte) self.cursor_affinity = .upstream;
+            } else if (byte == seg.start and dl > 0) {
+                const previous = safeSegRange(self.doc, self.wrap_map.displayLineInfo(dl - 1, self.doc));
+                if (previous.end == byte) self.cursor_affinity = .downstream;
+            }
+            return byte;
         }
         self.cursor_affinity = .downstream;
         const txt = self.doc.getText();
@@ -1297,6 +1400,7 @@ pub const TextareaState = struct {
             .font_family = "system",
             .font_size = self.font_size,
             .font_weight = self.font_weight,
+            .use_monospace = self.monospace,
         }) catch return null;
         return .{ .line = line, .insert_offset = insert };
     }
@@ -1338,6 +1442,10 @@ pub const TextareaState = struct {
     fn measureSlice(self: *const TextareaState, text: []const u8) f32 {
         if (text.len == 0) return 0;
         if (self.cx_ref) |cx| {
+            if (self.monospace) {
+                const line = cx.text.visualLine(.{ .text = text, .font_family = "system", .font_size = self.font_size, .font_weight = self.font_weight, .use_monospace = true }) catch return 0;
+                return line.width;
+            }
             return cx.text.measureTextWidth(text, self.font_size, self.font_weight, false);
         }
         if (self.measure_fn) |mfn| return mfn(text.ptr, text.len, self.font_size, self.font_weight, false);
@@ -1464,12 +1572,63 @@ test "textarea sanitizeText: 剥离 ANSI ESC 序列而非只删 ESC 字节" {
 
 /// Each event is one user edit txn (see TextareaState.beginUserEdit / events.zig
 /// inputEventHandler)
+/// Textarea field (ControlShell root): focus / blur update editing state here, as events, never
+/// by replacing the node's on_focus / on_blur (the shell's :focus hooks live there). Blur clears
+/// even while disabled (disable revokes focus), then runs as an edit transaction.
+pub fn textareaFieldEventHandler(event: Event, context: ?*anyopaque) EventResult {
+    const state: *TextareaState = @ptrCast(@alignCast(context orelse return .ignored));
+    switch (event) {
+        .focus => state.focused = true,
+        .blur => {
+            state.focused = false;
+            state.cancelImeComposition();
+            state.cursor.anchor = null;
+            state.is_dragging = false;
+            state.drag_pointer = null;
+            state.suspend_drag_until_mouse_up = false;
+            state.consecutive_mouse_downs = 0;
+            state.last_mouse_down_instant = null;
+        },
+        else => {},
+    }
+    return textareaEventHandler(event, context);
+}
+
 pub fn textareaEventHandler(event: Event, context: ?*anyopaque) EventResult {
     const state: *TextareaState = @ptrCast(@alignCast(context orelse return .ignored));
     if (state.disabled) return .ignored;
+    if (state.readonly) if (readonlyGate(event)) |result| return result;
     state.beginUserEdit();
     defer state.endUserEdit();
     return handleTextareaEvent(state, event);
+}
+
+/// Read-only Textarea (same set as the single-line Input): caret movement, select all, copy, pointer
+/// selection and focus traversal pass; text input, IME, paste, cut, undo / redo, Enter and the
+/// other editing keys stop here (handled, so they do not bubble as if unconsumed). null = pass on.
+fn readonlyGate(event: Event) ?EventResult {
+    switch (event) {
+        .text_input, .ime_preedit, .ime_commit, .ime_delete_surrounding => return .handled,
+        .key_down => |e| {
+            if (e.key == .tab) return .ignored; // focus traversal
+            const allowed = switch (e.key) {
+                .left, .right, .up, .down, .home, .end, .page_up, .page_down, .escape => true,
+                .a, .c => events_mod.primaryModifier(e.modifiers),
+                else => false,
+            };
+            if (!allowed) return .handled;
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// The native text client (IME, dictation, text services) is attached exactly when the Textarea is
+/// editable: not statically disabled (no handlers) and not read-only. A focused Textarea's text input
+/// session is refreshed at once (a change from a timer reaches the IME without waiting for an event).
+fn syncTextareaClient(cx: *Cx, state: *TextareaState, node: *Node, static_disabled: bool) void {
+    node.behavior.interaction.text_input_client = if (!static_disabled and !state.readonly) textareaLiveClient(state) else null;
+    if (cx.focus_manager.getFocused() == node) cx.refreshTextInputSession();
 }
 
 fn handleTextareaEvent(state: *TextareaState, event: Event) EventResult {
@@ -1634,7 +1793,7 @@ fn handleTextareaEvent(state: *TextareaState, event: Event) EventResult {
                     vl_state.scroll_state.scroll_y = std.math.clamp(vl_state.scroll_state.scroll_y - scroll.dy, 0, max_sy);
                     if (vl_state.scroll_state.scroll_y == prev_sy) return .ignored;
                     vl_state.content_node.style.translate_y = -vl_state.scroll_state.effectiveScrollY();
-                    vl_state.content_node.markCompositePropDirty();
+                    vl_state.content_node.markHitLayerMotionPropDirty();
                     return .handled;
                 }
             }
@@ -1670,12 +1829,15 @@ fn textareaRenderItem(item_node: *Node, index: usize, cx: *Cx, user_context: ?*a
         line_content = replacement.compose(line_content, seg.start, "", false, state.ime_render_buffer.items);
     }
     const has_content = state.doc.totalLength() > 0 or state.hasImePreedit();
+    if (!has_content and index == 0) line_content = state.placeholder_text orelse "";
+    const plain_row = has_content and !state.hasImePreedit() and state.ime_replacement == null;
 
-    @import("row_text.zig").setEditable(item_node, cx, line_content, if (has_content) state.tokens.tokens.color.fg_primary else state.tokens.tokens.color.fg_secondary, state.font_size, state.font_weight, state.line_height) catch {
+    @import("row_text.zig").setEditableFace(item_node, cx, line_content, if (state.disabled) state.tokens.tokens.color.fg_disabled else if (has_content) state.tokens.tokens.color.fg_primary else state.tokens.tokens.color.fg_secondary, state.font_size, state.font_weight, state.line_height, state.monospace) catch {
         state.dirty = true;
         @import("row_text.zig").retry(cx, state.input_container_node orelse item_node);
         return;
     };
+    applyDecorationSpans(state, item_node, cx, if (plain_row) seg.start else 0, if (plain_row) seg.end else 0);
 }
 
 // ============================================================================
@@ -1689,7 +1851,7 @@ fn textareaA11yScroll(context: *anyopaque, start: u32, end: u32, align_top: bool
     if ((start < text.len and text[start] & 0xc0 == 0x80) or (end < text.len and text[end] & 0xc0 == 0x80)) return false;
     const first = text_coordinates.clampByteOffset(text, .{ .value = start }, .backward).value;
     const last = text_coordinates.clampByteOffset(text, .{ .value = end }, .forward).value;
-    state.a11y_scroll_request = .{ .start = @intCast(first), .end = @intCast(last), .align_top = align_top, .text_hash = std.hash.Wyhash.hash(0, text), .caret = state.cursor.offset, .anchor = state.cursor.anchor };
+    state.a11y_scroll_request = .{ .start = @intCast(first), .end = @intCast(last), .align_top = align_top, .text_hash = @import("trace").work_counters.hashText(0, text), .caret = state.cursor.offset, .anchor = state.cursor.anchor };
     if (state.input_container_node) |node| node.markRenderDirty();
     return true;
 }
@@ -1699,11 +1861,12 @@ fn applyTextareaA11yScroll(state: *TextareaState) void {
     if (state.wrap_map.enabled and (state.wrap_map.needs_rebuild or state.wrap_map.has_interpolated_lines)) return;
     state.a11y_scroll_request = null;
     const text = state.getText();
-    if (request.text_hash != std.hash.Wyhash.hash(0, text) or request.caret != state.cursor.offset or request.anchor != state.cursor.anchor) return;
+    if (request.text_hash != @import("trace").work_counters.hashText(0, text) or request.caret != state.cursor.offset or request.anchor != state.cursor.anchor) return;
     const list = state.vl_state orelse return;
     const offset = if (request.align_top) request.start else if (request.end > request.start) grapheme.prevBoundary(text, request.end) else request.end;
     const point = state.doc.offsetToLineCol(offset);
     const row = state.wrap_map.bufferToDisplay(point.line, point.col).display_line;
+    if (core_ui.host_native_text_fields) return; // the native <textarea> scrolls itself
     virtual_list.scrollIndexIntoView(list, row, if (request.align_top) .start else .end);
 }
 
@@ -1817,8 +1980,29 @@ fn textareaA11yCarets(context: *anyopaque, allocator: Allocator) ![]core_ui.A11y
     return output.toOwnedSlice(allocator);
 }
 
+fn recolorBoxText(node: *Node, color: Color) void {
+    var txt = node.getText() orelse return;
+    txt.color = color;
+    txt.color_set = true;
+    node.setText(txt);
+    node.markRenderDirty();
+}
+
 fn textareaBeforeRender(node: *Node) void {
+    // Dirty marks describe this paint. Blink, edge drag, pending wrapping and
+    // allocation retries already schedule their own future deadlines.
+    @import("../../core/redraw.zig").consumeCurrentFrame(node, @intFromPtr(&textareaBeforeRender));
     const state: *TextareaState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
+    // Rows, caret, selection and IME colors read `state.tokens`; theme replay runs this hook after
+    // `Cx.setTheme` (see input/render.zig followThemeTokens), so follow the window's tokens and
+    // repaint the rows without touching the document, cursor or composition.
+    if (state.cx_ref) |cx| if (state.tokens != cx.tokens) {
+        state.tokens = cx.tokens;
+        state.markDirty();
+        // The label and helper boxes carry text built from the mount-time tokens (BoxText).
+        if (state.label_text_node) |label| recolorBoxText(label, styles.textareaLabelStyle(state.tokens).color);
+        if (state.helper_text_node) |helper| recolorBoxText(helper, styles.textareaHelperStyle(state.tokens, state.has_error).color);
+    };
     if (node.behavior.interaction.a11y) |*a11y| {
         const selection = state.cursor.selection();
         a11y.value_text = state.getText();
@@ -1844,6 +2028,21 @@ fn textareaBeforeRender(node: *Node) void {
                 }
             }.set,
             .scroll_into_view = textareaA11yScroll,
+            .scroll_y = if (state.vl_state) |vl| vl.scroll_state.scroll_y else 0,
+            .set_scroll = struct {
+                fn set(context: *anyopaque, _: f32, y: f32) bool {
+                    const textarea: *TextareaState = @ptrCast(@alignCast(context));
+                    const vl = textarea.vl_state orelse return false;
+                    // The browser reports whole pixels: within 1px of the end is the end, or
+                    // the last fractional pixel keeps the bottom fade on.
+                    const max = vl.scroll_state.maxScrollY();
+                    const v = if (y >= max - 1) max else y;
+                    if (@abs(vl.scroll_state.scroll_y - v) < 0.01) return false;
+                    @import("../scroll_area/mod.zig").setScrollY(vl.scroll_state, vl.content_node, v);
+                    textarea.markDirty();
+                    return true;
+                }
+            }.set,
             .line_boundaries = textareaA11yLines,
             .geometry_segments = textareaA11yGeometry,
             .row_geometry = textareaA11yRows,
@@ -1851,20 +2050,22 @@ fn textareaBeforeRender(node: *Node) void {
             .frame_for_range = textareaA11yFrame,
             .range_at_point = textareaA11yRangeAtPoint,
         };
+        // Readonly / disabled: readable and selectable text, never writable from outside.
+        if (a11y.readonly or a11y.disabled) a11y.editable_text.?.set_value = null;
     }
 
-    // Keep wrapping and virtual row pitch in step with programmatic font changes.
+    // Keep wrapping and virtual row pitch in step with programmatic font metric changes.
     if (state.wrap_map.font_size != state.font_size or state.wrap_map.font_weight != state.font_weight or state.wrap_map.char_width != state.char_width) {
         state.wrap_map.font_size = state.font_size;
         state.wrap_map.font_weight = state.font_weight;
         state.wrap_map.char_width = state.char_width;
         state.wrap_map.rebuildAll(state.doc);
-        state.dirty = true;
+        state.markDirty();
     }
     if (state.vl_state) |list| if (list.props.item_height != state.line_height) {
         list.props.item_height = state.line_height;
         virtual_list.updateItemCount(list, list.item_count);
-        state.dirty = true;
+        state.markDirty();
     };
 
     // Metrics sync
@@ -1888,6 +2089,8 @@ fn textareaBeforeRender(node: *Node) void {
             if (state.cx_ref) |cx| cx.scheduleRedrawAfterNs(16 * std.time.ns_per_ms);
         }
     }
+
+    syncAutoRows(state);
 
     // Caret blink
     const now = @import("zenit_time").Instant.now(state.io) catch null;
@@ -1927,7 +2130,9 @@ fn textareaBeforeRender(node: *Node) void {
             const dp = state.cursorDisplayPoint();
             // Autoscroll owns a continuous pixel offset. ensureVisible would
             // round partial bottom rows up every frame and accelerate dragging.
-            if (!edge_scrolling) virtual_list.ensureVisible(vl_state, dp.display_line);
+            // A native <textarea> (core_ui.host_native_text_fields) scrolls itself and reports
+            // its scrollTop through EditableText.set_scroll.
+            if (!edge_scrolling and !core_ui.host_native_text_fields) virtual_list.ensureVisible(vl_state, dp.display_line);
         }
         node.markRenderDirty();
     }
@@ -1994,6 +2199,9 @@ fn textareaBeforeRender(node: *Node) void {
             cnode.markRenderDirty();
         }
     }
+
+    // Decorations (under the selection: both under the glyphs)
+    drawDecorations(state, container_inner_x, container_inner_y, scroll_y);
 
     // Selection node
     if (state.selection_node) |sel| {
@@ -2247,13 +2455,153 @@ fn textareaLiveClient(state: *TextareaState) core_ui.TextInputClient {
     };
 }
 
+/// A highlighted text range (`TextareaState.setDecorations`).
+pub const TextDecoration = struct {
+    start: usize,
+    end: usize,
+    fill: Color,
+    border: Color = Color.TRANSPARENT,
+    radius: f32 = 4,
+    /// Extra width on each side and height trimmed from the line box, so a chip reads as a pill
+    /// around its text instead of a full-height bar.
+    pad_x: f32 = 2,
+    inset_y: f32 = 1,
+    /// The text in the range paints in this color (a paint-only span on each row: the caret,
+    /// wrapping and hit testing are unchanged).
+    text_color: ?Color = null,
+    /// An icon over the start of the range, centered on the line. The caller leaves room for it
+    /// in the text (an em space before a label, say).
+    icon: ?core_ui.svg_assets.Asset = null,
+    icon_color: Color = Color.TRANSPARENT,
+    icon_size: f32 = 12,
+    /// From the range's left edge.
+    icon_dx: f32 = 1,
+};
+
+const DecoIcon = struct { node: *Node, icon_id: u32, tint: Color };
+
+fn placeDecoIcon(state: *TextareaState, cx: *Cx, index: usize, d: TextDecoration, x: f32, y: f32) bool {
+    const asset = d.icon.?;
+    const id: u32 = if (asset.icon_id) |i| @intCast(i) else 0;
+    var created = false;
+    if (index < state.deco_icons.items.len) {
+        const e = state.deco_icons.items[index];
+        if (e.icon_id != id or !Color.eql(e.tint, d.icon_color)) {
+            const overlay = e.node.parent;
+            if (overlay) |o| o.removeChild(e.node);
+            cx.freeNode(e.node);
+            _ = state.deco_icons.orderedRemove(index);
+        }
+    }
+    if (index == state.deco_icons.items.len) {
+        const overlay = state.overlay_node orelse return false;
+        const n = core_ui.iconTint(cx, asset, d.icon_color, .{ .width = .{ .px = d.icon_size }, .height = .{ .px = d.icon_size } }) catch return false;
+        overlay.insertChildBefore(cx.allocator, n, if (overlay.children.items.len > 0) overlay.children.items[0] else null) catch {
+            cx.freeNode(n);
+            return false;
+        };
+        state.deco_icons.append(state.allocator, .{ .node = n, .icon_id = id, .tint = d.icon_color }) catch return false;
+        created = true;
+    }
+    const n = state.deco_icons.items[index].node;
+    n.setLayoutRect(.{ .x = @round(x), .y = @round(y), .w = d.icon_size, .h = d.icon_size });
+    n.markRenderDirty();
+    return created;
+}
+
+/// Paint-only color spans for a row from the decorations that set `text_color`.
+fn applyDecorationSpans(state: *TextareaState, node: *Node, cx: *Cx, seg_start: usize, seg_end: usize) void {
+    var buf: [16]core_ui.TextSpan = undefined;
+    var count: usize = 0;
+    for (state.decorations.items) |d| {
+        const color = d.text_color orelse continue;
+        const a = @max(d.start, seg_start);
+        const b = @min(d.end, seg_end);
+        if (b <= a or count == buf.len) continue;
+        buf[count] = .{ .start = @intCast(a - seg_start), .end = @intCast(b - seg_start), .color = color };
+        count += 1;
+    }
+    const want = buf[0..count];
+    var t = node.getTextRaw() orelse return;
+    if (t.spans.len == want.len) {
+        var same = true;
+        for (t.spans, want) |x, y| {
+            if (x.start != y.start or x.end != y.end or !Color.eql(x.color orelse Color.TRANSPARENT, y.color.?)) same = false;
+        }
+        if (same) return;
+    }
+    const owned = if (count > 0) (cx.allocator.dupe(core_ui.TextSpan, want) catch return) else &.{};
+    t.spans = owned;
+    t.spans_owned = count > 0;
+    t.spans_affect_layout = false;
+    node.setText(t);
+    node.markRenderDirty();
+}
+
+fn drawDecorations(state: *TextareaState, inner_x: f32, inner_y: f32, scroll_y: f32) void {
+    const overlay = state.selection_underlay_node orelse return;
+    const cx = state.cx_ref orelse return;
+    var used: usize = 0;
+    var created = false;
+    var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
+    defer placements.deinit(state.allocator);
+    const text_len = state.doc.totalLength();
+    var icons_used: usize = 0;
+    for (state.decorations.items) |d| {
+        if (d.end <= d.start or d.end > text_len) continue;
+        placements.clearRetainingCapacity();
+        state.collectRangePlacements(d.start, d.end, state.allocator, &placements) catch continue;
+        if (d.icon != null and placements.items.len > 0) {
+            const p = placements.items[0];
+            const line_y = inner_y + @as(f32, @floatFromInt(p.display_line)) * state.line_height - scroll_y;
+            if (placeDecoIcon(state, cx, icons_used, d, inner_x + p.rect.x + d.icon_dx, line_y + (state.line_height - d.icon_size) / 2)) created = true;
+            icons_used += 1;
+        }
+        for (placements.items) |p| {
+            if (used == state.deco_nodes.items.len) {
+                // Border and corner radius are set once here: changing them per frame would make the
+                // layer lay out again after this pass and undo every rect placed in it (the caret's
+                // too). Per frame only the rect and the colors change.
+                const n = box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 }, .corner_radius = d.radius, .border = .{ .width = 1, .color = Color.TRANSPARENT } }, .{}) catch return;
+                // First in the underlay: the selection paints over decorations.
+                overlay.insertChildBefore(cx.allocator, n, if (overlay.children.items.len > 0) overlay.children.items[0] else null) catch return;
+                state.deco_nodes.append(state.allocator, n) catch return;
+                created = true;
+            }
+            const n = state.deco_nodes.items[used];
+            used += 1;
+            n.setLayoutRect(.{
+                .x = @round(inner_x + p.rect.x - d.pad_x),
+                .y = @round(inner_y + @as(f32, @floatFromInt(p.display_line)) * state.line_height - scroll_y + d.inset_y),
+                .w = @round(p.rect.width + d.pad_x * 2),
+                .h = @max(state.line_height - d.inset_y * 2, 1),
+            });
+            n.setBackgroundRaw(d.fill);
+            n.setBorderColor(d.border);
+            n.markRenderDirty();
+        }
+    }
+    // A node inserted now gets its box from this frame's layout pass (0 × 0); placing it again
+    // next frame keeps it where it belongs.
+    if (created) state.markDirty();
+    for (state.deco_icons.items[@min(icons_used, state.deco_icons.items.len)..]) |e| {
+        e.node.setLayoutRect(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+        e.node.markRenderDirty();
+    }
+    for (state.deco_nodes.items[used..]) |n| {
+        n.setLayoutRect(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+        n.setBackgroundRaw(Color.TRANSPARENT);
+        n.setBorderColor(Color.TRANSPARENT);
+        n.markRenderDirty();
+    }
+}
+
 fn ensureExtraSelNodes(state: *TextareaState, needed: usize) void {
     const overlay = state.selection_underlay_node orelse return;
     const cx = state.cx_ref orelse return;
     while (state.extra_sel_nodes.items.len < needed) {
         const esel = box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{}) catch return;
         overlay.appendChild(cx.allocator, esel) catch return;
-        esel.parent = overlay;
         state.extra_sel_nodes.append(state.allocator, esel) catch return;
     }
 }
@@ -2276,7 +2624,6 @@ fn ensureExtraPreeditNodes(state: *TextareaState, needed: usize) void {
     while (state.extra_preedit_nodes.items.len < needed) {
         const underline = box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{}) catch return;
         overlay.appendChild(cx.allocator, underline) catch return;
-        underline.parent = overlay;
         state.extra_preedit_nodes.append(state.allocator, underline) catch return;
     }
 }
@@ -2291,6 +2638,374 @@ fn hideExtraPreeditNodesFrom(state: *TextareaState, start: usize) void {
         underline.setBackgroundRaw(Color.TRANSPARENT);
         underline.markRenderDirty();
     }
+}
+
+fn frameBorderTarget(n: *Node) Color {
+    if (n.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(.border_color)) |slot| if (slot.active) return slot.to_color;
+    return n.style.border.color;
+}
+
+test "Textarea: 框跟随外壳——静止 / 悬停 / 聚焦（1.5px accent）/ 动态出错（聚焦也保持 1px）/ 动态禁用；编辑态的焦点处理不顶掉外壳钩子" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const err = try scope.createSignal([]const u8, "");
+    const disabled = try scope.createSignal(bool, false);
+    const mounted = try Textarea(.{ .value = "a", .error_msg = err, .disabled = disabled }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    cx.layout();
+    _ = cx.render();
+    const c = cx.tokens.tokens.color;
+    const field = mounted.input;
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(field)));
+    try std.testing.expect(Color.eql(c.input_bg, field.getBackground()));
+    try std.testing.expectEqual(@as(f32, 1), field.style.border.width);
+
+    field.behavior.events.on_hover.?.invoke();
+    try std.testing.expect(Color.eql(c.accent, frameBorderTarget(field)));
+    field.behavior.events.on_leave.?.invoke();
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(field)));
+
+    cx.setFocus(field);
+    try std.testing.expect(mounted.state.focused);
+    try std.testing.expect(Color.eql(c.accent, frameBorderTarget(field)));
+    try std.testing.expectEqual(@as(f32, 1.5), field.style.border.width);
+    cx.clearFocus();
+    try std.testing.expect(!mounted.state.focused);
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(field)));
+    try std.testing.expectEqual(@as(f32, 1), field.style.border.width);
+
+    err.set("required");
+    try std.testing.expect(Color.eql(c.danger, frameBorderTarget(field)));
+    cx.setFocus(field);
+    try std.testing.expect(Color.eql(c.danger, frameBorderTarget(field)));
+    try std.testing.expectEqual(@as(f32, 1), field.style.border.width);
+    cx.clearFocus();
+    err.set("");
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(field)));
+
+    cx.setFocus(field);
+    disabled.set(true);
+    try std.testing.expect(!cx.isFocused(field));
+    try std.testing.expect(!mounted.state.focused);
+    try std.testing.expect(Color.eql(c.border, frameBorderTarget(field)));
+    try std.testing.expect(!field.behavior.interaction.focusable);
+    try std.testing.expectEqual(core_ui.CursorShape.default, field.style.cursor);
+}
+
+test "Textarea: embedded leaves the frame to the compound control in every state" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const err = try scope.createSignal([]const u8, "");
+    const mounted = try Textarea(.{ .value = "a", .rows = 1, .error_msg = err, .embedded = true }).mountResult(scope, cx);
+    const plain = try Textarea(.{ .value = "a", .rows = 1 }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    try root.appendChild(alloc, plain.wrapper);
+    cx.layout();
+    _ = cx.render();
+    const field = mounted.input;
+    const transparent = cx.tokens.tokens.color.transparent;
+    const expectBare = struct {
+        fn check(n: *Node, clear: Color) !void {
+            try std.testing.expectEqual(@as(f32, 0), n.style.border.width);
+            try std.testing.expect(Color.eql(clear, n.getBackground()));
+        }
+    }.check;
+
+    try expectBare(field, transparent);
+    try std.testing.expectEqual(@as(f32, 0), mounted.state.padding_h);
+    // The field fills its wrapper, which the compound control sizes; state changes keep it.
+    try std.testing.expectApproxEqAbs(mounted.wrapper.rectFromWorldOrFallback().h, field.rectFromWorldOrFallback().h, 0.01);
+    mounted.wrapper.setStyleInline(alloc, .{ .height = .{ .px = 90 } });
+    cx.layout();
+    try std.testing.expectApproxEqAbs(@as(f32, 90), field.rectFromWorldOrFallback().h, 0.01);
+    try std.testing.expect(field.meta.per_frame.hooks.slots.focus_ring_anim == null);
+    try std.testing.expect(plain.input.meta.per_frame.hooks.slots.focus_ring_anim != null);
+    try std.testing.expect(plain.state.padding_h > 0);
+
+    field.behavior.events.on_hover.?.invoke();
+    try expectBare(field, transparent);
+    field.behavior.events.on_leave.?.invoke();
+    cx.setFocus(field);
+    try std.testing.expect(mounted.state.focused);
+    try expectBare(field, transparent);
+    err.set("required");
+    try expectBare(field, transparent);
+    cx.clearFocus();
+    err.set("");
+    try expectBare(field, transparent);
+    cx.layout();
+    try std.testing.expectApproxEqAbs(@as(f32, 90), field.rectFromWorldOrFallback().h, 0.01);
+}
+
+test "Textarea: header / footer slots make one compound field (frame, focus within, rows), none = old tree" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(420, 400);
+    const root = try box(cx, .{ .width = .{ .px = 396 }, .height = .{ .px = 400 }, .direction = .column }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+
+    // No slot: the shell is the wrapper's child, as before.
+    const plain = try Textarea(.{ .value = "a", .rows = 1 }).mountResult(scope, cx);
+    try root.appendChild(alloc, plain.wrapper);
+    try std.testing.expect(plain.frame == null and plain.header == null and plain.footer == null);
+    try std.testing.expectEqual(plain.input, plain.wrapper.children.items[0]);
+
+    var res: TextareaResult = undefined;
+    var chip: *Node = undefined;
+    var tool: *Node = undefined;
+    var outside: *Node = undefined;
+    try view.mount(scope, cx, root, .{
+        view.with(Textarea(.{ .value = "draft", .rows = 1 }), .{}).slots(.{
+            .header = view.capture(&chip, view.box(.{ .style = .{ .width = .{ .px = 120 }, .height = .{ .px = 28 } } }, {})),
+            .footer = view.capture(&tool, view.box(.{ .focusable = true, .style = .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } } }, {})),
+        }).capture(&res),
+        view.capture(&outside, view.box(.{ .focusable = true, .style = .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } } }, {})),
+    });
+    cx.layout();
+    _ = cx.render();
+    const frame = res.frame.?;
+    try std.testing.expectEqualStrings("TextareaFrame", frame.meta.ownership.meta.component_name.?);
+    try std.testing.expectEqual(frame, res.wrapper.children.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), frame.children.items.len);
+    try std.testing.expectEqual(res.header.?, chip.parent.?);
+    try std.testing.expectEqual(res.footer.?, tool.parent.?);
+    // The text draws no frame of its own; the compound frame carries the field look.
+    try std.testing.expectEqual(@as(f32, 0), res.input.style.border.width);
+    try std.testing.expect(res.input.meta.per_frame.hooks.slots.focus_ring_anim == null);
+    try std.testing.expect(res.state.padding_h > 0);
+    const c = cx.tokens.tokens.color;
+    try std.testing.expect(Color.eql(c.input_bg, frame.getBackground()));
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(frame)));
+    try std.testing.expectEqual(cx.tokens.tokens.radius.panel, frame.style.effectiveRadius());
+    // Rows: header 8 + 28, the text, footer 36; the wrapper follows.
+    const fr = frame.rectFromWorldOrFallback();
+    try std.testing.expectApproxEqAbs(@as(f32, 36), res.footer.?.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 36), res.header.?.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(fr.h, 36 + 36 + res.input.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(fr.h, res.wrapper.rectFromWorldOrFallback().h, 0.5);
+
+    // Focus in the text or in a footer control: one focused control.
+    cx.setFocus(res.input);
+    try std.testing.expect(Color.eql(c.accent, frameBorderTarget(frame)));
+    try std.testing.expectEqual(@as(f32, 1.5), frame.style.border.width);
+    cx.setFocus(tool);
+    try std.testing.expect(Color.eql(c.accent, frameBorderTarget(frame)));
+    cx.setFocus(outside);
+    try std.testing.expect(Color.eql(c.border_strong, frameBorderTarget(frame)));
+    try std.testing.expectEqual(@as(f32, 1), frame.style.border.width);
+
+    // A press on the frame's padding puts the caret in the text; one landing on a footer control
+    // (focus already inside) keeps that control's focus.
+    frame.behavior.events.on_click.?.invoke();
+    try std.testing.expect(cx.isFocused(res.input));
+    cx.setFocus(tool);
+    frame.behavior.events.on_click.?.invoke();
+    try std.testing.expect(cx.isFocused(tool));
+}
+
+test "textarea(compound): mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("textarea(compound)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            return try view.render(scope, cx, view.col(.{}, .{view.with(Textarea(.{ .value = "x", .placeholder = "Ask" }), .{}).slots(.{
+                .header = view.text(.{}, "chip"),
+                .footer = view.text(.{}, "tools"),
+            })}));
+        }
+    }.m);
+}
+
+test "Textarea: 占位符行在渲染时保持占位符颜色，不继承外壳的前景色" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Textarea(.{ .placeholder = "Write something" }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    cx.layout();
+    _ = cx.render();
+    cx.layout();
+    _ = cx.render();
+    const painted = @import("../../core/render_engine/text_render.zig").resolveNodeLogicalTextProps;
+    const find = struct {
+        fn f(n: *Node) ?*Node {
+            if (n.getText()) |txt| if (std.mem.eql(u8, txt.content, "Write something")) return n;
+            for (n.children.items) |c| if (f(c)) |hit| return hit;
+            return null;
+        }
+    }.f;
+    const text_node = find(mounted.input).?;
+    try std.testing.expect(Color.eql(cx.tokens.tokens.color.fg_secondary, painted(text_node).?.color));
+}
+
+test "Textarea: decorations draw under the text at their range and go away when cleared" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Textarea(.{ .value = "ask @db-1 now" }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    cx.layout();
+    _ = cx.render();
+    const fill = Color{ .r = 79, .g = 94, .b = 217, .a = 20 };
+    mounted.state.setDecorations(&.{.{ .start = 4, .end = 9, .fill = fill, .border = fill }});
+    cx.layout();
+    _ = cx.render();
+    // Placed by the pre-render pass (layout runs first; as for the selection underlay).
+    const node = mounted.state.input_container_node.?;
+    const hook = struct {
+        fn run(n: *Node) void {
+            var it: ?*Node = n;
+            while (it) |x| : (it = x.parent) if (x.meta.per_frame.hooks.before_render.main) |f| return f(x);
+        }
+    }.run;
+    hook(node);
+    try std.testing.expectEqual(@as(usize, 1), mounted.state.deco_nodes.items.len);
+    const deco = mounted.state.deco_nodes.items[0];
+    // Under everything else in the underlay (the selection paints over it), with a width.
+    try std.testing.expect(deco.parent.?.children.items[0] == deco);
+    const r = deco.rectFromWorldOrFallback();
+    try std.testing.expect(r.w > 20 and r.h > 4);
+    try std.testing.expect(Color.eql(fill, deco.getBackground()));
+    // A stale range is skipped; clearing hides the node.
+    mounted.state.setDecorations(&.{.{ .start = 4, .end = 400, .fill = fill }});
+    hook(node);
+    try std.testing.expect(deco.rectFromWorldOrFallback().w == 0);
+    mounted.state.setDecorations(&.{.{ .start = 4, .end = 9, .fill = fill }});
+    hook(node);
+    try std.testing.expect(deco.rectFromWorldOrFallback().w > 20);
+    mounted.state.setDecorations(&.{});
+    hook(node);
+    try std.testing.expect(deco.rectFromWorldOrFallback().w == 0);
+}
+
+test "Textarea: rows pin caret metrics; programmatic metric changes rewrap and re-pitch" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    // Enclosing typography must not reach the editable rows.
+    root.setStyleInline(alloc, .{ .font_size = 24, .font_weight = 700 });
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Textarea(.{ .value = "first line\nsecond line" }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    _ = cx.render();
+    _ = cx.render();
+    const state = mounted.state;
+    const find = struct {
+        fn f(n: *Node) ?*Node {
+            if (n.getText()) |txt| if (std.mem.eql(u8, txt.content, "first line")) return n;
+            for (n.children.items) |c| if (f(c)) |hit| return hit;
+            return null;
+        }
+    }.f;
+    const row = find(mounted.input).?;
+    const painted = row.resolveTextProps().?;
+    try std.testing.expectEqual(state.font_size, painted.font_size);
+    try std.testing.expectEqual(state.font_weight, painted.font_weight);
+    try std.testing.expectApproxEqAbs(state.line_height, painted.line_height * painted.font_size, 0.01);
+
+    state.font_size = 18;
+    state.font_weight = 600;
+    state.line_height = 26;
+    for (0..2) |_| {
+        textareaBeforeRender(mounted.input);
+        cx.layout();
+        _ = cx.render();
+    }
+    try std.testing.expectEqual(@as(f32, 18), state.wrap_map.font_size);
+    try std.testing.expectEqual(@as(u16, 600), state.wrap_map.font_weight);
+    try std.testing.expectEqual(@as(f32, 26), state.vl_state.?.props.item_height);
+    // The list re-binds its rows on its next visible-range update.
+    state.vl_state.?.updateVisibleItems();
+    const repainted = find(mounted.input).?.resolveTextProps().?;
+    try std.testing.expectEqual(@as(f32, 18), repainted.font_size);
+    try std.testing.expectEqual(@as(u16, 600), repainted.font_weight);
+}
+
+test "Textarea: monospace sets, measures and wraps the rows in the monospace face" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mono = try Textarea(.{ .value = "{\"key\": 1}", .monospace = true }).mountResult(scope, cx);
+    try root.appendChild(alloc, mono.wrapper);
+    const plain = try Textarea(.{ .value = "{\"key\": 1}" }).mountResult(scope, cx);
+    try root.appendChild(alloc, plain.wrapper);
+    _ = cx.render();
+    _ = cx.render();
+    const find = struct {
+        fn f(n: *Node) ?*Node {
+            if (n.getText()) |txt| if (std.mem.eql(u8, txt.content, "{\"key\": 1}")) return n;
+            for (n.children.items) |c| if (f(c)) |hit| return hit;
+            return null;
+        }
+    }.f;
+    try std.testing.expect(find(mono.input).?.getTextRaw().?.use_monospace_font);
+    try std.testing.expect(!find(plain.input).?.getTextRaw().?.use_monospace_font);
+    // Caret / selection measurement and wrapping use the face the rows are painted in.
+    try std.testing.expect(mono.state.monospace and !plain.state.monospace);
+    try std.testing.expect(mono.state.wrap_map.measure_ctx_fn.? == &Cx.measureMonoTextWidthCallback);
+    try std.testing.expect(plain.state.wrap_map.measure_ctx_fn.? == &Cx.measureTextWidthCallback);
+}
+
+test "Textarea: line_height / font_size / padding_v override the size tier's metrics" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Textarea(.{ .value = "first line\nsecond line", .line_height = 19, .font_size = 12, .padding_v = 0 }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    _ = cx.render();
+    _ = cx.render();
+    const state = mounted.state;
+    try std.testing.expectEqual(@as(f32, 19), state.line_height);
+    try std.testing.expectEqual(@as(f32, 12), state.font_size);
+    try std.testing.expectEqual(@as(f32, 0), state.padding_v);
+    try std.testing.expectEqual(@as(f32, 19), state.vl_state.?.props.item_height);
+    const find = struct {
+        fn f(n: *Node) ?*Node {
+            if (n.getText()) |txt| if (std.mem.eql(u8, txt.content, "first line")) return n;
+            for (n.children.items) |c| if (f(c)) |hit| return hit;
+            return null;
+        }
+    }.f;
+    const painted = find(mounted.input).?.resolveTextProps().?;
+    try std.testing.expectEqual(@as(f32, 12), painted.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 19), painted.line_height * painted.font_size, 0.01);
+    // Unset overrides keep the tier metrics.
+    const tier = try Textarea(.{ .value = "x" }).mountResult(scope, cx);
+    try root.appendChild(alloc, tier.wrapper);
+    const metrics = styles.textareaMetrics(cx.tokens, null, 4);
+    try std.testing.expectEqual(metrics.line_height, tier.state.line_height);
+    try std.testing.expectEqual(metrics.padding_v, tier.state.padding_v);
 }
 
 test "TextareaState: IME preedit text is fused into display segment content" {
@@ -2428,6 +3143,45 @@ test "TextareaState: production caret order hit testing and vertical x survive i
     try std.testing.expectEqual(line_text.len + 1 + expected_target.byte.value, state.cursor.offset);
     try std.testing.expectEqual(expected_target.affinity, state.cursor_affinity);
     try std.testing.expectApproxEqAbs(chosen.x.value, state.preferred_visual_x.?, 0.01);
+}
+
+test "Textarea soft-wrap boundary hit tests retain the clicked visual row" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    var fonts = try core_ui.FontSystem.init(std.testing.allocator, std.testing.io);
+    defer fonts.deinit();
+    cx.text.setFontSystem(&fonts);
+    defer cx.text.clearFontSystem();
+    var doc = TextareaDocument.init(std.testing.allocator);
+    defer doc.deinit();
+    doc.setText("مرحبا שלום abc 123 مرحبا שלום abc 123 مرحبا שלום abc 123");
+    var wm = TextareaWrapMap.init(std.testing.allocator, std.testing.io);
+    defer wm.deinit();
+    wm.setEnabled(true, &doc);
+    wm.setWrapWidth(110, &doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    var state = TextareaState{
+        .io = std.testing.io,
+        .doc = &doc,
+        .wrap_map = &wm,
+        .allocator = std.testing.allocator,
+        .cx_ref = cx,
+        .font_size = 13,
+        .line_height = 18.2,
+        .padding_h = 12,
+        .padding_v = 12,
+    };
+    defer state.deinit();
+    try std.testing.expect(wm.displayLineCount() >= 2);
+    for (0..wm.displayLineCount()) |row| {
+        // Outside either text edge resolves to a line endpoint. An endpoint byte shared
+        // by two soft-wrapped rows must keep this row when the caret is rendered.
+        for ([_]f32{ 0, 1000 }) |x| {
+            state.cursor.offset = state.hitTestAt(x, state.padding_v + (@as(f32, @floatFromInt(row)) + 0.5) * state.line_height);
+            const geometry = state.visualLineAtOffset(state.cursor.offset).?;
+            try std.testing.expectEqual(@as(u32, @intCast(row)), geometry.display_line);
+        }
+    }
 }
 
 test "Textarea accessibility range frame shares mixed-bidi VisualLine geometry" {
@@ -2678,7 +3432,35 @@ test "TextareaState: long IME composition preserves complete graphemes" {
 // Public API: Textarea component
 // ============================================================================
 
+/// `TextareaProps.auto_rows`: the line range the field's text area grows over.
+pub const AutoRows = struct { min: u32 = 1, max: u32 = 6 };
+
+/// Text area height for `auto_rows`: the display line count (after wrapping) clamped to
+/// [min, max] rows of the textarea's own line height, plus its vertical padding. A preedit is drawn
+/// inside its display line (it does not re-wrap), so composing never changes the count.
+pub fn autoRowsHeight(rows: AutoRows, display_lines: u32, line_height: f32, padding_v: f32) f32 {
+    const lo = @max(rows.min, 1);
+    const hi = @max(rows.max, lo);
+    const n = std.math.clamp(@max(display_lines, 1), lo, hi);
+    return @as(f32, @floatFromInt(n)) * line_height + padding_v * 2;
+}
+
+/// Follow the display line count (auto_rows): write the frame height when it changed. Runs in
+/// before-render after wrapping caught up with the layout width and the edit.
+fn syncAutoRows(state: *TextareaState) void {
+    const rows = state.auto_rows orelse return;
+    const frame = state.auto_frame orelse return;
+    const h = autoRowsHeight(rows, state.wrap_map.displayLineCount(), state.line_height, state.padding_v);
+    var spec = frame.peek();
+    if (spec.height) |cur| if (@abs(cur - h) < 0.01) return;
+    spec.height = h;
+    frame.set(spec);
+    if (state.cx_ref) |cx| cx.scheduleRedrawAfterNs(0);
+}
+
 pub const TextareaProps = struct {
+    /// Optional field-size specimen from RYMhT. null retains the roomy 100px textarea.
+    size: ?@import("../control_shell/mod.zig").ControlSize = null,
     /// Text value. Literal = self-held initial; `*Signal([]const u8)` controlled (interaction
     /// writes directly; must be created by `scope.createText`); `ui.split` intercepted by parent.
     /// External write rules same as Input.
@@ -2689,13 +3471,44 @@ pub const TextareaProps = struct {
     helper: Source([]const u8) = .{ .value = "" },
     error_msg: Source([]const u8) = .{ .value = "" },
     rows: u32 = 4,
+    /// Grow with the text: the text area is clamp(display lines after wrapping, min, max) × the
+    /// line height + its vertical padding, following edits and wrap-width changes (an IME preedit
+    /// is drawn inside its line and does not change it); past `max` the text scrolls inside (the
+    /// caret kept visible). Works for the plain and the compound (header / footer) field; the
+    /// wrapper then fits its rows. Ignored when `embedded` (the compound control sizes the field).
+    /// null = the fixed `rows` / `size` height.
+    auto_rows: ?AutoRows = null,
+    /// Compound field only: whether the `header` slot row is shown (display none when false: no
+    /// room, no hit, no a11y; its content stays mounted). Followed when a source, e.g. attachment
+    /// chips shown only while there are attachments. Ignored without a header row.
+    header_visible: Source(bool) = .{ .value = true },
     disabled: Source(bool) = .{ .value = false },
-    required: bool = false,
-    readonly: bool = false,
-    /// Omit the field fill, border, and focus ring for an embedded editor.
-    /// Focus, caret, selection, accessibility, and IME keep normal behavior.
-    borderless: bool = false,
+    /// Accessibility `required`. A source is followed.
+    required: Source(bool) = .{ .value = false },
+    /// Read-only: the text can be focused, selected and copied, not edited (no native text client, no
+    /// IME), like `Input.readonly`. A source is followed: turning it on cancels a composition in
+    /// progress; focus and selection are kept.
+    readonly: Source(bool) = .{ .value = false },
     width: ?f32 = null,
+    /// Inside a compound control that draws the frame itself (same contract as Input.embedded):
+    /// the shell drops its border, background and focus ring, the text sits flush horizontally
+    /// (the compound frame pads), and the field flexes in the parent row. The field fills the
+    /// returned `wrapper`, so the compound control sizes it through the wrapper (initially the
+    /// `rows` / `size` height).
+    embedded: bool = false,
+    /// Text in the monospace face (JSON, code); measured, wrapped and caret-placed as painted.
+    monospace: bool = false,
+    /// Line pitch (px) and font size overrides, e.g. to match a read-only code view the field
+    /// replaces while editing; null = the size tier's metrics.
+    line_height: ?f32 = null,
+    font_size: ?f32 = null,
+    /// Vertical text inset override (px); with `embedded` the host frame then sets the inset alone.
+    padding_v: ?f32 = null,
+    /// Per-state overrides of the field frame (hover / focus / invalid / disabled ...), merged
+    /// state by state over the field tone (ControlShell `root_style`): e.g. a transparent border
+    /// with a fill color per state. Default: none (the tone alone). The standalone focus frame's
+    /// border width (1.5px) still applies over it.
+    field_state_style: Source(core_ui.ConditionalStyle) = .{ .value = .{} },
     /// Called after user edit settled (landed value; slice only valid during callback)
     on_change: ?Handler([]const u8) = null,
 };
@@ -2712,11 +3525,51 @@ pub const TextareaResult = struct {
     state: *TextareaState,
     /// Text value signal (`ui.split` is null)
     value: ?*Signal([]const u8),
+    /// Compound field (a `header` and / or `footer` slot was passed): the frame that holds the
+    /// header, the text and the footer, and draws the field look for all of them. null otherwise.
+    frame: ?*Node = null,
+    /// `header` slot row (above the text: attachment chips), when passed.
+    header: ?*Node = null,
+    /// `footer` slot row (below the text: a tool row), when passed.
+    footer: ?*Node = null,
 
     /// `ui.view` hookup: `v.capture(&st.ta, W.Textarea(...))` grab edit state,
-    /// `.parts = .{ .input = "id" }` mark input.
+    /// `.parts = .{ .input = "id" }` mark input; `.slots(.{ .header = …, .footer = … })` fill
+    /// the compound field's rows.
     pub fn viewParts(self: TextareaResult) core_ui.ViewParts {
-        return .{ .root = self.wrapper };
+        var vp: core_ui.ViewParts = .{ .root = self.wrapper };
+        var i: usize = 0;
+        if (self.header) |h| {
+            vp.named[i] = .{ .name = "header", .at = .{ .parent = h } };
+            i += 1;
+        }
+        if (self.footer) |f| vp.named[i] = .{ .name = "footer", .at = .{ .parent = f } };
+        return vp;
+    }
+};
+
+/// Compound field focus: the frame shows the field's focus look while focus is anywhere inside it
+/// (the text or a footer control), so text and tool row read as one control.
+const CompoundFocus = struct {
+    focused: *Signal(bool),
+    input: ?*Node = null,
+    frame: ?*Node = null,
+    cx: *Cx,
+    fn enter(self: *CompoundFocus) void {
+        self.focused.set(true);
+    }
+    fn leave(self: *CompoundFocus) void {
+        self.focused.set(false);
+    }
+    /// A press on the frame's own padding (not on a control) puts the caret in the text.
+    fn press(self: *CompoundFocus) void {
+        const input = self.input orelse return;
+        const frame = self.frame orelse return;
+        if (!input.behavior.interaction.focusable) return;
+        // Focus already inside (the text, or the footer control this press landed on): keep it.
+        var cur: ?*Node = self.cx.focus_manager.getFocused();
+        while (cur) |n| : (cur = n.parent) if (n == frame) return;
+        self.cx.setFocus(input);
     }
 };
 
@@ -2731,19 +3584,27 @@ const helper_row_h: f32 = 20;
 const TextareaChrome = struct {
     state: *TextareaState,
     cx: *Cx,
-    tokens: *const ThemeTokens,
     label: Source([]const u8),
     helper: Source([]const u8),
     error_msg: Source([]const u8),
     placeholder: Source([]const u8),
     disabled: Source(bool),
+    /// The shell's invalid state (frame color follows it declaratively).
+    invalid: *Signal(bool),
     wrapper: *Node,
     textarea_node: *Node,
     field_h: f32,
+    /// Embedded: the compound control sizes the wrapper; chrome only shows / hides the rows.
+    embedded: bool,
     label_node: ?*Node = null,
     helper_node: ?*Node = null,
     placeholder_copy: []u8 = &.{},
     shown_disabled: bool = false,
+    readonly: Source(bool),
+    shown_readonly: bool,
+    required: Source(bool),
+    /// No handlers were installed (statically disabled): never a text client.
+    static_disabled: bool,
 
     fn effect(self: *TextareaChrome) void {
         self.apply(true) catch |err| std.log.err("[Textarea] updating chrome failed: {}", .{err});
@@ -2775,45 +3636,57 @@ const TextareaChrome = struct {
         const has_error = err_text.len > 0;
         if (has_error != self.state.has_error) {
             self.state.has_error = has_error;
-            if (!self.state.borderless and !self.state.focused) self.textarea_node.setBorderColor(self.restingBorder());
+            self.invalid.set(has_error);
             if (self.textarea_node.behavior.interaction.a11y) |*attrs| attrs.invalid = has_error;
-            self.textarea_node.markRenderDirty();
         }
         if (self.helper_node) |hn| {
             const shown = if (has_error) err_text else help_text;
             if (!std.mem.eql(u8, hn.getText().?.content, shown)) try hn.setTextContent(a, shown);
             var txt = hn.getText().?;
-            txt.color = styles.textareaHelperStyle(self.tokens, has_error).color;
+            txt.color = styles.textareaHelperStyle(self.state.tokens, has_error).color;
             hn.setText(txt);
             hn.setDisplay(if (shown.len > 0) .flex else .none);
             if (shown.len > 0) height += helper_row_h;
             hn.markRenderDirty();
         }
-        self.wrapper.style.height = .{ .px = height };
-        self.wrapper.markLayoutDirty();
+        if (!self.embedded) {
+            self.wrapper.style.height = .{ .px = height };
+            self.wrapper.markLayoutDirty();
+        }
         const disabled = self.disabled.read(tracked);
         if (disabled != self.shown_disabled) self.applyDisabled(disabled);
+        const readonly = self.readonly.read(tracked);
+        if (readonly != self.shown_readonly) self.applyReadonly(readonly);
+        const required = self.required.read(tracked);
+        if (self.textarea_node.behavior.interaction.a11y) |*attrs| attrs.required = required;
     }
 
-    fn restingBorder(self: *const TextareaChrome) Color {
-        return styles.textareaInitialBorderColor(self.tokens, self.state.has_error, self.state.disabled);
+    /// Dynamic read-only: editing is fenced by `state.readonly` (`readonlyGate`); here the native
+    /// text client is detached / restored and accessibility follows. Focus and selection are kept.
+    fn applyReadonly(self: *TextareaChrome, readonly: bool) void {
+        self.shown_readonly = readonly;
+        if (readonly) self.state.cancelImeComposition();
+        self.state.readonly = readonly;
+        const node = self.textarea_node;
+        syncTextareaClient(self.cx, self.state, node, self.static_disabled);
+        if (node.behavior.interaction.a11y) |*attrs| attrs.readonly = readonly;
+        self.state.markDirty();
+        node.markRenderDirty();
     }
 
     fn applyDisabled(self: *TextareaChrome, disabled: bool) void {
         self.shown_disabled = disabled;
         self.state.disabled = disabled;
+        self.state.markDirty();
         const node = self.textarea_node;
+        // Frame and cursor follow the shell's disabled parameter.
         // Blur first (dispatch blur, run original on_blur cleanup) then set unfocusable
         if (disabled) {
             self.state.cancelImeComposition();
             if (self.cx.focus_manager.getFocused() == node) self.cx.clearFocus();
         }
-        node.setBackground(if (self.state.borderless) Color.TRANSPARENT else styles.textareaBackground(self.tokens, disabled));
-        if (!self.state.borderless) node.setBorderColor(self.restingBorder());
-        node.style.cursor = if (disabled) .default else .text;
         node.setFocusable(!disabled);
         if (node.behavior.interaction.a11y) |*attrs| attrs.disabled = disabled;
-        node.markRenderDirty();
     }
 
     fn destroy(ptr: *anyopaque, alloc: Allocator) void {
@@ -2835,8 +3708,27 @@ pub const TextareaBuilder = struct {
         return self.mountResult(scope, cx);
     }
 
+    /// `ui.view` hookup with named slots: a `header` and / or `footer` slot makes the field
+    /// compound (see `mountCompound`).
+    pub fn viewMountWith(self: TextareaBuilder, scope: *Scope, cx: *Cx, presence: @import("../../view_parts.zig").SlotPresence) !TextareaResult {
+        return self.mountCompound(scope, cx, .{ .header = presence.has("header"), .footer = presence.has("footer") });
+    }
+
     /// Mount and return edit state + value signal
     pub fn mountResult(self: TextareaBuilder, scope: *Scope, cx: *Cx) !TextareaResult {
+        return self.mountCompound(scope, cx, .{});
+    }
+
+    pub const Rows = struct { header: bool = false, footer: bool = false };
+
+    /// Mount with optional slot rows. With a header and / or footer row the field is compound:
+    /// one frame (the field tone: background, border, hover / focus / invalid / disabled, radius
+    /// panel) holds the header row (attachment chips: wraps, 8 8 0 8, gap 6), the text (the
+    /// textarea itself drops its own frame and focus ring) and the footer row (a tool row: 36
+    /// high, 0 6, gap 2). The frame shows focus while focus is anywhere inside it, so the text
+    /// and the tools are one control; a press on its padding focuses the text. The wrapper grows
+    /// with the rows (label / helper still above / below).
+    pub fn mountCompound(self: TextareaBuilder, scope: *Scope, cx: *Cx, rows: Rows) !TextareaResult {
         cx.owner.enterMount();
         defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
@@ -2850,16 +3742,26 @@ pub const TextareaBuilder = struct {
         reactive.checkBorrow(my_scope, p.helper);
         reactive.checkBorrow(my_scope, p.error_msg);
         reactive.checkBorrow(my_scope, p.disabled);
+        reactive.checkBorrow(my_scope, p.readonly);
+        reactive.checkBorrow(my_scope, p.required);
+        reactive.checkBorrow(my_scope, p.field_state_style);
         const has_error = p.error_msg.peek().len > 0;
+        const readonly0 = p.readonly.peek();
         const disabled0 = p.disabled.peek();
         // Static disable as-is: disabled look, no event handler; dynamic by TextareaChrome gate
         const static_disabled = p.disabled.isStatic() and disabled0;
         const chrome_dynamic = !p.label_text.isStatic() or !p.helper.isStatic() or !p.error_msg.isStatic() or
-            !p.placeholder.isStatic() or !p.disabled.isStatic();
-        const line_height: f32 = 20;
-        const font_size: f32 = 13;
+            !p.placeholder.isStatic() or !p.disabled.isStatic() or !p.readonly.isStatic() or !p.required.isStatic();
+        const compound = (rows.header or rows.footer) and !p.embedded;
+        // The textarea draws no frame of its own: embedded in a caller's control, or inside the
+        // compound frame.
+        const frameless = p.embedded or compound;
+        const metrics = styles.textareaMetrics(t, p.size, p.rows);
+        const line_height = p.line_height orelse metrics.line_height;
+        const font_size = p.font_size orelse metrics.font_size;
         const char_width: f32 = 7.8;
-        const pad: f32 = 8;
+        const pad = if (p.embedded) 0 else metrics.padding_h;
+        const pad_v = p.padding_v orelse metrics.padding_v;
 
         const value = try reactive.resolveTextModel(my_scope, p.value);
 
@@ -2881,13 +3783,13 @@ pub const TextareaBuilder = struct {
         // Measure through this window's Cx; the legacy context-free callback
         // can otherwise select a different live window's FontSelector.
         const mfn = cx.text.measure_fn;
-        const measured_char_width = cx.text.measureTextWidth("M", font_size, 400, false);
+        const measured_char_width = if (p.monospace) Cx.measureMonoTextWidthCallback(cx, "M", 1, font_size, 400, false) else cx.text.measureTextWidth("M", font_size, 400, false);
         const real_char_width = if (measured_char_width > 0) measured_char_width else char_width;
 
         // WrapMap
         const wm = try my_scope.allocator.create(TextareaWrapMap);
         wm.* = TextareaWrapMap.init(my_scope.allocator, cx.io);
-        wm.measure_ctx_fn = Cx.measureTextWidthCallback;
+        wm.measure_ctx_fn = if (p.monospace) Cx.measureMonoTextWidthCallback else Cx.measureTextWidthCallback;
         wm.measure_ctx = cx;
         wm.char_width = real_char_width;
         wm.precise_wrap = true;
@@ -2913,15 +3815,15 @@ pub const TextareaBuilder = struct {
             .measure_fn = mfn,
             .char_width = real_char_width,
             .font_size = font_size,
+            .monospace = p.monospace,
             .line_height = line_height,
             .padding_h = pad,
-            .padding_v = pad,
+            .padding_v = pad_v,
             .placeholder_text = placeholder0,
             .cx_ref = cx,
             .tokens = t,
             .has_error = has_error,
             .disabled = disabled0,
-            .borderless = p.borderless,
         };
         if (initial_value.len > 0) state.cursor.offset = doc.totalLength();
         try my_scope.adoptResource(@ptrCast(state), struct {
@@ -2950,7 +3852,10 @@ pub const TextareaBuilder = struct {
         _ = wm.rewrapInterpolatedAll(doc);
         _ = wm.takePendingPatch();
 
-        const textarea_height = line_height * @as(f32, @floatFromInt(p.rows));
+        // auto_rows: the frame height starts at the mount-time line count (wrapped when `width` is
+        // known, else one display line per document line until the first layout).
+        const auto_rows: ?AutoRows = if (p.embedded) null else p.auto_rows;
+        const textarea_height = if (auto_rows) |ar| autoRowsHeight(ar, wm.displayLineCount(), line_height, pad_v) else metrics.height;
         const label0 = p.label_text.peek();
         const helper0 = if (has_error) p.error_msg.peek() else p.helper.peek();
         const build_label = !p.label_text.isStatic() or label0.len > 0;
@@ -2959,9 +3864,8 @@ pub const TextareaBuilder = struct {
         if (label0.len > 0) wrapper_height += label_row_h;
         if (helper0.len > 0) wrapper_height += helper_row_h;
 
-        const field_radius: f32 = 8;
-        const textarea_bg = if (p.borderless) Color.TRANSPARENT else styles.textareaBackground(t, disabled0);
-        const border_color = styles.textareaInitialBorderColor(t, has_error, disabled0);
+        const field_radius: f32 = if (frameless) 0 else metrics.radius;
+        const invalid_frame = try my_scope.createSignal(bool, has_error);
         const fill_inset: core_ui.Inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } };
         const zero_box: core_ui.BoxStyle = .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } };
         const layer_style: core_ui.BoxStyle = .{
@@ -2975,16 +3879,55 @@ pub const TextareaBuilder = struct {
         // Node tree (wrapper kept to return, disposedScope bound to it)
         const Parts = struct {
             label: ?*Node = null,
-            field_shell: *Node = undefined,
-            textarea: *Node = undefined,
+            shell: core_ui.ViewParts = undefined,
             underlay: *Node = undefined,
             selection: *Node = undefined,
             helper: ?*Node = null,
+            frame: *Node = undefined,
+            header: ?*Node = null,
+            footer: ?*Node = null,
         };
         var parts: Parts = .{};
+        const frame_spec: styles.TextareaFrame = .{ .width = if (compound) null else p.width, .height = if (p.embedded) null else textarea_height, .radius = field_radius };
+        const auto_frame: ?*Signal(styles.TextareaFrame) = if (auto_rows != null) try my_scope.createSignal(styles.TextareaFrame, frame_spec) else null;
+        const frame_src: Source(styles.TextareaFrame) = if (auto_frame) |sig| .{ .signal = sig } else .{ .value = frame_spec };
+        const compound_focus = try my_scope.createState(CompoundFocus, .{ .focused = try my_scope.createSignal(bool, false), .cx = cx });
+        const field_el = view.attrs(.{
+                .style = .{ view.styleBy(frame_src, styles.textareaFrame), view.when(!frameless, styles.textarea_focus) },
+                .state = .{ .invalid = invalid_frame },
+            }, view.with(control_shell.ControlShell(.{
+                .variant = .field,
+                .size = p.size orelse .md,
+                .disabled = p.disabled,
+                .invalid = invalid_frame,
+                .embedded = frameless,
+                // A read-only Textarea takes focus (select / copy): its focus shows too.
+                .focus_ring = if (!frameless and !static_disabled) @as(?hooks.FocusRingConfig, .{}) else null,
+                .root_style = p.field_state_style,
+                .cursor = .text,
+                .disabled_cursor = .default,
+                .tag = .input,
+                .content_style = core_ui.BoxStyle{
+                    .width = .{ .grow = .{} },
+                    .height = .{ .grow = .{} },
+                    .direction = .column,
+                    .align_items = .stretch,
+                    .min_height = 0,
+                    .min_width = 0,
+                },
+            }), .{}).capture(&parts.shell).slots(.{
+                // Selection underlay, append before text (vl.container): selection color blocks
+                // glyphs when after. Before, selection was in overlay after text, paint order
+                // inverted, selected text buried.
+                .content = view.capture(&parts.underlay, view.box(.{ .style = layer_style }, .{
+                    view.capture(&parts.selection, view.box(.{ .style = zero_box }, {})),
+                })),
+            }));
         const wrapper = try view.render(my_scope, cx, view.col(.{ .style = core_ui.BoxStyle{
-            .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
-            .height = .{ .px = wrapper_height },
+            .width = if (p.embedded) .{ .grow = .{ .min = 0 } } else if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
+            .flex_shrink = if (p.embedded) 1 else null,
+            .min_width = if (p.embedded) 0 else null,
+            .height = if (compound or auto_rows != null) .{ .fit = .{} } else .{ .px = wrapper_height },
             .gap = 4,
         } }, .{
             // Label (dynamic always built, hidden when empty): fixed-height box + own text
@@ -2992,36 +3935,21 @@ pub const TextareaBuilder = struct {
                 .style = .{ .height = .{ .px = 18 } },
                 .visible = label0.len > 0,
             }, {}), BoxText{ .style = styles.textareaLabelStyle(t), .content = label0 }, BoxText.apply)) else null,
-            view.capture(&parts.field_shell, view.col(.{ .style = core_ui.BoxStyle{
-                .width = .{ .grow = .{} },
-                .height = .{ .px = textarea_height },
-                .border = .{ .radius = field_radius },
-            } }, .{
-                view.capture(&parts.textarea, view.box(.{
-                    .style = core_ui.BoxStyle{
-                        .width = .{ .grow = .{} },
-                        .height = .{ .px = textarea_height },
-                        .background = textarea_bg,
-                        .border = .{ .width = if (p.borderless) 0 else 1, .color = if (p.borderless) Color.TRANSPARENT else border_color, .radius = field_radius },
-                        .overflow_hidden = true,
-                        .hit_shape = .{ .rounded_rect = field_radius },
-                        .clip_shape = .{ .rounded_rect = field_radius },
-                        // Explicitly declared scroll target to prevent wheel steal by outer
-                        // ScrollArea.
-                        .hit_roles = .{ .pointer = true, .scroll = true, .inspect = true },
-                        .cursor = if (!disabled0) .text else null,
-                    },
-                    .focusable = !disabled0,
-                }, .{
-                    // Selection underlay, append before text (vl.container):
-                    // selection color blocks glyphs when after. Before, selection was in overlay
-                    // after text,
-                    // paint order inverted, selected text buried.
-                    view.capture(&parts.underlay, view.box(.{ .style = layer_style }, .{
-                        view.capture(&parts.selection, view.box(.{ .style = zero_box }, {})),
-                    })),
-                })),
-            })),
+            // The field: ControlShell(.field) draws the frame and every frame state (hover / focus
+            // from the node, disabled / invalid from parameters); Textarea adds its fixed-height
+            // scroll surface as an overlay and stacks the line list's layers in the content slot.
+            if (compound) view.capture(&parts.frame, view.col(.{
+                .style = .{ shell_styles.Tone.of(.{ .kind = .field }), shell_styles.fade, view.styleBy(@as(?f32, p.width), styles.textareaCompoundFrame), styles.textarea_focus },
+                .state = .{ .focus = compound_focus.focused, .invalid = invalid_frame, .disabled = p.disabled, .expanded = false },
+                .on_focus_within = cx.on(CompoundFocus, compound_focus, CompoundFocus.enter),
+                .on_blur_within = cx.on(CompoundFocus, compound_focus, CompoundFocus.leave),
+                .on_click = cx.on(CompoundFocus, compound_focus, CompoundFocus.press),
+            }, .{
+                if (rows.header and compound) view.capture(&parts.header, view.row(.{ .style = styles.textarea_header_row, .visible = p.header_visible }, {})) else null,
+                field_el,
+                if (rows.footer and compound) view.capture(&parts.footer, view.row(.{ .style = styles.textarea_footer_row }, {})) else null,
+            })) else null,
+            if (!compound) field_el else null,
             // Helper / error text (dynamic always built, hidden when empty): fixed-height + own
             // text
             if (build_helper) view.capture(&parts.helper, view.setup(view.box(.{
@@ -3037,10 +3965,13 @@ pub const TextareaBuilder = struct {
         wrapper.addDebugState(@ptrCast(state));
 
         const label_text_node = parts.label;
-        const field_shell = parts.field_shell;
-        const textarea_node = parts.textarea;
-        // view doesn't declare node tag: edit area is semantic input node
-        textarea_node.tag = .input;
+        const textarea_node = parts.shell.root.?;
+        compound_focus.input = textarea_node;
+        if (compound) compound_focus.frame = parts.frame;
+        // Line list layers stack in the content slot; it fills the frame (padding 0, borders
+        // take no layout space), so its origin is the frame's.
+        const surface = parts.underlay.parent.?;
+        textarea_node.setFocusable(!disabled0);
         textarea_node.behavior.interaction.a11y = .{
             .role = .textarea,
             // Keep an unlabeled editor unlabeled; its value is exposed through
@@ -3048,17 +3979,18 @@ pub const TextareaBuilder = struct {
             .label = if (label_text_node) |ln| ln.getText().?.content else "",
             .placeholder = placeholder0,
             .disabled = disabled0,
-            .required = p.required,
-            .readonly = p.readonly,
+            .required = p.required.peek(),
+            .readonly = readonly0,
             .invalid = has_error,
             .multiline = true,
         };
-        if (!static_disabled and !p.readonly) {
+        state.readonly = readonly0;
+        if (!static_disabled and !readonly0) {
             textarea_node.behavior.interaction.text_input_client = textareaLiveClient(state);
         }
-        state.focus_ring_host = if (p.borderless) null else field_shell;
         state.input_container_node = textarea_node;
-        if (!p.borderless) textarea_node.applyTransition(allocator, &comptime recipe_mod.transition("border-color 150ms"));
+        state.auto_rows = auto_rows;
+        state.auto_frame = auto_frame;
         state.selection_underlay_node = parts.underlay;
         state.selection_node = parts.selection;
 
@@ -3067,21 +3999,24 @@ pub const TextareaBuilder = struct {
         // responsibility for *Node children (see Input's shell.node).
         const initial_lc = @max(@as(u32, 1), wm.displayLineCount());
         const vl = try virtual_list.VirtualList(.{ .item_count = initial_lc, .item_height = line_height, .overscan = 3 }).mountWithContext(my_scope, cx, @ptrCast(state), null, textareaRenderItem);
-        _ = try core_ui.adoptChild(cx, allocator, textarea_node, vl.container);
+        _ = try core_ui.adoptChild(cx, allocator, surface, vl.container);
         vl.container.style.width = .{ .grow = .{} };
         vl.container.style.height = .{ .grow = .{} };
-        vl.container.style.padding = Padding.all(pad);
+        vl.container.style.padding = Padding.symmetric(pad_v, pad);
         const vl_ext = try vl.container.style.ensureExtFallible(allocator);
-        const textarea_inner_shadow_alpha: u8 = if (t.tokens.color.input_bg.r <= 64 and t.tokens.color.input_bg.g <= 64 and t.tokens.color.input_bg.b <= 64) 84 else 40;
+        // Same fade as Input: a 6px band of the field background at the clip edge, then
+        // 24px to transparent, so overflowing rows dissolve into the field instead of
+        // sitting under a dark inner shadow.
         vl_ext.overflow_fade = .{
-            .size = 10,
-            .color = Color.rgba(0, 0, 0, textarea_inner_shadow_alpha),
+            .solid = 6,
+            .size = 24,
+            .color = styles.overflowFadeColor(t),
             .edges = .{ .top = true, .bottom = true, .left = false, .right = false },
         };
         var overlay: *Node = undefined;
         var preedit_underline: *Node = undefined;
         var cursor_node: *Node = undefined;
-        try view.mount(my_scope, cx, textarea_node, .{
+        try view.mount(my_scope, cx, surface, .{
             // Overlay (IME underline + cursor, both above text)
             view.capture(&overlay, view.box(.{ .style = layer_style }, .{
                 view.capture(&preedit_underline, view.box(.{ .style = zero_box }, {})),
@@ -3094,84 +4029,43 @@ pub const TextareaBuilder = struct {
         state.cursor_node = cursor_node;
         textarea_node.meta.per_frame.hooks.before_render.main = textareaBeforeRender;
 
-        // Events (dynamic disable also installs, entry gated by state.disabled)
-        if (!static_disabled and !p.readonly) {
-            textarea_node.behavior.events.on_event = textareaEventHandler;
-            textarea_node.behavior.events.event_context = state;
-
-            const state_opaque: *anyopaque = state;
-            textarea_node.behavior.events.on_focus = .{
-                .callback = struct {
-                    fn h(c: *anyopaque) void {
-                        const s: *TextareaState = @ptrCast(@alignCast(c));
-                        s.focused = true;
-                        if (!s.borderless and !s.has_error) if (s.input_container_node) |cn| {
-                            cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.tokens.color.input_border, false, true, false));
-                            cn.style.border.width = 1.5;
-                            cn.markRenderDirty();
-                        };
-                        if (s.focus_ring_host) |host| if (host.behavior.events.on_focus) |h2| h2.invoke();
-                    }
-                }.h,
-                .context = state_opaque,
-            };
-            textarea_node.behavior.events.on_blur = .{
-                .callback = struct {
-                    fn h(c: *anyopaque) void {
-                        const s: *TextareaState = @ptrCast(@alignCast(c));
-                        s.focused = false;
-                        s.cancelImeComposition();
-                        s.cursor.anchor = null;
-                        s.is_dragging = false;
-                        s.drag_pointer = null;
-                        s.suspend_drag_until_mouse_up = false;
-                        s.consecutive_mouse_downs = 0;
-                        s.last_mouse_down_instant = null;
-                        if (!s.borderless and !s.has_error) {
-                            const hovered = if (s.hover_signal) |hs| hs.get() else false;
-                            if (s.input_container_node) |cn| {
-                                cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.tokens.color.input_border, hovered, false, false));
-                                cn.style.border.width = 1;
-                                cn.markRenderDirty();
-                            }
-                        }
-                        if (s.focus_ring_host) |host| if (host.behavior.events.on_blur) |h2| h2.invoke();
-                    }
-                }.h,
-                .context = state_opaque,
-            };
-
-            const is_hovered = try hooks.useHover(my_scope, textarea_node);
-            state.hover_signal = is_hovered;
-            try my_scope.createEffect(.{ .textarea = textarea_node, .is_hovered = is_hovered, .state = state, .tokens = t }, struct {
-                fn u(c: anytype) void {
-                    const hovered = c.is_hovered.get();
-                    if (!c.state.borderless and !c.state.disabled and styles.hoverBorderApplies(c.state.focused, c.state.has_error))
-                        c.textarea.setBorderColor(styles.borderColor(c.tokens, c.tokens.tokens.color.input_border, hovered, false, false));
-                }
-            }.u);
-            if (!p.borderless) try hooks.useFocusRing(my_scope, cx, if (t.tokens.color.focus_ring.a == 0) textarea_node else field_shell, .{ .offset = 0 });
+        // Events (dynamic disable also installs, entry gated by state.disabled; read-only installs
+        // too, editing fenced by state.readonly so the text can still be selected and copied).
+        // The state is reachable even when not editable: before-render publishes the
+        // text (readonly/disabled: a readable, selectable value; the Web DOM host maps it
+        // to a native <textarea readonly|disabled>).
+        textarea_node.behavior.events.event_context = state;
+        if (!static_disabled) {
+            textarea_node.behavior.events.on_event = textareaFieldEventHandler;
         }
 
         const helper_text_node = parts.helper;
+        state.label_text_node = label_text_node;
+        state.helper_text_node = helper_text_node;
 
         if (chrome_dynamic) {
             const chrome = try my_scope.allocator.create(TextareaChrome);
             chrome.* = .{
                 .state = state,
                 .cx = cx,
-                .tokens = t,
                 .label = p.label_text,
                 .helper = p.helper,
                 .error_msg = p.error_msg,
                 .placeholder = p.placeholder,
                 .disabled = p.disabled,
+                .invalid = invalid_frame,
                 .wrapper = wrapper,
                 .textarea_node = textarea_node,
                 .field_h = textarea_height,
+                // The wrapper fits its rows (compound, auto_rows): chrome only shows / hides them.
+                .embedded = frameless or auto_rows != null,
                 .label_node = label_text_node,
                 .helper_node = helper_text_node,
                 .shown_disabled = disabled0,
+                .readonly = p.readonly,
+                .shown_readonly = readonly0,
+                .required = p.required,
+                .static_disabled = static_disabled,
             };
             try my_scope.adoptResource(@ptrCast(chrome), TextareaChrome.destroy);
             // First sync apply (fail exits), then effect follows
@@ -3183,7 +4077,16 @@ pub const TextareaBuilder = struct {
         // short-circuit)
         try my_scope.createEffect(binding, TextareaBinding.valueEffect);
 
-        return .{ .wrapper = wrapper, .input = textarea_node, .state = state, .value = value.asSignal() };
+        if (compound) parts.frame.meta.ownership.meta.component_name = "TextareaFrame";
+        return .{
+            .wrapper = wrapper,
+            .input = textarea_node,
+            .state = state,
+            .value = value.asSignal(),
+            .frame = if (compound) parts.frame else null,
+            .header = parts.header,
+            .footer = parts.footer,
+        };
     }
 };
 
@@ -3570,6 +4473,7 @@ test "textarea frame retries pending wrap without a width change" {
     var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator, .input_inner_w = 64 };
     defer state.deinit();
     var node: Node = .{ .id = 1, .tag = .box, .style = .{}, .children = .empty };
+    defer @import("../../core/node_lifecycle.zig").releaseStandaloneState(&node);
     node.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 100 });
     node.behavior.events.event_context = &state;
     textareaBeforeRender(&node);
@@ -3884,6 +4788,29 @@ const TaEnv = struct {
     }
 };
 
+test "frame request consumption paints textarea edits in the current tick" {
+    const t = std.testing;
+    const env = try TaEnv.init();
+    defer env.deinit();
+    const r = try Textarea(.{ .value = "abc", .embedded = true }).mountResult(env.scope, env.cx);
+    try env.cx.root.?.appendChild(t.allocator, r.wrapper);
+    for (0..3) |_| {
+        env.cx.advanceFrameClock();
+        env.cx.layout();
+        _ = env.cx.render();
+    }
+    try t.expect(!env.cx.wantsFrame());
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "文" } });
+    env.cx.advanceFrameClock();
+    env.cx.layout();
+    _ = env.cx.render();
+    try t.expectEqualStrings("abc文", r.state.getText());
+    try t.expectEqual(@as(usize, 6), r.state.cursor.offset);
+    try t.expect(!r.state.dirty);
+    try t.expect(!env.cx.hasPendingSceneWork());
+    try t.expect(!env.cx.wantsFrame());
+}
+
 test "Textarea value: 打字写回 signal；外部写入进文档且不可撤销；组字中推迟" {
     const env = try TaEnv.init();
     defer env.deinit();
@@ -4163,6 +5090,29 @@ test "textarea: mount 在任意分配点失败时不泄漏（sweep）" {
     }.m);
 }
 
+// Reference-checked OOM sweep (see oom_sweep.zig): a mount that reports success must look exactly
+// like the uninjected mount; `check` also pins the states the reference was given.
+test "textarea(error+disabled): mount 成功即外观完整，任意分配点失败不假成功（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMountVerified("textarea(error+disabled)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const err_msg = try scope.createText("Required", .{});
+            const disabled = try scope.createSignal(bool, false);
+            return (try Textarea(.{ .value = "a\nb", .label_text = "Notes", .error_msg = err_msg, .disabled = disabled, .width = 240 }).mountResult(scope, cx)).wrapper;
+        }
+    }.m, struct {
+        fn invalidFrame(n: *Node) bool {
+            if (n.style.border.width > 0 and Color.eql(theme.dark.tokens.color.danger, n.style.border.color)) return true;
+            for (n.children.items) |c| if (invalidFrame(c)) return true;
+            return false;
+        }
+        fn check(root: *Node) anyerror!void {
+            // the error message drives the frame's :invalid border at mount
+            try std.testing.expect(invalidFrame(root));
+        }
+    }.check);
+}
+
 test "textarea(dynamic): mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("textarea(dynamic)", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
@@ -4341,4 +5291,398 @@ test "IME textarea surrounding deletion preserves selected bytes and cursor dire
     try t.expectEqual(@as(usize, 3), state.effectiveImeCursorOffset());
     state.clearImePreedit();
     try t.expect(state.ime_cursor_visible);
+}
+
+test "Textarea placeholder paints only while document is empty and never becomes its value" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    const scope = try Scope.init(t.allocator, null, cx.owner);
+    defer scope.dispose();
+    const result = try Textarea(.{ .placeholder = "Write a longer message…", .width = 320 }).mountResult(scope, cx);
+    defer cx.freeNode(result.wrapper);
+    const row = try core_ui.box(cx, .{}, .{});
+    defer cx.freeNode(row);
+    textareaRenderItem(row, 0, cx, result.state);
+    try t.expectEqualStrings("Write a longer message…", row.getText().?.content);
+    try t.expectEqualStrings("", result.value.?.peek());
+    result.value.?.set("Actual content");
+    textareaRenderItem(row, 0, cx, result.state);
+    try t.expectEqualStrings("Actual content", row.getText().?.content);
+}
+
+test "textarea large history shares unchanged pages through eviction, undo, and redo" {
+    const t = std.testing;
+    var doc = try TextareaDocument.initFallible(t.allocator);
+    defer doc.deinit();
+    var wm = TextareaWrapMap.init(t.allocator, t.io);
+    defer wm.deinit();
+    var state: TextareaState = .{ .io = t.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+
+    const original = try t.allocator.alloc(u8, UndoEntry.paged_threshold);
+    defer t.allocator.free(original);
+    @memset(original, 'x');
+    try doc.setTextChecked(original);
+    state.cursor.offset = original.len;
+
+    for (0..40) |_| {
+        _ = textareaEventHandler(.{ .text_input = .{ .text = "文" } }, &state);
+    }
+    try t.expectEqual(@as(u8, 32), state.undo_count);
+    const page = state.undo_stack[0].pages[0];
+    for (state.undo_stack) |entry| try t.expectEqual(page, entry.pages[0]);
+    try t.expectEqual(@as(usize, 32), page.refs);
+    state.undo();
+    try t.expectEqual(original.len + 39 * "文".len, state.cursor.offset);
+    try t.expectEqual(page, state.redo_stack[0].pages[0]);
+    state.redo();
+    try t.expectEqual(original.len + 40 * "文".len, state.cursor.offset);
+    try t.expectEqualStrings(original, doc.getText()[0..original.len]);
+    for (0..40) |i| try t.expectEqualStrings("文", doc.getText()[original.len + i * "文".len ..][0.."文".len]);
+    state.clearUndoHistory();
+}
+
+fn largeUndoSnapshotAllocationContract(allocator: Allocator) !void {
+    const t = std.testing;
+    const original = try t.allocator.alloc(u8, UndoEntry.paged_threshold);
+    defer t.allocator.free(original);
+    @memset(original, 'a');
+    var first = try UndoEntry.capture(allocator, original, .{}, null);
+    defer first.deinit(allocator);
+    original[UndoEntry.page_size] = 'b';
+    var second = UndoEntry.capture(allocator, original, .{}, &first) catch |err| {
+        for (first.pages) |page| try t.expectEqual(@as(usize, 1), page.refs);
+        return err;
+    };
+    defer second.deinit(allocator);
+    try t.expectEqual(first.pages[0], second.pages[0]);
+    try t.expect(first.pages[1] != second.pages[1]);
+    const joined = try second.join(allocator);
+    defer allocator.free(joined);
+    try t.expectEqualStrings(original, joined);
+}
+
+test "textarea shared history rolls back partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, largeUndoSnapshotAllocationContract, .{});
+}
+
+// ── auto_rows ──
+
+fn autoSettle(cx: *Cx) void {
+    for (0..4) |_| {
+        cx.layout();
+        _ = cx.render();
+    }
+}
+
+fn autoExpectRows(res: TextareaResult, rows: u32) !void {
+    const st = res.state;
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(rows)) * st.line_height + st.padding_v * 2, res.input.rectFromWorldOrFallback().h, 0.01);
+}
+
+fn autoScrollY(res: TextareaResult) f32 {
+    return res.state.vl_state.?.scroll_state.scroll_y;
+}
+
+fn autoMaxScrollY(res: TextareaResult) f32 {
+    return res.state.vl_state.?.scroll_state.maxScrollY();
+}
+
+/// The shared scenario: one line, more lines, capped at max (scrolls, caret visible), shrink back
+/// after deleting, wrap-width changes, a preedit that does not move the height.
+fn autoRowsScenario(cx: *Cx, res: TextareaResult, holder: *Node) !void {
+    const st = res.state;
+    autoSettle(cx);
+    try autoExpectRows(res, 1);
+    try std.testing.expectApproxEqAbs(autoRowsHeight(.{}, 1, st.line_height, st.padding_v), res.input.rectFromWorldOrFallback().h, 0.01);
+    st.insertText("a\nb\nc");
+    autoSettle(cx);
+    try autoExpectRows(res, 3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), autoScrollY(res), 0.01);
+    // Past max (6): the height stops at 6 rows and the text scrolls with the caret in view.
+    st.insertText("\nd\ne\nf\ng\nh\ni\nj");
+    autoSettle(cx);
+    try autoExpectRows(res, 6);
+    try std.testing.expect(autoMaxScrollY(res) > 0);
+    try std.testing.expectApproxEqAbs(autoMaxScrollY(res), autoScrollY(res), 0.5);
+    // Deleting shrinks it back (and the scroll returns to the top).
+    st.selectAll();
+    st.deleteBackward();
+    autoSettle(cx);
+    try autoExpectRows(res, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), autoScrollY(res), 0.01);
+    // Wrapping counts: a long line takes several display lines; a wider field fewer.
+    st.insertText("wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap wrap");
+    autoSettle(cx);
+    const narrow_lines = st.wrap_map.displayLineCount();
+    try std.testing.expect(narrow_lines >= 2);
+    try autoExpectRows(res, @min(narrow_lines, 6));
+    holder.style.width = .{ .px = 900 };
+    holder.markLayoutDirty();
+    autoSettle(cx);
+    const wide_lines = st.wrap_map.displayLineCount();
+    try std.testing.expect(wide_lines < narrow_lines);
+    try autoExpectRows(res, @min(wide_lines, 6));
+    // A preedit is drawn inside its display line: the height does not move while composing,
+    // frame after frame; the committed text then counts.
+    holder.style.width = .{ .px = 240 };
+    holder.markLayoutDirty();
+    st.selectAll();
+    st.deleteBackward();
+    autoSettle(cx);
+    const h0 = res.input.rectFromWorldOrFallback().h;
+    st.handleImePreedit("候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选", 3);
+    for (0..3) |_| {
+        autoSettle(cx);
+        try std.testing.expectApproxEqAbs(h0, res.input.rectFromWorldOrFallback().h, 0.01);
+    }
+    st.handleImeCommit("候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选候选");
+    autoSettle(cx);
+    try std.testing.expect(res.input.rectFromWorldOrFallback().h > h0);
+}
+
+test "Textarea: auto_rows (plain) grows with the lines, caps at max and scrolls, shrinks back; preedit does not move it" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1000, 600);
+    const root = try box(cx, .{ .width = .{ .px = 1000 }, .height = .{ .px = 600 }, .direction = .column, .align_items = .start }, .{});
+    cx.root = root;
+    const holder = try box(cx, .{ .width = .{ .px = 240 }, .height = .{ .fit = .{} }, .direction = .column }, .{});
+    try root.appendChild(alloc, holder);
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const res = try Textarea(.{ .auto_rows = .{}, .helper = "Enter to send" }).mountResult(scope, cx);
+    try holder.appendChild(alloc, res.wrapper);
+    try std.testing.expect(res.frame == null);
+    try autoRowsScenario(cx, res, holder);
+    // The wrapper fits its rows: the field + gap + helper row.
+    try std.testing.expectApproxEqAbs(res.input.rectFromWorldOrFallback().h + 4 + 16, res.wrapper.rectFromWorldOrFallback().h, 0.5);
+}
+
+test "Textarea: auto_rows (compound) grows the text between header and footer, caps at max, shrinks back" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1000, 600);
+    const root = try box(cx, .{ .width = .{ .px = 1000 }, .height = .{ .px = 600 }, .direction = .column, .align_items = .start }, .{});
+    cx.root = root;
+    const holder = try box(cx, .{ .width = .{ .px = 240 }, .height = .{ .fit = .{} }, .direction = .column }, .{});
+    try root.appendChild(alloc, holder);
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    var res: TextareaResult = undefined;
+    try view.mount(scope, cx, holder, .{
+        view.with(Textarea(.{ .auto_rows = .{ .min = 1, .max = 6 }, .placeholder = "Ask" }), .{}).slots(.{
+            .header = view.box(.{ .style = .{ .width = .{ .px = 60 }, .height = .{ .px = 28 } } }, {}),
+            .footer = view.box(.{ .style = .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } } }, {}),
+        }).capture(&res),
+    });
+    const frame = res.frame.?;
+    try autoRowsScenario(cx, res, holder);
+    // Header 8 + 28 and footer 36 around the grown text; the wrapper follows the frame.
+    const fr = frame.rectFromWorldOrFallback();
+    try std.testing.expectApproxEqAbs(36 + 36 + res.input.rectFromWorldOrFallback().h, fr.h, 0.5);
+    try std.testing.expectApproxEqAbs(fr.h, res.wrapper.rectFromWorldOrFallback().h, 0.5);
+}
+
+test "Textarea: auto_rows min rows and a theme switch keep the grown height" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 400);
+    const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 }, .direction = .column }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const res = try Textarea(.{ .value = "one", .auto_rows = .{ .min = 2, .max = 4 } }).mountResult(scope, cx);
+    try root.appendChild(alloc, res.wrapper);
+    autoSettle(cx);
+    try autoExpectRows(res, 2);
+    res.state.insertText("\ntwo\nthree");
+    autoSettle(cx);
+    try autoExpectRows(res, 3);
+    cx.setTheme(&theme.light);
+    autoSettle(cx);
+    try autoExpectRows(res, 3);
+}
+
+test "Textarea: without auto_rows the field keeps its fixed rows height, tree and reactive nodes" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 400);
+    const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 }, .direction = .column }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    // (The first mount in a window creates window-wide state; compare the second.)
+    try root.appendChild(alloc, (try Textarea(.{ .value = "warm" }).mountResult(scope, cx)).wrapper);
+    const g0 = cx.owner.graph.countByKind();
+    const res = try Textarea(.{ .value = "a\nb\nc\nd\ne\nf\ng", .rows = 4 }).mountResult(scope, cx);
+    const g1 = cx.owner.graph.countByKind();
+    try root.appendChild(alloc, res.wrapper);
+    autoSettle(cx);
+    const metrics = styles.textareaMetrics(cx.tokens, null, 4);
+    try std.testing.expect(res.state.auto_rows == null and res.state.auto_frame == null);
+    try std.testing.expectApproxEqAbs(metrics.height, res.input.rectFromWorldOrFallback().h, 0.01);
+    try std.testing.expectEqual(core_ui.Sizing{ .px = metrics.height }, res.wrapper.style.height);
+    // auto_rows adds exactly its frame signal, no node.
+    const g2 = cx.owner.graph.countByKind();
+    const auto = try Textarea(.{ .value = "a\nb\nc\nd\ne\nf\ng", .rows = 4, .auto_rows = .{} }).mountResult(scope, cx);
+    const g3 = cx.owner.graph.countByKind();
+    try root.appendChild(alloc, auto.wrapper);
+    try std.testing.expectEqual(g1.get(.signal) - g0.get(.signal) + 1, g3.get(.signal) - g2.get(.signal));
+    try std.testing.expectEqual(g1.get(.memo) - g0.get(.memo), g3.get(.memo) - g2.get(.memo));
+    const count = struct {
+        fn of(n: *Node) usize {
+            var total: usize = 1;
+            for (n.children.items) |c| total += of(c);
+            return total;
+        }
+    }.of;
+    autoSettle(cx);
+    try std.testing.expectEqual(count(res.wrapper), count(auto.wrapper));
+}
+
+test "textarea(auto_rows): mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("textarea(auto_rows)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            return try Textarea(.{ .value = "a\nb", .auto_rows = .{ .min = 1, .max = 3 }, .helper = "h" }).mount(scope, cx);
+        }
+    }.m);
+}
+
+test "textarea(auto_rows, compound): mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("textarea(auto_rows compound)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            return try view.render(scope, cx, view.col(.{}, .{view.with(Textarea(.{ .value = "x", .auto_rows = .{} }), .{}).slots(.{
+                .header = view.text(.{}, "chip"),
+                .footer = view.text(.{}, "tools"),
+            })}));
+        }
+    }.m);
+}
+
+test "Textarea: header_visible hides / shows the compound header row and the frame follows" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(420, 400);
+    const root = try box(cx, .{ .width = .{ .px = 396 }, .height = .{ .px = 400 }, .direction = .column }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const shown = try scope.createSignal(bool, false);
+    var res: TextareaResult = undefined;
+    var chip: *Node = undefined;
+    try view.mount(scope, cx, root, .{
+        view.with(Textarea(.{ .value = "draft", .rows = 1, .header_visible = shown }), .{}).slots(.{
+            .header = view.capture(&chip, view.box(.{ .style = .{ .width = .{ .px = 120 }, .height = .{ .px = 28 } } }, {})),
+            .footer = view.box(.{ .style = .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } } }, {}),
+        }).capture(&res),
+    });
+    cx.layout();
+    _ = cx.render();
+    // Hidden: the row (and its content, still mounted) takes no room.
+    try std.testing.expect(!res.header.?.isDisplayedInTree());
+    try std.testing.expectEqual(res.header.?, chip.parent.?);
+    const text_h = res.input.rectFromWorldOrFallback().h;
+    try std.testing.expectApproxEqAbs(36 + text_h, res.frame.?.rectFromWorldOrFallback().h, 0.5);
+    shown.set(true);
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(res.header.?.isDisplayedInTree() and chip.isDisplayedInTree());
+    try std.testing.expectApproxEqAbs(36 + 36 + text_h, res.frame.?.rectFromWorldOrFallback().h, 0.5);
+    shown.set(false);
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(!res.header.?.isDisplayedInTree());
+    try std.testing.expectApproxEqAbs(36 + text_h, res.frame.?.rectFromWorldOrFallback().h, 0.5);
+}
+
+test "Textarea: readonly follows a source — editing fenced, text client detached and restored, a11y; focus and selection kept" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const locked = try scope.createSignal(bool, false);
+    const mounted = try Textarea(.{ .value = "draft", .readonly = locked }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    cx.layout();
+    _ = cx.render();
+    const field = mounted.input;
+    try std.testing.expect(field.behavior.interaction.text_input_client != null);
+    cx.focus_manager.setFocus(field);
+    _ = textareaFieldEventHandler(.{ .text_input = .{ .text = "!" } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getText());
+    _ = textareaFieldEventHandler(.{ .ime_preedit = .{ .text = "zhong", .cursor_utf8_offset = 5 } }, mounted.state);
+    try std.testing.expect(mounted.state.imeIsComposing());
+
+    locked.set(true);
+    try std.testing.expect(mounted.state.readonly);
+    try std.testing.expect(!mounted.state.imeIsComposing());
+    try std.testing.expect(field.behavior.interaction.text_input_client == null);
+    try std.testing.expect(field.behavior.interaction.a11y.?.readonly);
+    try std.testing.expect(cx.text_input_session.active_node == null);
+    try std.testing.expect(cx.focus_manager.getFocused() == field);
+    _ = textareaFieldEventHandler(.{ .text_input = .{ .text = "x" } }, mounted.state);
+    _ = textareaFieldEventHandler(.{ .key_down = .{ .key = .@"return" } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getText());
+    _ = textareaFieldEventHandler(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } }, mounted.state);
+    try std.testing.expectEqualStrings("draft!", mounted.state.getSelectedText().?);
+
+    locked.set(false);
+    try std.testing.expect(!mounted.state.readonly);
+    try std.testing.expect(field.behavior.interaction.text_input_client != null);
+    try std.testing.expect(!field.behavior.interaction.a11y.?.readonly);
+    _ = textareaFieldEventHandler(.{ .text_input = .{ .text = "y" } }, mounted.state);
+    try std.testing.expectEqualStrings("y", mounted.state.getText());
+    cx.focus_manager.setFocus(null);
+}
+
+test "Textarea: a static readonly textarea takes focus and selects (handlers installed, no text client)" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const mounted = try Textarea(.{ .value = "notes", .readonly = true }).mountResult(scope, cx);
+    try root.appendChild(alloc, mounted.wrapper);
+    cx.layout();
+    _ = cx.render();
+    const field = mounted.input;
+    try std.testing.expect(field.behavior.events.on_event != null);
+    try std.testing.expect(field.behavior.interaction.text_input_client == null);
+    try std.testing.expect(field.behavior.interaction.a11y.?.readonly);
+    cx.focus_manager.setFocus(field);
+    _ = textareaFieldEventHandler(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } }, mounted.state);
+    try std.testing.expectEqualStrings("notes", mounted.state.getSelectedText().?);
+    _ = textareaFieldEventHandler(.{ .text_input = .{ .text = "x" } }, mounted.state);
+    try std.testing.expectEqualStrings("notes", mounted.state.getText());
+    cx.focus_manager.setFocus(null);
+}
+
+test "Textarea: required follows a source (accessibility)" {
+    const alloc = std.testing.allocator;
+    var cx = try Cx.init(alloc, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(alloc, null, cx.owner);
+    defer scope.dispose();
+    const needed = try scope.createSignal(bool, false);
+    const mounted = try Textarea(.{ .required = needed }).mountResult(scope, cx);
+    cx.root = mounted.wrapper;
+    try std.testing.expect(!mounted.input.behavior.interaction.a11y.?.required);
+    needed.set(true);
+    try std.testing.expect(mounted.input.behavior.interaction.a11y.?.required);
+    needed.set(false);
+    try std.testing.expect(!mounted.input.behavior.interaction.a11y.?.required);
 }

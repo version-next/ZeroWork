@@ -132,3 +132,129 @@ test "window chrome clip and topmost client overlays block inherited drag" {
     cx.publishWindowRegions();
     try std.testing.expectEqual(chrome.Region.drag, cx.windowRegionAt(10, 10));
 }
+
+test "a drag region floating over a scroll area: window chrome drags its empty space, the legacy custom_inset band ignores regions" {
+    const cx = try init();
+    defer cx.deinit();
+    // Content that scrolls under the title bar (scroll target over the whole window) ...
+    const scroller = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = 300 }, .height = .{ .px = 180 } }, .{});
+    scroller.behavior.events.on_scroll = struct {
+        fn f(_: @import("../events.zig").ScrollEvent, _: ?*anyopaque) ui.EventResult {
+            return .ignored;
+        }
+    }.f;
+    // ... and a header floating over its top: hit-opaque (content under it takes no clicks), a
+    // drag region, with one button.
+    const button = try ui.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    button.behavior.interaction.focusable = true;
+    const header = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = 300 }, .height = .{ .px = 50 } }, .{button});
+    const root = try ui.box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 180 } }, .{ scroller, header });
+    cx.root = root;
+    cx.publishWindowRegions();
+    // Without a declared region the scroll target under the header makes it a control (unchanged).
+    try std.testing.expect(cx.legacyWindowControlAt(200, 20));
+    header.setStyle(cx.allocator, .hit_behavior, ui.HitBehavior.@"opaque");
+    header.behavior.interaction.window_region = .drag;
+    header.markInteractionDirty();
+    cx.publishWindowRegions();
+    // Window chrome (`WindowConfig.chrome`): the declared region decides.
+    try std.testing.expectEqual(chrome.Region.drag, cx.windowRegionAt(200, 20)); // header empty space: drag
+    try std.testing.expectEqual(chrome.Region.client, cx.windowRegionAt(20, 20)); // its button: control
+    try std.testing.expectEqual(chrome.Region.client, cx.windowRegionAt(200, 100)); // content below the header: control
+    try std.testing.expect(cx.hitTest(200, 20) == header); // clicks never reach the content under it
+    // Legacy `.custom_inset` band: regions are not read, the hit-opaque header is a pointer
+    // target like any other, so the point stays a control.
+    try std.testing.expect(cx.legacyWindowControlAt(200, 20));
+    try std.testing.expect(cx.legacyWindowControlAt(20, 20));
+    try std.testing.expect(cx.legacyWindowControlAt(200, 100));
+    cx.tick_depth += 1;
+    try std.testing.expectEqual(chrome.Region.client, cx.windowRegionAt(200, 20)); // mid-tick: fail closed
+    try std.testing.expect(cx.legacyWindowControlAt(200, 20));
+    cx.tick_depth -= 1;
+}
+
+test "standalone window overlay portal does not hide window regions (matches the runtime portal)" {
+    const cx = try init();
+    defer cx.deinit();
+    const root = try ui.box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 180 } }, .{});
+    root.behavior.interaction.window_region = .drag;
+    cx.root = root;
+    const portal = try cx.ensurePopoverPortalRoot();
+    try std.testing.expectEqual(ui.HitBehavior.children_only, portal.style.ext.?.hit_behavior.?);
+    cx.publishWindowRegions();
+    try std.testing.expectEqual(chrome.Region.drag, cx.windowRegionAt(150, 90));
+    try std.testing.expect(!cx.legacyWindowControlAt(150, 90));
+}
+
+// Reference-checked OOM sweep (components/oom_sweep.zig): the header's inset and the controls'
+// order / spacing / button looks are bound to the chrome state; their first application is part
+// of the mount, so a mount that reports success must carry them completely.
+test "window header + controls: mount 成功即外观完整，任意分配点失败不假成功（sweep）" {
+    const sw = @import("../components/oom_sweep.zig");
+    try sw.sweepMountVerified("window_chrome(header+controls)", struct {
+        fn m(scope: *ui.Scope, cx: *ui.Cx) anyerror!?*ui.Node {
+            // published before anything observes it (a set() would notify through the graph)
+            cx.window_chrome_signal = try ui.Signal(chrome.State).create(cx.owner, .{ .effective_mode = .custom, .controls_owner = .native, .controls_geometry_known = false, .width = 72 });
+            const header = try helpers.WindowHeader(.{ .style = .{ .padding = ui.Padding.all(4) } }, .{"Title"}).mount(scope, cx);
+            errdefer cx.destroyDetached(header);
+            const controls = try helpers.WindowControls(.{}).mount(scope, cx);
+            header.appendChild(cx.allocator, controls) catch |err| {
+                cx.destroyDetached(controls);
+                return err;
+            };
+            return header;
+        }
+    }.m, struct {
+        fn check(root: *ui.Node) anyerror!void {
+            // unknown native geometry: the header reserves the whole width on the left
+            try std.testing.expectEqual(@as(f32, 72), root.style.padding.left);
+            try std.testing.expectEqual(chrome.Region.drag, root.behavior.interaction.window_region);
+            const controls = root.children.items[root.children.items.len - 1];
+            try std.testing.expectEqual(@as(usize, 3), controls.children.items.len);
+            try std.testing.expect(controls.style.gap > 0);
+        }
+    }.check);
+}
+
+fn themedHeaderLayout(_: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .{ .px = 38 }, .direction = .row, .align_items = .center, .padding = .{ .right = 10 } };
+}
+
+fn expectHeaderInsetSurvivesTheme(comptime style: anytype, owner: chrome.ControlsOwner) !void {
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(300, 180);
+    var state: chrome.State = .{ .effective_mode = .custom, .controls_owner = owner, .width = 300, .height = 180 };
+    if (owner == .native) {
+        state.native_controls[0] = .{ .x = 160, .y = 0, .w = 140, .h = 32 };
+        state.native_controls_count = 1;
+    }
+    (try cx.windowChrome()).set(state);
+    const scope = try ui.Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const header = try helpers.WindowHeader(.{ .style = style }, .{helpers.ClientRegion(.{ .style = .{ .width = .{ .px = 24 }, .height = .{ .px = 24 } } }, .{})}).mount(scope, cx);
+    // The root owns the header; cx.deinit frees the tree.
+    const root = try ui.box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 180 } }, .{});
+    cx.root = root;
+    try root.appendChild(cx.allocator, header);
+    cx.layout();
+    const before = header.style.padding;
+    const controls_before = header.children.items[header.children.items.len - 1].globalRect();
+    cx.setTheme(&ui.theme.light);
+    cx.layout();
+    try std.testing.expectEqual(before, header.style.padding);
+    try std.testing.expectEqual(controls_before, header.children.items[header.children.items.len - 1].globalRect());
+    cx.setTheme(&ui.theme.dark);
+    cx.layout();
+    try std.testing.expectEqual(before, header.style.padding);
+}
+
+const static_header_layout: ui.BoxStyle = .{ .width = .fill(), .height = .{ .px = 38 }, .padding = .{ .right = 10 } };
+
+test "window header keeps its control inset across a theme switch" {
+    const static_style = static_header_layout;
+    try expectHeaderInsetSurvivesTheme(static_style, .native);
+    try expectHeaderInsetSurvivesTheme(themedHeaderLayout, .native);
+    try expectHeaderInsetSurvivesTheme(static_style, .framework);
+    try expectHeaderInsetSurvivesTheme(themedHeaderLayout, .framework);
+}

@@ -5,6 +5,22 @@ const catalog = @import("model_catalog.zig");
 const transport = @import("provider_transport.zig");
 const http = @import("provider_http.zig");
 pub const list_refresh_seconds = 5 * 60;
+pub const public_catalog_url = "https://models.dev/api.json";
+const automation = @import("../platform/runtime_mode.zig").automation;
+/// Test-mode builds and unit tests never fetch the public catalog: provider fixtures are
+/// offline, and their model ids were never listed there, so the public lookup only ever
+/// added an outbound dial (REQUESTS #53). A test that needs public capability metadata
+/// supplies a local models.dev-format file through ZEROWORK_TEST_PUBLIC_MODEL_CATALOG.
+/// Formal builds keep fetching public_catalog_url.
+fn testPublicCatalog(allocator: std.mem.Allocator) ?[]const u8 {
+    const path = std.c.getenv("ZEROWORK_TEST_PUBLIC_MODEL_CATALOG") orelse {
+        std.log.info("model discovery: public catalog skipped in test-mode (no network)", .{});
+        return null;
+    };
+    var threaded: std.Io.Threaded = .init(std.heap.c_allocator, .{});
+    defer threaded.deinit();
+    return std.Io.Dir.cwd().readFileAlloc(threaded.io(), std.mem.span(path), allocator, .limited(32 * 1024 * 1024)) catch null;
+}
 fn initialContextWindow(p: config.AiProvider, advertised: ?u32, require_list: bool) u32 {
     // Missing metadata stays unknown; never invent an 8K model window.
     return advertised orelse if (require_list) 0 else p.context_window;
@@ -22,6 +38,8 @@ pub const ModelMetadata = struct { id: []const u8, reasoning_known: bool, vision
 pub const Service = struct {
     job: ?*Job = null,
     current: ?*Job = null,
+    /// The UI that polls this service (its owner binds it); a finished job publishes to it.
+    wake: ?*const @import("publication.zig").Wake = null,
     generation: u64 = 0,
     next_refresh: i64 = 0,
     next_list_refresh: i64 = 0,
@@ -62,6 +80,7 @@ pub const Service = struct {
         const job = try Job.create(.{ .providers = @constCast(&[_]config.AiProvider{selected}), .provider_count = 1 }, revision);
         errdefer job.destroy();
         job.require_list = true;
+        job.wake = self.wake;
         job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
         self.request_error = null;
         self.job = job;
@@ -77,6 +96,7 @@ pub const Service = struct {
         const job = try Job.create(.{ .default_provider = @import("provider_config.zig").providerId(selected), .providers = @constCast(&[_]config.AiProvider{selected}), .provider_count = 1 }, 0);
         errdefer job.destroy();
         job.probe = true;
+        job.wake = self.wake;
         job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
         self.request_error = null;
         self.job = job;
@@ -132,7 +152,8 @@ pub const Service = struct {
             if (full_refresh or list_refresh) {
                 const job = try Job.createRefresh(ai, self.effective(ai, revision), revision, !full_refresh);
                 errdefer job.destroy();
-                job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
+                job.wake = self.wake;
+        job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
                 self.job = job;
                 self.revision = revision;
                 if (full_refresh) self.next_refresh = now + catalog.refresh_seconds;
@@ -145,6 +166,7 @@ pub const Service = struct {
 const Job = struct {
     arena: std.heap.ArenaAllocator,
     ai: config.Ai,
+    wake: ?*const @import("publication.zig").Wake = null,
     revision: u64,
     thread: ?std.Thread = null,
     cancel: @import("provider.zig").CancelToken = .{},
@@ -189,7 +211,10 @@ const Job = struct {
         std.heap.c_allocator.destroy(self);
     }
     fn run(self: *Job) void {
-        defer self.done.store(true, .release);
+        defer {
+            self.done.store(true, .release);
+            @import("publication.zig").publish(self.wake);
+        }
         const result = if (self.probe) self.testChat() else self.discover();
         result catch |err| {
             self.failure = err;
@@ -317,11 +342,14 @@ const Job = struct {
                 // Missing capability metadata is resolved independently of list availability.
                 if (!self.require_list and !fallback_attempted and (capability.reasoning == null or !capability.control_known or capability.context == null or capability.vision == null or (p.kind == .anthropic and capability.output == null))) {
                     fallback_attempted = true;
-                    const public_plan: http.RequestPlan = .{ .method = .GET, .endpoint = "https://models.dev/api.json", .accept = "application/json", .auth_style = .none, .timeout_ms = 10000, .cancel = &self.cancel };
-                    if (self.fetch(t, public_plan, "")) |bytes| {
+                    const public_body: ?[]const u8 = if (comptime automation) testPublicCatalog(self.arena.allocator()) else blk: {
+                        const public_plan: http.RequestPlan = .{ .method = .GET, .endpoint = public_catalog_url, .accept = "application/json", .auth_style = .none, .timeout_ms = 10000, .cancel = &self.cancel };
+                        break :blk self.fetch(t, public_plan, "") catch null;
+                    };
+                    if (public_body) |bytes| {
                         fallback = catalog.Catalog.parse(std.heap.c_allocator, bytes, .models_dev) catch null;
                         if (fallback != null) self.success = true;
-                    } else |_| {}
+                    }
                 }
                 if (fallback) |f| for (f.entries) |entry| {
                     if (entry.api.len != 0 and sameHost(entry.api, p.endpoint)) {
@@ -676,6 +704,43 @@ test "model discovery missing window stays unknown while explicit and advertised
         } else {
             const selected = try selection.fromSettings(ai);
             try std.testing.expectEqual(case.expected, selected.context_window);
+        }
+    }
+}
+
+test "model discovery in test builds reads the public catalog only from a local fixture file" {
+    const c = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data =
+        \\{"fixture":{"models":{"catalog-fixture":{"reasoning":false,"limit":{"context":65536},"modalities":{"input":["text","image"]}}}}}
+    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
+    defer std.testing.allocator.free(path_z);
+    defer _ = c.unsetenv("ZEROWORK_TEST_PUBLIC_MODEL_CATALOG");
+    for ([_]bool{ false, true }) |with_fixture| {
+        if (with_fixture) _ = c.setenv("ZEROWORK_TEST_PUBLIC_MODEL_CATALOG", path_z, 1) else _ = c.unsetenv("ZEROWORK_TEST_PUBLIC_MODEL_CATALOG");
+        // Closed loopback port: the provider list is unavailable, so only the public catalog can supply metadata.
+        var models = [_]config.AiModel{.{ .id = "catalog-fixture", .context_window = 8192, .default = true }};
+        var providers = [_]config.AiProvider{.{ .name = "fixture", .kind = .openai_compat, .enabled = true, .endpoint = "http://127.0.0.1:1/v1", .models = &models, .model_count = 1 }};
+        const job = try Job.create(.{ .default_provider = "fixture", .providers = &providers, .provider_count = 1 }, 1);
+        defer job.destroy();
+        try job.discover();
+        const model = job.ai.providers[0].models[0];
+        if (with_fixture) {
+            try std.testing.expect(job.success);
+            try std.testing.expectEqual(@as(u32, 65536), model.context_window);
+            try std.testing.expect(model.vision and model.context_discovered and model.reasoning_discovered);
+        } else {
+            // No network in test builds: nothing was learned and the configured values stand.
+            try std.testing.expect(!job.success);
+            try std.testing.expectEqual(@as(u32, 8192), model.context_window);
+            try std.testing.expect(!model.vision and !model.context_discovered);
         }
     }
 }

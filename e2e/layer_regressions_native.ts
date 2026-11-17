@@ -1,6 +1,7 @@
 /** Retained material regressions through production settings and AI controls.
  * node e2e/layer_regressions_native.ts /absolute/test-mode/binary /absolute/output
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -8,6 +9,7 @@ import {mkdir, mkdtemp, open, readFile, writeFile, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
+import {aiToggleId} from './ai_entry.ts';
 
 const binary = resolve(process.argv[2]), out = resolve(process.argv[3]);
 await mkdir(out, {recursive: true});
@@ -79,17 +81,17 @@ try {
   assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid), app.pid);
   await h.resizeWindow(1440,900); await click('workspace.empty.local');
   // No AI open has occurred: its original opaque Dark branch is detached.
-  await selectTheme('light'); await click('ai.strip'); await capture('light-first-open');
+  await selectTheme('light'); await click(await aiToggleId()); await capture('light-first-open');
   const original = (await visible('ai.panel')).id;
   const draft = await visible('ai.prompt');
   await h.clickAt(draft.rect.x+40,draft.rect.y+15); await h.type_('分层回归草稿');
   for (const theme of ['sauber','dark','light']) {
     await click('ai.collapse'); await h.sleep(250); await selectTheme(theme);
-    await click('ai.strip'); await capture(theme+'-after-hidden-theme');
+    await click(await aiToggleId()); await capture(theme+'-after-hidden-theme');
     assert.equal((await visible('ai.panel')).id, original, 'retained node identity');
     assert.equal((await h.inputState('ai.prompt')).buffer, '分层回归草稿');
   }
-  for (let i=0;i<4;i++) {await click('ai.collapse');await h.sleep(250);await click('ai.strip');await visible('ai.panel');}
+  for (let i=0;i<4;i++) {await click('ai.collapse');await h.sleep(250);await click(await aiToggleId());await visible('ai.panel');}
   await capture('light-reopened');
   await h.resizeWindow(860,480); await capture('light-compact');
   await h.resizeWindow(1440,900); await h.key('k',{cmd:true});

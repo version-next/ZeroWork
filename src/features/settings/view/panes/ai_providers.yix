@@ -1,0 +1,269 @@
+//! AI 辅助 › 服务提供方（F-set-ai，人工验收反馈第 10 条：`GV8pb` 改两级）：列表页（`lxZqv`：头像 + 名称 / 协议与模型数 +
+//! 默认 / 未启用 + 箭头，下面“添加服务提供方…”）→ 点一行进入这个提供方的详情页（第三级，`Location.ai_provider`）。
+//! 详情页：连接（启用、名称、API 协议、API 地址、API Key）、模型（获取清单、添加、星标默认、编辑、删除）与删除提供方。
+//! 全部原生组件（`W.Pressable` 行、`W.Switch` / `W.Input` / `W.Select` / `W.Button` / `W.Tag` / `W.Badge` / `W.Tooltip`），
+//! 外观不覆盖；行之间的分隔线同其它设置面板（人工验收反馈 6）。状态与动作在 `model/ai_pane.zig`（`m.ai`）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const S = @import("../styles.yss");
+const P = @import("ai.yss");
+const A = m.ai;
+const F = m.fields.ai;
+
+const providers_pane = &F.providers;
+
+fn send(vm: *m.ViewModel, command: A.Command) void {
+    vm.dispatch(m.Intent.aiDo(command));
+}
+fn openProvider(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .open_provider = index });
+}
+fn addProvider(vm: *m.ViewModel) void {
+    send(vm, .add_provider);
+}
+fn toggleProvider(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .toggle_provider = index });
+}
+fn setKind(vm: *m.ViewModel, index: u8, kind: ?[]const u8) void {
+    send(vm, .{ .set_kind = .{ .provider = index, .kind = kind } });
+}
+fn editName(vm: *m.ViewModel, index: u8, text: []const u8) void {
+    send(vm, .{ .edit_text = .{ .provider = index, .field = .name, .text = text } });
+}
+fn editEndpoint(vm: *m.ViewModel, index: u8, text: []const u8) void {
+    send(vm, .{ .edit_text = .{ .provider = index, .field = .endpoint, .text = text } });
+}
+fn editKey(vm: *m.ViewModel, index: u8, text: []const u8) void {
+    send(vm, .{ .edit_text = .{ .provider = index, .field = .api_key, .text = text } });
+}
+fn reveal(vm: *m.ViewModel) void {
+    send(vm, .reveal_key);
+}
+fn fetchModels(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .fetch_models = index });
+}
+fn addModel(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .add_model = index });
+}
+fn editModel(vm: *m.ViewModel, index: u8, model: u8) void {
+    send(vm, .{ .edit_model = .{ .provider = index, .model = model } });
+}
+fn defaultModel(vm: *m.ViewModel, index: u8, model: u8) void {
+    send(vm, .{ .default_model = .{ .provider = index, .model = model } });
+}
+fn deleteModel(vm: *m.ViewModel, index: u8, model: u8) void {
+    send(vm, .{ .delete_model = .{ .provider = index, .model = model } });
+}
+fn deleteProvider(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .delete_provider = index });
+}
+fn cancelProvider(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .cancel_provider = index });
+}
+fn shown(vm: *m.ViewModel) bool {
+    return vm.paneShown(providers_pane);
+}
+fn locked(vm: *m.ViewModel) bool {
+    return A.saving(vm);
+}
+fn eye(vm: *m.ViewModel) ?ui.SvgAsset {
+    return ui.icons.get(if (A.revealed(vm)) "eye-off" else "eye");
+}
+fn statusColor(vm: *m.ViewModel, index: u8) W.TagColor {
+    return if (A.providerEnabled(vm, index)) .success else .neutral;
+}
+fn enableA11y(vm: *m.ViewModel, index: u8) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = "启用服务提供方", .checked = A.providerEnabled(vm, index), .disabled = A.saving(vm) };
+}
+const kind_options = [_]W.SelectOption{ .{ .value = "anthropic", .label = "Anthropic" }, .{ .value = "openai_compat", .label = "OpenAI 兼容" }, .{ .value = "ollama", .label = "Ollama" } };
+
+/// 列表页（`lxZqv`）。
+pub fn ProviderList(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.ai.providers" style={S.pane} visible={shown(vm)}>
+            <box testId="settings.ai.provider_pane" style={S.pane_header}>
+                <text style={S.pane_title}>服务提供方</text>
+                <spacer />
+                <text style={S.pane_meta} box={S.pane_meta_box}>{A.providerCountText(vm)}</text>
+            </box>
+            {if (A.hasProviders(vm)) <box testId="settings.ai.provider_list" style={S.pane_body}>
+                {for (A.providerItems(vm)) |item| <ProviderRow key={item.key} vm={vm} index={item.index} last={item.last} />}
+            </box> else <box testId="settings.ai.providers.empty" style={S.pane_body}>
+                <W.Empty icon={ui.icons.sparkles} title="添加你的第一个服务提供方" description="支持 Anthropic、OpenAI 兼容接口与 Ollama。" actionLabel="新增服务提供方" actionDisabled={locked(vm)} onAction={addProvider(vm)} actionTestId="settings.ai.providers.empty.add" />
+            </box>}
+            <text testId="settings.ai.provider_error" style={P.ai_error} box={P.ai_error_box} visible={A.errorShown(vm)}>{A.errorText(vm)}</text>
+            <box style={P.ai_actions} visible={A.hasProviders(vm)}>
+                <W.Button testId="settings.ai.add_provider" label="添加服务提供方…" a11yLabel="新增服务提供方" variant={.secondary} size={.sm} iconAsset={ui.icons.plus} iconSize={14} disabled={locked(vm)} onClick={addProvider(vm)} />
+            </box>
+        </box>
+    );
+}
+
+/// 列表行（`bCylr`）：整行是一个原生 `W.Pressable`，点开详情页。
+fn ProviderRow(vm: *m.ViewModel, index: u8, last: bool) View {
+    return (
+        <W.Pressable testId={A.providerId(index, "header")} a11yLabel={A.providerName(vm, index)} disabled={locked(vm)} onClick={openProvider(vm, index)} style={P.AiProviderRow.of(.{ .locked = locked(vm) })}>
+            <box testId={A.providerId(index, "logo")} style={P.ai_avatar}>
+                <text style={P.ai_avatar_text}>{A.providerInitial(vm, index)}</text>
+            </box>
+            <box testId={A.providerId(index, "card")} style={P.AiProviderInner.of(.{ .last = last })}>
+                <box style={P.ai_copy}>
+                    <text style={P.ai_row_title} box={P.ai_row_title_box}>{A.providerName(vm, index)}</text>
+                    <text testId={A.providerId(index, "summary")} style={P.ai_row_summary} box={P.ai_row_title_box}>{A.providerSummary(vm, index)}</text>
+                </box>
+                <W.Badge testId={A.providerId(index, "default")} label="默认" status={.info} size={.sm} visible={A.providerIsDefault(vm, index)} />
+                <text testId={A.providerId(index, "state")} style={P.ai_row_state} visible={A.providerDisabledShown(vm, index)}>{A.providerStatus(vm, index)}</text>
+                <icon src={ui.icons.chevron_right} style={P.ai_chevron} />
+            </box>
+        </W.Pressable>
+    );
+}
+
+/// 详情页（第三级）：连接、模型、删除。`index` 在内容页挂载时定下（换提供方是一次导航，整页重挂）。
+pub fn ProviderDetail(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box testId="settings.ai.providers" style={S.category_panes} visible={shown(vm)}>
+            <box testId={A.providerId(index, "detail")} style={S.category_panes}>
+                <ConnectionPane vm={vm} index={index} />
+                <ModelsPane vm={vm} index={index} />
+                <text testId="settings.ai.provider_error" style={P.ai_error} box={P.ai_error_box} visible={A.errorShown(vm)}>{A.errorText(vm)}</text>
+                <box style={P.ai_danger_row}>
+                    {if (A.isNewProvider(vm, index)) <W.Button testId={A.providerId(index, "cancel_provider")} label="取消新增" variant={.ghost} size={.sm} disabled={locked(vm)} onClick={cancelProvider(vm, index)} /> else <W.Button testId={A.providerId(index, "delete_provider")} label="删除服务提供方" variant={.danger} size={.sm} disabled={A.deleteProviderBlocked(vm, index)} onClick={deleteProvider(vm, index)} />}
+                </box>
+            </box>
+        </box>
+    );
+}
+
+/// 字段的校验提示（`settings.ai.provider.<i>.<字段>.error`，无问题时不显示）。
+fn FieldProblem(vm: *m.ViewModel, index: u8, field: A.Field, id: []const u8) View {
+    return <text testId={id} style={S.setting_error} visible={A.fieldInvalid(vm, index, field)}>{A.fieldProblem(vm, index, field)}</text>;
+}
+
+fn ConnectionPane(vm: *m.ViewModel, index: u8) View {
+    const enable_a11y = computed(enableA11y(vm, index));
+    return (
+        <box style={S.pane}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>连接</text>
+                <spacer />
+                <W.Tag testId={A.providerId(index, "status")} label={A.providerStatus(vm, index)} color={statusColor(vm, index)} size={.sm} />
+            </box>
+            <box style={S.pane_body}>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={S.setting_line}>
+                        <box style={S.setting_copy}>
+                            <box style={S.setting_heading}>
+                                <text style={S.setting_label}>启用</text>
+                                {if (A.providerDisabledShown(vm, index)) <W.Tooltip text="配置完成后，使用右侧开关启用。" position={.top} parts={.{ .content = A.providerId(index, "enable_help.tooltip") }}>
+                                    <W.Button testId={A.providerId(index, "enable_help")} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.circle_help} iconSize={14} a11yLabel="配置完成后，使用右侧开关启用。" />
+                                </W.Tooltip>}
+                            </box>
+                            <text style={S.setting_hint} box={S.setting_hint_box}>{A.enableHint(vm, index)}</text>
+                        </box>
+                        <W.Switch testId={A.providerId(index, "enabled")} checked={A.providerEnabled(vm, index)} disabled={locked(vm)} a11y={enable_a11y} onChange={|_| toggleProvider(vm, index)} />
+                    </box>
+                </box>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={S.setting_line}>
+                        <text style={S.setting_label} box={S.info_label_box}>服务提供方名称 *</text>
+                        <W.Input value={A.fieldText(vm, index, .name)} placeholder="例如：团队模型服务" width={280} invalid={A.fieldInvalid(vm, index, .name)} disabled={locked(vm)} focusId={A.providerFocus(index, .name)} autoFocus={A.isNewProvider(vm, index)} onChange={|t| editName(vm, index, t)} onSubmit={|t| editName(vm, index, t)} parts={.{ .input_container = A.providerId(index, "name") }} />
+                    </box>
+                    <FieldProblem vm={vm} index={index} field={.name} id={A.providerId(index, "name.error")} />
+                </box>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={S.setting_line}>
+                        <text style={S.setting_label} box={S.info_label_box}>API 协议</text>
+                        <W.Select panelWidth={.trigger} options={&kind_options} value={A.kindValue(vm, index)} width={280} disabled={locked(vm)} onChange={|v| setKind(vm, index, v)} parts={.{ .trigger = A.providerId(index, "kind") }} />
+                    </box>
+                </box>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={S.setting_line}>
+                        <text style={S.setting_label} box={S.info_label_box}>API 地址 *</text>
+                        <W.Input value={A.fieldText(vm, index, .endpoint)} placeholder="https://api.example.com/v1" width={280} invalid={A.fieldInvalid(vm, index, .endpoint)} disabled={locked(vm)} focusId={A.providerFocus(index, .endpoint)} onChange={|t| editEndpoint(vm, index, t)} onSubmit={|t| editEndpoint(vm, index, t)} parts={.{ .input_container = A.providerId(index, "endpoint") }} />
+                    </box>
+                    <FieldProblem vm={vm} index={index} field={.endpoint} id={A.providerId(index, "endpoint.error")} />
+                </box>
+                <box style={S.SettingRow.of(.{ .last = true })}>
+                    <box style={S.setting_line}>
+                        <box style={S.setting_copy}>
+                            <box style={S.setting_heading}>
+                                <text style={S.setting_label}>{A.apiKeyLabel(vm, index)}</text>
+                                <W.Tooltip text="API Key 存储于 macOS 钥匙串" position={.top} parts={.{ .content = A.providerId(index, "keychain.tooltip") }}>
+                                    <W.Button testId={A.providerId(index, "keychain")} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.lock} iconSize={14} a11yLabel="API Key 存储于 macOS 钥匙串" />
+                                </W.Tooltip>
+                            </box>
+                        </box>
+                        <box style={P.ai_control}>
+                            {if (A.revealed(vm)) <W.Input value={A.fieldText(vm, index, .api_key)} placeholder="输入 API Key" width={248} invalid={A.fieldInvalid(vm, index, .api_key)} disabled={locked(vm)} focusId={A.providerFocus(index, .api_key)} onChange={|t| editKey(vm, index, t)} onSubmit={|t| editKey(vm, index, t)} parts={.{ .input_container = A.providerId(index, "api_key") }} /> else <W.Input value={A.fieldText(vm, index, .api_key)} inputType={.password} placeholder="输入 API Key" width={248} invalid={A.fieldInvalid(vm, index, .api_key)} disabled={locked(vm)} focusId={A.providerFocus(index, .api_key)} onChange={|t| editKey(vm, index, t)} onSubmit={|t| editKey(vm, index, t)} parts={.{ .input_container = A.providerId(index, "api_key") }} />}
+                            <W.Tooltip text={A.revealLabel(vm)} position={.top}>
+                                <W.Button testId={A.providerId(index, "reveal_key")} variant={.ghost} size={.sm} iconOnly={true} iconAsset={eye(vm)} iconSize={14} a11yLabel={A.revealLabel(vm)} disabled={locked(vm)} onClick={reveal(vm)} />
+                            </W.Tooltip>
+                        </box>
+                    </box>
+                    <FieldProblem vm={vm} index={index} field={.api_key} id={A.providerId(index, "api_key.error")} />
+                </box>
+            </box>
+        </box>
+    );
+}
+
+fn ModelsPane(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box style={S.pane}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>模型</text>
+                <text style={S.pane_meta}>{A.modelCountText(vm, index)}</text>
+                <spacer />
+                <box style={P.ai_header_actions}>
+                    <W.Button testId={A.providerId(index, "fetch_models")} label={A.fetchLabel(vm, index)} variant={.ghost} size={.xs} disabled={A.fetchBlocked(vm, index)} onClick={fetchModels(vm, index)} />
+                    <W.Button testId={A.providerId(index, "add_model")} label="添加模型" variant={.ghost} size={.xs} iconAsset={ui.icons.plus} iconSize={12} disabled={locked(vm)} onClick={addModel(vm, index)} />
+                </box>
+            </box>
+            <box style={S.pane_body}>
+                <text testId={A.providerId(index, "catalog_status")} style={P.ai_note} box={P.ai_note_box} visible={A.catalogShown(vm, index)}>{A.catalogMessage(vm, index)}</text>
+                {if (A.hasModels(vm, index)) <box testId={A.providerId(index, "models")} style={S.category_block}>
+                    {for (A.modelItems(vm, index)) |item| <ModelRow key={item.key} vm={vm} index={index} model={item.index} last={item.last} />}
+                </box> else <W.Empty icon={ui.icons.box} title="尚未添加模型" description="获取模型清单后选择，也可手动输入模型。" actionLabel="添加第一个模型" actionDisabled={locked(vm)} onAction={addModel(vm, index)} actionTestId={A.providerId(index, "first_model")} />}
+            </box>
+        </box>
+    );
+}
+
+/// 模型行：名称（点开编辑器，悬停显示全名）、上下文、能力标签、默认徽标；星标设为默认、编辑、删除。
+fn ModelRow(vm: *m.ViewModel, index: u8, model: u8, last: bool) View {
+    return (
+        <box testId={A.modelId(index, model, "card")} style={S.SettingRow.of(.{ .last = last })}>
+            <box style={S.setting_line}>
+                <box style={P.ai_copy}>
+                    <W.Tooltip text={A.modelName(vm, index, model)} position={.top} parts={.{ .content = A.modelId(index, model, "name.tooltip") }}>
+                        <W.Pressable testId={A.modelId(index, model, "header")} a11yLabel={A.modelName(vm, index, model)} disabled={locked(vm)} onClick={editModel(vm, index, model)} style={P.AiModelName.of(.{})}>
+                            <text testId={A.modelId(index, model, "name.text")} style={P.ai_model_text} box={P.ai_row_title_box}>{A.modelName(vm, index, model)}</text>
+                        </W.Pressable>
+                    </W.Tooltip>
+                    <box testId={A.modelId(index, model, "metadata")} style={P.ai_model_meta}>
+                        <W.Tooltip text={A.modelContextFull(vm, index, model)} position={.top}>
+                            <text style={P.ai_model_context}>{A.modelContext(vm, index, model)}</text>
+                        </W.Tooltip>
+                        <W.Tag label="推理" variant={.outline} size={.sm} visible={A.modelReasoning(vm, index, model)} />
+                        <W.Tag label="识图" variant={.outline} size={.sm} visible={A.modelVision(vm, index, model)} />
+                        <W.Tag label="仅文本" variant={.outline} size={.sm} visible={A.modelTextOnly(vm, index, model)} />
+                        <W.Badge label="默认" status={.info} size={.sm} visible={A.modelIsDefault(vm, index, model)} />
+                    </box>
+                </box>
+                <box style={P.ai_model_actions}>
+                    <W.Tooltip text={A.defaultModelTip(vm, index, model)} position={.top}>
+                        <W.Button testId={A.modelId(index, model, "default_model")} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.star} iconSize={14} a11yLabel={A.defaultModelTip(vm, index, model)} disabled={A.defaultModelBlocked(vm, index, model)} onClick={defaultModel(vm, index, model)} />
+                    </W.Tooltip>
+                    <W.Tooltip text="编辑模型" position={.top}>
+                        <W.Button testId={A.modelId(index, model, "edit_model")} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.pencil} iconSize={14} a11yLabel="编辑模型" disabled={locked(vm)} onClick={editModel(vm, index, model)} />
+                    </W.Tooltip>
+                    <W.Tooltip text={A.deleteModelTip(vm, index, model)} position={.top}>
+                        <W.Button testId={A.modelId(index, model, "delete_model")} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.trash_2} iconSize={14} a11yLabel={A.deleteModelTip(vm, index, model)} disabled={A.deleteModelBlocked(vm, index, model)} onClick={deleteModel(vm, index, model)} />
+                    </W.Tooltip>
+                </box>
+            </box>
+        </box>
+    );
+}

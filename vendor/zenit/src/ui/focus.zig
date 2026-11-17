@@ -39,6 +39,71 @@ pub const SCOPED_BUF_CAP: usize = 512;
 pub const FocusVisibility = enum { inherit, show, hide };
 pub const InputModality = enum { pointer, keyboard };
 
+/// Observes committed focus changes and silent focus loss (Cx installs the declarative-focus
+/// registry, focus_targets.zig). `focused` runs once a transition commits its new owner (null
+/// for a transition to nothing); `lost` runs before a silent path drops the owner, with
+/// `read_client` true only when the node's callback context is still alive (abandonFocus).
+pub const FocusObserver = struct {
+    context: *anyopaque,
+    focused: *const fn (context: *anyopaque, node: ?*Node) void,
+    lost: *const fn (context: *anyopaque, node: *Node, read_client: bool) void,
+    /// What an auto-focus scope taking focus should focus (`pushScopeWith`, then each settle of
+    /// its pending entry), see `EntryQuery` / `EntryTarget`. Null hook = no declarations (the
+    /// first focusable node).
+    entry_target: ?*const fn (context: *anyopaque, scope: *Node, query: EntryQuery) EntryTarget = null,
+    /// A ready named target (`focusId`) anywhere in the window, null = none (`ScopeExit.return_focus`).
+    find_target: ?*const fn (context: *anyopaque, name: []const u8) ?*Node = null,
+    /// A scope entry's placeholder moved `transition_epoch` from `old` to `new` and nothing else
+    /// happened: pending work stamped `old` is still current (the placeholder is not an intent).
+    restamp: ?*const fn (context: *anyopaque, old: u64, new: u64) void = null,
+};
+
+pub const EntryQuery = struct {
+    /// The scope's named initial focus (`ScopeEntry.initial_focus`).
+    initial: ?[]const u8 = null,
+    /// Consider a pending view-model focus request aimed into the scope (entry: yes; the trap
+    /// refocus after a released node: no).
+    requests: bool = true,
+};
+
+/// Answer of `FocusObserver.entry_target`.
+pub const EntryTarget = union(enum) {
+    /// Focus this node (inside the scope); the entry is done.
+    focus: *Node,
+    /// The named target is mounted in the scope but not ready (hidden, disabled): hold focus on
+    /// the scope's placeholder and wait for it.
+    wait,
+    /// The named target (or the target of a pending request) is not mounted in the scope yet: it
+    /// may still come (rows filled after the open) or never (a stale name). Focus this default now
+    /// (null = the first focusable node) as a placeholder and take the target if it shows up
+    /// before the user acts.
+    later: ?*Node,
+    /// No declaration: the first focusable node.
+    none,
+};
+
+/// How a scope takes focus (`FocusManager.pushScopeWith`).
+pub const ScopeEntry = struct {
+    /// focusId of the control focused when the scope takes focus (copied; resolved by the
+    /// observer inside the scope). null = a declared `autoFocus` inside, else the first focusable.
+    initial_focus: ?[]const u8 = null,
+    /// Where focus returns when the scope is removed with restore. null = the focus at push.
+    default_return: ?*Node = null,
+    /// Holds focus while the entry waits for its target (inside the scope, need not be focusable:
+    /// a dialog panel). null = the scope node when it is focusable, else the first focusable.
+    placeholder: ?*Node = null,
+};
+
+/// How a scope gives focus back (`FocusManager.removeScopeWith`).
+pub const ScopeExit = struct {
+    /// Give focus back (the caller decides, e.g. only while focus is still inside).
+    restore: bool,
+    /// focusId of the control focus returns to (resolved by the observer in the whole window once
+    /// the scope is gone); null or not ready = `ScopeEntry.default_return` / the focus at push.
+    /// Only for the active scope: a scope removed from under another keeps that one's trap.
+    return_focus: ?[]const u8 = null,
+};
+
 /// Focus manager
 pub const FocusManager = struct {
     allocator: Allocator,
@@ -76,6 +141,7 @@ pub const FocusManager = struct {
     /// a runtime-index rebuild, and `unregisterFocusableSilent` during node
     /// teardown, are reconciled by Cx at their own boundary instead. Any new
     /// path that writes `current_focus` directly owes the same reconcile.
+    observer: ?FocusObserver = null,
     settled_context: ?*anyopaque = null,
     on_focus_settled: ?*const fn (context: *anyopaque) void = null,
 
@@ -90,6 +156,15 @@ pub const FocusManager = struct {
 
     /// Scoped focus order buffer (Phase 6: 64->512)
     scoped_buf: [SCOPED_BUF_CAP]*Node = undefined,
+    /// The pending entry of the active auto-focus scope (it has not settled on its target yet,
+    /// see `pushScopeWith`). One at a time: pushing another scope ends it.
+    scope_entry: ?PendingEntry = null,
+    /// Counts user input (pointer down, key down, wheel; `noteUserInput`): a pending scope entry
+    /// ends at the first one, so a target that shows up later never takes focus from under the
+    /// user.
+    input_epoch: u64 = 0,
+    /// Focus lost to a released node while a trap scope was active (`refocusActiveTrapScope`).
+    pending_trap_refocus: ?struct { node: ?*Node, handle: ?NodeHandle, epoch: u64 } = null,
 
     /// Most recent focus change reason (for :focus-visible)
     last_focus_reason: FocusReason = .programmatic,
@@ -98,6 +173,18 @@ pub const FocusManager = struct {
     focus_visible: bool = false,
     visibility_listeners: std.ArrayList(VisibilityListener) = .empty,
     next_visibility_id: u64 = 0,
+
+    const PendingEntry = struct {
+        scope_id: u32,
+        /// `transition_epoch` at push, or after this entry's own last placeholder.
+        epoch: u64,
+        input_epoch: u64,
+        /// Owned copy of `ScopeEntry.initial_focus`.
+        name: ?[]u8,
+        /// `ScopeEntry.placeholder` (identity-checked before use).
+        placeholder: ?*Node,
+        placeholder_handle: ?NodeHandle,
+    };
 
     const VisibilityListener = struct {
         id: u64,
@@ -158,7 +245,13 @@ pub const FocusManager = struct {
     }
 
     /// Record input before dispatch: programmatic focus inside a handler inherits it.
+    /// User input reached the window (pointer down, key down, wheel): ends a pending scope entry.
+    pub fn noteUserInput(self: *FocusManager) void {
+        self.input_epoch +%= 1;
+    }
+
     pub fn noteInputModality(self: *FocusManager, modality: InputModality) void {
+        self.noteUserInput();
         self.input_modality = modality;
         const visible = modality == .keyboard and self.getFocused() != null;
         if (visible == self.focus_visible) return;
@@ -175,6 +268,7 @@ pub const FocusManager = struct {
     }
 
     pub fn deinit(self: *FocusManager) void {
+        self.dropEntry();
         self.visibility_listeners.deinit(self.allocator);
         self.focus_order.deinit(self.allocator);
     }
@@ -299,6 +393,13 @@ pub const FocusManager = struct {
         // if identity allocation fails. Preserve the current owner instead.
         if (node != null and self.registry != null and new_identity == null) return;
 
+        // focus-within: ancestors (and the node itself) that focus leaves / enters, taken from
+        // the tree before any callback can change it.
+        var leaving: WithinList = .{};
+        var entering: WithinList = .{};
+        if (old_node) |old| self.collectWithin(&leaving, old, node, .blur);
+        if (node) |new| self.collectWithin(&entering, new, old_node, .focus);
+
         self.transition_epoch = std.math.add(u64, self.transition_epoch, 1) catch @panic("focus epoch exhausted");
         const epoch = self.transition_epoch;
         self.transition_depth += 1;
@@ -320,11 +421,14 @@ pub const FocusManager = struct {
                 if (self.transition_epoch != epoch) return;
             }
         }
+        if (!self.invokeWithin(&leaving, .blur, epoch)) return;
 
+        if (node == null) if (self.observer) |o| o.focused(o.context, null);
         if (node) |new| {
             if (!self.canReceiveFocus(new_identity, new)) return;
             self.current_focus = new;
             self.current_focus_handle = new_identity;
+            if (self.observer) |o| o.focused(o.context, new);
             new.markRenderDirty();
             if (new.behavior.events.on_focus) |handler| handler.invoke();
             if (self.transition_epoch != epoch) return;
@@ -333,8 +437,58 @@ pub const FocusManager = struct {
                     .related_node_id = old_id,
                     .reason = reason,
                 } });
+                if (self.transition_epoch != epoch) return;
+                _ = self.invokeWithin(&entering, .focus, epoch);
             }
         }
+    }
+
+    const WithinKind = enum { focus, blur };
+    /// Deeper ancestors than this are not notified (no real tree nests that many listeners).
+    const max_within = 32;
+    const WithinList = struct {
+        nodes: [max_within]*Node = undefined,
+        identities: [max_within]?NodeHandle = undefined,
+        len: usize = 0,
+    };
+
+    fn withinHandler(node: *const Node, kind: WithinKind) ?core.HandlerRef {
+        return switch (kind) {
+            .focus => node.behavior.events.on_focus_within,
+            .blur => node.behavior.events.on_blur_within,
+        };
+    }
+
+    /// `from` and its ancestors with a focus-within handler of `kind` that do not also contain
+    /// `other` (focus moving inside a subtree neither leaves nor enters it), innermost first.
+    fn collectWithin(self: *FocusManager, list: *WithinList, from: *Node, other: ?*Node, kind: WithinKind) void {
+        var cur: ?*Node = from;
+        while (cur) |n| : (cur = n.parent) {
+            if (withinHandler(n, kind) == null) continue;
+            if (other) |o| if (isAncestorOrSelf(n, o)) break;
+            if (list.len == max_within) return;
+            list.nodes[list.len] = n;
+            list.identities[list.len] = self.identityHandleFor(n);
+            list.len += 1;
+        }
+    }
+
+    fn isAncestorOrSelf(ancestor: *const Node, node: *const Node) bool {
+        var cur: ?*const Node = node;
+        while (cur) |n| : (cur = n.parent) if (n == ancestor) return true;
+        return false;
+    }
+
+    /// Run the collected handlers innermost first; a node freed by an earlier callback is
+    /// skipped, a superseding transition stops the rest (returns false).
+    fn invokeWithin(self: *FocusManager, list: *const WithinList, kind: WithinKind, epoch: u64) bool {
+        for (list.nodes[0..list.len], list.identities[0..list.len]) |n, identity| {
+            if (!self.survivedCallbacks(identity, n)) continue;
+            if (self.registry != null and identity == null) continue;
+            if (withinHandler(n, kind)) |handler| handler.invoke();
+            if (self.transition_epoch != epoch) return false;
+        }
+        return true;
     }
 
     /// Clear focus
@@ -350,8 +504,10 @@ pub const FocusManager = struct {
         const owns = self.current_focus == node or
             (if (self.current_focus_handle) |h| h.id == node.id else false);
         if (!owns) return;
+        if (self.observer) |o| o.lost(o.context, node, true);
         self.current_focus = null;
         self.current_focus_handle = null;
+        self.refocusActiveTrapScope();
         self.a11y_bridge.notifyFocusChange(null);
         if (self.on_focus_settled) |callback| {
             if (self.settled_context) |context| callback(context);
@@ -395,6 +551,35 @@ pub const FocusManager = struct {
         }.lessThan);
     }
 
+    /// The focused node went away (released, its subtree removed, or its owner abandoned it) while a
+    /// trap scope is active (an open Modal / Popover with `trap_focus`): focus goes back into that
+    /// scope at the next settle (`settleTrapRefocus`), instead of leaving the
+    /// open panel unfocused. A panel that rebuilds the row holding focus keeps focus inside.
+    pub fn refocusActiveTrapScope(self: *FocusManager) void {
+        if (self.scope_count == 0) return;
+        const index = self.scope_count - 1;
+        const handle = self.scope_stack_handles[index];
+        const node = self.scope_stack[index];
+        const scope_node: ?*Node = if (self.registry) |registry| (if (handle) |h| registry.resolve(h, null) else null) else node;
+        const scope = scope_node orelse return;
+        const cfg = scope.behavior.interaction.focus_scope orelse return;
+        if (!cfg.trap) return;
+        self.pending_trap_refocus = .{ .node = node, .handle = handle, .epoch = self.transition_epoch };
+    }
+
+    /// Settle `refocusActiveTrapScope` once per frame, after named focus restoration
+    /// (`FocusTargets.settle`) had its turn: any focus transition since the loss, focus already
+    /// somewhere, or a different active scope drops it.
+    pub fn settleTrapRefocus(self: *FocusManager) void {
+        const pending = self.pending_trap_refocus orelse return;
+        self.pending_trap_refocus = null;
+        if (pending.epoch != self.transition_epoch or self.getFocused() != null) return;
+        const active = self.activeScope() orelse return;
+        const same = if (pending.handle) |h| h.id == active.id else pending.node == active;
+        if (!same) return;
+        _ = self.focusScopeNow(active);
+    }
+
     /// Silent removal (node release path): no blur handler, callback context may be gone
     /// with scope, invoke is UAF. Just unlink + clear current_focus.
     pub fn unregisterFocusableSilent(self: *FocusManager, node: *Node) void {
@@ -402,12 +587,16 @@ pub const FocusManager = struct {
         // free, current_focus may point to freed sibling, getFocused cached fallback dereferences
         // it -> UAF/segfault (real app proves it).
         if (self.current_focus == node) {
+            if (self.observer) |o| o.lost(o.context, node, false);
             self.current_focus = null;
             self.current_focus_handle = null;
+            self.refocusActiveTrapScope();
         } else if (self.current_focus_handle) |h| {
             if (h.id == node.id) {
+                if (self.observer) |o| o.lost(o.context, node, false);
                 self.current_focus = null;
                 self.current_focus_handle = null;
+                self.refocusActiveTrapScope();
             }
         }
         for (self.focus_order.items, 0..) |n, i| {
@@ -460,6 +649,7 @@ pub const FocusManager = struct {
         if (removed_focused) {
             self.current_focus = null;
             self.current_focus_handle = null;
+            self.refocusActiveTrapScope();
         }
     }
 
@@ -474,8 +664,9 @@ pub const FocusManager = struct {
     }
 
     /// Tab / Shift+Tab: from current focus along order forward / back, skipping nodes in
-    /// display:none subtrees (focus_order collected on struct change, display toggle does
-    /// not recollect, visibility checked during traversal).
+    /// display:none subtrees and inside closed dialogs (`keyboardReachable`; focus_order is
+    /// collected on struct change, display toggles and scope pushes do not recollect, so both
+    /// are checked during traversal).
     fn focusStep(self: *FocusManager, dir: enum { forward, backward }) void {
         const order = self.scopedFocusOrder();
         if (order.len == 0) return;
@@ -492,7 +683,7 @@ pub const FocusManager = struct {
         var i = start;
         for (0..order.len) |_| {
             i = if (dir == .forward) (i + 1) % order.len else (if (i == 0) order.len - 1 else i - 1);
-            if (order[i].isDisplayedInTree()) {
+            if (self.keyboardReachable(order[i])) {
                 self.setFocusWithReason(order[i], .tab);
                 return;
             }
@@ -514,6 +705,7 @@ pub const FocusManager = struct {
                 }
                 self.current_focus = null;
                 self.current_focus_handle = null;
+                self.refocusActiveTrapScope();
                 return null;
             }
         }
@@ -608,51 +800,240 @@ pub const FocusManager = struct {
 
     // ---- Focus Scope ----
 
-    /// Push Focus Scope (e.g., Modal opens)
-    /// Save current focus to memory stack, auto_focus focuses first node in scope
+    /// Push a focus scope with default entry (see `pushScopeWith`).
     pub fn pushScope(self: *FocusManager, scope_node: *Node) void {
-        if (self.scope_count >= self.scope_stack.len) return;
-
-        // Save current focus ID to memory stack
-        self.scope_memory[self.scope_count] = if (self.getFocused()) |f| f.id else null;
-        self.scope_memory_handles[self.scope_count] = self.current_focus_handle;
-
-        self.scope_stack[self.scope_count] = if (self.registry == null) scope_node else null;
-        self.scope_stack_handles[self.scope_count] = self.trackedHandleFor(scope_node);
-        self.scope_count += 1;
-
-        // auto_focus: focus first focusable node in scope
-        if (scope_node.behavior.interaction.focus_scope) |cfg| {
-            if (cfg.auto_focus) {
-                const order = self.scopedFocusOrder();
-                if (order.len > 0) {
-                    self.setFocus(order[0]);
-                }
-            }
-        }
+        self.pushScopeWith(scope_node, .{});
     }
 
-    /// Pop Focus Scope, restore prior focus
+    /// Push a focus scope (a Modal / Sheet / Popover opens): remember where focus returns
+    /// (`entry.default_return`, else the focus now) and, for an `auto_focus` scope, move focus in.
+    ///
+    /// Entry: focus already inside the scope stays (the opener put it there). Else the observer
+    /// (`entry_target`) names the target: a pending view-model request aimed into the scope, the
+    /// named `entry.initial_focus`, a declared `autoFocus`; else the first focusable node. Until a
+    /// named target is ready, the entry stays pending: focus is held inside the scope (on
+    /// `entry.placeholder`, or a default control, see `EntryTarget`) and moves to the target in the
+    /// settle where it becomes ready (`settleScopeEntry`). Holding is a placeholder, not an intent:
+    /// it supersedes neither the entry nor other pending declarative focus (`restamp`). The entry
+    /// ends at its target, at any other focus transition, at user input (`input_epoch`), or when
+    /// the scope stops being the active one.
+    pub fn pushScopeWith(self: *FocusManager, scope_node: *Node, entry: ScopeEntry) void {
+        if (self.scope_count >= self.scope_stack.len) return;
+        const slot = self.scope_count;
+
+        const restore = entry.default_return orelse self.getFocused();
+        self.scope_memory[slot] = if (restore) |n| n.id else null;
+        self.scope_memory_handles[slot] = if (entry.default_return) |n| self.trackedHandleFor(n) else self.current_focus_handle;
+
+        self.scope_stack[slot] = if (self.registry == null) scope_node else null;
+        self.scope_stack_handles[slot] = self.trackedHandleFor(scope_node);
+        self.scope_count += 1;
+        // A scope pushed over a pending entry ends it.
+        self.dropEntry();
+
+        const cfg = scope_node.behavior.interaction.focus_scope orelse return;
+        if (!cfg.auto_focus) return;
+        if (self.getFocused()) |focused| if (focused == scope_node or focused.isDescendantOf(scope_node)) return;
+        const name: ?[]u8 = if (entry.initial_focus) |n| (self.allocator.dupe(u8, n) catch null) else null;
+        self.scope_entry = .{
+            .scope_id = scope_node.id,
+            .epoch = self.transition_epoch,
+            .input_epoch = self.input_epoch,
+            .name = name,
+            .placeholder = entry.placeholder,
+            .placeholder_handle = if (entry.placeholder) |n| self.trackedHandleFor(n) else null,
+        };
+        self.resolveEntry();
+    }
+
+    fn dropEntry(self: *FocusManager) void {
+        if (self.scope_entry) |e| if (e.name) |n| self.allocator.free(n);
+        self.scope_entry = null;
+    }
+
+    /// The active scope of a live pending entry, else null (dropping a stale entry). A scope just
+    /// mounted may not resolve yet (not in the node index until the next rebuild): the entry
+    /// stays, the next settle retries.
+    fn liveEntryScope(self: *FocusManager) ?*Node {
+        const e = self.scope_entry orelse return null;
+        const top_id: ?u32 = if (self.scope_count == 0) null else if (self.scope_stack_handles[self.scope_count - 1]) |h| h.id else if (self.scope_stack[self.scope_count - 1]) |n| n.id else null;
+        if (e.epoch != self.transition_epoch or e.input_epoch != self.input_epoch or top_id == null or top_id.? != e.scope_id) {
+            self.dropEntry();
+            return null;
+        }
+        return self.activeScope();
+    }
+
+    /// The active scope while its entry is pending (declarative focus inside it waits for the
+    /// entry: `FocusTargets` leaves the `autoFocus` targets inside to `entry_target`).
+    pub fn pendingEntryScope(self: *FocusManager) ?*Node {
+        return self.liveEntryScope();
+    }
+
+    /// The scope's named initial focus changed while its entry is pending (the name depends on
+    /// data that arrived after the open): wait for the new name instead.
+    pub fn updateScopeEntry(self: *FocusManager, scope_node: *Node, initial_focus: ?[]const u8) void {
+        const scope = self.liveEntryScope() orelse return;
+        if (scope != scope_node) return;
+        const e = &self.scope_entry.?;
+        if (e.name) |old| {
+            if (initial_focus) |n| if (std.mem.eql(u8, old, n)) return;
+            self.allocator.free(old);
+        } else if (initial_focus == null) return;
+        e.name = if (initial_focus) |n| (self.allocator.dupe(u8, n) catch null) else null;
+        self.resolveEntry();
+    }
+
+    /// Settle the active scope's pending entry: after the window's indexes are rebuilt (a target
+    /// mounted in this frame is focused in this frame), after the before-render tick and at the
+    /// start of each rendered frame (a target shown or enabled without an order change).
+    pub fn settleScopeEntry(self: *FocusManager) void {
+        if (self.scope_entry == null) return;
+        self.resolveEntry();
+    }
+
+    /// One attempt at the pending entry.
+    fn resolveEntry(self: *FocusManager) void {
+        const scope_node = self.liveEntryScope() orelse return;
+        const e = self.scope_entry.?;
+        const pick: EntryTarget = if (self.observer) |o| (if (o.entry_target) |resolve| resolve(o.context, scope_node, .{ .initial = e.name }) else .none) else .none;
+        // The observer may have run callbacks: re-check before acting.
+        if (self.liveEntryScope() != scope_node) return;
+        switch (pick) {
+            .focus => |target| if (target == scope_node or target.isDescendantOf(scope_node)) {
+                self.dropEntry();
+                self.setFocus(target);
+                return;
+            },
+            .none => if (self.firstReachableIn(scope_node)) |target| {
+                self.dropEntry();
+                self.setFocus(target);
+                return;
+            },
+            .wait, .later => {},
+        }
+        const holder = self.entryHolder(scope_node, e);
+        const hold: ?*Node = switch (pick) {
+            .later => |default| (if (default) |d| (if (d == scope_node or d.isDescendantOf(scope_node)) d else null) else null) orelse self.firstReachableIn(scope_node) orelse holder,
+            else => holder orelse self.firstReachableIn(scope_node),
+        };
+        if (hold) |node| if (self.getFocused() != node) self.placeholderFocus(node);
+    }
+
+    /// Where a waiting entry holds focus: `ScopeEntry.placeholder` while alive and reachable, else
+    /// the scope node when it can take focus.
+    fn entryHolder(self: *FocusManager, scope_node: *Node, e: PendingEntry) ?*Node {
+        if (e.placeholder) |p| {
+            const alive = if (self.registry) |r| (if (e.placeholder_handle) |h| r.isCurrentIdentity(h, p) else false) else true;
+            if (alive and (p == scope_node or p.isDescendantOf(scope_node)) and self.keyboardReachable(p)) return p;
+            return null;
+        }
+        const i = scope_node.behavior.interaction;
+        if ((i.focusable or i.tab_index != null) and self.keyboardReachable(scope_node)) return scope_node;
+        return null;
+    }
+
+    fn firstReachableIn(self: *FocusManager, scope_node: *Node) ?*Node {
+        for (self.scopedFocusOrder()) |n| {
+            if (n.isDescendantOf(scope_node) and self.keyboardReachable(n)) return n;
+        }
+        return null;
+    }
+
+    /// Hold focus on `node` for the pending entry: no focus ring, and when nothing but this
+    /// transition happened, every pending item stamped with the previous epoch is restamped (the
+    /// entry itself, the trap refocus, the observer's requests / autoFocus / restore).
+    fn placeholderFocus(self: *FocusManager, node: *Node) void {
+        const before = self.transition_epoch;
+        self.setFocusWithVisibility(node, .programmatic, .hide);
+        const after = self.transition_epoch;
+        const e = &(self.scope_entry orelse return);
+        if (after != before + 1 or e.epoch != before) {
+            self.dropEntry();
+            return;
+        }
+        e.epoch = after;
+        if (self.pending_trap_refocus) |*p| if (p.epoch == before) {
+            p.epoch = after;
+        };
+        if (self.observer) |o| if (o.restamp) |restamp| restamp(o.context, before, after);
+    }
+
+    /// Focus back into the active trap scope after its focused node went away
+    /// (`settleTrapRefocus`): a declared `autoFocus` inside, else the first focusable node. No
+    /// requests, no named entry, no placeholder.
+    fn focusScopeNow(self: *FocusManager, scope_node: *Node) bool {
+        if (self.observer) |o| if (o.entry_target) |resolve| switch (resolve(o.context, scope_node, .{ .requests = false })) {
+            .focus => |target| if (target == scope_node or target.isDescendantOf(scope_node)) {
+                self.setFocus(target);
+                return true;
+            },
+            .wait, .later, .none => {},
+        };
+        const target = self.firstReachableIn(scope_node) orelse return false;
+        self.setFocus(target);
+        return true;
+    }
+
+    /// Tab traversal / scope auto-focus may land on `node`: displayed, and not inside a trap
+    /// scope that is not on the scope stack (a closed Modal / Sheet keeps its content mounted;
+    /// the content is inert until the dialog's scope is pushed again), and not inside an `inert`
+    /// subtree (`NodeInteraction.inert`).
+    pub fn keyboardReachable(self: *FocusManager, node: *const Node) bool {
+        if (!node.isDisplayedInTree()) return false;
+        var cur: ?*const Node = node;
+        while (cur) |n| : (cur = n.parent) {
+            if (n.behavior.interaction.inert) return false;
+            const cfg = n.behavior.interaction.focus_scope orelse continue;
+            if (cfg.trap and !self.scopeOnStack(n)) return false;
+        }
+        return true;
+    }
+
+    fn scopeOnStack(self: *const FocusManager, node: *const Node) bool {
+        for (0..self.scope_count) |i| {
+            if (self.scope_stack_handles[i]) |h| {
+                if (h.id == node.id) return true;
+            } else if (self.scope_stack[i] == node) return true;
+        }
+        return false;
+    }
+
+    /// Pop the active scope and restore the focus it remembered.
     pub fn popScope(self: *FocusManager) void {
         if (self.scope_count == 0) return;
+        self.popScopeTo(null);
+    }
+
+    /// Pop the active scope; focus goes to the named target `return_focus` when it is ready once
+    /// the scope is gone, else to the remembered focus, else nowhere.
+    fn popScopeTo(self: *FocusManager, return_focus: ?[]const u8) void {
         self.scope_count -= 1;
-        self.scope_stack[self.scope_count] = null;
-        self.scope_stack_handles[self.scope_count] = null;
+        const slot = self.scope_count;
+        self.scope_stack[slot] = null;
+        self.scope_stack_handles[slot] = null;
+        self.dropEntry();
+        const saved_handle = self.scope_memory_handles[slot];
+        const saved_id = self.scope_memory[slot];
+        self.scope_memory_handles[slot] = null;
+        self.scope_memory[slot] = null;
+        // Looked up after the pop: this scope's trap no longer confines the target.
+        if (self.namedTarget(return_focus)) |node| {
+            self.setFocus(node);
+            return;
+        }
 
         // Restore remembered focus
-        if (self.scope_memory_handles[self.scope_count]) |saved_handle| {
-            self.scope_memory_handles[self.scope_count] = null;
-            self.scope_memory[self.scope_count] = null;
+        if (saved_handle) |handle| {
             if (self.registry) |registry| {
-                if (registry.resolve(saved_handle, null)) |saved_node| {
+                if (registry.resolve(handle, null)) |saved_node| {
                     self.setFocus(saved_node);
                     return;
                 }
             }
-        } else if (self.scope_memory[self.scope_count]) |saved_id| {
-            self.scope_memory[self.scope_count] = null;
+        } else if (saved_id) |id| {
             for (self.focus_order.items) |node| {
-                if (node.id == saved_id) {
+                if (node.id == id) {
                     self.setFocus(node);
                     return;
                 }
@@ -660,6 +1041,69 @@ pub const FocusManager = struct {
         }
         // Saved node gone, clear focus
         self.clearFocus();
+    }
+
+    /// Remove a particular overlay's scope (see `removeScopeWith`).
+    pub fn removeScope(self: *FocusManager, node_id: u32, restore: bool) void {
+        self.removeScopeWith(node_id, .{ .restore = restore });
+    }
+
+    /// Remove a particular overlay's scope. An ancestor may close while an independently portaled
+    /// child still owns focus. With `exit.restore`, a named `exit.return_focus` that is ready once
+    /// the scope is gone takes focus; otherwise the active scope gives focus back to what it
+    /// remembered (a scope below the active one hands its memory to the scope above it).
+    pub fn removeScopeWith(self: *FocusManager, node_id: u32, exit: ScopeExit) void {
+        var i: usize = 0;
+        while (i < self.scope_count) : (i += 1) {
+            const id = if (self.scope_stack_handles[i]) |handle| handle.id else if (self.scope_stack[i]) |node| node.id else continue;
+            if (id == node_id) break;
+        }
+        if (i == self.scope_count) return;
+        const top = i + 1 == self.scope_count;
+        if (top and exit.restore) {
+            self.popScopeTo(exit.return_focus);
+            return;
+        }
+
+        const end = self.scope_count;
+        if (i + 1 < end) {
+            // Redirect a nested scope's remembered focus if it points into
+            // the removed scope. Keep a live, independent restore target.
+            const registry = self.registry;
+            const removed = if (registry) |r| r.resolve(self.scope_stack_handles[i], null) else self.scope_stack[i];
+            const next_restore = if (registry) |r| r.resolve(self.scope_memory_handles[i + 1], null) else null;
+            if (next_restore == null or (removed != null and next_restore.?.isDescendantOf(removed.?))) {
+                self.scope_memory[i + 1] = if (exit.restore) self.scope_memory[i] else null;
+                self.scope_memory_handles[i + 1] = if (exit.restore) self.scope_memory_handles[i] else null;
+            }
+            @memmove(self.scope_stack[i .. end - 1], self.scope_stack[i + 1 .. end]);
+            @memmove(self.scope_stack_handles[i .. end - 1], self.scope_stack_handles[i + 1 .. end]);
+            @memmove(self.scope_memory[i .. end - 1], self.scope_memory[i + 1 .. end]);
+            @memmove(self.scope_memory_handles[i .. end - 1], self.scope_memory_handles[i + 1 .. end]);
+        } else self.dropEntry();
+        self.scope_count -= 1;
+        self.scope_stack[end - 1] = null;
+        self.scope_stack_handles[end - 1] = null;
+        self.scope_memory[end - 1] = null;
+        self.scope_memory_handles[end - 1] = null;
+    }
+
+    fn namedTarget(self: *FocusManager, name: ?[]const u8) ?*Node {
+        const n = name orelse return null;
+        const o = self.observer orelse return null;
+        const find = o.find_target orelse return null;
+        return find(o.context, n);
+    }
+
+    /// Forget every scope (Cx teardown / reset): no restore, entries freed.
+    pub fn resetScopes(self: *FocusManager) void {
+        self.dropEntry();
+        self.scope_count = 0;
+        self.scope_stack = @as([SCOPE_STACK_CAP]?*Node, @splat(null));
+        self.scope_stack_handles = @as([SCOPE_STACK_CAP]?NodeHandle, @splat(null));
+        self.scope_memory = @as([SCOPE_STACK_CAP]?u32, @splat(null));
+        self.scope_memory_handles = @as([SCOPE_STACK_CAP]?NodeHandle, @splat(null));
+        self.pending_trap_refocus = null;
     }
 
     /// Get current active scope node
@@ -1847,6 +2291,117 @@ test "Focus memory: restore after popScope" {
     try std.testing.expect(ctx.focus_manager.current_focus == outer_btn);
 }
 
+test "Focus memory: removing an outer overlay keeps the inner scope active" {
+    const a = std.testing.allocator;
+    const cx = try core.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{ .width = .fixed(640), .height = .fixed(480) }, .{});
+    cx.root = root;
+    const trigger = try core.box(cx, .{}, .{});
+    const outer = try core.box(cx, .{}, .{});
+    const nested_trigger = try core.box(cx, .{}, .{});
+    const inner = try core.box(cx, .{}, .{});
+    try root.appendChild(a, trigger);
+    try root.appendChild(a, outer);
+    try outer.appendChild(a, nested_trigger);
+    // The overlay portal is a sibling of the outer overlay.
+    try root.appendChild(a, inner);
+    cx.layout();
+
+    const fm = &cx.focus_manager;
+    fm.setFocus(trigger);
+    fm.pushScope(outer);
+    fm.setFocus(nested_trigger);
+    fm.pushScope(inner);
+    fm.setFocus(inner);
+    fm.removeScope(outer.id, true);
+    try std.testing.expectEqual(inner, fm.activeScope().?);
+    try std.testing.expectEqual(inner, fm.getFocused().?);
+    fm.removeScope(inner.id, true);
+    try std.testing.expectEqual(trigger, fm.getFocused().?);
+}
+
+test "Scope entry: default_return is where focus goes back; a named return only for the active scope" {
+    const a = std.testing.allocator;
+    const cx = try core.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{ .width = .fixed(640), .height = .fixed(480) }, .{});
+    cx.root = root;
+    const opener = try core.box(cx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+    const trigger = try core.box(cx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+    const elsewhere = try core.box(cx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+    const panel = try core.box(cx, .{ .width = .fixed(200), .height = .fixed(100) }, .{});
+    const upper = try core.box(cx, .{ .width = .fixed(200), .height = .fixed(100) }, .{});
+    for ([_]*Node{ opener, trigger, elsewhere }) |n| n.behavior.interaction.focusable = true;
+    for ([_]*Node{ opener, trigger, elsewhere, panel, upper }) |n| try root.appendChild(a, n);
+    _ = try cx.focus_targets.register(cx, .target, elsewhere, "elsewhere", false);
+    cx.layout();
+    const fm = &cx.focus_manager;
+    fm.setFocus(opener);
+    fm.pushScopeWith(panel, .{ .default_return = trigger });
+    fm.removeScopeWith(panel.id, .{ .restore = true });
+    try std.testing.expectEqual(trigger, fm.getFocused().?);
+    // Named return (resolved once the scope is gone), not ready = the default.
+    fm.pushScopeWith(panel, .{ .default_return = opener });
+    fm.removeScopeWith(panel.id, .{ .restore = true, .return_focus = "elsewhere" });
+    try std.testing.expectEqual(elsewhere, fm.getFocused().?);
+    fm.pushScopeWith(panel, .{ .default_return = opener });
+    fm.removeScopeWith(panel.id, .{ .restore = true, .return_focus = "missing" });
+    try std.testing.expectEqual(opener, fm.getFocused().?);
+    // A scope removed from under another: the active one keeps focus.
+    fm.pushScopeWith(panel, .{ .default_return = opener });
+    fm.pushScope(upper);
+    fm.setFocus(upper);
+    fm.removeScopeWith(panel.id, .{ .restore = true, .return_focus = "elsewhere" });
+    try std.testing.expectEqual(upper, fm.getFocused().?);
+    fm.removeScope(upper.id, false);
+}
+
+test "Scope entry: a pending entry ends at user input, at another scope pushed over it, and at any other transition" {
+    const a = std.testing.allocator;
+    const cx = try core.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{ .width = .fixed(640), .height = .fixed(480) }, .{});
+    cx.root = root;
+    const outside = try core.box(cx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+    outside.behavior.interaction.focusable = true;
+    // A focus-trapping panel that can hold focus itself (tabindex -1), with nothing focusable yet.
+    const panel = try core.box(cx, .{ .width = .fixed(200), .height = .fixed(100) }, .{});
+    panel.behavior.interaction.focusable = true;
+    panel.behavior.interaction.tab_index = -1;
+    panel.behavior.interaction.focus_scope = .{ .trap = true, .auto_focus = true };
+    const upper = try core.box(cx, .{ .width = .fixed(200), .height = .fixed(100) }, .{});
+    try root.appendChild(a, outside);
+    try root.appendChild(a, panel);
+    try root.appendChild(a, upper);
+    cx.layout();
+    _ = cx.render();
+    const fm = &cx.focus_manager;
+    const Case = enum { input, push, transition };
+    for ([_]Case{ .input, .push, .transition }) |case| {
+        fm.setFocus(outside);
+        fm.pushScope(panel);
+        try std.testing.expectEqual(panel, fm.getFocused().?);
+        try std.testing.expect(fm.scope_entry != null);
+        switch (case) {
+            .input => fm.noteUserInput(),
+            .push => fm.pushScope(upper),
+            .transition => fm.setFocus(panel),
+        }
+        if (case == .push) fm.removeScope(upper.id, false);
+        const control = try core.box(cx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+        control.behavior.interaction.focusable = true;
+        try panel.appendChild(a, control);
+        cx.layout();
+        _ = cx.render();
+        try std.testing.expect(fm.scope_entry == null);
+        try std.testing.expectEqual(panel, fm.getFocused().?);
+        fm.removeScope(panel.id, false);
+        panel.removeChild(control);
+        cx.freeNode(control);
+    }
+}
+
 test "Focus memory: auto_focus on push" {
     var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
@@ -2638,4 +3193,152 @@ test "FocusManager: notification cursor survives removing earlier current and la
     try std.testing.expectEqual(@as(usize, 1), observers[3].calls);
     fm.notifyVisibility();
     try std.testing.expectEqual(@as(usize, 2), observers[3].calls);
+}
+
+test "FocusManager: focus-within runs on the subtrees focus enters / leaves, innermost first, after focus / blur" {
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const outer = try core.box(cx, .{}, .{});
+    const inner = try core.box(cx, .{}, .{});
+    const a = try core.box(cx, .{}, .{});
+    const b = try core.box(cx, .{}, .{});
+    const c = try core.box(cx, .{}, .{});
+    try root.appendChild(std.testing.allocator, outer);
+    try outer.appendChild(std.testing.allocator, inner);
+    try inner.appendChild(std.testing.allocator, a);
+    try inner.appendChild(std.testing.allocator, b);
+    try outer.appendChild(std.testing.allocator, c);
+    for ([_]*Node{ a, b, c }) |n| n.setFocusable(true);
+    const Log = struct {
+        buf: [16]u8 = undefined,
+        len: usize = 0,
+        fn put(self: *@This(), ch: u8) void {
+            self.buf[self.len] = ch;
+            self.len += 1;
+        }
+        fn text(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+    var log: Log = .{};
+    const Rec = struct {
+        log: *Log,
+        ch: u8,
+        fn run(self: *@This()) void {
+            self.log.put(self.ch);
+        }
+    };
+    var outer_in: Rec = .{ .log = &log, .ch = 'O' };
+    var outer_out: Rec = .{ .log = &log, .ch = 'o' };
+    var inner_in: Rec = .{ .log = &log, .ch = 'I' };
+    var inner_out: Rec = .{ .log = &log, .ch = 'i' };
+    var a_focus: Rec = .{ .log = &log, .ch = 'F' };
+    var a_blur: Rec = .{ .log = &log, .ch = 'B' };
+    outer.behavior.events.on_focus_within = core.Cx.handlerFrom(Rec, &outer_in, Rec.run);
+    outer.behavior.events.on_blur_within = core.Cx.handlerFrom(Rec, &outer_out, Rec.run);
+    inner.behavior.events.on_focus_within = core.Cx.handlerFrom(Rec, &inner_in, Rec.run);
+    inner.behavior.events.on_blur_within = core.Cx.handlerFrom(Rec, &inner_out, Rec.run);
+    a.behavior.events.on_focus = core.Cx.handlerFrom(Rec, &a_focus, Rec.run);
+    a.behavior.events.on_blur = core.Cx.handlerFrom(Rec, &a_blur, Rec.run);
+
+    cx.setFocus(a); // enters both, after a's own focus, innermost first
+    try std.testing.expectEqualStrings("FIO", log.text());
+    log.len = 0;
+    cx.setFocus(b); // inside inner: only a's own blur, nothing enters or leaves
+    try std.testing.expectEqualStrings("B", log.text());
+    cx.setFocus(a);
+    log.len = 0;
+    cx.setFocus(c); // leaves inner only (c is still inside outer)
+    try std.testing.expectEqualStrings("Bi", log.text());
+    log.len = 0;
+    cx.setFocus(a);
+    try std.testing.expectEqualStrings("FI", log.text());
+    log.len = 0;
+    cx.focus_manager.clearFocus(); // leaves both
+    try std.testing.expectEqualStrings("Bio", log.text());
+}
+
+test "FocusManager: a focus-within handler that moves focus stops the superseded notifications" {
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const outer = try core.box(cx, .{}, .{});
+    const inner = try core.box(cx, .{}, .{});
+    const a = try core.box(cx, .{}, .{});
+    const elsewhere = try core.box(cx, .{}, .{});
+    try root.appendChild(std.testing.allocator, outer);
+    try outer.appendChild(std.testing.allocator, inner);
+    try inner.appendChild(std.testing.allocator, a);
+    try root.appendChild(std.testing.allocator, elsewhere);
+    a.setFocusable(true);
+    elsewhere.setFocusable(true);
+    const Redirect = struct {
+        cx: *core.Cx,
+        to: *Node,
+        runs: usize = 0,
+        fn run(self: *@This()) void {
+            self.runs += 1;
+            self.cx.setFocus(self.to);
+        }
+    };
+    const Count = struct {
+        n: usize = 0,
+        fn run(self: *@This()) void {
+            self.n += 1;
+        }
+    };
+    var redirect: Redirect = .{ .cx = cx, .to = elsewhere };
+    var outer_in: Count = .{};
+    var outer_out: Count = .{};
+    inner.behavior.events.on_focus_within = core.Cx.handlerFrom(Redirect, &redirect, Redirect.run);
+    outer.behavior.events.on_focus_within = core.Cx.handlerFrom(Count, &outer_in, Count.run);
+    outer.behavior.events.on_blur_within = core.Cx.handlerFrom(Count, &outer_out, Count.run);
+    cx.setFocus(a);
+    try std.testing.expectEqual(@as(usize, 1), redirect.runs);
+    try std.testing.expect(cx.focus_manager.getFocused() == elsewhere);
+    // The nested transition (a -> elsewhere) left outer; the superseded one never announced it.
+    try std.testing.expectEqual(@as(usize, 0), outer_in.n);
+    try std.testing.expectEqual(@as(usize, 1), outer_out.n);
+}
+
+test "FocusManager: a blur-within handler that frees an outer listener skips it" {
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const outer = try core.box(cx, .{}, .{});
+    const inner = try core.box(cx, .{}, .{});
+    const a = try core.box(cx, .{}, .{});
+    const elsewhere = try core.box(cx, .{}, .{});
+    try root.appendChild(std.testing.allocator, outer);
+    try outer.appendChild(std.testing.allocator, inner);
+    try inner.appendChild(std.testing.allocator, a);
+    try root.appendChild(std.testing.allocator, elsewhere);
+    a.setFocusable(true);
+    elsewhere.setFocusable(true);
+    const Free = struct {
+        cx: *core.Cx,
+        victim: *Node,
+        fn run(self: *@This()) void {
+            self.cx.detachChild(self.victim.parent.?, self.victim);
+            self.cx.freeNode(self.victim);
+        }
+    };
+    const Count = struct {
+        n: usize = 0,
+        fn run(self: *@This()) void {
+            self.n += 1;
+        }
+    };
+    var free: Free = .{ .cx = cx, .victim = outer };
+    var outer_out: Count = .{};
+    inner.behavior.events.on_blur_within = core.Cx.handlerFrom(Free, &free, Free.run);
+    outer.behavior.events.on_blur_within = core.Cx.handlerFrom(Count, &outer_out, Count.run);
+    cx.setFocus(a);
+    cx.setFocus(elsewhere);
+    try std.testing.expectEqual(@as(usize, 0), outer_out.n);
+    try std.testing.expect(cx.focus_manager.getFocused() == elsewhere);
 }

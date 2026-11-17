@@ -1,0 +1,40 @@
+//! Runtime fixture for focus-within events (ZeroWork G31): a host container and a component
+//! element (`W.Pressable`, whose root is the focusable node) report focus entering / leaving
+//! their subtree. Lives outside tests/yix so it is not an LP3 equivalence input.
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub const Log = struct {
+    entered: usize = 0,
+    left: usize = 0,
+    root_entered: usize = 0,
+    root_left: usize = 0,
+};
+
+fn enter(log: *Log) void {
+    log.entered += 1;
+}
+fn leave(log: *Log) void {
+    log.left += 1;
+}
+fn rootEnter(log: *Log) void {
+    log.root_entered += 1;
+}
+fn rootLeave(log: *Log) void {
+    log.root_left += 1;
+}
+
+pub fn Panel(log: *Log) View {
+    return (
+        <col testId="fw.panel">
+            <box testId="fw.slot" onFocusWithin={enter(log)} onBlurWithin={leave(log)}>
+                <W.Button testId="fw.a" label="A" />
+                <W.Button testId="fw.b" label="B" />
+            </box>
+            <W.Pressable testId="fw.press" onFocusWithin={rootEnter(log)} onBlurWithin={rootLeave(log)}>
+                <text>Press</text>
+            </W.Pressable>
+            <W.Button testId="fw.outside" label="Outside" />
+        </col>
+    );
+}

@@ -9,7 +9,7 @@ pub fn renderVisibleText(engine: VtEngine, allocator: std.mem.Allocator) ![]u8 {
 
 /// Projects viewport text with an optional timestamp prefix per line.
 /// The default keeps the historical no-gutter rendering contract.
-pub fn renderVisibleTextWithGutter(engine: VtEngine, allocator: std.mem.Allocator, gutter: @import("../ui/timestamp_gutter.zig").Gutter) ![]u8 {
+pub fn renderVisibleTextWithGutter(engine: VtEngine, allocator: std.mem.Allocator, gutter: @import("timestamp_gutter.zig").Gutter) ![]u8 {
     const snapshot = engine.snapshot();
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
@@ -24,7 +24,7 @@ pub fn renderVisibleTextWithGutter(engine: VtEngine, allocator: std.mem.Allocato
         try appendTrimmedLine(&plain_list, allocator, line.cells);
         if (gutter.enabled) {
             var line_buffer: [4096]u8 = undefined;
-            const rendered = try @import("../ui/timestamp_gutter.zig").prefixLine(gutter, &line_buffer, line.received_at_ms, plain_list.items);
+            const rendered = try @import("timestamp_gutter.zig").prefixLine(gutter, &line_buffer, line.received_at_ms, plain_list.items);
             try output.appendSlice(allocator, rendered);
         } else {
             try output.appendSlice(allocator, plain_list.items);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const ui = @import("ui");
+const graph_assertions = @import("graph_assertions.zig");
 const stories = @import("_stories.yix.zig");
 const counter = @import("yix_counter");
 /// docs/YIX_REFERENCE.md §2.1 example: code in docs must compile and run
@@ -8,9 +9,26 @@ const doc_chip = @import("_doc_chip.yix.zig");
 const tokens_probe = @import("_tokens_probe.yss.zig");
 const params = @import("_params.yss.zig");
 const review_style = @import("_review_style.yss.zig");
+/// tests/yix_runtime/recipe_dims.yix: recipe dimension values that are expressions
+const recipe_dims = @import("yix_recipe_dims");
+/// tests/yix_runtime/popups.yix: trigger components written as templates
+const popups = @import("yix_popups");
+/// tests/yix_runtime/looks.yix: W.Button look (ui.view.Look)
+const looks = @import("yix_looks");
+/// tests/yix_runtime/subtree_order.yix: a removed row / unloaded branch is not recomputed first
+const subtree_order = @import("yix_subtree_order");
+/// tests/yix_runtime/parts_exprs.yix: expressions inside parts / state / a11y (G24)
+const parts_exprs = @import("yix_parts_exprs");
+/// tests/yix_runtime/builder_values.yix: parameters forwarded to builder widget props (G25)
+const builder_values = @import("yix_builder_values");
+/// tests/yix_runtime/chrome.yix: GlassBox fill, ScrollArea scrollEdge, TitlebarEdge (G28 / G29)
+const chrome = @import("yix_chrome");
+/// tests/yix_runtime/focus_within.yix: onFocusWithin / onBlurWithin on hosts and component roots (G31)
+const focus_within = @import("yix_focus_within");
 
 comptime {
     _ = @import("review_reactive_tests.zig");
+    _ = @import("lifecycle_split_tests.zig");
 }
 
 const Env = struct {
@@ -331,12 +349,12 @@ test "Yix owned text signal compiles and updates" {
 test "Yix computed over props stays static for static props and follows signal props" {
     var a = try Env.init();
     defer a.deinit();
-    const before = a.cx.owner.graph.countByKind();
+    const before = try graph_assertions.staticCounts(a.cx);
     try a.mount(stories.Doubled(.{ .n = 4 }));
     try testing.expect(a.find("double 8") != null);
     try testing.expectEqualStrings("Doubled", a.root.?.meta.ownership.meta.component_name.?);
     // Static prop: no memo, no effect (matches hand-written component 'static props zero effect')
-    const after = a.cx.owner.graph.countByKind();
+    const after = try graph_assertions.staticCounts(a.cx);
     try testing.expectEqual(before.get(.memo), after.get(.memo));
     try testing.expectEqual(before.get(.effect), after.get(.effect));
 
@@ -573,9 +591,9 @@ test "B1 静态提升按实际依赖收缩：静态参数 + 函数调用里读�
 
     var f = try Env.init();
     defer f.deinit();
-    const before = f.cx.owner.graph.countByKind();
+    const before = try graph_assertions.staticCounts(f.cx);
     try f.mount(stories.StaticTwice(.{ .n = 4 }));
-    const after = f.cx.owner.graph.countByKind();
+    const after = try graph_assertions.staticCounts(f.cx);
     try testing.expect(f.find("twice 8") != null);
     try testing.expectEqual(before.get(.memo), after.get(.memo));
     try testing.expectEqual(before.get(.effect), after.get(.effect));
@@ -720,14 +738,14 @@ test "P3a：普通 box 的 :focus / :focus-visible 由节点焦点驱动，:disa
     try e.mount(stories.StateBox(.{ .disabled = disabled }));
     const sb = findTestId(e.root.?, "sb") orelse return error.TestUnexpectedResult;
     try testing.expectApproxEqAbs(@as(f32, 1), sb.getOpacity(), 0.001);
-    e.cx.focus_manager.last_focus_reason = .click;
-    sb.behavior.events.on_focus.?.invoke();
+    // Focus through the manager: :focus-visible follows its resolved visibility (pointer focus
+    // hides the ring, keyboard focus shows it), not a raw focus reason.
+    e.cx.focus_manager.setFocusWithVisibility(sb, .click, .hide);
     try testing.expectApproxEqAbs(@as(f32, 0.9), sb.getOpacity(), 0.001);
-    sb.behavior.events.on_blur.?.invoke();
-    e.cx.focus_manager.last_focus_reason = .tab;
-    sb.behavior.events.on_focus.?.invoke();
+    e.cx.focus_manager.clearFocus();
+    e.cx.focus_manager.setFocusWithVisibility(sb, .tab, .show);
     try testing.expectApproxEqAbs(@as(f32, 0.8), sb.getOpacity(), 0.001);
-    sb.behavior.events.on_blur.?.invoke();
+    e.cx.focus_manager.clearFocus();
     try testing.expectApproxEqAbs(@as(f32, 1), sb.getOpacity(), 0.001);
     disabled.set(true);
     try testing.expectApproxEqAbs(@as(f32, 0.5), sb.getOpacity(), 0.001);
@@ -759,6 +777,48 @@ test "P3b：具名插槽与 {children} 在容器中间（子元素插在锚点�
     try testing.expect(indexIn(body) < indexIn(after)); // Default slot in middle: inserted before anchor
     try e.click("More"); // Event in footer named slot writes caller signal
     try testing.expect(e.find("body 1") != null);
+}
+
+test "可选具名插槽：缺席不建槽盒、不占 gap；传入时位置正确、事件写调用方信号" {
+    {
+        var e = try Env.init();
+        defer e.deinit();
+        try e.mount(stories.FieldBare(.{}));
+        const field = findTestId(e.root.?, "field") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 1), field.children.items.len); // only content
+        try testing.expect(findTestId(e.root.?, "field.icon") == null);
+        try testing.expect(findTestId(e.root.?, "field.append") == null);
+        try testing.expect(e.find("body") != null);
+    }
+    {
+        var e = try Env.init();
+        defer e.deinit();
+        try e.mount(stories.FieldFull(.{}));
+        const field = findTestId(e.root.?, "field") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 3), field.children.items.len);
+        const icon = findTestId(e.root.?, "field.icon") orelse return error.TestUnexpectedResult;
+        const append = findTestId(e.root.?, "field.append") orelse return error.TestUnexpectedResult;
+        try testing.expect(icon == field.children.items[0]);
+        try testing.expect(append == field.children.items[2]);
+        const ico = e.find("ico") orelse return error.TestUnexpectedResult;
+        try testing.expect(ico.parent == icon);
+        // Slot at the end of its box: appended after the box's own children.
+        const bracket = e.find("[") orelse return error.TestUnexpectedResult;
+        try testing.expect(bracket.parent == append and indexIn(bracket) == 0);
+        try testing.expect(e.find("body 0") != null);
+        try e.click("go");
+        try testing.expect(e.find("body 1") != null);
+    }
+}
+
+test "可选具名插槽：Zig 调用方 .slots(.{ .icon = null }) 与可选值同样按缺席处理" {
+    var e = try Env.init();
+    defer e.deinit();
+    const no_icon: ?@TypeOf(ui.view.text(.{}, "x")) = null;
+    try e.mount(ui.view.with(stories.Field(.{}), .{ui.view.text(.{}, "body")}).slots(.{ .icon = no_icon, .append = null }));
+    const field = findTestId(e.root.?, "field") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), field.children.items.len);
+    try testing.expect(e.find("body") != null);
 }
 
 fn indexIn(n: *ui.Node) usize {
@@ -932,9 +992,9 @@ test "受控值收到只读源 + onChange：合成 split，父组件改写的值
 test "参数化样式：静态参数不建 effect；可选参数为 null 时取 ?? 后备值" {
     var e = try Env.init();
     defer e.deinit();
-    const before = e.cx.owner.graph.countByKind().get(.effect);
+    const before = (try graph_assertions.staticCounts(e.cx)).get(.effect);
     try e.mount(ui.view.box(.{ .style = params.panel.of(.{ .width = 120, .background = ui.Color.hex(0x112233) }) }, .{}));
-    try testing.expectEqual(before, e.cx.owner.graph.countByKind().get(.effect));
+    try testing.expectEqual(before, (try graph_assertions.staticCounts(e.cx)).get(.effect));
     try testing.expectEqual(ui.Sizing{ .px = 120 }, e.root.?.style.width);
     try testing.expectEqual(ui.Color.hex(0x112233), e.root.?.getBackground());
     try testing.expectEqual(@as(f32, 1), e.root.?.getOpacity());
@@ -992,6 +1052,19 @@ test "参数化样式：多层阴影（token + 自定义）与 token 后备值�
     try testing.expect(n.style.shadowSlice()[1].color.eql(ui.theme.modes.dark.tokens.color.accent));
 }
 
+test "YSS 普通样式的 {zig} 读主题 t：按当前主题解析，换主题跟随" {
+    var e = try Env.init();
+    defer e.deinit();
+    try e.mount(ui.view.box(.{ .style = params.themed_ring }, .{}));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    const n = e.root.?;
+    e.cx.setTheme(&ui.theme.modes.light);
+    try testing.expect(n.style.ext.?.outline.?.color.eql(ui.theme.modes.light.tokens.color.accent));
+    e.cx.setTheme(&ui.theme.modes.dark);
+    try testing.expect(n.style.ext.?.outline.?.color.eql(ui.theme.modes.dark.tokens.color.accent));
+}
+
 test "组件参数名以 on 开头但类型是数据（onTop: bool）：字面量与信号按值传；事件参数收到标识符时调用它" {
     var e = try Env.init();
     defer e.deinit();
@@ -1036,4 +1109,645 @@ test "嵌套 for：内层列表是外层行的派生值，内层行引用外层�
     defer e2.deinit();
     try e2.mount(stories.TypeOfProbe(.{ .n = 21 }));
     try testing.expect(e2.find("42") != null);
+}
+
+test "LP3 setup/view: generated hooks and refs roll back at every allocation failure" {
+    const fixture = @import("_lifecycle_split.yix.zig");
+    // Reset the bounded hook log for each mount attempted by the sweep.
+    const Probe = struct {
+        fn component(args: anytype) @TypeOf(fixture.Split(args)) {
+            fixture.log_len = 0;
+            fixture.last_ref = null;
+            return fixture.Split(args);
+        }
+    };
+    try allocationSweep(Probe.component);
+}
+
+test "LP3 setup/view: initial slotted components roll back every allocation failure" {
+    const fixture = @import("_lifecycle_split.yix.zig");
+    try allocationSweep(fixture.SlottedForOom);
+}
+
+test "Yix recipe dimensions: a row variable's field and a call over a parameter follow their sources" {
+    var e = try Env.init();
+    defer e.deinit();
+    const space = e.cx.tokens.tokens.space;
+    const Item = recipe_dims.Item;
+    const a = [_]Item{ .{ .id = 1, .on = false }, .{ .id = 2, .on = true } };
+    const b = [_]Item{ .{ .id = 1, .on = true }, .{ .id = 2, .on = false } };
+    const rows = try e.scope.createSignal([]const Item, &a);
+    const n = try e.scope.createSignal(i32, 0);
+    try e.mount(recipe_dims.Rows(.{ .items = rows, .n = n }));
+    const root = e.root.?;
+    try testing.expectEqual(space.space100, root.style.gap);
+    // children: list start anchor, the two rows, end anchor.
+    try testing.expectEqual(@as(usize, 4), root.children.items.len);
+    const first = root.children.items[1];
+    const second = root.children.items[2];
+    try testing.expectEqual(space.space100, first.style.gap);
+    try testing.expectEqual(space.space300, second.style.gap);
+    // Same keys: the rows are reused and restyle from the new values (x.on is a derived source).
+    rows.set(&b);
+    try testing.expect(root.children.items[1] == first);
+    try testing.expectEqual(space.space300, first.style.gap);
+    try testing.expectEqual(space.space100, second.style.gap);
+    // busy(n) over a parameter source.
+    n.set(2);
+    try testing.expectEqual(space.space300, root.style.gap);
+    n.set(0);
+    try testing.expectEqual(space.space100, root.style.gap);
+}
+
+test "YSS token gradient: endpoints follow interaction state and theme" {
+    var e = try Env.init();
+    defer e.deinit();
+    const hover = try e.scope.createSignal(bool, false);
+    const active = try e.scope.createSignal(bool, false);
+    try e.mount(ui.view.box(.{ .style = review_style.token_gradient, .state = .{ .hover = hover, .active = active } }, .{}));
+    const node = e.root.?;
+    const gradientOf = struct {
+        fn f(n: *ui.Node) ui.Gradient {
+            return n.style.ext.?.gradient.?;
+        }
+    }.f;
+    var c = e.cx.tokens.tokens.color;
+    try testing.expect(gradientOf(node).from.eql(c.accent));
+    try testing.expect(gradientOf(node).to.eql(c.bg_primary));
+    try testing.expectEqual(ui.GradientDirection.diagonal, gradientOf(node).direction);
+    hover.set(true);
+    try testing.expect(gradientOf(node).from.eql(c.bg_hover));
+    try testing.expect(gradientOf(node).to.eql(c.accent));
+    try testing.expectEqual(ui.GradientDirection.vertical, gradientOf(node).direction);
+    active.set(true);
+    try testing.expect(gradientOf(node).from.eql(ui.Color.lerp(c.accent, c.bg_primary, 0.5)));
+    try testing.expect(gradientOf(node).to.eql(ui.Color.hex(0x102030)));
+    try testing.expectEqual(ui.GradientDirection.horizontal, gradientOf(node).direction);
+    active.set(false);
+    hover.set(false);
+    // Theme publication re-resolves the token endpoints.
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    const other = if (e.cx.tokens == &ui.theme.modes.light) &ui.theme.modes.dark else &ui.theme.modes.light;
+    e.cx.setTheme(other);
+    c = other.tokens.color;
+    // Precondition: the two modes differ in the end color, so a stale endpoint fails below.
+    try testing.expect(!ui.theme.modes.light.tokens.color.bg_primary.eql(ui.theme.modes.dark.tokens.color.bg_primary));
+    try testing.expect(gradientOf(node).from.eql(c.accent));
+    try testing.expect(gradientOf(node).to.eql(c.bg_primary));
+}
+
+fn isInside(n: *ui.Node, ancestor: *ui.Node) bool {
+    var p: ?*ui.Node = n;
+    while (p) |x| : (p = x.parent) if (x == ancestor) return true;
+    return false;
+}
+
+test "Yix trigger components: Tooltip / Menu children are the trigger, Popover takes trigger={…}" {
+    var e = try Env.init();
+    defer e.deinit();
+    var tip: ui.widgets.TooltipResult = undefined;
+    // Popups portal to the window root: mount a root first, then the elements into it.
+    try e.mount(ui.view.col(.{}, .{}));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    // The Zig form goes through capture, to see the result's trigger and content nodes.
+    try ui.view.mount(e.scope, e.cx, e.root.?, ui.view.col(.{}, .{
+        popups.Help(.{ .tip = "Explain" }),
+        ui.view.with(ui.widgets.Tooltip(.{ .text = "z" }), .{ui.view.box(.{ .test_id = "z.trigger" }, .{})}).parts(.{ .content = "z.content" }).capture(&tip),
+        popups.More(.{}),
+        popups.Info(.{}),
+    }));
+    const root = e.root.?;
+    // Yix Tooltip: the button sits in the trigger, under the wrapper that carries testId.
+    const wrap = findTestId(root, "help.wrap") orelse return error.TestUnexpectedResult;
+    const help = findTestId(root, "help") orelse return error.TestUnexpectedResult;
+    try testing.expect(help != wrap and isInside(help, wrap));
+    // Zig form of the same shape: children land in TooltipResult.trigger, parts name the content.
+    try testing.expect(isInside(findTestId(root, "z.trigger").?, tip.trigger));
+    try testing.expectEqualStrings("z.content", tip.content.meta.ownership.meta.test_id.?);
+    const more = findTestId(root, "more") orelse return error.TestUnexpectedResult;
+    // Popover: trigger={…} fills the trigger, children fill the panel.
+    const info = findTestId(root, "info") orelse return error.TestUnexpectedResult;
+    // The button sits in the trigger node directly under the popover wrapper (the Info root); the
+    // closed panel is detached (the children slot itself is unchanged).
+    try testing.expectEqualStrings("Info", info.parent.?.parent.?.meta.ownership.meta.component_name.?);
+    // Menu: the button sits in the trigger, directly under the menu wrapper (the More root).
+    try testing.expectEqualStrings("More", more.parent.?.parent.?.meta.ownership.meta.component_name.?);
+}
+
+fn hoverNode(n: *ui.Node, on: bool) void {
+    const h = if (on) n.behavior.events.on_hover.? else n.behavior.events.on_leave.?;
+    h.callback(h.context);
+}
+
+test "Button look: a token style merges per state into the tone and follows the theme" {
+    var e = try Env.init();
+    defer e.deinit();
+    const off = try e.scope.createSignal(bool, false);
+    try e.mount(ui.view.col(.{}, .{}));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    var button: *ui.Node = undefined;
+    try ui.view.mount(e.scope, e.cx, e.root.?, ui.view.capture(&button, looks.Glass(.{ .off = off })));
+    var c = e.cx.tokens.tokens.color;
+    try testing.expect(bgTarget(button).eql(c.bg_secondary));
+    hoverNode(button, true);
+    try testing.expect(bgTarget(button).eql(c.bg_hover));
+    hoverNode(button, false);
+    try testing.expect(bgTarget(button).eql(c.bg_secondary));
+    // The look has no :disabled, so the tone's disabled layer stays above the look's base (an
+    // overlay `style` would win over it).
+    off.set(true);
+    try testing.expect(!bgTarget(button).eql(c.bg_secondary));
+    off.set(false);
+    // Theme switch re-resolves the look's tokens.
+    const other = if (e.cx.tokens == &ui.theme.modes.light) &ui.theme.modes.dark else &ui.theme.modes.light;
+    try testing.expect(!ui.theme.modes.light.tokens.color.bg_secondary.eql(ui.theme.modes.dark.tokens.color.bg_secondary));
+    e.cx.setTheme(other);
+    c = other.tokens.color;
+    try testing.expect(bgTarget(button).eql(c.bg_secondary));
+}
+
+test "Button look: a recipe part whose dimension reads a parameter follows the parameter" {
+    var e = try Env.init();
+    defer e.deinit();
+    const on = try e.scope.createSignal(bool, false);
+    try e.mount(ui.view.col(.{}, .{ looks.Tinted(.{ .on = on }), looks.TintedNot(.{ .on = on }) }));
+    const a = e.root.?.children.items[0];
+    const b = e.root.?.children.items[1];
+    const c = e.cx.tokens.tokens.color;
+    try testing.expect(bgTarget(a).eql(c.bg_secondary));
+    try testing.expect(bgTarget(b).eql(c.accent));
+    on.set(true);
+    try testing.expect(bgTarget(a).eql(c.accent));
+    try testing.expect(bgTarget(b).eql(c.bg_secondary));
+}
+
+test "Button look from Zig: Look.from and props conversion; an empty look changes nothing" {
+    var e = try Env.init();
+    defer e.deinit();
+    try e.mount(ui.view.col(.{}, .{
+        ui.widgets.Button(.{ .label = "a", .variant = .ghost, .look = looks.glass }),
+        ui.widgets.Button(.{ .label = "b", .variant = .ghost, .look = ui.view.Look.from(looks.glass) }),
+        ui.widgets.Button(.{ .label = "c", .variant = .ghost }),
+        ui.widgets.Button(.{ .label = "d", .variant = .ghost, .look = .{} }),
+    }));
+    const kids = e.root.?.children.items;
+    const c = e.cx.tokens.tokens.color;
+    try testing.expect(bgTarget(kids[0]).eql(c.bg_secondary));
+    try testing.expect(bgTarget(kids[1]).eql(c.bg_secondary));
+    try testing.expect(bgTarget(kids[2]).eql(bgTarget(kids[3])));
+    try testing.expect(!bgTarget(kids[2]).eql(c.bg_secondary));
+}
+
+/// Background a node is heading to (the tone animates background changes).
+fn bgTarget(n: *ui.Node) ui.Color {
+    if (n.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(.background)) |slot| if (slot.active) return slot.to_color;
+    return n.getBackground();
+}
+
+const SubtreeOrderEnv = struct {
+    e: Env,
+    vm: subtree_order.Vm,
+    fn init() !SubtreeOrderEnv {
+        var e = try Env.init();
+        errdefer e.deinit();
+        subtree_order.stale_reads = 0;
+        return .{ .e = e, .vm = .{
+            .page = try e.scope.createSignal(u8, 0),
+            .pick = try e.scope.createSignal(?u8, 2),
+            .tab = try e.scope.createSignal(subtree_order.Tab, .list),
+        } };
+    }
+    /// Text contents under the root, depth first, joined by spaces.
+    fn texts(s: *SubtreeOrderEnv, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        collectTexts(s.e.root.?, &w);
+        return w.buffered();
+    }
+};
+fn collectTexts(n: *ui.Node, w: *std.Io.Writer) void {
+    if (n.getText()) |t| if (t.content.len != 0) {
+        if (w.end != 0) w.writeByte(' ') catch {};
+        w.writeAll(t.content) catch {};
+    };
+    for (n.children.items) |c| collectTexts(c, w);
+}
+
+// ZeroWork G21: the list source and a row's own derived value both read `page`. Removing the row
+// must come before the row's text is brought up to date, or `name(vm, row.i)` runs with the new
+// page and an index that page does not have.
+test "Yix {for}: a row removed by the list is not recomputed with the new state (inline row)" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(subtree_order.InlineRows(.{ .vm = &s.vm }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a0 a1 a2", s.texts(&buf));
+    s.vm.page.set(1);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("b0", s.texts(&buf));
+    s.vm.page.set(0);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("a0 a1 a2", s.texts(&buf));
+}
+
+test "Yix {for}: a row removed by the list is not recomputed with the new state (row component)" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(subtree_order.ComponentRows(.{ .vm = &s.vm }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a0 a1 a2", s.texts(&buf));
+    s.vm.page.set(1);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("b0", s.texts(&buf));
+}
+
+test "Yix {for}: nested lists remove outer rows before inner rows are recomputed" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(subtree_order.NestedRows(.{ .vm = &s.vm }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a0 a1 a2 a0 a1 a2 a0 a1 a2", s.texts(&buf));
+    s.vm.page.set(1);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("b0", s.texts(&buf));
+}
+
+test "Yix {if}: an unloaded branch is not recomputed with the condition's new state" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(subtree_order.Picked(.{ .vm = &s.vm }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a2", s.texts(&buf));
+    s.vm.pick.set(null);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("none", s.texts(&buf));
+    s.vm.pick.set(1);
+    try testing.expectEqualStrings("a1", s.texts(&buf));
+}
+
+test "Yix {switch}: an unloaded branch is not recomputed with the switched value's new state" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(subtree_order.Tabs(.{ .vm = &s.vm }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a0", s.texts(&buf));
+    s.vm.tab.set(.empty);
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("empty", s.texts(&buf));
+}
+
+// Inside an outer reactive callback (event / hover dispatch) the reconcile's row disposal is
+// deferred until that callback unwinds, while the drain keeps going: the removed rows' effects
+// must still be skipped.
+test "Yix {for} / {if}: removed rows and branches stay quiet when their disposal is deferred" {
+    var s = try SubtreeOrderEnv.init();
+    defer s.e.deinit();
+    try s.e.mount(ui.view.col(.{}, .{ subtree_order.InlineRows(.{ .vm = &s.vm }), subtree_order.Picked(.{ .vm = &s.vm }) }));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("a0 a1 a2 a2", s.texts(&buf));
+    const owner = s.e.cx.owner;
+    owner.beginReactiveCallback();
+    owner.beginBatch();
+    s.vm.page.set(1);
+    s.vm.pick.set(null);
+    owner.endBatch();
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    owner.endReactiveCallback();
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("b0 none", s.texts(&buf));
+    // Unbatched writes inside the callback drain one by one.
+    owner.beginReactiveCallback();
+    s.vm.page.set(0);
+    s.vm.pick.set(0);
+    s.vm.page.set(1);
+    owner.endReactiveCallback();
+    try testing.expectEqual(@as(u32, 0), subtree_order.stale_reads);
+    try testing.expectEqualStrings("b0 a0", s.texts(&buf));
+}
+
+test "Yix parts: a part's style and test_id are attribute expressions over the view model" {
+    var e = try Env.init();
+    defer e.deinit();
+    const space = e.cx.tokens.tokens.space;
+    var vm: parts_exprs.Vm = .{ .overview = try e.scope.createSignal(bool, false) };
+    try e.mount(ui.view.col(.{}, .{ parts_exprs.Attrs(.{ .vm = &vm }), parts_exprs.IdOnly(.{ .vm = &vm }) }));
+    // contentId(vm) gave both parts their test id (read at mount).
+    const attrs = findTestId(e.root.?.children.items[0], "vm.content") orelse return error.PartNotFound;
+    _ = findTestId(e.root.?.children.items[1], "vm.content") orelse return error.PartNotFound;
+    try testing.expectEqual(space.space100, attrs.style.gap);
+    // overview(vm) reads a signal: the part restyles when it changes.
+    vm.overview.set(true);
+    try testing.expectEqual(space.space300, attrs.style.gap);
+    vm.overview.set(false);
+    try testing.expectEqual(space.space100, attrs.style.gap);
+    // The test id stays what it was at mount.
+    vm.id = "other";
+    vm.overview.set(true);
+    try testing.expect(findTestId(e.root.?, "vm.content") != null);
+}
+
+test "Yix parts: a recipe given directly as a part's value follows its dimension expression" {
+    var e = try Env.init();
+    defer e.deinit();
+    const space = e.cx.tokens.tokens.space;
+    const off = try e.scope.createSignal(bool, false);
+    try e.mount(parts_exprs.Shorthand(.{ .off = off }));
+    const content = (e.find("b") orelse return error.TextNotFound).parent.?;
+    try testing.expectEqual(space.space300, content.style.gap);
+    off.set(true);
+    try testing.expectEqual(space.space100, content.style.gap);
+}
+
+test "Yix state= / a11y=: field values that are expressions are lifted like attributes" {
+    var e = try Env.init();
+    defer e.deinit();
+    const space = e.cx.tokens.tokens.space;
+    var vm: parts_exprs.Vm = .{ .overview = try e.scope.createSignal(bool, false) };
+    const off = try e.scope.createSignal(bool, false);
+    try e.mount(parts_exprs.States(.{ .vm = &vm, .off = off }));
+    const root = e.root.?;
+    try testing.expectEqual(space.space300, root.style.gap);
+    try testing.expectEqualStrings("body", root.behavior.interaction.a11y.?.label.?);
+    off.set(true);
+    try testing.expect(root.style.gap != space.space300);
+    vm.overview.set(true);
+    try testing.expectEqualStrings("overview", root.behavior.interaction.a11y.?.label.?);
+}
+
+fn findRole(n: *ui.Node, role: ui.A11yRole) ?*ui.Node {
+    if (n.behavior.interaction.a11y) |a| if (a.role == role) return n;
+    for (n.children.items) |c| if (findRole(c, role)) |r| return r;
+    return null;
+}
+
+test "Yix result handle (ZeroWork AI-1): ref on a builder element binds its own mount result, with attributes and slots" {
+    {
+        var e = try Env.init();
+        defer e.deinit();
+        const note = try ui.view.createRef(e.scope, ui.widgets.input.TextareaResult);
+        const hint = try e.scope.createSignal([]const u8, "Ask");
+        try e.mount(builder_values.NoteField(.{ .note = note, .hint = hint }));
+        // The builder's result, not its root node: the edit state, the text node and both slot rows.
+        const result = note.get() orelse return error.HandleNotBound;
+        try testing.expectEqualStrings("row.note", result.wrapper.meta.ownership.meta.test_id.?);
+        try testing.expect(result.header != null and result.footer != null and result.frame != null);
+        result.state.insertText("hi");
+        try testing.expectEqualStrings("hi", result.state.getText());
+    }
+    {
+        var e = try Env.init();
+        defer e.deinit();
+        const note = try ui.view.createRef(e.scope, ui.widgets.input.TextareaResult);
+        try e.mount(builder_values.BareNote(.{ .note = note }));
+        try testing.expect(note.get() != null and note.get().?.header == null);
+    }
+    {
+        var e = try Env.init();
+        defer e.deinit();
+        var slot: ?ui.widgets.input.TextareaResult = null;
+        try e.mount(builder_values.LocalNote(.{ .slot = &slot }));
+        try testing.expectEqualStrings("row.local", slot.?.wrapper.meta.ownership.meta.test_id.?);
+    }
+}
+
+test "Yix builder props (G25): a parameter forwarded to a plain prop is read at mount, source props follow" {
+    var e = try Env.init();
+    defer e.deinit();
+    const unit = try e.scope.createSignal([]const u8, "MB");
+    const hint = try e.scope.createSignal([]const u8, "size");
+    const off = try e.scope.createSignal(bool, false);
+    const width = try e.scope.createSignal(?f32, 150);
+    try e.mount(builder_values.InputRow(.{ .unit = unit, .hint = hint, .off = off, .width = width }));
+    // appendText / width are plain props: the parameter's value at mount.
+    _ = e.find("MB") orelse return error.TextNotFound;
+    const field = findRole(e.root.?, .textbox) orelse return error.FieldNotFound;
+    try testing.expectEqualStrings("size", field.behavior.interaction.a11y.?.placeholder.?);
+    try testing.expect(!field.behavior.interaction.a11y.?.disabled);
+    unit.set("GB");
+    width.set(90);
+    try testing.expect(e.find("MB") != null and e.find("GB") == null);
+    // placeholder / disabled are sources: they follow.
+    hint.set("amount");
+    off.set(true);
+    try testing.expectEqualStrings("amount", field.behavior.interaction.a11y.?.placeholder.?);
+    try testing.expect(field.behavior.interaction.a11y.?.disabled);
+}
+
+test "Yix builder props (G25): expressions over a struct parameter reach plain props and part test ids" {
+    var e = try Env.init();
+    defer e.deinit();
+    const row = try e.scope.createSignal(builder_values.Row, .{ .unit = "ms", .id = "row.delay" });
+    try e.mount(builder_values.ExprRow(.{ .row = row }));
+    _ = e.find("ms") orelse return error.TextNotFound;
+    _ = findTestId(e.root.?, "row.delay") orelse return error.PartNotFound;
+}
+
+test "Yix builder props (G25): Select / Tooltip take forwarded parameters" {
+    var e = try Env.init();
+    defer e.deinit();
+    const options = [_]ui.widgets.SelectOption{ .{ .value = "a", .label = "Alpha" }, .{ .value = "b", .label = "Beta" } };
+    const hint = try e.scope.createSignal([]const u8, "Pick one");
+    const help = try e.scope.createSignal([]const u8, "Explains");
+    // Popups portal to the window root: mount a root first, then the elements into it.
+    try e.mount(ui.view.col(.{}, .{}));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    try ui.view.mount(e.scope, e.cx, e.root.?, ui.view.col(.{}, .{
+        builder_values.SelectRow(.{ .options = &options, .hint = hint, .width = 120 }),
+        builder_values.TipRow(.{ .help = help, .width = 200 }),
+    }));
+    _ = e.find("Pick one") orelse return error.TextNotFound;
+    hint.set("Choose");
+    _ = e.find("Choose") orelse return error.TextNotFound;
+    _ = e.find("?") orelse return error.TextNotFound;
+}
+
+test "Yix builder props (G25): Yix components follow forwarded parameters; whole a11y and testId over a struct parameter" {
+    var e = try Env.init();
+    defer e.deinit();
+    const title = try e.scope.createSignal([]const u8, "Save");
+    const off = try e.scope.createSignal(bool, false);
+    try e.mount(builder_values.Controls(.{ .title = title, .off = off }));
+    _ = e.find("Save") orelse return error.TextNotFound;
+    title.set("Apply");
+    try testing.expect(e.find("Save") == null and e.find("Apply") != null);
+    const button = findRole(e.root.?, .button) orelse return error.ButtonNotFound;
+    try testing.expect(!button.behavior.interaction.a11y.?.disabled);
+    off.set(true);
+    try testing.expect(button.behavior.interaction.a11y.?.disabled);
+
+    var s = try Env.init();
+    defer s.deinit();
+    const row = try s.scope.createSignal(builder_values.Row, .{ .id = "row.keepalive", .name = "Keepalive" });
+    const on = try s.scope.createSignal(bool, false);
+    try s.mount(builder_values.SwitchRow(.{ .row = row, .on = on }));
+    const sw = findTestId(s.root.?, "row.keepalive") orelse return error.SwitchNotFound;
+    try testing.expectEqualStrings("Keepalive", sw.behavior.interaction.a11y.?.label.?);
+    try testing.expect(!sw.behavior.interaction.a11y.?.checked.?);
+    on.set(true);
+    try testing.expect(sw.behavior.interaction.a11y.?.checked.?);
+}
+
+test "Yix chrome (G28 / G29): GlassBox fill gives its flex child the rest; ScrollArea scrollEdge and TitlebarEdge mount" {
+    var e = try Env.init();
+    defer e.deinit();
+    e.cx.setTheme(&ui.theme.light);
+    try e.mount(chrome.Shell(.{}));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    e.cx.setViewport(900, 600);
+    e.cx.layout();
+    const nav = findTestId(e.root.?, "chrome.nav") orelse return error.NavNotFound;
+    const list = findTestId(e.root.?, "chrome.nav.list") orelse return error.ListNotFound;
+    try testing.expectApproxEqAbs(@as(f32, 600), nav.rectFromWorldOrFallback().h, 0.5);
+    // 600 - padding 20 - top 28 - note 20 - two gaps 24
+    try testing.expectApproxEqAbs(@as(f32, 508), list.rectFromWorldOrFallback().h, 0.5);
+    const viewport = findTestId(e.root.?, "chrome.viewport") orelse return error.ViewportNotFound;
+    const band = viewport.children.items[1];
+    try testing.expectEqualStrings("ScrollEdgeEffect", band.meta.ownership.meta.component_name.?);
+    try testing.expectApproxEqAbs(@as(f32, 48), band.rectFromWorldOrFallback().h, 0.5);
+    const edge = findTestId(e.root.?, "chrome.edge") orelse return error.EdgeNotFound;
+    try testing.expectEqual(@as(u8, 249), edge.style.ext.?.multi_gradient.?.stops[0].color.r);
+    e.cx.setTheme(&ui.theme.dark);
+    try testing.expectEqual(@as(u8, 34), edge.style.ext.?.multi_gradient.?.stops[0].color.r);
+}
+
+test "Yix chrome (G27): GlassToolbarGroup / GlassToolbarButton with a disabled parameter; GlassToolbar takes groups as children" {
+    var e = try Env.init();
+    defer e.deinit();
+    const can_back = try e.scope.createSignal(bool, false);
+    const Hits = struct {
+        n: usize = 0,
+        fn hit(self: *@This()) void {
+            self.n += 1;
+        }
+    };
+    var hits: Hits = .{};
+    try e.mount(chrome.Header(.{ .can_back = can_back, .on_back = ui.Cx.handlerFrom(Hits, &hits, Hits.hit) }));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    e.cx.layout();
+    const group = findTestId(e.root.?, "chrome.history") orelse return error.GroupNotFound;
+    try testing.expectEqualStrings("GlassToolbarGroup", group.meta.ownership.meta.component_name.?);
+    try testing.expectApproxEqAbs(@as(f32, 78), group.rectFromWorldOrFallback().w, 0.5);
+    const back = findTestId(e.root.?, "chrome.history.back") orelse return error.BackNotFound;
+    const forward = findTestId(e.root.?, "chrome.history.forward") orelse return error.ForwardNotFound;
+    try testing.expect(back.behavior.interaction.a11y.?.disabled);
+    try testing.expect(forward.behavior.interaction.a11y.?.disabled);
+    try testing.expectEqualStrings("Back", back.behavior.interaction.a11y.?.label.?);
+    const r = back.globalRect();
+    const press = back.behavior.events.on_event.?;
+    _ = press(.{ .mouse_down = .{ .x = r.x + 4, .y = r.y + 4 } }, back.behavior.events.event_context);
+    _ = press(.{ .mouse_up = .{ .x = r.x + 4, .y = r.y + 4 } }, back.behavior.events.event_context);
+    try testing.expectEqual(@as(usize, 0), hits.n);
+    can_back.set(true);
+    try testing.expect(!back.behavior.interaction.a11y.?.disabled);
+    _ = press(.{ .mouse_down = .{ .x = r.x + 4, .y = r.y + 4 } }, back.behavior.events.event_context);
+    _ = press(.{ .mouse_up = .{ .x = r.x + 4, .y = r.y + 4 } }, back.behavior.events.event_context);
+    try testing.expectEqual(@as(usize, 1), hits.n);
+    const toolbar = findTestId(e.root.?, "chrome.toolbar") orelse return error.ToolbarNotFound;
+    try testing.expectEqual(@as(usize, 1), toolbar.children.items.len);
+    try testing.expectEqualStrings("GlassToolbarGroup", toolbar.children.items[0].meta.ownership.meta.component_name.?);
+}
+
+test "Yix focus-within (G31): host container and component root see focus enter / leave their subtree" {
+    var e = try Env.init();
+    defer e.deinit();
+    var log: focus_within.Log = .{};
+    try e.mount(focus_within.Panel(.{ .log = &log }));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    e.cx.layout();
+    const a = findTestId(e.root.?, "fw.a") orelse return error.ANotFound;
+    const b = findTestId(e.root.?, "fw.b") orelse return error.BNotFound;
+    const press = findTestId(e.root.?, "fw.press") orelse return error.PressNotFound;
+    const outside = findTestId(e.root.?, "fw.outside") orelse return error.OutsideNotFound;
+    e.cx.setFocus(a);
+    try testing.expectEqual(@as(usize, 1), log.entered);
+    // Moving inside the subtree neither leaves nor enters it.
+    e.cx.setFocus(b);
+    try testing.expectEqual(@as(usize, 1), log.entered);
+    try testing.expectEqual(@as(usize, 0), log.left);
+    e.cx.setFocus(press);
+    try testing.expectEqual(@as(usize, 1), log.left);
+    try testing.expectEqual(@as(usize, 1), log.root_entered);
+    e.cx.setFocus(outside);
+    try testing.expectEqual(@as(usize, 1), log.root_left);
+    e.cx.setFocus(b);
+    try testing.expectEqual(@as(usize, 2), log.entered);
+    e.cx.focus_manager.clearFocus();
+    try testing.expectEqual(@as(usize, 2), log.left);
+    try testing.expectEqual(@as(usize, 1), log.root_left);
+}
+
+test "Yix chrome (G32 / G33): W.Kbd follows its parameters; W.Button iconPosition trailing" {
+    var e = try Env.init();
+    defer e.deinit();
+    e.cx.setTheme(&ui.theme.light);
+    const caps = try e.scope.createSignal([]const []const u8, &.{ "⌘", "K" });
+    const tone = try e.scope.createSignal(ui.widgets.KbdTone, .neutral);
+    try e.mount(chrome.ShortcutRow(.{ .caps = caps, .tone = tone }));
+    e.cx.root = e.root;
+    defer e.cx.root = null;
+    e.cx.layout();
+    _ = e.find("⌘") orelse return error.CapNotFound;
+    const k = e.find("K") orelse return error.CapNotFound;
+    try testing.expectEqual(ui.theme.light.tokens.color.bg_primary, k.getBackground());
+    caps.set(&.{ "⌘", "⇧", "P" });
+    tone.set(.accent);
+    const p = e.find("P") orelse return error.CapNotFound;
+    try testing.expectEqual(ui.theme.light.tokens.color.accent_tag_bg, p.getBackground());
+    try testing.expect(e.find("K") == null);
+    e.cx.layout();
+    const link = findTestId(e.root.?, "chrome.link") orelse return error.LinkNotFound;
+    const label = e.find("GitHub") orelse return error.LabelNotFound;
+    var glyph: ?*ui.Node = null;
+    for (link.children.items) |slot| for (slot.children.items) |c| for (c.children.items) |g| {
+        if (g.getIcon() != null) glyph = g;
+    };
+    try testing.expect(glyph.?.globalRect().x > label.globalRect().x);
+}
+
+test "Yix chrome (G38): W.NotificationHost declared in a template runs posts from a parameter" {
+    var e = try Env.init();
+    defer e.deinit();
+    const post = try e.scope.createSignal(ui.widgets.NotificationPost, .{});
+    try e.mount(chrome.Toasts(.{ .post = post }));
+    post.set(post.peek().next(.{ .hint = .{ .text = "Saved", .mark = .success } }));
+    const container = findComponent(e.root.?, "NotificationViewport") orelse
+        (if (e.cx.popover_portal_root) |portal| findComponent(portal, "NotificationViewport") else null) orelse return error.HostNotFound;
+    const n: *ui.widgets.Notifier = @ptrCast(@alignCast(container.meta.per_frame.hooks.slots.anim_state.?));
+    try testing.expectEqual(@as(usize, 1), n.count());
+    try testing.expectEqual(ui.widgets.NotificationPosition.top_right, n.options.position);
+}
+
+fn findComponent(n: *ui.Node, name: []const u8) ?*ui.Node {
+    if (n.meta.ownership.meta.component_name) |c| if (std.mem.eql(u8, c, name)) return n;
+    for (n.children.items) |c| if (findComponent(c, name)) |r| return r;
+    return null;
+}
+
+test "Yix chrome (G35): testId on a builder whose Props declare test_id lands where the builder puts it" {
+    var e = try Env.init();
+    defer e.deinit();
+    try e.mount(chrome.SliderRow(.{ .id = "row.volume" }));
+    const track = findTestId(e.root.?, "row.volume") orelse return error.TrackNotFound;
+    try testing.expect(track != e.root.?);
+    // Not on the Slider's own root: on its track.
+    const slider = findComponent(e.root.?, "Slider") orelse return error.SliderNotFound;
+    try testing.expect(track != slider and track.isDescendantOf(slider));
+    _ = findTestId(e.root.?, "chrome.slider.toolbar") orelse return error.ToolbarNotFound;
+}
+
+test "Yix chrome (G35): with a ref on the element, testId still lands on the builder's track and the ref gets the result" {
+    var e = try Env.init();
+    defer e.deinit();
+    const slider_ref = try ui.view.createRef(e.scope, ui.widgets.slider.SliderResult);
+    try e.mount(chrome.SliderRefRow(.{ .id = "row.balance", .slider = slider_ref }));
+    const track = findTestId(e.root.?, "row.balance") orelse return error.TrackNotFound;
+    const slider = slider_ref.get() orelse return error.RefNotSet;
+    try testing.expect(track != slider.wrapper and track.isDescendantOf(slider.wrapper));
+    try testing.expect(slider.wrapper.meta.ownership.meta.test_id == null);
 }

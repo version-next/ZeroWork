@@ -9,6 +9,10 @@ cursor_style = "block"
 sidebar_collapsed = false
 input_line_highlight = true
 timestamp_gutter = false
+# 终端右键："menu" 弹出菜单（默认）/ "paste" 直接粘贴
+terminal_right_click = "menu"
+# 浮动卡片切换动画："anchor" 收向所属标签（默认）/ "fade" 淡出并轻微缩小
+float_card_transition = "anchor"
 
 [completion]
 enabled = true

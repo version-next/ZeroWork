@@ -5,14 +5,18 @@
  * ZW_AI_TEST_PREFIX=/tmp/zw-patch-main-native ZW_AI_TEST_EXPECTED_SHA256=<sha>
  *   node e2e/ai_execution_route_native.ts /tmp/zw-ai-execution-route-evidence
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
-import {spawn,execFile} from 'node:child_process';
-import {promisify} from 'node:util';
+import {spawn} from 'node:child_process';
+import {readPasteboardText} from './private_pasteboard.ts';
 import {createHash,randomBytes} from 'node:crypto';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,open,realpath,access} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-patch-main-native');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
 const h=await import(join(prefix,'share/zenit/harness/client.ts'));
@@ -38,12 +42,20 @@ const payload=(envelope:any)=>{
  return envelope;
 };
 const target=(envelope:any)=>{if(envelope.targets){assert.equal(envelope.targets.length,1);return envelope.targets[0]}return envelope};
+// 给模型的执行快照已精简（不含 submit/accept/command_hash/start/end 等原生回执，见 ai_execution_lifecycle_native 同款断言）；
+// 原生回执取自 AI_TOOL_TRACE host_result 的原始宿主结果，与 ai_execution_lifecycle_native 一致，绝不从模型文本重建。
+const fullHostResults=new Map<string,any>();
 const result=(results:Map<string,any>,id:string,success=true)=>{
  const envelope=results.get(id);if(!envelope)return null;
- const item=target(envelope),body=payload(item);observations.set(id,{envelope,body,at:new Date().toISOString()});
+ const item=target(envelope),modelBody=payload(item),full=fullHostResults.get(id),body=full?payload(target(full)):modelBody;observations.set(id,{envelope,body,model_body:modelBody,at:new Date().toISOString()});
+ if(modelBody.snapshot&&full){assert.equal(modelBody.snapshot.state,body.snapshot.state);assert.equal(modelBody.snapshot.execution_id,body.snapshot.execution_id)}
  if(success)assert.equal(item.status,'succeeded',`${id}: ${JSON.stringify(envelope)}`);
  return body;
 };
+// 早于本 Task 的历史消息带「[历史环境，仅作记录]\n」前缀（src/ai/session_runtime.zig 历史投影）。
+const historyPrefix='[历史环境，仅作记录]\n',historical=(content:string)=>content.startsWith(historyPrefix)?content.slice(historyPrefix.length):content;
+// 运行方式分段按钮：ai.interaction.route.{0,1,2} = 批处理 / 当前终端 / 新工作终端（ai_composer_interaction_view.zig，下标即 routing.Route 序号）。
+const routeId=(option:string)=>'ai.interaction.route.'+({batch:0,current:1,new:2} as any)[option];
 const validateWire=(body:any)=>{
  const pending=new Map<string,any>();
  for(const message of body.messages){
@@ -51,7 +63,7 @@ const validateWire=(body:any)=>{
   if(message.role==='tool'){
    const call=pending.get(message.tool_call_id);assert(call,`orphan result ${message.tool_call_id}`);
    if(emitted.has(call.id)){const expected=emitted.get(call.id);assert.equal(call.function.name,expected.wire);assert.deepEqual(JSON.parse(call.function.arguments),expected.arguments,'original wire arguments changed')}
-   JSON.parse(message.content);pending.delete(message.tool_call_id);
+   JSON.parse(historical(message.content));pending.delete(message.tool_call_id);
   }
  }
  assert.equal(pending.size,0,'every original call must have a production result before the next provider round');
@@ -84,10 +96,11 @@ const assertInterval=(value:any,stage:Stage)=>{
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'execution-route-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);validateWire(body);
+  const raw=await readRequestText(req);const body=JSON.parse(raw);if(isTitleRequest(body))return skipTitle(res);validateWire(body);
+  for(const line of(await readFile(join(out,'app.log'),'utf8')).split('\n')){const start=line.indexOf('AI_TOOL_TRACE ');if(start<0)continue;try{const event=JSON.parse(line.slice(start+14));if(event.event==='host_result')fullHostResults.set(event.call_id,event.result)}catch{}}
   const userIndex=body.messages.findLastIndex((m:any)=>m.role==='user'&&/\[R-(CURRENT|BATCH|INTENT|NEW)\]/.test(String(m.content)));
   const stage=/\[R-(CURRENT|BATCH|INTENT|NEW)\]/.exec(String(body.messages[userIndex]?.content))?.[1] as Stage;assert(stages.includes(stage),'fixture stage must come from the actual submitted composer text');
-  const current=body.messages.slice(userIndex+1),results=new Map<string,any>(current.filter((m:any)=>m.role==='tool').map((m:any)=>[m.tool_call_id,JSON.parse(m.content)]));
+  const current=body.messages.slice(userIndex+1),results=new Map<string,any>(current.filter((m:any)=>m.role==='tool').map((m:any)=>[m.tool_call_id,JSON.parse(historical(m.content))]));
   requests.push({at:new Date().toISOString(),stage,wire:body.messages,results:[...results].map(([id,envelope])=>({id,envelope}))});
   res.writeHead(200,{'content-type':'text/event-stream'});res.flushHeaders();
   const stem=stage.toLowerCase(),context=result(results,stem+'-context'),inventory=result(results,stem+'-sessions');
@@ -106,7 +119,7 @@ const server=createServer(async(req,res)=>{
    const opened=result(results,'new-open');if(!opened)return emit(body,res,'new-open','host.open_session',{group_ref:group.group_ref,source_ref:source.session_ref,connection_policy:'new_only',retention:'ask',request_key:key+'-open'});
    assert.equal(opened.ownership,'created_task');assert.equal(opened.retention,'ask');assert.notEqual(opened.session_ref,source.session_ref);
    let ready=result(results,'new-ready');if(!ready)return emit(body,res,'new-ready','host.wait_session_ready',{operation_ref:opened.operation_ref,after_revision:opened.source_revision,wait_ms:30000});
-   for(let i=1;ready.state!=='ready'&&i<5;i++){const value=result(results,'new-ready-'+i);if(!value)return emit(body,res,'new-ready-'+i,'host.wait_session_ready',{operation_ref:opened.operation_ref,after_revision:ready.source_revision,wait_ms:30000});ready=value}
+   for(let i=1;ready.state!=='ready';i++){const value=result(results,'new-ready-'+i);if(!value){if(!pollWithin('new-ready',120000))break;return emit(body,res,'new-ready-'+i,'host.wait_session_ready',{operation_ref:opened.operation_ref,after_revision:ready.source_revision,wait_ms:30000})}ready=value}
    assert.equal(ready.state,'ready');assert.equal(ready.membership_committed,true);assert.equal(ready.ownership,'created_task');assert.equal(ready.session_ref,opened.session_ref);destination=ready;Object.assign(facts.NEW,{group,next,opened,ready});
   }
   const actualId=stem+'-actual',actualName=stage==='BATCH'?'run_command':'host.run_in_terminal';
@@ -114,7 +127,7 @@ const server=createServer(async(req,res)=>{
   if(stage==='BATCH'){assert.equal(actual.status,'succeeded');assert.equal(actual.exit,0);assert(actual.stdout.includes(cases.BATCH.marker));facts.BATCH.actual=actual}
   else{
    assert(actual.execution_ref?.startsWith('x1:'));let value=result(results,stem+'-wait');if(!value)return emit(body,res,stem+'-wait','host.wait_execution',{execution_ref:actual.execution_ref,after_revision:actual.source_revision,wait_ms:30000,max_bytes:8192});
-   for(let i=1;value.state!=='interval_recorded'&&i<6;i++){assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(value.state),JSON.stringify(value));const next=result(results,stem+'-wait-'+i);if(!next)return emit(body,res,stem+'-wait-'+i,'host.wait_execution',{execution_ref:actual.execution_ref,after_revision:value.source_revision,wait_ms:30000,max_bytes:8192});value=next}
+   for(let i=1;value.state!=='interval_recorded';i++){assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(value.state),JSON.stringify(value));const next=result(results,stem+'-wait-'+i);if(!next){if(!pollWithin(stem+'-wait',120000))break;return emit(body,res,stem+'-wait-'+i,'host.wait_execution',{execution_ref:actual.execution_ref,after_revision:value.source_revision,wait_ms:30000,max_bytes:8192})}value=next}
    assertInterval(value,stage);facts[stage].actual=value;
   }
   assert.equal(await readFile(cases[stage].file,'utf8'),cases[stage].marker+'\n','the fixed diagnostic command must execute exactly once');
@@ -155,37 +168,37 @@ async function normalQuit(){
 }
 try{
  await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  for(const stage of stages){
   report.active_stage=stage;await send(stage);const approved=new Set<string>(),start=performance.now();
   while(!finalEmitted&&performance.now()-start<100000){
    assert.equal(fixtureFailure,null);const recovery=(await h.query('ai.recovery')).find(shown);assert(!recovery,`provider recovery: ${text(recovery)}`);
-   if((await h.query('ai.host_approval')).some(shown)){
+   if((await h.query('ai.interaction.panel')).some(shown)){
     assert(activeCall,'every pending card belongs to the current original provider call');const call=activeCall,id=call.id;
     if(approved.has(id)){await h.sleep(80);continue}
     assert.equal(await exists(cases.EXTRA.file),false);
     const lifecycle=['new-group','new-open'].includes(id),extra=id==='intent-extra',trusted=stage==='INTENT'&&!extra;
-    report.pending_approval={stage,id,tool:call.name,arguments:call.arguments,native:await h.query('ai.host_approval')};
+    report.pending_approval={stage,id,tool:call.name,arguments:call.arguments,native:await h.query('ai.interaction.panel')};
     if(!lifecycle&&!extra&&id===stage.toLowerCase()+'-actual'&&!trusted)report.primary_failure={category:'product',phase:'exact-route-grant-reuse',reason:`The selected exact command requested an unexpected second approval at ${id}`,evidence:report.pending_approval};
     assert(lifecycle||extra||id===stage.toLowerCase()+'-wrong'||trusted&&id==='intent-actual',`unexpected new approval ${id}; exact route grant was not reused`);
-    const card=await visible('ai.host_approval'),summary=text(await visible('ai.host_approval.summary')),targetText=text(await visible('ai.host_approval.target'));
+    const card=await visible('ai.interaction.panel'),summary=text(await visible('ai.interaction.command')),targetText=text(await visible('ai.interaction.target'));
     if(!lifecycle){
      const expected=extra?cases.EXTRA.command:cases[stage].command;assert.equal(summary,Buffer.from(expected).subarray(0,200).toString('utf8'));
-     await click('ai.host_approval.copy');const complete=(await promisify(execFile)('/usr/bin/pbpaste',[],{encoding:'utf8'})).stdout;assert.equal(complete,expected,'native copy preserves the full exact pending command');
+     await click('ai.interaction.copy');const complete=(await readPasteboardText());assert.equal(complete,expected,'native copy preserves the full exact pending command');
      assert.equal(await exists((extra?cases.EXTRA:cases[stage]).file),false,'no command write before permission');
-     if(trusted){assert.equal((await h.query('ai.host_approval.route.batch')).filter(shown).length,0,'actual submitted intent fixes only this command route')}
+     if(trusted){assert.equal((await h.query(routeId('batch'))).filter(shown).length,0,'actual submitted intent fixes only this command route')}
      else{
-      for(const option of['batch','current','new'])await visible('ai.host_approval.route.'+option);
+      for(const option of['batch','current','new'])await visible(routeId(option));
       const order=stage==='CURRENT'?['batch','current','new','current']:[stage==='BATCH'?'batch':stage==='NEW'?'new':'current'];
       const beforeRequests=requests.length;
       for(const option of order){
-       await click('ai.host_approval.route.'+option);const same=await visible('ai.host_approval');assert.equal(same.id,card.id);assert.equal(text(await visible('ai.host_approval.summary')),summary);assert.equal(text(await visible('ai.host_approval.target')),targetText);assert.equal(requests.length,beforeRequests,'selection alone must not advance provider or execute');assert.equal(await exists((extra?cases.EXTRA:cases[stage]).file),false);
+       await click(routeId(option));const same=await visible('ai.interaction.panel');assert.equal(same.id,card.id);assert.equal(text(await visible('ai.interaction.command')),summary);assert.equal(text(await visible('ai.interaction.target')),targetText);assert.equal(requests.length,beforeRequests,'selection alone must not advance provider or execute');assert.equal(await exists((extra?cases.EXTRA:cases[stage]).file),false);
        report.route_selections.push({stage,id,option,card_id:same.id,summary,target:targetText,provider_requests:requests.length,zero_writes:true});await capture(stage.toLowerCase()+'-pending-'+option);
       }
      }
     }
     await capture(stage.toLowerCase()+'-'+id+'-before-'+(extra?'reject':'approve'));
-    approved.add(id);report.approvals.push({stage,id,kind:lifecycle?'lifecycle':'command',decision:extra?'reject':'approve',summary,target:targetText});await click(extra?'ai.host_approval.reject':'ai.host_approval.accept');
+    approved.add(id);report.approvals.push({stage,id,kind:lifecycle?'lifecycle':'command',decision:extra?'reject':'approve',summary,target:targetText});await click(extra?'ai.interaction.reject':'ai.interaction.approve');
    }
    if(!finalEmitted)await h.sleep(80);
   }
@@ -204,20 +217,20 @@ try{
  }
  const wrongIds=stages.map(stage=>stage.toLowerCase()+'-wrong');for(const id of wrongIds)assert.equal(events.filter(event=>event.call_id===id&&['dynamic_dispatch','exec_started','host_received','group_host_received'].includes(event.event)).length,0);
  const batchDispatch=events.filter(event=>event.event==='exec_started');assert.equal(batchDispatch.length,1);assert.equal(batchDispatch[0].call_id,'batch-actual');
- const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));const runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal'&&record.execution);assert.deepEqual(runs.map((run:any)=>run.original_call).sort(),['current-actual','intent-actual','new-actual']);
+ const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));const runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal'&&record.execution);assert.deepEqual(runs.map((run:any)=>run.original_call).sort(),['current-actual','intent-actual','new-actual']);
  for(const run of runs){assert.equal(run.stage,'succeeded');assert.equal(run.execution_receipt.interval_saved,true);assert.equal(run.execution_receipt.output_scope,'session_interval');assert.equal(run.execution_receipt.local_released,true)}
  const manifests:any[]=[];for(const path of await readdir(data,{recursive:true}))if(String(path).endsWith('.json'))try{const document=JSON.parse(await readFile(join(data,String(path)),'utf8'));if(document.execution_ranges?.length)manifests.push({path:String(path),document})}catch{}
  for(const stage of['CURRENT','INTENT','NEW'])assert.equal(manifests.flatMap(item=>item.document.execution_ranges).filter((range:any)=>range.execution_id===facts[stage].actual.snapshot.execution_id&&range.interval_saved).length,1);
  await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));await writeFile(join(out,'recording-manifests.json'),JSON.stringify(manifests,null,2));
  report.checks.push('One actual ask card offers batch/current/new, keeps exact original command and target through selection, and advances only after one approve action','run_command → current PTY and PTY → batch return structured cancelled_unsent/requires_plan_change with zero adapter dispatch and zero writes before a later provider round emits the selected real tool','Each route executes its fixed unpredictable printf diagnostic once; batch has one real exec_started and the three PTY runs have real durably saved intervals','The actual composer submitted current-terminal instruction fixes the first route while exact command approval remains required; a different successor command gets a new selectable approval and rejection causes zero writes','New-work-terminal selection keeps exact same-Task source through explicit group/open approvals, one proved task-owned new_only Local identity and the chosen command on that real new PTY','Every original provider call retains its wire arguments, has one production feedback result, and normal Quit exits without a signal');
  await normalQuit();report.status='passed';
-}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;if(report.phase==='aggregate-verification')report.aggregate_failure=String(error);else report.scenarios[report.active_stage]={status:'failed',error:String(error)};process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{});try{await normalQuit()}catch(closeError){report.normal_quit_error=String(closeError)}}
+}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;if(report.phase==='aggregate-verification')report.aggregate_failure=String(error);else report.scenarios[report.active_stage]={status:'failed',error:String(error)};process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{});try{await normalQuit()}catch(closeError){report.normal_quit_error=String(closeError)}}
 finally{
  report.facts=facts;report.requests=requests;report.emitted=[...emitted.values()];report.observations=Object.fromEntries(observations);report.files={};for(const[name,value]of Object.entries(cases))try{report.files[name]={path:value.file,content:await readFile(value.file,'utf8')}}catch{report.files[name]={path:value.file,content:null}}
  const raw=await readFile(join(out,'app.log'),'utf8');report.native_errors=raw.split('\n').filter(line=>line.includes('ai worker turn failed:'));report.events=await traceEvents();
  await writeFile(join(out,'provider-wire.json'),JSON.stringify(requests,null,2));await writeFile(join(out,'raw-tool-results.json'),JSON.stringify(Object.fromEntries(observations),null,2));
  await writeFile(join(out,'tool-feedback.json'),JSON.stringify(report.events.filter((event:any)=>event.event==='tool_feedback').map((event:any)=>({...event,envelope:JSON.parse(event.content)})),null,2));
- try{await writeFile(join(out,'final-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.json')))}catch{}
+ try{await writeFile(join(out,'final-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.v4.json')))}catch{}
  const preservedManifests:any[]=[];for(const path of await readdir(data,{recursive:true}))if(String(path).endsWith('.json'))try{const document=JSON.parse(await readFile(join(data,String(path)),'utf8'));if(document.execution_ranges?.length)preservedManifests.push({path:String(path),document})}catch{}await writeFile(join(out,'final-recording-manifests.json'),JSON.stringify(preservedManifests,null,2));
  let forced=false;if(app.exitCode===null&&app.signalCode===null){forced=true;app.kill('SIGTERM')}await Promise.race([ended,h.sleep(2000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended}report.cleanup={forced,exit_code:app.exitCode,signal:app.signalCode};if(forced&&report.status==='passed'){report.status='failed';report.error='normal Quit was not achieved';process.exitCode=1}
  server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));await log.close();report.isolation={directory:iso,preserved:true,data,rpc,zdot};await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));

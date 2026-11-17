@@ -6,10 +6,16 @@ const presentation = @import("../host/plugin_ui_contract.zig");
 const frames = @import("../host/frame_budget.zig");
 const bmc = @import("bmc_ikvm/plugin.zig");
 const ledger = @import("bmc_ikvm/management_journal.zig");
+const enablement = @import("../host/plugin_enablement.zig");
 
 pub fn Bundle(comptime acceptance_plugins: bool) type {
     return struct {
         const Self = @This();
+        const Fixture = @import("fixture_probe/plugin.zig").Plugin;
+        /// “已链接插件表”（PLUGIN_ARCH_PLAN 6.2.1 Q5 / PL1 第 6 条）：不初始化插件就能读到的元数据，
+        /// 全仓只有这里按 ID 列举随应用提供的插件。
+        pub const linked = [_]enablement.Linked{bmc.Plugin.linked} ++ (if (acceptance_plugins) [_]enablement.Linked{Fixture.linked} else [_]enablement.Linked{});
+        const capacity = linked.len;
         const Resources = struct {
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -17,16 +23,19 @@ pub fn Bundle(comptime acceptance_plugins: bool) type {
             frame_budget: frames.Budget = frames.Budget.init(frames.application_bytes),
             journal_backend: ledger.FileBackend,
             plugin: ?*bmc.Plugin = null,
-            fixture: if (acceptance_plugins) ?*@import("fixture_probe/plugin.zig").Plugin else void = if (acceptance_plugins) null else {},
+            fixture: if (acceptance_plugins) ?*Fixture else void = if (acceptance_plugins) null else {},
         };
 
         // Backend contexts and reservations borrow Resources, never this
         // return-by-value Bundle. Moving the Bundle cannot invalidate them.
         resources: ?*Resources,
-        manifest_entries: [if (acceptance_plugins) 2 else 1]registry.PluginManifest,
-        renderer_entries: [if (acceptance_plugins) 2 else 1]presentation.RendererDefinition,
+        manifest_entries: [capacity]registry.PluginManifest = undefined,
+        renderer_entries: [capacity]presentation.RendererDefinition = undefined,
+        count: usize = 0,
 
-        pub fn init(allocator: std.mem.Allocator, io: std.Io, data_directory: []const u8) !Self {
+        /// 被禁用的随应用插件（`launch.isEnabled(id) == false`）不初始化、不交给注册表（Q5）：不调它的 `init`，
+        /// 不打开它自己的数据文件（bmc 的 `bmc-management-v1.json` 只在 init 里经 journal 读写），也不删除。
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, data_directory: []const u8, launch: *const enablement.Launch) !Self {
             const resources = try allocator.create(Resources);
             errdefer allocator.destroy(resources);
             const directory = try openDataDirectory(io, data_directory);
@@ -37,22 +46,31 @@ pub fn Bundle(comptime acceptance_plugins: bool) type {
                 .directory = directory,
                 .journal_backend = .{ .io = io, .dir = directory, .filename = "bmc-management-v1.json" },
             };
-            const plugin = try bmc.Plugin.init(allocator, .{ .frame_budget = &resources.frame_budget, .journal_backend = try resources.journal_backend.backend() });
-            // init has not exposed a factory or started a worker yet.
-            errdefer plugin.deinit() catch unreachable;
-            resources.plugin = plugin;
-            if (comptime acceptance_plugins) {
-                const fixture = try @import("fixture_probe/plugin.zig").Plugin.init(allocator);
-                resources.fixture = fixture;
-                return .{ .resources = resources, .manifest_entries = .{ plugin.manifest(), fixture.manifest() }, .renderer_entries = .{ plugin.renderer(), fixture.renderer() } };
+            var self: Self = .{ .resources = resources };
+            if (launch.isEnabled(bmc.Plugin.linked.id)) {
+                const plugin = try bmc.Plugin.init(allocator, .{ .frame_budget = &resources.frame_budget, .journal_backend = try resources.journal_backend.backend() });
+                resources.plugin = plugin;
+                self.append(plugin.manifest(), plugin.renderer());
             }
-            return .{ .resources = resources, .manifest_entries = .{plugin.manifest()}, .renderer_entries = .{plugin.renderer()} };
+            // init has not exposed a factory or started a worker yet.
+            errdefer if (resources.plugin) |plugin| plugin.deinit() catch unreachable;
+            if (comptime acceptance_plugins) if (launch.isEnabled(Fixture.linked.id)) {
+                const fixture = try Fixture.init(allocator);
+                resources.fixture = fixture;
+                self.append(fixture.manifest(), fixture.renderer());
+            };
+            return self;
+        }
+        fn append(self: *Self, manifest: registry.PluginManifest, renderer: presentation.RendererDefinition) void {
+            self.manifest_entries[self.count] = manifest;
+            self.renderer_entries[self.count] = renderer;
+            self.count += 1;
         }
         pub fn manifests(self: *const Self) []const registry.PluginManifest {
-            return if (self.resources != null) &self.manifest_entries else &.{};
+            return if (self.resources != null) self.manifest_entries[0..self.count] else &.{};
         }
         pub fn renderers(self: *const Self) []const presentation.RendererDefinition {
-            return if (self.resources != null) &self.renderer_entries else &.{};
+            return if (self.resources != null) self.renderer_entries[0..self.count] else &.{};
         }
         pub fn frameBudget(self: *Self) *frames.Budget {
             return &self.resources.?.frame_budget;

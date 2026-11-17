@@ -325,6 +325,68 @@ static void a11y_range_contract(HWND window) {
     range->Release(); provider->Release();
     printf("Windows UIA RangeValue: %u checks; typed numeric actions, valid bounds and retained lifetime\n", checks-before);
 }
+static void a11y_static_text_name_contract(HWND window) {
+    using namespace zenit_uia;
+    const unsigned before = checks, failures_before = failed;
+    auto *binding = (Binding *)zenit_uia_create(window); CHECK(binding); if (!binding) return;
+    InputNode nodes[5] = {};
+    for (uint32_t i = 0; i < 5; ++i) {
+        nodes[i].id = i + 1; nodes[i].parent_index = no_parent; nodes[i].role = 52;
+    }
+    char visible[] = "D1 中🧪";
+    nodes[0].value = {visible, strlen(visible)};
+    nodes[1].name = {"Explicit", 8}; nodes[1].value = {"Visible", 7};
+    nodes[2].state = zenit_a11y::secure_state;
+    nodes[2].value = {(const char *)1, SIZE_MAX}; // Never dereference a secure value.
+    nodes[3].role = 10; nodes[3].value = {"Edit contents", 13};
+    CHECK(zenit_uia_publish(binding, nodes, 5));
+    auto *retained = binding->context->acquire(); CHECK(retained);
+    memset(visible, 'x', sizeof(visible)-1); // No borrowed UTF8 storage.
+    const wchar_t *expected[] = {L"D1 中🧪", L"Explicit", L"", L"", L""};
+    for (uint32_t i = 0; i < 5; ++i) {
+        auto *provider = new Provider(binding, i+1); CHECK(provider);
+        if (provider) {
+            VARIANT value = {};
+            CHECK(provider->GetPropertyValue(UIA_NamePropertyId, &value) == S_OK && value.vt == VT_BSTR &&
+                !wcscmp(value.bstrVal, expected[i]));
+            VariantClear(&value); provider->Release();
+        }
+    }
+    auto *cached = new Provider(binding, 1); CHECK(cached);
+    nodes[0].value = {"Latest 中", strlen("Latest 中")};
+    CHECK(zenit_uia_publish(binding, nodes, 5));
+    if (cached) {
+        VARIANT value = {};
+        CHECK(cached->GetPropertyValue(UIA_NamePropertyId, &value) == S_OK && value.vt == VT_BSTR &&
+            !wcscmp(value.bstrVal, L"Latest 中")); VariantClear(&value);
+    }
+    zenit_uia_destroy(binding);
+    if (cached) {
+        VARIANT value = {};
+        CHECK(cached->GetPropertyValue(UIA_NamePropertyId, &value) == (HRESULT)UIA_E_ELEMENTNOTAVAILABLE);
+        VariantClear(&value); cached->Release();
+    }
+    CHECK(retained && !wcscmp(retained->find(1)->name, L"D1 中🧪"));
+    if (retained) retained->release();
+    // Name aliases the snapshot's owned value; no second allocation/string quota.
+    const size_t length = zenit_a11y::max_string_bytes/2 + 1;
+    char *large = (char *)malloc(length); CHECK(large);
+    if (large) {
+        memset(large, 'a', length);
+        nodes[0].value = {large, length};
+        auto *snapshot = zenit_a11y::Snapshot::create(nodes, 1); CHECK(snapshot);
+        free(large);
+        if (snapshot) {
+            CHECK(snapshot->find(1)->name == snapshot->find(1)->value);
+            CHECK(wcslen(snapshot->find(1)->name) == length);
+            snapshot->release();
+        }
+    }
+    if (failed == failures_before)
+        printf("Windows UIA demand case: static text names and retained ownership PASS\n");
+    printf("Windows accessibility static text names: %u checks\n", checks-before);
+}
+
 static void a11y_provider_contract(HWND window) {
     using namespace zenit_uia;
     unsigned before = checks;

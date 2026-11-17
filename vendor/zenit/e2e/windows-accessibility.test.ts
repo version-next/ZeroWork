@@ -13,6 +13,9 @@ test("Windows system UI Automation reads the projected App tree without taking f
   const first = await nativeTree();
   const zenit = first.nodes.filter((node: any) => node.framework === "Zenit");
   assert(zenit.length > 5, `UIA did not expose virtual controls: ${JSON.stringify(first.nodes)}`);
+  const text = zenit.filter((node: any) => node.role === 50020);
+  assert(text.length > 0 && text.every((node: any) => node.name.trim().length > 0),
+    `visible static UIA text has an empty Name: ${JSON.stringify(text)}`);
   const noise = zenit.find((node: any) => node.name === "Noise");
   assert(noise && noise.role === 50000 && noise.enabled && noise.focusable && noise.invoke_available, `Noise is not an invokable accessible Button: ${JSON.stringify(noise)}`);
   const root = first.nodes[0];

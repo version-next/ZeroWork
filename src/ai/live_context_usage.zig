@@ -59,6 +59,8 @@ pub const Mailbox = struct {
     mutex: std.atomic.Mutex = .unlocked,
     turn: u64 = 0,
     value: ?Snapshot = null,
+    /// The UI that reads this box (its owner binds it); a publication wakes it.
+    wake: ?*const @import("publication.zig").Wake = null,
     fn lock(self: *Mailbox) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -70,9 +72,13 @@ pub const Mailbox = struct {
         self.value = null;
     }
     pub fn publish(self: *Mailbox, turn: u64, value: Snapshot) void {
-        self.lock();
-        defer self.mutex.unlock();
-        if (self.turn == turn) self.value = value;
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.turn != turn) return;
+            self.value = value;
+        }
+        @import("publication.zig").publish(self.wake);
     }
     pub fn read(self: *Mailbox, turn: u64) ?Snapshot {
         self.lock();

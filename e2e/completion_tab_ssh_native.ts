@@ -1,6 +1,7 @@
 /** Real SSH/Bash Tab completion -> submission -> application history menu.
  * ZW_TEST_PYTHON=/path/to/python-with-paramiko node e2e/completion_tab_ssh_native.ts /fresh/output /path/to/zerowork
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -15,7 +16,8 @@ const isolated = await realpath(await mkdtemp(join(tmpdir(), "zw-tab-history-"))
 const rpc = join(isolated, "rpc"), data = join(isolated, "data"), peerOutput = join(output, "peer");
 await Promise.all([mkdir(rpc), mkdir(data)]);
 const peerLog = await open(join(output, "peer.log"), "w"), appLog = await open(join(output, "app.log"), "w");
-const peer = spawn(process.env.ZW_TEST_PYTHON ?? "python3", ["e2e/builtin_records_ssh_peer.py", "--out", peerOutput, "--plain-bash"], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
+assert(process.env.ZW_TEST_PYTHON, "ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used");
+const peer = spawn(process.env.ZW_TEST_PYTHON, ["-I", "e2e/builtin_records_ssh_peer.py", "--out", peerOutput, "--plain-bash"], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
 const peerEnded = new Promise(resolve_ => peer.once("close", resolve_));
 let app: ReturnType<typeof spawn> | undefined, appEnded: Promise<unknown> | undefined;
 const report: any = {

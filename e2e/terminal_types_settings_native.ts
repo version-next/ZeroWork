@@ -1,25 +1,27 @@
 /** Verify builtin choices, custom declaration wording and persistence in real native settings. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {mkdir,mkdtemp,realpath,open,readFile,writeFile} from 'node:fs/promises';
 import {resolve,join} from 'node:path';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {settingsNav} from './settings_nav.ts';
+const nav=settingsNav();
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);await mkdir(out,{recursive:true});
 const shown=(n:any)=>n&&!n.hidden&&n.visible!==false&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const flat=(n:any):any[]=>shown(n)?[n,...(n.children??[]).flatMap(flat)]:[];
 const report:any={binary,sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),status:'running',runs:[],limits:['Isolated native test windows; public Harness input, no physical keyboard/IME or VoiceOver verification.','HTML source wording is synchronized; browser preview was unavailable because file URLs were blocked.']};
 try{for(const theme of ['dark','light']){
  const iso=await realpath(await mkdtemp('/private/tmp/zw-term-settings-'));const data=join(iso,'data'),rpc=join(iso,'rpc');await mkdir(data);await mkdir(rpc);
- await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[ui]\ntheme="'+theme+'"\nfont_family="Menlo"\n[ssh]\nterm="xterm-256color"\n');
+ await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[updates]\nauto_check=false\n[ui]\ntheme="'+theme+'"\nfont_family="Menlo"\n[ssh]\nterm="xterm-256color"\n');
  process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;const log=await open(join(out,theme+'.log'),'w');const app=spawn(binary,[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',log.fd,log.fd]});const ended=new Promise(r=>app.once('close',r));
  const run:any={theme,status:'running',checks:[]};report.runs.push(run);
  const node=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);
  const click=async(id:string)=>{const r=(await node(id)).rect;assert((await h.clickAt(r.x+r.w/2,r.y+r.h/2)).ok)};
  const capture=async(name:string)=>{await h.sleep(300);assert((await h.screenshot(join(out,theme+'-'+name+'.png'))).ok);await writeFile(join(out,theme+'-'+name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(['settings.field.term','settings.help.term.tooltip','settings.term.option.xterm-256color','settings.term.option.xterm','settings.term.option.vt100','settings.term.option.custom','settings.term.custom.note'].map(async id=>[id,await h.query(id)]))),null,2))};
  try{
-  await h.waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1440,900);await click('toolbar.settings');await click('settings.nav.ssh');
-  if(!(await h.query('settings.field.term')).some(shown))await click('settings.ssh.connection.header');
+  await h.waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1440,900);await nav.toField('term'); // SSH 与网络 › 连接 (two-level settings, settings_nav.ts; panes no longer fold)
   const hint=await node('settings.help.term');await h.mouseMove(hint.rect.x+hint.rect.w/2,hint.rect.y+hint.rect.h/2);
   const help=await node('settings.help.term.tooltip');assert(flat(help).some(n=>n.text?.includes('自定义仅声明 TERM 名称')));await capture('help');await h.mouseMove(10,10);
   await click('settings.field.term');

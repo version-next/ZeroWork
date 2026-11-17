@@ -33,10 +33,10 @@ pub fn mount(_: ?*anyopaque, args: contract.EditorMount) !contract.EditorInstanc
     self.editor.protocol_picker = args.protocol_picker;
     self.editor.protocol_id = args.protocol_id;
     self.editor.protocol = std.meta.stringToEnum(types.Protocol, args.protocol_id) orelse return error.UnsupportedProtocol;
-    if (self.editor.protocol != .ssh and self.editor.protocol != .sftp) return error.UnsupportedProtocol;
     self.editor.connection_configs = args.connection_configs;
     self.editor.draft_id = args.editor_id;
     self.editor.draft_revision = args.draft_revision;
+    self.editor.editor_host = args.editor_host;
     self.editor.on_result = result;
     self.editor.result_ctx = self;
     const root = try self.editor.mount(args.cx, args.scope);
@@ -51,6 +51,7 @@ pub fn mount(_: ?*anyopaque, args: contract.EditorMount) !contract.EditorInstanc
         const host = try reader.resolve(try envelopes.decodeLegacy(arena.allocator(), initial));
         self.editor.loadDraft(types.Draft.fromHost(host));
     } else self.editor.loadDraft(.{ .protocol = self.editor.protocol });
+    if (args.child) |child| if (child.intent == .create_jump) try self.editor.configureJumpChild(child.subject);
     self.editor.show();
     return .{ .context = self, .vtable = &vtable, .handles_actions = true };
 }
@@ -105,8 +106,8 @@ fn modalPresentation(raw: *anyopaque) contract.ModalPresentation {
     const remote_editor = self.editor;
     const editing = remote_editor.source_owner != null;
     return .{
-        .width = @import("../../ui/wizard_styles.zig").width,
-        .title = if (editing) "编辑连接" else "新建连接",
+        .width = @import("../../features/connections/wizard/view/wizard_styles.zig").width,
+        .title = if (remote_editor.jump_child_target != null) "新建主机 › 新建跳板主机" else if (editing) "编辑主机" else "新建主机",
         .warning = false,
     };
 }
@@ -114,12 +115,18 @@ fn parentPresentationVisible(raw: *anyopaque) bool {
     const self: *Instance = @ptrCast(@alignCast(raw));
     return !self.editor.copy_open.?.peek();
 }
-const vtable: contract.EditorInstance.VTable = .{ .snapshot = snapshot, .clear_secrets = clear, .unmount = release, .cancel = cancel, .preferred_modal_height = preferredModalHeight, .modal_presentation = modalPresentation, .parent_presentation_visible = parentPresentationVisible, .visibility_changed = visibility };
+fn childCompleted(raw: *anyopaque, completion: @import("../../host/content_context.zig").ChildCompletion) void {
+    const self: *Instance = @ptrCast(@alignCast(raw));
+    self.editor.childCompleted(completion);
+}
+const vtable: contract.EditorInstance.VTable = .{ .snapshot = snapshot, .clear_secrets = clear, .unmount = release, .cancel = cancel, .preferred_modal_height = preferredModalHeight, .modal_presentation = modalPresentation, .parent_presentation_visible = parentPresentationVisible, .visibility_changed = visibility, .child_completed = childCompleted };
 
 /// Explicit legacy remote UI adapter for the application's existing Draft and
 /// probe callers. A missing/replaced contribution cannot construct this view.
 pub fn loadDraft(shell: anytype, draft: types.Draft) !void {
-    if (shell.title) |title| try title.setTextContent(shell.alloc, if (draft.source_owner != null) "编辑连接" else "新建连接");
+    // A native-window shell that is not mounted yet replays this on mount.
+    if (@hasDecl(@TypeOf(shell.*), "deferDraft")) if (try shell.deferDraft(draft)) return;
+    if (shell.title) |title| try title.setTextContent(shell.alloc, if (draft.source_owner != null) "编辑主机" else "新建主机");
     const protocol_id = @tagName(draft.protocol);
     if (!std.mem.eql(u8, shell.protocol_id, protocol_id) or current(shell) == null) try shell.selectContribution(protocol_id);
     const state = current(shell) orelse return error.RemoteEditorUnavailable;

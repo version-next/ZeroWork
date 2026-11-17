@@ -1,4 +1,5 @@
-//! Per-owner conversation state. Session and group IDs are separate domains.
+//! Per-owner conversation state. Owners are tabs (M10); legacy session / group
+//! owners only appear on conversations replayed from old journal rows.
 const std = @import("std");
 const scope = @import("tool_scope.zig");
 const cards = @import("card_stream.zig");
@@ -81,8 +82,14 @@ pub const Message = struct {
     }
 };
 pub const Phase = enum { idle, running, approval, done, failed, stopped };
+/// Told about every phase change of a conversation in a Store (`Store.observePhases`).
+pub const PhaseObserver = struct {
+    context: *anyopaque,
+    changed: *const fn (context: *anyopaque, conversation: u64, phase: Phase) void,
+};
 pub const State = struct {
     title: @import("conversation_title.zig").Title = .{},
+    /// Read freely; written only through `Store.setPhase`, which tells the observers.
     phase: Phase = .idle,
     id: u64 = 0,
     conversation_id: ConversationId = .{},
@@ -149,10 +156,34 @@ pub const Store = struct {
     /// presented owners. A picker ticket never points into the State array.
     attachment_drafts: std.ArrayList(*@import("local_text_attachments.zig").Draft) = .empty,
     image_drafts: std.ArrayList(*@import("image_attachments.zig").Draft) = .empty,
+    /// Presentation layers that show conversation phases (one per window that lists conversations).
+    phase_observers: std.ArrayList(PhaseObserver) = .empty,
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
     }
+    /// The one way a conversation's phase changes: observers hear about it as it happens, so no view
+    /// has to poll the states. A same-value write is a no-op.
+    pub fn setPhase(self: *Store, state: *State, phase: Phase) void {
+        if (state.phase == phase) return;
+        state.phase = phase;
+        for (self.phase_observers.items) |observer| observer.changed(observer.context, state.id, phase);
+    }
+    /// Registers `observer` until `unobservePhases` with the same context (one registration per context).
+    pub fn observePhases(self: *Store, observer: PhaseObserver) !void {
+        for (self.phase_observers.items) |*existing| if (existing.context == observer.context) {
+            existing.* = observer;
+            return;
+        };
+        try self.phase_observers.append(self.allocator, observer);
+    }
+    pub fn unobservePhases(self: *Store, context: *anyopaque) void {
+        for (self.phase_observers.items, 0..) |observer, index| if (observer.context == context) {
+            _ = self.phase_observers.orderedRemove(index);
+            return;
+        };
+    }
     pub fn deinit(self: *Store) void {
+        self.phase_observers.deinit(self.allocator);
         for (self.states.items) |*state| state.deinit(self.allocator);
         self.states.deinit(self.allocator);
         self.attachment_ids.deinit(self.allocator);
@@ -263,25 +294,42 @@ pub const Store = struct {
         state.selected = false;
         state.ended = true;
         state.listed = true;
-        state.phase = .stopped;
+        self.setPhase(state, .stopped);
         state.model.visible = false;
     }
     pub const Handoff = struct { id: ConversationId, runtime_id: u64, from: scope.Owner, to: scope.Owner, revision: u64, next_revision: u64 };
     /// Reserve/validate before a controller publishes the group. This plan has
     /// no borrowed State pointer and commits without allocation or cloning data.
-    pub fn prepareHandoff(self: *Store, id: ConversationId, from: scope.Owner, revision: u64, group_id: u64) !Handoff {
+    /// M10：交接是"把一个 tab 的对话交给它并入的容器 tab"，两端都是 tab 归属；只读的旧归属不能交接。
+    pub fn prepareHandoff(self: *Store, id: ConversationId, from: scope.Owner, revision: u64, to: scope.Owner) !Handoff {
         const state = self.findConversation(id) orelse return error.ConversationNotFound;
         if (state.child_agent != null or state.closed or state.ended or !state.owner.eql(from) or state.binding_revision != revision) return error.BindingChanged;
-        if (from != .session or group_id == 0) return error.InvalidBindingHandoff;
+        if (!validHandoff(from, to)) return error.InvalidBindingHandoff;
         if (self.authority) |service| if (service.store.hasBoundChildren(id)) return error.ChildSettlementRequired;
-        for (self.states.items) |other| if (other.child_agent == null and !other.closed and other.owner.eql(.{ .group = group_id })) return error.BindingConflict;
-        return .{ .id = id, .runtime_id = state.id, .from = from, .to = .{ .group = group_id }, .revision = revision, .next_revision = try @import("../host/identity.zig").advance(revision) };
+        if (self.handoffConflict(state.id, to)) return error.BindingConflict;
+        return .{ .id = id, .runtime_id = state.id, .from = from, .to = to, .revision = revision, .next_revision = try @import("../host/identity.zig").advance(revision) };
+    }
+    /// A tab shows one conversation at a time (its selected one) and may keep others (`create`,
+    /// `select`). A conversation handed to `to` becomes the one shown there, so the hand-off is
+    /// refused only when `to` is already showing a live conversation of its own. The tab's other,
+    /// unselected or ended conversations do not block it: a conversation that left its tab for a
+    /// container tab (AI docked into a split) must be able to come back to the tab that still
+    /// holds its siblings.
+    fn handoffConflict(self: *const Store, moving: u64, to: scope.Owner) bool {
+        for (self.states.items) |other| {
+            if (other.id == moving or other.child_agent != null or !other.owner.eql(to)) continue;
+            if (other.selected and !other.closed and !other.ended) return true;
+        }
+        return false;
+    }
+    fn validHandoff(from: scope.Owner, to: scope.Owner) bool {
+        return from == .tab and to == .tab and from.tab != 0 and to.tab != 0 and from.tab != to.tab;
     }
     pub fn commitHandoff(self: *Store, plan: Handoff) !void {
         const state = self.findConversation(plan.id) orelse return error.ConversationNotFound;
         if (state.child_agent != null or state.id != plan.runtime_id or state.closed or state.ended or !state.owner.eql(plan.from) or state.binding_revision != plan.revision) return error.BindingChanged;
-        if (plan.from != .session or plan.to != .group or plan.to.group == 0 or plan.next_revision != try @import("../host/identity.zig").advance(plan.revision)) return error.InvalidBindingHandoff;
-        for (self.states.items) |other| if (other.child_agent == null and !other.closed and other.owner.eql(plan.to)) return error.BindingConflict;
+        if (!validHandoff(plan.from, plan.to) or plan.next_revision != try @import("../host/identity.zig").advance(plan.revision)) return error.InvalidBindingHandoff;
+        if (self.handoffConflict(state.id, plan.to)) return error.BindingConflict;
         if (self.authority) |service| if (service.store.find(plan.id)) |record| {
             const ticket = try service.store.fence(record.id);
             if (ticket.binding != plan.revision) return error.BindingChanged;
@@ -397,7 +445,7 @@ test "conversation selection follows the live binding instead of a stale single-
     var store = Store.init(a);
     defer store.deinit();
     store.authority = &service;
-    const owner: scope.Owner = .{ .session = 1 };
+    const owner: scope.Owner = .{ .tab = 1 };
     const agent = try service.store.attach(owner);
     const ticket = try service.store.create(agent.id);
     const original = try store.create(owner);
@@ -423,7 +471,7 @@ test "conversation selection follows the live binding instead of a stale single-
 test "conversation title stays fixed after followups and uses the first question as fallback" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
-    const state = try store.create(.{ .session = 1 });
+    const state = try store.create(.{ .tab = 1 });
     try std.testing.expect(state.beginTitle("帮我排查 nginx 启动失败"));
     try std.testing.expect(!state.beginTitle("继续"));
     try std.testing.expectEqualStrings("帮我排查 nginx 启动失败", state.title.text().?);
@@ -433,20 +481,21 @@ test "conversation title stays fixed after followups and uses the first question
         .{ .user = true, .text = @constCast("第一条实际问题") },
         .{ .user = true, .text = @constCast("好的") },
     };
-    const untitled = try store.create(.{ .session = 1 });
+    const untitled = try store.create(.{ .tab = 1 });
     try std.testing.expectEqualStrings("第一条实际问题", untitled.titleText(&history, "继续", &scratch).?);
     try std.testing.expect(untitled.titleText(&.{}, null, &scratch) == null);
 }
 
-test "same numeric session and group IDs retain separate conversations" {
+test "tab owners and replayed legacy owners with the same number retain separate conversations" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
-    const session = try store.get(.{ .session = 7 });
-    _ = try session.stream.append(.{ .text = "session answer" });
-    const group = try store.get(.{ .group = 7 });
-    try std.testing.expectEqual(@as(usize, 0), group.stream.count());
-    _ = try group.stream.append(.{ .text = "group answer" });
-    try std.testing.expectEqualStrings("session answer", (try store.get(.{ .session = 7 })).stream.cards.items[0].text);
+    const tab = try store.get(.{ .tab = 7 });
+    _ = try tab.stream.append(.{ .text = "tab answer" });
+    // M10：旧日志回放出的 session / group 归属与同号的 tab 归属互不相干。
+    const legacy = try store.get(.{ .group = 7 });
+    try std.testing.expectEqual(@as(usize, 0), legacy.stream.count());
+    _ = try legacy.stream.append(.{ .text = "legacy group answer" });
+    try std.testing.expectEqualStrings("tab answer", (try store.get(.{ .tab = 7 })).stream.cards.items[0].text);
 }
 
 test "stable conversation identity isolates equal UI counters across windows and restart" {
@@ -454,28 +503,28 @@ test "stable conversation identity isolates equal UI counters across windows and
     defer first.deinit();
     var second = Store.init(std.testing.allocator);
     defer second.deinit();
-    const first_state = try first.create(.{ .session = 7 });
+    const first_state = try first.create(.{ .tab = 7 });
     const id = first_state.conversation_id;
-    const other = try second.create(.{ .session = 7 });
+    const other = try second.create(.{ .tab = 7 });
     try std.testing.expectEqual(first_state.id, other.id);
     try std.testing.expect(id.valid() and other.conversation_id.valid());
     try std.testing.expect(!id.eql(other.conversation_id));
     try std.testing.expect(first.findConversation(other.conversation_id) == null);
     try std.testing.expect(second.findConversation(id) == null);
     const ui_id = first_state.id;
-    _ = try first.create(.{ .session = 7 });
+    _ = try first.create(.{ .tab = 7 });
     try std.testing.expect(first.select(ui_id));
     try std.testing.expect(first.findConversation(id).?.conversation_id.eql(id));
     first.remove(ui_id);
     try std.testing.expect(first.findConversation(id) == null);
     var restarted = Store.init(std.testing.allocator);
     defer restarted.deinit();
-    const fresh = try restarted.create(.{ .session = 7 });
+    const fresh = try restarted.create(.{ .tab = 7 });
     try std.testing.expectEqual(ui_id, fresh.id);
     try std.testing.expect(!fresh.conversation_id.eql(id));
     restarted.next_id = std.math.maxInt(u64);
-    _ = try restarted.create(.{ .session = 7 });
-    try std.testing.expectError(error.ConversationIdentityExhausted, restarted.create(.{ .session = 7 }));
+    _ = try restarted.create(.{ .tab = 7 });
+    try std.testing.expectError(error.ConversationIdentityExhausted, restarted.create(.{ .tab = 7 }));
 }
 
 test "conversation handoff preserves history controls drafts and pending tickets without cloning" {
@@ -483,7 +532,7 @@ test "conversation handoff preserves history controls drafts and pending tickets
     const attachments = @import("local_text_attachments.zig");
     var store = Store.init(a);
     defer store.deinit();
-    const owner: scope.Owner = .{ .session = 7 };
+    const owner: scope.Owner = .{ .tab = 7 };
     const state = try store.create(owner);
     const id = state.conversation_id;
     const runtime_id = state.id;
@@ -494,11 +543,11 @@ test "conversation handoff preserves history controls drafts and pending tickets
     const file_ticket = try files.begin();
     const images = try store.imageDraft(owner);
     const image_ticket = try images.begin("/captured.png", .{});
-    const plan = try store.prepareHandoff(id, owner, 1, 9);
+    const plan = try store.prepareHandoff(id, owner, 1, .{ .tab = 9 });
     try store.commitHandoff(plan);
     const moved = store.findConversation(id).?;
     try std.testing.expectEqual(runtime_id, moved.id);
-    try std.testing.expectEqual(@as(u64, 9), moved.owner.group);
+    try std.testing.expectEqual(@as(u64, 9), moved.owner.tab);
     try std.testing.expect(moved.initial_owner.?.eql(owner));
     try std.testing.expectEqualStrings("未发送的草稿", moved.draft.?);
     try std.testing.expectEqualStrings("原会话历史", moved.history.items[0].text);
@@ -523,38 +572,40 @@ test "conversation handoff preserves history controls drafts and pending tickets
     try std.testing.expectEqualStrings("late reader content", other_files.items.items[0].reference.content().?.bytes);
     try std.testing.expect(other_files.conversation_id.?.eql(standalone.conversation_id));
     try std.testing.expect(!other_files.contains(file_ticket) and !other_files.contains(other_ticket));
-    try std.testing.expect(store.find(runtime_id).?.owner == .group);
+    try std.testing.expect(store.find(runtime_id).?.owner.eql(.{ .tab = 9 }));
     try std.testing.expectError(error.BindingChanged, store.commitHandoff(plan));
-    try std.testing.expectError(error.InvalidBindingHandoff, store.prepareHandoff(id, .{ .group = 9 }, 2, 10));
+    try std.testing.expectError(error.InvalidBindingHandoff, store.prepareHandoff(id, .{ .tab = 9 }, 2, .{ .tab = 9 }));
+    // 只读的旧归属不能交接，也不能作为交接目标（M10）。
+    try std.testing.expectError(error.InvalidBindingHandoff, store.prepareHandoff(id, .{ .tab = 9 }, 2, .{ .group = 10 }));
     // Deleted conversations cannot be recreated by an old picker/reader ticket.
     store.remove(runtime_id);
     try std.testing.expect(store.attachmentDraftForTicket(file_ticket) == null);
     try std.testing.expect(store.imageDraftForTicket(image_ticket) == null);
 }
 
-test "owner controls own callback model strings and keep session and group overrides separate" {
+test "owner controls own callback model strings and keep single-card and split tab overrides separate" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
     var provider_id = [_]u8{ 'l', 'a', 'b' };
     var model_id = [_]u8{ 'o', 'p', 's' };
-    const first = try store.get(.{ .session = 7 });
+    const first = try store.get(.{ .tab = 7 });
     try first.controls.setModel(store.allocator, .{ .provider_id = &provider_id, .model_id = &model_id });
     first.controls.permission = .auto;
     first.controls.effort = .high;
     @memset(&provider_id, 'x');
     @memset(&model_id, 'x');
-    const grouped = try store.get(.{ .group = 7 });
+    const grouped = try store.get(.{ .tab = 70 });
     try std.testing.expect(grouped.controls.model == null and grouped.controls.permission == null and grouped.controls.effort == null);
     try grouped.controls.setModel(store.allocator, .{ .provider_id = "local", .model_id = "quiet" });
     grouped.controls.permission = .confirm;
     grouped.controls.effort = .low;
-    _ = try store.get(.{ .session = 8 });
-    const restored = &(try store.get(.{ .session = 7 })).controls;
+    _ = try store.get(.{ .tab = 8 });
+    const restored = &(try store.get(.{ .tab = 7 })).controls;
     try std.testing.expectEqualStrings("lab", restored.model.?.provider_id);
     try std.testing.expectEqualStrings("ops", restored.model.?.model_id);
     try std.testing.expectEqual(PermissionMode.auto, restored.permission.?);
     try std.testing.expectEqual(Effort.high, restored.effort.?);
-    const group_restored = &(try store.get(.{ .group = 7 })).controls;
+    const group_restored = &(try store.get(.{ .tab = 70 })).controls;
     try std.testing.expectEqualStrings("quiet", group_restored.model.?.model_id);
     try std.testing.expectEqual(PermissionMode.confirm, group_restored.permission.?);
     try std.testing.expectEqual(Effort.low, group_restored.effort.?);
@@ -621,31 +672,60 @@ test "owner controls model replacement keeps prior state on allocation failure a
     try std.testing.expectEqual(Effort.medium, controls.effort.?);
 }
 
+test "handoff: a conversation returns to the tab that kept its other conversations; a tab showing its own refuses" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    // Tab 1: an earlier conversation and the one in use (selected).
+    const earlier = (try store.get(.{ .tab = 1 })).id;
+    const used = try store.create(.{ .tab = 1 });
+    const used_id = used.id;
+    const conversation = used.conversation_id;
+    try std.testing.expect(!store.find(earlier).?.selected);
+    // The AI is docked: the tab's conversation goes to the container tab 2.
+    var plan = try store.prepareHandoff(conversation, .{ .tab = 1 }, store.find(used_id).?.binding_revision, .{ .tab = 2 });
+    try store.commitHandoff(plan);
+    try std.testing.expect(store.find(used_id).?.owner.eql(.{ .tab = 2 }));
+    try std.testing.expect(store.find(earlier).?.owner.eql(.{ .tab = 1 }));
+    // Floated back: tab 1 still holds the earlier (unselected) conversation and takes its own back.
+    plan = try store.prepareHandoff(conversation, .{ .tab = 2 }, store.find(used_id).?.binding_revision, .{ .tab = 1 });
+    try store.commitHandoff(plan);
+    try std.testing.expect(store.find(used_id).?.owner.eql(.{ .tab = 1 }));
+    try std.testing.expectEqual(used_id, store.active(.{ .tab = 1 }).?.id);
+    try std.testing.expect(!store.find(earlier).?.selected);
+    // A tab that is showing a live conversation of its own does not take another one.
+    const other = try store.create(.{ .tab = 3 });
+    try std.testing.expect(other.selected);
+    try std.testing.expectError(error.BindingConflict, store.prepareHandoff(conversation, .{ .tab = 1 }, store.find(used_id).?.binding_revision, .{ .tab = 3 }));
+    // Its ended conversation does not count either.
+    try store.endActivity(other.id, store.find(other.id).?.binding_revision);
+    _ = try store.prepareHandoff(conversation, .{ .tab = 1 }, store.find(used_id).?.binding_revision, .{ .tab = 3 });
+}
+
 test "multiple AI conversations remain isolated within one tab and close by identity" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
-    const first = try store.get(.{ .session = 1 });
+    const first = try store.get(.{ .tab = 1 });
     const id = first.id;
     _ = try first.stream.append(.{ .text = "first answer" });
-    const second_id = (try store.create(.{ .session = 1 })).id;
+    const second_id = (try store.create(.{ .tab = 1 })).id;
     try std.testing.expect(second_id != id);
-    try std.testing.expectEqual(@as(usize, 0), (try store.get(.{ .session = 1 })).stream.count());
+    try std.testing.expectEqual(@as(usize, 0), (try store.get(.{ .tab = 1 })).stream.count());
     try std.testing.expect(store.select(id));
-    try std.testing.expectEqualStrings("first answer", (try store.get(.{ .session = 1 })).stream.cards.items[0].text);
+    try std.testing.expectEqualStrings("first answer", (try store.get(.{ .tab = 1 })).stream.cards.items[0].text);
     store.remove(second_id);
     try std.testing.expect(store.find(second_id) == null);
-    try std.testing.expectEqual(id, (try store.get(.{ .session = 1 })).id);
+    try std.testing.expectEqual(id, (try store.get(.{ .tab = 1 })).id);
 }
 
 test "implicit conversation stays out of list and deletion restores a surviving conversation" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
-    const initial = (try store.get(.{ .session = 1 })).id;
+    const initial = (try store.get(.{ .tab = 1 })).id;
     try std.testing.expect(!store.find(initial).?.listed);
-    const second = (try store.create(.{ .session = 1 })).id;
+    const second = (try store.create(.{ .tab = 1 })).id;
     store.find(second).?.closed = true;
     store.find(second).?.selected = false;
-    try std.testing.expectEqual(initial, (try store.get(.{ .session = 1 })).id);
+    try std.testing.expectEqual(initial, (try store.get(.{ .tab = 1 })).id);
     store.remove(second);
     try std.testing.expectEqual(@as(usize, 1), store.states.items.len);
 }
@@ -655,13 +735,13 @@ test "wire history conversation identity isolates background completion and fres
     const a = std.testing.allocator;
     var store = Store.init(a);
     defer store.deinit();
-    const first_id = (try store.create(.{ .session = 7 })).id;
+    const first_id = (try store.create(.{ .tab = 7 })).id;
     var displayed = try WireHistory.copy(a, &.{.{ .content = "first conversation" }}, "answer");
     defer displayed.deinit();
     // Model the real host's move when another conversation becomes visible.
     store.find(first_id).?.wire_history = displayed;
     displayed = .{};
-    const next_id = (try store.create(.{ .session = 7 })).id;
+    const next_id = (try store.create(.{ .tab = 7 })).id;
     try std.testing.expectEqual(@as(usize, 0), store.wireHistoryFor(next_id, next_id, &displayed).?.messages.len);
     const background = store.wireHistoryFor(first_id, next_id, &displayed).?;
     try std.testing.expect(background != &displayed);
@@ -673,8 +753,44 @@ test "wire history conversation identity isolates background completion and fres
     displayed = store.find(first_id).?.wire_history;
     store.find(first_id).?.wire_history = .{};
     try std.testing.expectEqualStrings("original request result", store.wireHistoryFor(first_id, first_id, &displayed).?.messages[0].content);
-    const group_id = (try store.create(.{ .group = 7 })).id;
+    const group_id = (try store.create(.{ .tab = 7 })).id;
     try std.testing.expectEqual(@as(usize, 0), store.wireHistoryFor(group_id, first_id, &displayed).?.messages.len);
     store.remove(next_id);
     try std.testing.expect(store.wireHistoryFor(next_id, first_id, &displayed) == null);
+}
+
+test "phase changes reach every observer once, same-value writes and removed observers hear nothing" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    const Seen = struct {
+        calls: usize = 0,
+        conversation: u64 = 0,
+        phase: Phase = .idle,
+        fn changed(raw: *anyopaque, conversation: u64, phase: Phase) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.conversation = conversation;
+            self.phase = phase;
+        }
+    };
+    var first: Seen = .{};
+    var second: Seen = .{};
+    try store.observePhases(.{ .context = &first, .changed = Seen.changed });
+    try store.observePhases(.{ .context = &second, .changed = Seen.changed });
+    // Registering the same context again replaces it instead of doubling the calls.
+    try store.observePhases(.{ .context = &first, .changed = Seen.changed });
+    const state = try store.create(.{ .tab = 7 });
+    store.setPhase(state, .running);
+    try std.testing.expectEqual(Phase.running, state.phase);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(state.id, first.conversation);
+    try std.testing.expectEqual(Phase.running, second.phase);
+    store.setPhase(state, .running);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    store.unobservePhases(&second);
+    store.setPhase(state, .approval);
+    try std.testing.expectEqual(@as(usize, 2), first.calls);
+    try std.testing.expectEqual(Phase.approval, first.phase);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
 }

@@ -239,11 +239,7 @@ pub const Draft = struct {
     candidates: std.ArrayList(Candidate) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, owner: Owner) !Draft {
-        const id = switch (owner) {
-            .session => |id| id,
-            .group => |id| id,
-        };
-        if (id == 0) return error.InvalidAttachmentOwner;
+        if (owner.raw() == 0) return error.InvalidAttachmentOwner;
         return .{ .allocator = allocator, .owner = owner };
     }
     /// The host cancels/joins all readers before destroying the draft/store.

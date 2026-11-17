@@ -269,7 +269,7 @@ pub const Loop = struct {
         const context = next.table.host_context orelse return error.InvalidHostAuthority;
         try context.validate();
         if (!context.conversation_id.eql(old_context.conversation_id) or !context.task_id.eql(old_context.task_id) or context.grant_revision != old_context.grant_revision or context.binding_revision < old_context.binding_revision or !context.binding.eql(next.table.captured_scope.owner)) return error.InvalidHostAuthority;
-        if (!context.binding.eql(old_context.binding) and (old_context.binding != .session or context.binding != .group or context.binding_revision != old_context.binding_revision +| 1)) return error.InvalidBindingHandoff;
+        if (!context.binding.eql(old_context.binding) and (old_context.contentOf() != .session or context.contentOf() != .group or context.binding_revision != old_context.binding_revision +| 1)) return error.InvalidBindingHandoff;
         if (context.binding_revision == old_context.binding_revision and !context.binding.eql(old_context.binding)) return error.InvalidBindingHandoff;
         if (next.notice.len != 0 and (next.notice_revision == 0 or next.notice_revision <= self.notice_revision)) return error.StaleNotice;
         const a = self.arena.allocator();
@@ -521,7 +521,7 @@ pub const Loop = struct {
             return record.result_body.?;
         }
         const live_policy = if (host.current_permission) |read| read(host.context) else policy;
-        const verdict = if (selected.tool == .run_command) permission.classify(live_policy, selected.command, self.scope.owner == .group) else permission.Verdict.allow_auto;
+        const verdict = if (selected.tool == .run_command) permission.classify(live_policy, selected.command, self.scope.contentOf() == .group) else permission.Verdict.allow_auto;
         if (verdict == .deny_exec_copy_only) {
             record.result_body = try self.errorBody("ToolExecutionDenied", &selected.targets);
             return record.result_body.?;

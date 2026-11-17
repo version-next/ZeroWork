@@ -1,0 +1,102 @@
+//! 页签条（design-r3 稿 3，Pencil `Oxgby`；Island B v3 `ZW4 / Tab`）。基础组件全部是 zenit 原生、默认外观：
+//!
+//! - 每个页签包一层原生 `W.Tooltip`（600 ms，“完整名称 · 路径或地址 · shell · 快捷键”）；关闭钮是原生 ghost xs
+//!   图标按钮，悬停 / 键盘焦点在页签上时出现，否则透明占位；按住 ⌘ 时关闭槽里换成“⌘1…⌘9”。
+//! - 放不下时，最久没用过的非激活页签收进条尾的“⌄ n”（原生 ghost sm 按钮 + 原生 `W.Menu`），激活页签总是可见。
+//! - 条尾的“+”是原生 ghost sm 图标按钮；点击由宿主接（新建会话菜单锚在它上面）。
+//! - 页签面、标题、计数、类型图标、状态点、分隔线是我们自己的盒子，外观由 `tab_strip.yss` 的样式函数按
+//!   `tab_strip_view.zig` 的信号算出（悬停 / 按下 / 激活 / 拖起 / 合组目标）。
+//! - 每个页签面以 `tabAnchorId`（`workspace.tab.<页签 id>`）登记为 Z12 `motionAnchor`：页签所属的浮动卡片
+//!   （AI 面板）收进 / 展开自这个页签。
+//! - 选中、关闭、右键菜单、中键关闭、双击重命名、拖动重排 / 合组都在 workspace（经视图模型的 Hooks）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/tab_strip.zig");
+const vmod = @import("tab_strip_view.zig");
+const S = @import("tab_strip.yss");
+
+pub const ids = struct {
+    pub const strip = "tabs.strip";
+    pub const viewport = "tabs.viewport";
+    pub const drag_destination = "tabs.drag_destination";
+    /// “⌄ n”溢出按钮与它的菜单面板。
+    pub const overflow = "tabs.all";
+    pub const overflow_menu = "tabs.all.menu";
+    pub const new_slot = "tabs.new_slot";
+    pub const new_tab = "toolbar.new_session";
+    pub const tooltip = "tabs.tooltip";
+    pub const title = "tabs.title";
+    pub const count = "groups.tab.count";
+    pub const type_icon = "tabs.type_icon";
+    pub const connection_state = "tabs.connection.state";
+    pub const ordinal = "tabs.ordinal";
+    pub const group_tab = "groups.tab";
+};
+
+fn Tab(vm: *vmod.ViewModel, row: m.Row) View {
+    const surface = ref();
+    const title = ref();
+    const close = ref();
+    const icon = ref();
+    const ordinal = ref();
+    var tip: bool = signal(false);
+    const look = computed(vm.look(row));
+    const width = computed(row.width);
+    const title_width = computed(row.title_width);
+    const count_width = computed(row.count_width);
+    const bounce = computed(vm.visual(row.id).bounce);
+    const dot = computed(vm.visual(row.id).dot);
+    const tint = computed(vm.visual(row.id).tint);
+    const glyph = computed(vm.visual(row.id).icon);
+    effect(if (vm.tipsEpoch() != 0) tip = false);
+    onMount(vmod.keepNodes(vm, row.id, surface, title, close, icon, ordinal));
+    return (
+        <vmod.TabCell vm={vm} id={row.id} group={row.grouped}>
+            <W.Tooltip text={row.tip} position={.bottom_start} open={tip} onOpenChange={|on| if (on and !vm.tipAllowed(row.id)) tip = false} parts={.{ .content = ids.tooltip }}>
+                <box testId={row.cell_test_id} style={ui.view.styleBy(width, S.cell)} onEvent={vmod.ViewModel.cellEvent} eventContext={vm.cell(row.id)} onHover={vm.hover(row.id, true)} onLeave={vm.hover(row.id, false)}>
+                    <box style={S.divider} visible={vm.dividerShown(row)} />
+                    <box style={S.trigger}>
+                        <box ref={surface} testId={row.test_id} motionAnchor={row.anchor} focusable={true} a11y={.{ .role = .tab, .label = row.name, .selected = row.active }} onFocusWithin={vm.focus(row.id, true)} onBlurWithin={vm.focus(row.id, false)} style={ui.view.styleBy(look, S.surface)}>
+                            <box ref={icon} style={S.icon_slot}>
+                                <icon testId={ids.type_icon} style={ui.view.styleBy(bounce, S.typeIcon)} src={glyph} tint={ui.view.tintBy(tint, S.typeTint)} />
+                                <box testId={ids.connection_state} style={ui.view.styleBy(dot, S.dot)} />
+                            </box>
+                            <text ref={title} testId={ids.title} style={ui.view.styleBy(look, S.title)} box={ui.view.styleBy(title_width, S.titleBox)}>{row.name}</text>
+                            {if (row.grouped) <text testId={ids.count} style={ui.view.styleBy(look, S.count)} box={ui.view.styleBy(count_width, S.countBox)}>{row.count}</text>}
+                            <box style={S.spacer} />
+                            <box style={S.CloseSlot.of(.{ .hidden = !vm.closeShown(row.id) })}>
+                                <W.Button ref={close} testId={row.close_test_id} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.x} a11yLabel={row.close_label} onEvent={vmod.ViewModel.closeEvent} eventContext={vm.cell(row.id)} />
+                            </box>
+                            <box style={S.ordinal_box} visible={vm.ordinalsShown()}>
+                                <text ref={ordinal} testId={ids.ordinal} style={S.ordinal}>{row.ordinal}</text>
+                            </box>
+                        </box>
+                    </box>
+                </box>
+            </W.Tooltip>
+        </vmod.TabCell>
+    );
+}
+
+pub fn TabStrip(vm: *vmod.ViewModel) View {
+    const new_tab = ref();
+    const viewport = ref();
+    const gap = computed(vm.gapX());
+    onMount(vmod.keepStrip(vm, new_tab, viewport));
+    return (
+        <row testId={ids.strip} style={S.strip}>
+            <row ref={viewport} testId={ids.viewport} style={S.viewport}>
+                {for (vm.rows()) |row| <Tab vm={vm} row={row} />}
+                <box testId={ids.drag_destination} style={ui.view.styleBy(gap, S.dragGap)} visible={vm.gapShown()} />
+            </row>
+            <box style={S.overflow} visible={vm.overflowShown()}>
+                <W.Menu items={vm.overflowItems()} panelTestId={ids.overflow_menu} width={240} position={.bottom_end} onSelect={|id| vm.pickOverflow(id)}>
+                    <W.Button testId={ids.overflow} variant={.ghost} size={.sm} iconAsset={ui.icons.chevron_down} label={vm.overflowLabel()} a11yLabel="更多页签" />
+                </W.Menu>
+            </box>
+            <box testId={ids.new_slot} style={S.NewSlot.of(.{ .after_tabs = vm.hasTabs() })}>
+                <W.Button ref={new_tab} testId={ids.new_tab} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.plus} a11yLabel="新建会话" />
+            </box>
+        </row>
+    );
+}

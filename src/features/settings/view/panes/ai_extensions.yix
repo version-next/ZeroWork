@@ -1,0 +1,244 @@
+//! AI 辅助 › 技能与 MCP（F-set-ai；旧 `ai_extensions_settings`）：本地技能（导入 / 拖入、启用、查看 SKILL.md、重新导入、移除）
+//! 与 MCP 服务（添加 / 编辑表单、启用、测试连接、查看工具、网页登录 / 退出授权、移除）。
+//! 全部原生组件：`W.Switch`、`W.Button`、`W.Menu`（“更多”）、`W.Tooltip`、`W.Input`、`W.Textarea`；后台任务（导入、读取、测试、授权）
+//! 由宿主执行（`Effect.ai`），结果与提示经 `HostStatus.ai` 回来；提示显示在它所属的卡片（本地技能 / MCP 服务）底部，同旧视图。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const S = @import("../styles.yss");
+const P = @import("ai.yss");
+const A = m.ai;
+const F = m.fields.ai;
+
+const extensions_pane = &F.extensions;
+
+fn send(vm: *m.ViewModel, command: A.Command) void {
+    vm.dispatch(m.Intent.aiDo(command));
+}
+fn toggleSkill(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .toggle_skill = index });
+}
+fn viewSkill(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .view_skill = index });
+}
+fn skillMenu(vm: *m.ViewModel, index: u8, id: []const u8) void {
+    send(vm, .{ .skill_menu = .{ .index = index, .id = id } });
+}
+fn toggleServer(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .toggle_server = index });
+}
+fn testServer(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .test_server = index });
+}
+fn viewServer(vm: *m.ViewModel, index: u8) void {
+    send(vm, .{ .view_server = index });
+}
+fn serverMenu(vm: *m.ViewModel, index: u8, id: []const u8) void {
+    send(vm, .{ .server_menu = .{ .index = index, .id = id } });
+}
+fn act(vm: *m.ViewModel, which: A.Command) void {
+    send(vm, which);
+}
+fn transport(vm: *m.ViewModel, which: A.Transport) void {
+    send(vm, .{ .mcp_transport = which });
+}
+fn setField(vm: *m.ViewModel, field: A.McpField, text: []const u8) void {
+    send(vm, .{ .mcp_text = .{ .field = field, .text = text } });
+}
+fn shown(vm: *m.ViewModel) bool {
+    return vm.paneShown(extensions_pane);
+}
+fn busy(vm: *m.ViewModel) bool {
+    return A.extBusy(vm);
+}
+fn stdioVariant(vm: *m.ViewModel) W.ButtonVariant {
+    return if (A.mcpStdio(vm)) .primary else .secondary;
+}
+fn httpVariant(vm: *m.ViewModel) W.ButtonVariant {
+    return if (A.mcpHttp(vm)) .primary else .secondary;
+}
+fn serverIcon(vm: *m.ViewModel, index: u8) ui.SvgAsset {
+    return if (A.serverHttp(vm, index)) ui.icons.globe else ui.icons.server;
+}
+/// 拖入技能文件 / 文件夹（同旧 `dropEvent`）：只认一次放下、文件载荷；路径解码与校验在 view-model。
+fn dropEvent(event: ui.events.Event, raw: ?*anyopaque) ui.events.EventResult {
+    if (event != .drag) return .ignored;
+    const vm: *m.ViewModel = @ptrCast(@alignCast(raw orelse return .ignored));
+    const drag = event.drag;
+    if (drag.kind != .dropped) return .stop;
+    if (drag.payload_truncated or drag.payload_kind != .file_or_url) {
+        send(vm, .drop_invalid);
+        return .stop;
+    }
+    send(vm, .{ .drop_skill = drag.paths });
+    return .stop;
+}
+fn dropContext(vm: *m.ViewModel) ?*anyopaque {
+    return vm;
+}
+fn dropHandler() ?*const fn (ui.events.Event, ?*anyopaque) ui.events.EventResult {
+    return dropEvent;
+}
+
+/// “更多”菜单：经菜单唯一的投影（`app_menu.static`，menus 包）——常用在前，危险项“移除”最后、前有分隔线。
+const app_menu = @import("../../../shell/mod.zig").app_menu;
+const skill_menu_items = app_menu.static(&.{ .{ .id = "reimport", .label = "重新导入", .icon_asset = &ui.icons.refresh_cw }, .{ .id = "remove", .label = "移除", .icon_asset = &ui.icons.trash, .danger = true } });
+const stdio_menu_items = app_menu.static(&.{ .{ .id = "edit", .label = "编辑", .icon_asset = &ui.icons.pencil }, .{ .id = "remove", .label = "移除", .icon_asset = &ui.icons.trash, .danger = true } });
+const http_menu_items = app_menu.static(&.{ .{ .id = "edit", .label = "编辑", .icon_asset = &ui.icons.pencil }, .{ .id = "authorize", .label = "网页登录", .icon_asset = &ui.icons.external_link }, .{ .id = "remove", .label = "移除", .icon_asset = &ui.icons.trash, .danger = true } });
+const http_authorized_menu_items = app_menu.static(&.{ .{ .id = "edit", .label = "编辑", .icon_asset = &ui.icons.pencil }, .{ .id = "authorize", .label = "网页登录", .icon_asset = &ui.icons.external_link }, .{ .id = "logout", .label = "退出授权", .icon_asset = &ui.icons.log_out }, .{ .id = "remove", .label = "移除", .icon_asset = &ui.icons.trash, .danger = true } });
+fn serverMenuItems(vm: *m.ViewModel, index: u8) []const W.MenuItem {
+    if (!A.serverHttp(vm, index)) return stdio_menu_items;
+    return if (A.serverAuthorized(vm, index)) http_authorized_menu_items else http_menu_items;
+}
+
+pub fn Extensions(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.ai.extensions" style={S.category_panes} visible={shown(vm)}>
+            <box testId="settings.ai.skills" style={S.pane}>
+                <box testId="settings.ai.skills.header" style={S.pane_header}>
+                    <text style={S.pane_title}>本地技能</text>
+                    <spacer />
+                    <text style={S.pane_meta} box={S.pane_meta_box}>导入 SKILL.md 或技能文件夹，保存后供助手使用。</text>
+                </box>
+                <box testId="settings.skills.drop" style={S.pane_body} onEvent={dropHandler()} eventContext={dropContext(vm)}>
+                    <box testId="settings.skills.toolbar" style={P.ai_ext_toolbar}>
+                        <text testId="settings.skills.summary" style={P.ai_ext_summary} box={P.ai_ext_summary_box}>{A.skillSummary(vm)}</text>
+                        <W.Button testId="settings.skills.add" label="添加技能" variant={.secondary} size={.sm} disabled={busy(vm)} onClick={act(vm, .add_skill)} />
+                    </box>
+                    {for (A.skillItems(vm)) |item| <SkillRow key={item.key} vm={vm} index={item.index} last={item.last} />}
+                    {if (A.skillsStatusShown(vm)) <text testId="settings.extensions.status" style={P.ai_error} box={P.ai_error_box}>{A.extStatus(vm)}</text>}
+                </box>
+            </box>
+            <box testId="settings.ai.mcp" style={S.pane}>
+                <box testId="settings.ai.mcp.header" style={S.pane_header}>
+                    <text style={S.pane_title}>MCP 服务</text>
+                    <spacer />
+                    <W.Button testId="settings.mcp.add" label="添加" a11yLabel="添加 MCP 服务" variant={.ghost} size={.xs} iconAsset={ui.icons.plus} iconSize={12} disabled={busy(vm)} visible={A.mcpIdle(vm)} onClick={act(vm, .new_server)} />
+                </box>
+                <box style={S.pane_body}>
+                    <text style={P.ai_note} box={P.ai_note_box}>连接外部工具与资源，供助手在对话中使用。</text>
+                    {for (A.serverItems(vm)) |item| <ServerRow key={item.key} vm={vm} index={item.index} last={item.last} />}
+                    {if (A.mcpEditing(vm)) <McpForm vm={vm} />}
+                    {if (A.mcpStatusShown(vm)) <text testId="settings.extensions.status" style={P.ai_error} box={P.ai_error_box}>{A.extStatus(vm)}</text>}
+                </box>
+            </box>
+            <box style={P.ai_ext_job} visible={A.jobBusy(vm)}>
+                <text style={P.ai_hint}>正在处理…</text>
+                <W.Button testId="settings.extensions.cancel" label="取消" variant={.secondary} size={.sm} onClick={act(vm, .cancel_job)} />
+            </box>
+        </box>
+    );
+}
+
+fn SkillRow(vm: *m.ViewModel, index: u8, last: bool) View {
+    const toggle_a11y = computed(skillA11y(vm, index));
+    return (
+        <box testId={A.skillId(index, "row")} style={P.AiExtRow.of(.{ .last = last })}>
+            <box style={P.ai_ext_line}>
+                <box style={P.ai_ext_icon_tile}>
+                    <icon src={ui.icons.sparkles} style={P.ai_ext_icon} />
+                </box>
+                <box style={P.ai_ext_identity}>
+                    <W.Tooltip text={A.skillName(vm, index)}>
+                        <text testId={A.skillId(index, "name")} style={P.ai_ext_title} box={P.ai_ext_text_box}>{A.skillName(vm, index)}</text>
+                    </W.Tooltip>
+                    <text testId={A.skillId(index, "description")} style={P.ai_ext_meta} box={P.ai_ext_text_box}>{A.skillDescription(vm, index)}</text>
+                </box>
+                <W.Switch testId={A.skillId(index, "toggle")} checked={A.skillEnabled(vm, index)} disabled={busy(vm)} a11y={toggle_a11y} onChange={|_| toggleSkill(vm, index)} />
+                <W.Button testId={A.skillId(index, "view")} label={A.skillViewLabel(vm, index)} variant={.ghost} size={.sm} disabled={busy(vm)} onClick={viewSkill(vm, index)} />
+                <W.Menu items={skill_menu_items} width={180} position={.bottom_end} onSelect={|id| skillMenu(vm, index, id)}>
+                    <W.Button testId={A.skillId(index, "more")} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.ellipsis} iconSize={16} a11yLabel="更多技能操作" disabled={busy(vm)} />
+                </W.Menu>
+            </box>
+            {if (A.skillExpanded(vm, index)) <W.Textarea testId="settings.extensions.detail" value={A.detailText(vm)} rows={6} readonly={true} />}
+        </box>
+    );
+}
+fn skillA11y(vm: *m.ViewModel, index: u8) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = A.skillToggleLabel(vm, index), .checked = A.skillEnabled(vm, index), .disabled = busy(vm) };
+}
+fn serverA11y(vm: *m.ViewModel, index: u8) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = A.serverToggleLabel(vm, index), .checked = A.serverEnabled(vm, index), .disabled = busy(vm) };
+}
+
+fn ServerRow(vm: *m.ViewModel, index: u8, last: bool) View {
+    const toggle_a11y = computed(serverA11y(vm, index));
+    return (
+        <box testId={A.serverId(index, "row")} style={P.AiExtRow.of(.{ .last = last })}>
+            <box style={P.ai_ext_line}>
+                <box style={P.ai_ext_icon_tile}>
+                    <icon src={serverIcon(vm, index)} style={P.ai_ext_icon} />
+                </box>
+                <box style={P.ai_ext_identity}>
+                    <W.Tooltip text={A.serverName(vm, index)}>
+                        <text testId={A.serverId(index, "name")} style={P.ai_ext_title} box={P.ai_ext_text_box}>{A.serverName(vm, index)}</text>
+                    </W.Tooltip>
+                    <text testId={A.serverId(index, "metadata")} style={P.ai_ext_meta} box={P.ai_ext_text_box}>{A.serverMeta(vm, index)}</text>
+                </box>
+                <W.Switch testId={A.serverId(index, "toggle")} checked={A.serverEnabled(vm, index)} disabled={busy(vm)} a11y={toggle_a11y} onChange={|_| toggleServer(vm, index)} />
+                <W.Button testId={A.serverId(index, "test")} label="测试" a11yLabel="测试连接" variant={.ghost} size={.sm} disabled={busy(vm)} onClick={testServer(vm, index)} />
+                <W.Button testId={A.serverId(index, "view")} label={A.serverViewLabel(vm, index)} variant={.ghost} size={.sm} disabled={A.serverViewBlocked(vm, index)} a11yLabel={A.serverViewA11y(vm, index)} onClick={viewServer(vm, index)} />
+                <W.Menu items={serverMenuItems(vm, index)} width={180} position={.bottom_end} onSelect={|id| serverMenu(vm, index, id)}>
+                    <W.Button testId={A.serverId(index, "more")} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.ellipsis} iconSize={16} a11yLabel="更多服务操作" disabled={busy(vm)} />
+                </W.Menu>
+            </box>
+            <text style={P.ai_ext_failure} box={P.ai_ext_failure_box} visible={A.serverFailed(vm, index)}>{A.serverFailure(vm, index)}</text>
+            {if (A.serverExpanded(vm, index)) <W.Textarea testId="settings.extensions.detail" value={A.detailText(vm)} rows={6} readonly={true} />}
+        </box>
+    );
+}
+
+fn McpInput(vm: *m.ViewModel, field: A.McpField) View {
+    return (
+        <box style={P.ai_field}>
+            <text style={P.ai_hint}>{A.mcpLabel(field)}</text>
+            <W.Input value={A.mcpValue(vm, field)} parts={.{ .input_container = A.mcpFieldId(field) }} onChange={|t| setField(vm, field, t)} onSubmit={|t| setField(vm, field, t)} />
+        </box>
+    );
+}
+fn McpLines(vm: *m.ViewModel, field: A.McpField) View {
+    return (
+        <box style={P.ai_field}>
+            <text style={P.ai_hint}>{A.mcpLabel(field)}</text>
+            <W.Textarea testId={A.mcpFieldId(field)} value={A.mcpValue(vm, field)} rows={2} onChange={|t| setField(vm, field, t)} />
+        </box>
+    );
+}
+
+/// MCP 添加 / 编辑表单（旧 `View.form`）：stdio / HTTP 两组字段、应用到草稿、取消、清除秘密。
+fn McpForm(vm: *m.ViewModel) View {
+    return (
+        <box style={P.ai_ext_form}>
+            <box style={P.ai_ext_buttons}>
+                <W.Button testId="settings.mcp.stdio" label="stdio" variant={stdioVariant(vm)} size={.sm} onClick={transport(vm, .stdio)} />
+                <W.Button testId="settings.mcp.http" label="HTTP" variant={httpVariant(vm)} size={.sm} onClick={transport(vm, .http)} />
+            </box>
+            <McpInput vm={vm} field={.name} />
+            {if (A.mcpStdio(vm)) <box style={P.ai_ext_form}>
+                <McpInput vm={vm} field={.program} />
+                <McpLines vm={vm} field={.arguments} />
+                <McpInput vm={vm} field={.cwd} />
+                <McpLines vm={vm} field={.environment} />
+            </box> else <box style={P.ai_ext_form}>
+                <McpInput vm={vm} field={.endpoint} />
+                <McpLines vm={vm} field={.headers} />
+            </box>}
+            <McpInput vm={vm} field={.timeout} />
+            <McpLines vm={vm} field={.bindings} />
+            <McpLines vm={vm} field={.roots} />
+            {if (A.mcpHttp(vm)) <box style={P.ai_ext_form}>
+                <McpInput vm={vm} field={.oauth_client_id} />
+                <McpInput vm={vm} field={.oauth_scope} />
+            </box>}
+            <text style={P.ai_hint}>新服务默认停用。先应用到草稿，可测试连接，再启用并保存。应用前请勿离开本页。</text>
+            <box style={P.ai_ext_buttons}>
+                <W.Button testId="settings.mcp.apply" label="应用到草稿" variant={.primary} size={.sm} onClick={act(vm, .mcp_apply)} />
+                <W.Button testId="settings.mcp.cancel" label="取消编辑" variant={.secondary} size={.sm} onClick={act(vm, .mcp_cancel)} />
+            </box>
+            <box style={P.ai_ext_buttons} visible={A.mcpEditingExisting(vm)}>
+                <W.Button testId="settings.mcp.clear_env" label="清除环境变量" variant={.secondary} size={.sm} onClick={act(vm, .clear_environment)} />
+                <W.Button testId="settings.mcp.clear_headers" label="清除请求头" variant={.secondary} size={.sm} onClick={act(vm, .clear_headers)} />
+            </box>
+        </box>
+    );
+}

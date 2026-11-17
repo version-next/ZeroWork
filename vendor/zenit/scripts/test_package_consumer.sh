@@ -109,6 +109,11 @@ fi
 # it is part of the real package.
 test -d "$PACKAGE_ROOT/vendor"
 test -s "$PACKAGE_ROOT/e2e/client.ts"
+test -s "$PACKAGE_ROOT/docs/FOCUS_AND_KEY_CAPTURE_DESIGN.md"
+test -s "$PACKAGE_ROOT/docs/ANCHOR_TRANSITION.md"
+for language_doc in YIX_REFERENCE YIX_YSS_GUIDE YSS VIEW_DSL YIX_COMPONENTS; do
+  test -s "$PACKAGE_ROOT/docs/$language_doc.md"
+done
 test ! -e "$PACKAGE_ROOT/.github"
 test ! -e "$PACKAGE_ROOT/docs/internal"
 test ! -e "$PACKAGE_ROOT/private"

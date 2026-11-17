@@ -193,7 +193,7 @@ test "wire history new turn keeps prior result without redispatching prior call"
     var fixture: Fixture = .{};
     var manager = manager_mod.Manager.init(a);
     defer manager.deinit();
-    manager.scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    manager.scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     manager.tool_host = .{ .context = &fixture, .execute = Fixture.execute };
     manager.turn_id = 1;
     const backend: provider.Provider = .{ .ctx = &fixture, .chat = Fixture.chat, .models = Fixture.models };
@@ -223,7 +223,7 @@ test "wire history cancellation keeps actual paired rejection and rejects incomp
     const a = std.testing.allocator;
     var token: provider.CancelToken = .{};
     token.cancel();
-    const scope: @import("tool_scope.zig").Scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const scope: @import("tool_scope.zig").Scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     var loop = loop_mod.Loop.init(a, scope, 1, .{});
     defer loop.deinit();
     try loop.start(.{ .model = "test", .system = "", .messages = &.{.{ .content = "cancelled question" }}, .tools = &.{.{ .tool = .read_terminal, .session_ids = &.{101} }} });
@@ -252,7 +252,7 @@ test "wire history ordinary text with no tools survives consecutive manager runs
     const a = std.testing.allocator;
     var manager = manager_mod.Manager.init(a);
     defer manager.deinit();
-    manager.scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    manager.scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     manager.turn_id = 1;
     const backend: provider.Provider = .{ .ctx = undefined, .chat = Backend.chat, .models = Backend.models };
     _ = try manager.run(backend, .{ .model = "test", .system = "", .messages = &.{.{ .content = "text question" }} });

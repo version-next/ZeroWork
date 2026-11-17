@@ -261,6 +261,40 @@ pub fn contains(values: []const []const u8, candidate: []const u8) bool {
 pub fn sameBoot(a: BootState, b: BootState) bool {
     return optionalEqual(a.enabled, b.enabled) and optionalEqual(a.target, b.target) and optionalEqual(a.mode, b.mode);
 }
+/// Field-by-field equality with slices compared by content: owned copies of the same value never
+/// share addresses, so `std.meta.eql` cannot answer "did this publication change anything".
+pub fn sameValue(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => return a == b,
+        .optional => {
+            if ((a == null) != (b == null)) return false;
+            return a == null or sameValue(a.?, b.?);
+        },
+        .array => {
+            for (a, b) |x, y| if (!sameValue(x, y)) return false;
+            return true;
+        },
+        .pointer => |info| {
+            comptime std.debug.assert(info.size == .slice);
+            if (a.len != b.len) return false;
+            if (info.child == u8) return std.mem.eql(u8, a, b);
+            for (a, b) |x, y| if (!sameValue(x, y)) return false;
+            return true;
+        },
+        .@"struct" => |info| {
+            inline for (info.field_names) |name| if (!sameValue(@field(a, name), @field(b, name))) return false;
+            return true;
+        },
+        .@"union" => {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            switch (a) {
+                inline else => |payload, tag| return if (@TypeOf(payload) == void) true else sameValue(payload, @field(b, @tagName(tag))),
+            }
+        },
+        else => @compileError("sameValue: unsupported type " ++ @typeName(T)),
+    }
+}
 pub fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if ((a == null) != (b == null)) return false;
     return a == null or std.mem.eql(u8, a.?, b.?);

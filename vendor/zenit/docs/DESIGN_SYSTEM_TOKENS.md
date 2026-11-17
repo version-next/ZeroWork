@@ -1,10 +1,10 @@
 # Zenit Design System Tokens v1
 
-生成器的使用方法、接口和支持范围见 [TOOLING.md](design-system/TOOLING.md)。
+状态：v1 生成器、UI provider 绑定、统一引用、typography 和 examples 迁移已实现。日期：2026-10-04。实际命令、接口和剩余边界见 [TOOLING.md](design-system/TOOLING.md)。
 
 本方案面向现有 `ui.css / ui.cva / ui.sva / styles.zig / Yix`。JSON 负责声明设计材料，Zig 负责组件、计算和状态选择。配套的 [theme.example.json](design-system/theme.example.json) 是完整语法示例，[theme.schema.json](design-system/theme.schema.json) 提供编辑器结构校验；引用解析、循环检查等仍由生成器完成。
 
-示例展示声明和消费规则，数值不是现有默认主题的替代品。
+示例展示声明和消费规则，数值不是现有默认主题的替代品；真实迁移需按第 11 节逐值保留当前外观。
 
 ## 1. 决策与职责
 
@@ -48,7 +48,7 @@ JSON 不描述组件树、事件、recipe variants、hover/selected 等节点状
 | `semantic` | 否 | semantic 材料，默认空 |
 | `$modes` | 否 | 自定义主题模式的名称、明暗属性和回退关系 |
 
-输入使用严格 UTF-8 JSON。重复键、注释、尾逗号均报错。第一版一个入口文件，不引入 import/extends/deep-merge 配置语言；共享设计系统可以作为 Zig 包提供生成模块，文件组合可在后续有实际需求时另行设计。
+输入使用严格 UTF-8 JSON。重复键、注释、尾逗号均报错。文件内不引入 import/extends/deep-merge 配置语言；多文件组合只有一种：生成器按命令行顺序叠加主题层（底层 + overlay，覆盖须逐 token 显式 `$override`，见 10.1）。共享设计系统可以作为 Zig 包提供生成模块。
 
 ### 2.1 名称和路径
 
@@ -268,7 +268,7 @@ Sizing 字段已支持裸 token 枚举与显式 size ref。`.fill/.fit` 优先�
 
 展开只设置聚合实际声明的字段，不能构造带默认字段的完整 TextStyle 来覆盖前一层。`.typography` 用在不接受文本属性的目标上编译报错。
 
-当前 `sva` 的所有 slot 输出 `ConditionalStyle/BoxStyle`，直接交给 `view.text` 会报错。v1 不伪装已支持文本 slot：标题用独立 css/样式函数或 styleBy，root 等 box slot 使用 sva。将来可以扩展 slot 的目标类型，但它是明确的样式系统能力，不由 token 生成器偷偷改变。
+`sva` 支持文本 slot：视图里 `.of(args).label` 可直接交给 `view.text`，手动解析用 `.Slot(.label).resolveText(variants, base, t)`（`src/ui/css.zig`）。文本 slot 不接受条件层（`_hover` 等，文字状态用 variant 表达），也不参与 `derived`（derived 只供盒几何）。这是样式系统自身的能力，不由 token 生成器改变。
 
 ## 7. css / cva / sva / 旧 recipe / Yix 接入
 
@@ -311,15 +311,23 @@ token 条件先选定具体值；组件 `_hover/_active/_focus/_disabled/...` �
 }
 ```
 
-这只是现有 token 引用语法。没有 `bindings` 字段、`Values.system`、旧字段镜像、自动同名映射或缺失 token 的 preset 回退。recipe 直接引用一个不存在的 token 会编译失败；应用需要提供实际使用的 recipe 所依赖的 semantic 名称。默认文字样式同样有明确的 `color.fg_primary` / `font_size.lg` 依赖。
+这只是现有 token 引用语法。没有 `bindings` 字段、`Values.system`、旧字段镜像或自动同名映射；缺失 token 唯一的回退是下面的组件角色默认别名。recipe 直接引用一个不存在的 token 会编译失败；应用需要提供实际使用的 recipe 所依赖的 semantic 名称。默认文字样式同样有明确的 `color.fg_primary` / `font_size.lg` 依赖。
 
-解析器只负责固定 JSON 语法和类型规则，不认识 Button、Input 等组件，也不验证组件 token 名称。两层在消费时地位相同；组件依赖可以直接满足于基础材料，也可以通过 semantic 聚合、补充或引用自定义基础名称。不要为了满足名称约定把整个基础尺度搬进 semantic。全套示例所需的名称见 [examples/theme.json](../examples/theme.json)。
+### 8.0 组件角色 token
 
-应用选择默认设计系统时使用框架的 `default.json`；选择自定义 provider 时，完全使用应用声明，不偷偷合并默认材料。ControlShell 的 xs/sm/md/lg 是组件自己的 `sva` size 变体；`ui.widgets.ControlSize` 与 `control_shell.metrics(t, size)` 都属于组件层。主题不存组件尺寸矩阵。
+内置控件的配色读组件角色 token，而不是直接读 `accent` 等通用语义名：按钮 `button_primary_*` / `button_secondary_*` / `button_danger_*`，Checkbox / Radio `checkbox_*`，Switch `switch_*`，Slider `range_*`，Progress `progress_*`，以及焦点填充 `bg_focus`。完整清单及默认别名目标见 `src/tokens/roles.zig`。`default.json` 与 `examples/theme.json` 显式声明每个角色，值是别名，生成后的平铺值与角色出现前 recipe 读到的值逐字节相同。
+
+生成期别名会展开成平铺值：运行期复制 `ui.theme.light` 改 `tokens.color.accent` 不会传给 `checkbox_checked_bg` 等角色；要改某个控件配色，直接写对应角色字段（例如 `t.tokens.color.checkbox_fg`）后 `cx.setTheme`。
+
+主题 JSON 若缺少某个角色（任一拼写 `a_b` / `a-b` 均算已声明），解析器按 `roles.zig` 把它补成 `semantic` 层对目标 token 的别名（如 `semantic.color.checkbox_fg = {semantic.color.fg_inverse}`）；目标也不存在时不补。这样角色出现前写好的完整主题照常编译、外观不变，生成的 `Values` 也总带这些字段。补齐在解析器里做（生成器、dev preview、yix-lsp 共用），而不是在消费端（`ui.tokenRef` 或手写 Zig 读字段）做回退：后者需要每个读点各自记得回退，并且运行期 `Values` 字段会因主题而异。
+
+除这张角色表外，解析器只负责固定 JSON 语法和类型规则，不认识 Button、Input 等组件，也不验证组件 token 名称。两层在消费时地位相同；组件依赖可以直接满足于基础材料，也可以通过 semantic 聚合、补充或引用自定义基础名称。不要为了满足名称约定把整个基础尺度搬进 semantic。全套示例所需的名称见 [examples/theme.json](../examples/theme.json)。
+
+应用选择默认设计系统时使用框架的 `default.json`；选择自定义 provider 时，完全使用应用声明，不偷偷合并默认材料。ControlShell 的 xs/sm/md/lg 是组件自己的 size 变体（`src/ui/components/control_shell/styles.yss` 的插槽配方 `SizeRecipe`，编译为 `ui.sva`，跨维度几何是参数化样式 `geometry`）；`ui.widgets.ControlSize` 与 `ui.widgets.control_shell.metrics(t, size)` 都属于组件层。主题不存组件尺寸矩阵：默认 JSON 只提供被 recipe 引用的材料（如 `semantic.size.control_xs/sm/md/lg` = 20/24/32/40、`semantic.size.row` = 28、`tokens.radius.control` = 6），档位如何组合 padding、字号、圆角由 recipe 决定。
 
 ### 示例的分类规则
 
-- `tokens` 放可复用的基础尺度：`space.space50 = 2`、`space.space100 = 4`、`space.space200 = 8`，以及字号、字重、圆角、尺寸、时长和阴影。数字后缀表示尺度档位，100 对应 4 个逻辑像素。
+- `tokens` 放可复用的基础尺度：`space.space50 = 2`、`space.space100 = 4`、`space.space200 = 8`，以及字号、字重、圆角、尺寸、时长和阴影。数字后缀表示尺度档位，100 对应 4 个逻辑像素。默认 `src/tokens/default.json` 的基础层还包括调色板色阶 `color.app_gray / neutral / blue / green / amber / red / violet / teal.<档位>`、角色圆角 `radius.control / panel / island / dialog / focus`（6 / 8 / 10 / 12 / 8）、`border_width.focus` 与 elevation 阴影 `shadow.xs / sm / md / lg`（y 偏移 / 模糊 1/2、2/8、6/20、12/40，三种模式各有颜色）；semantic 颜色（`accent`、`bg_primary`、各状态的 `*_tag_bg/border`、`*_alert_bg/border`、`*_pressed`、`button_base_*` / `button_pressed_bg`、`disabled_bg` 等）按模式引用这些色阶。
 - `semantic` 放用途：前景/背景/状态色、内容字号、标题排版聚合。允许引用材料，也允许直接补充值；不为每个语义值制造无意义的同值基础别名。
 - `size = .sm/.md/.lg` 如何组合字号、padding、radius、icon，由组件 recipe 声明。光学校正可以留在 recipe，不为一次性偏移扩大全局 token 表。
 - 两层共享 `TOKENS`，同类别完整路径不能重复；基础材料不能反向引用 semantic。
@@ -387,10 +395,75 @@ expected font_size reference, found duration: tokens.duration.fast
 
 空标量分组允许存在，但不产生 token，不能作为引用目标。包装器只允许在 token 最外层出现；`$value` 不再包含包装器，模式分支只接受直接值或引用。
 
-## 11. 参考
+### 10.1 应用主题分层
+
+应用以 zenit 默认主题为底、只追加或覆盖少量 token 时，不复制 `default.json`（复制会随 zenit 更新漂移），而是叠加层：
+
+```text
+zenit-tokens generate default.json app.tokens.json [more.tokens.json ...] --out theme.gen.zig
+zenit-tokens check    default.json app.tokens.json
+zenit-tokens explain  default.json app.tokens.json semantic.color.zw_island_ground --mode dark
+```
+
+- 第一个文件是底层，其后按顺序合并；每层是一份完整语法的主题文件（`$version: 1`），只有底层必须有 `tokens`，overlay 可以只写 `semantic` 或 `$modes`。
+- overlay 声明下层没有的路径时直接加入，分组跨层合并（overlay 可向底层的 `color.blue` 分组加档位）。新增的 semantic 名称和内置名称一样成为 `Values` 字段、`refs` 常量和 `.yss` / `ui.css` 名称：`semantic.color.zw_island_ground` 在 Zig 中是 `cx.tokens.tokens.color.zw_island_ground`，在 `.yss` 中写 `zw-island-ground`。
+- 覆盖下层已声明的路径必须逐 token 显式标注，否则报错，并列出两处声明（`文件#JSON Pointer`）：
+
+  ```json
+  {"$version": 1, "semantic": {"color": {
+    "accent": {"$override": true, "$value": {"$light": "#a23010", "$dark": "#e07050"}}
+  }}}
+  ```
+
+  `$override` 只能为 `true`；它必须真的覆盖了下层的同一路径，且留在同一层级（`semantic.color.accent` 不能被 `tokens.color.accent` 覆盖），否则报错。覆盖后整个合并结果重新解析，下层引用该 token 的别名（包括组件角色 token，如 `switch_track_on`）一并跟随。
+- `$modes` 同理：新增模式直接加入；与下层同名的模式需在该模式对象里写 `"$override": true`。
+- token / 分组冲突、同层重复与单文件规则相同。诊断的偏移和 JSON Pointer 指向出错的那个文件；生成元数据的 `pointer` 在多层时写成 `文件#/json/pointer`（单文件保持 `/json/pointer`，生成结果逐字节不变）。`explain` 按 token 最终来源的文件追踪分支与引用。
+- 构建接入：`zenit.generateThemeLayers(b, dep, &.{ zenit.defaultThemePath(dep), b.path("src/ui/theme/app.tokens.json") }, .{ .target = target, .optimize = optimize })`，结果交给 `wireThemeProvider` / `attachWithOptions(.theme_provider)`。单层时等价 `generateTheme`。
+- 边界：dev preview 的主题热重载（`ui/theme_reload.zig`）仍只解析一个 JSON 文件；分层主题改动走重新构建。
+
+## 11. 迁移顺序
+
+| 阶段 | 工作 | 交付门槛 |
+|---|---|---|
+| A：独立生成器 | JSON/模式/引用/类型/元数据，规范值模块与默认 preset | 生成 Zig 可编译；错误定位、确定性输出、OOM 测试通过 |
+| B：类型与解析接入 | provider 构建绑定、统一 TOKENS 引用与具体值、类别枚举、旧具名函数接口统一 | 自定义字号名可在 css/cva/sva 使用；错误类别编译失败 |
+| C：组件与更新 | 内置 recipe 的直接 semantic 依赖、所有主题消费路径、overlay 通知、TypographyPatch | light/dark/custom mode 切换正确；保留 hover/variant；聚合不覆盖未声明字段 |
+| D：真实迁移 | 当前三套主题、counter、Storybook 样式和组件调用点 | 解析后的全部旧 token 数值等价；四态截图精确一致；相关测试与 Storybook e2e 通过 |
+| E：按需求扩展 | 局部主题、字体资源、窗口 source 辅助接口、其他值类别 | 每项有真实组件用例和独立性能/行为验收，不提前扩大 JSON 语言 |
+
+默认 preset 从现有 theme.zig 的真实值迁移，不能根据颜色相同就随意引入语义别名。例如现有 high_contrast 的 button_primary_bg 与 accent 不同，不能把 light/dark 的偶然一致推广到所有模式。
+
+枚举简写只查询应用实际生成的 token，不保留旧名称别名。迁移可以重命名和重新分类，但必须保持解析后的视觉值；官方间距尺度采用 space50/space100/space200。本文不改变已有 style literal ratchet 政策。
+
+## 12. 必须验收的行为
+
+- 自定义 `xLargeBlaBla` 和默认系统无关；不存在的 `.xxxl` 正确报错。
+- `tokens = {}`、缺省 semantic、空类别可生成和构建；空类别的值类型由类别合同确定，不能通过读取“第一个 token 字段”推导。
+- 两层相同类别/路径的重复定义、token 与分组路径冲突在生成时拒绝；分组可合并，不同类别可同名。
+- refs 与 Values.tokens 均为统一结构；合法调整声明层级但保持类别/路径时，消费代码不变，无需区分基础与 semantic。
+- 引用链、复合字段引用、直接 semantic 补充值都正确；不存在、反向依赖、跨类别和循环均定位到输入。
+- 只有目标有 dark 分支的间接引用仍随主题变化；模式专属合法依赖不会被联合图误判为环。
+- dark 缺省、自定义 fallback、未知条件、缺 light、条件和值混写、重复 JSON 键均符合语义。
+- 数字单位和范围、颜色 alpha 顺序、未声明排版字段、复合分支默认值有固定回归用例。
+- 同一引用用于 css、cva 的各层、sva 各 slot、具名函数、旧 recipe 和 Yix，解析结果一致。
+- variant 来自 Signal，切换模式时 variant/hover 保持；恢复条件后无陈旧样式残留。
+- 组件自己按窗口选择 variant 时，compound 继续按当前 variant 工作；独立组件可采用不同适配策略。
+- 两个不同 token provider 的外部消费项目分别构建；共享规范类型实例，避免 module identity 错误。
+- 不生成 system 字段或任何旧角色回退；内置 recipe 的缺失 semantic token 编译失败。
+- source metadata 可关闭而不改变渲染结果；生成内容不随 JSON 对象顺序、机器路径或时间戳变化。
+
+## 13. Panda 借鉴与取舍
+
+采用材料/语义/recipe 分层、slot 共用变体、类别校验、引用和生成接口。保留 Zig 样式函数与响应式值，避免引入源码扫描式样式提取、本地/配置式 recipe 两套生成语义以及任意 CSS 选择器解释器。
+
+Panda 的条件样式允许组件自行决定响应式行为；semantic 条件是能力而非必需架构。这里同样优先保留使用处选择。
+
+参考：
 
 - [Panda Tokens](https://panda-css.com/docs/theming/tokens)
 - [Panda Slot Recipe](https://panda-css.com/docs/recipes/slot-recipes)
 - [Panda Responsive variants](https://panda-css.com/docs/recipes/responsive-variants)
 - [Panda Dynamic styling](https://panda-css.com/docs/styling/dynamic-styling)
 - [Panda composite token regression tests](https://github.com/chakra-ui/panda/blob/802eb61ba7955f00a755401ff2ddbfac39a7c385/crates/pandacss_tokens/tests/from_config.rs#L387)
+
+当前接入位置：`src/ui/css.zig` 的 ScaleType/token/usesTokens，`src/ui/view.zig` 的样式计划与文本合并，`src/ui/core.zig` 的 theme signal/setTheme，`src/ui/recipe.zig` 的旧 recipe，`build.zig` 的模块实例绑定。本文是这些后续实现的共同合同。

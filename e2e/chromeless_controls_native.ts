@@ -2,13 +2,17 @@
  * Only private data, local terminal and synthetic Harness input are used.
  * Pixel review is a separate required acceptance step; no physical IME claim.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { waitForServerReady, waitFor, query, focused, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep } from '../zig-out/share/zenit/harness/client.ts';
+import { waitForServerReady, waitFor, query, focused, inputState, clickTestId, clickAt, key, type_, resizeWindow, screenshot, sleep } from '../zig-out/share/zenit/harness/client.ts';
+import { settingsNav } from './settings_nav.ts';
+const nav = settingsNav();
 
 const options: Record<string, string> = {};
 for (let i = 2; i < process.argv.length; i += 2) {
@@ -66,7 +70,7 @@ async function field(id: string, name: string) {
   report.checks.push(`${id}: real keyboard traversal enters actual input; blur transfers focus; focus and blur pixels captured`);
 }
 function descendants() {
-  const rows = execFileSync('/bin/ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' }).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
+  const rows = psCompat(['-axo', 'pid=,ppid=']).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
   const owned = new Set<number>([child.pid!]);
   for (let i = 0; i < rows.length; i++) for (const [pid, parent] of rows) if (owned.has(parent)) owned.add(pid);
   return [...owned].filter(pid => pid !== child.pid);
@@ -77,9 +81,9 @@ try {
   await resizeWindow(1440, 900);
   await visible('sidebar.host');
   await field('sidebar.search', '01-sidebar-search');
-  await click('toolbar.settings');
+  await nav.open();
   await field('settings.search', '02-settings-search');
-  await click('settings.nav.appearance');
+  await nav.toCategory('appearance');
   await edit('settings.search', 'font_size');
   await visible('settings.field.font_size');
   await field('settings.field.font_size', '03-settings-font-size');
@@ -87,17 +91,22 @@ try {
   await capture('04-settings-invalid', ['settings.field.font_size', 'settings.footer.state']);
   assert.match((await visible('settings.footer.state')).text, /错误|修正|无效/);
   await edit('settings.field.font_size', '14'); await key('return');
-  await edit('settings.search', ''); await click('settings.close');
+  // The preferences window has no close button: Cmd+W (settings_nav.ts) asks first while a draft exists.
+  await edit('settings.search', ''); await key('w', { cmd: true }); await sleep(300);
   if ((await query('settings.confirmation.discard')).some(shown)) await click('settings.confirmation.discard');
-  await click('toolbar.quick_connect');
+  await nav.gone('settings.panel');
+  await key('k',{cmd:true});await sleep(300); // 快速连接：标题栏旧按钮已移除（r3-tabs-toolbar），入口是 ⌘K
   await field('quick.query', '05-quick-query'); await click('quick.close');
-  await click('sidebar.new'); await click('sidebar.new.host');
+  // Island B v3（e1372d88）：侧栏头部的 “+” 菜单（sidebar.new › sidebar.new.host）已随改版移除，新建主机入口在侧栏底部
+  // （有主机时 sidebar.footer.new，空态 sidebar.empty.new），直接打开连接向导窗口。
+  await click((await query('sidebar.empty.new')).some(shown) ? 'sidebar.empty.new' : 'sidebar.footer.new');
   await field('wizard.name', '06-wizard-name');
   await visible('wizard.name.error');
   await capture('07-wizard-error-text', ['wizard.name', 'wizard.name.error']);
   await click('wizard.cancel');
   await click('workspace.empty.local'); await visible('terminal.surface');
-  await key('r', { cmd: true, shift: true }); await visible('tabs.rename.input');
+  // 页签重命名：稿 3（3a81589d）起快捷键是 F2，且焦点在终端内容里时让给终端；这里用另一个现行入口——双击页签标题。
+  { const tab = await visible('tabs.title'); assert((await clickAt(tab.rect.x + tab.rect.w / 2, tab.rect.y + tab.rect.h / 2, 2)).ok); } await visible('tabs.rename.input');
   await field('tabs.rename.input', '08-tab-rename');
   let saveFocused = false;
   for (let step = 0; step < 12; step++) {

@@ -2,6 +2,8 @@
  * A trace's first output is only called echo after this fixture verifies text.
  * Usage: node e2e/terminal_latency.ts BINARY OUTPUT [local|ssh]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,realpath,mkdir,readFile,writeFile,open,rm} from 'node:fs/promises';
@@ -105,7 +107,7 @@ finally:
  }
  report.step='after-output-typing';await typing('after_output_typing');
  await sleep(500);const frames=(await stats()).frame_count;
- const cpu=()=>{const p=execFileSync('/bin/ps',['-p',String(app.pid),'-o','time='],{encoding:'utf8'}).trim().split(':').map(Number);return p.reduce((s,x)=>s*60+x,0);};
+ const cpu=()=>{const p=psCompat(['-p',String(app.pid),'-o','time=']).trim().split(':').map(Number);return p.reduce((s,x)=>s*60+x,0);};
  const a=cpu(),at=performance.now();await sleep(3000);const b=cpu();report.idle={cpu_percent:(b-a)*100000/(performance.now()-at),frames:(await stats()).frame_count-frames};
  report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);report.failure_focus=await focused().catch(()=>null);process.exitCode=1;await writeFile(join(out,'failure-ui.json'),JSON.stringify(await query('plugin.challenge.modal'))).catch(()=>{});await screenshot(join(out,'failure.png')).catch(()=>{});}

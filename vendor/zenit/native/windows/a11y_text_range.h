@@ -126,6 +126,8 @@ public:
         if (!range) return E_OUTOFMEMORY; *out = range; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid == IID_IUnknown || iid == __uuidof(ITextRangeProvider)) *out = static_cast<ITextRangeProvider *>(this);
         else if (iid == range_state_iid) *out = static_cast<RangeState *>(this);
@@ -135,24 +137,32 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG count = (ULONG)InterlockedDecrement(&refs); if (!count) delete this; return count; }
     HRESULT STDMETHODCALLTYPE Read(LONG *identity, uint32_t *handle, uint32_t *first, uint32_t *last) override {
+        binding->activity();
+        demand_trace("Read");
         if (!identity || !handle || !first || !last) return E_POINTER;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         AcquireSRWLockShared(&lock); *identity = binding->identity; *handle = id; *first = start; *last = end;
         ReleaseSRWLockShared(&lock); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("Clone");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         AcquireSRWLockShared(&lock); auto *copy = new TextRange(binding, snapshot, id, start, end); ReleaseSRWLockShared(&lock);
         if (!copy) return E_OUTOFMEMORY; *out = copy; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider *other, BOOL *out) override {
+        binding->activity();
+        demand_trace("Compare");
         if (!out) return E_POINTER; *out = FALSE;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         uint32_t first, last; HRESULT result = peer(other, first, last); if (FAILED(result)) return result;
         AcquireSRWLockShared(&lock); *out = start == first && end == last; ReleaseSRWLockShared(&lock); return S_OK;
     }
     ZENIT_UIA_ENUM_INPUT HRESULT STDMETHODCALLTYPE CompareEndpoints(TextPatternRangeEndpoint which, ITextRangeProvider *other, TextPatternRangeEndpoint target, int *out) override {
+        binding->activity();
+        demand_trace("CompareEndpoints");
         if (!out) return E_POINTER; *out = 0;
         if (!endpoint(which) || !endpoint(target)) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -162,6 +172,8 @@ public:
         *out = here < there ? -1 : here > there ? 1 : 0; return S_OK;
     }
     ZENIT_UIA_ENUM_INPUT HRESULT STDMETHODCALLTYPE MoveEndpointByRange(TextPatternRangeEndpoint which, ITextRangeProvider *other, TextPatternRangeEndpoint target) override {
+        binding->activity();
+        demand_trace("MoveEndpointByRange");
         if (!endpoint(which) || !endpoint(target)) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         uint32_t first, last; HRESULT result = peer(other, first, last); if (FAILED(result)) return result;
@@ -172,6 +184,8 @@ public:
         ReleaseSRWLockExclusive(&lock); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetText(int maximum, BSTR *out) override {
+        binding->activity();
+        demand_trace("GetText");
         if (!out) return E_POINTER; *out = nullptr;
         if (maximum < -1) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -182,16 +196,22 @@ public:
         *out = SysAllocStringLen(original->value+first, count); return *out ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple **out) override {
+        binding->activity();
+        demand_trace("GetEnclosingElement");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         auto *provider = new Provider(binding, id); if (!provider) return E_OUTOFMEMORY; *out = provider; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetChildren");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         *out = SafeArrayCreateVector(VT_UNKNOWN, 0, 0); return *out ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE GetAttributeValue(TEXTATTRIBUTEID attribute, VARIANT *out) override {
+        binding->activity();
+        demand_trace("GetAttributeValue");
         if (!out) return E_POINTER; VariantInit(out);
         View view(binding); const Node *node = current(view); if (!node) return UIA_E_ELEMENTNOTAVAILABLE;
         if (attribute == UIA_IsReadOnlyAttributeId) { out->vt = VT_BOOL; out->boolVal = value_readonly(node) ? VARIANT_TRUE : VARIANT_FALSE; return S_OK; }
@@ -199,11 +219,15 @@ public:
         if (SUCCEEDED(result)) { out->vt = VT_UNKNOWN; out->punkVal = unsupported; } return result;
     }
     HRESULT STDMETHODCALLTYPE Select() override {
+        binding->activity();
+        demand_trace("Select");
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         AcquireSRWLockShared(&lock); uint32_t first = start, last = end; ReleaseSRWLockShared(&lock);
         return binding->enqueue_selection(id, first, last, snapshot->find(id)->value);
     }
     HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID attribute, VARIANT value, BOOL, ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("FindAttribute");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); const Node *node = current(view); if (!node) return UIA_E_ELEMENTNOTAVAILABLE;
         if (attribute != UIA_IsReadOnlyAttributeId) return S_OK; // Unsupported attributes have no known matching span.
@@ -213,6 +237,8 @@ public:
         if (!match) return E_OUTOFMEMORY; *out = match; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindText(BSTR needle, BOOL backward, BOOL ignore_case, ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("FindText");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (!needle) return E_INVALIDARG;
@@ -236,6 +262,8 @@ public:
         if (!match) return E_OUTOFMEMORY; *out = match; return S_OK;
     }
     ZENIT_UIA_ENUM_INPUT HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(TextUnit unit) override {
+        binding->activity();
+        demand_trace("ExpandToEnclosingUnit");
         if (unit < TextUnit_Character || unit > TextUnit_Document) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const Node *original = snapshot->find(id);
@@ -255,6 +283,8 @@ public:
         ReleaseSRWLockExclusive(&lock); return S_OK;
     }
     ZENIT_UIA_ENUM_INPUT HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(TextPatternRangeEndpoint which, TextUnit unit, int count, int *out) override {
+        binding->activity();
+        demand_trace("MoveEndpointByUnit");
         if (!out) return E_POINTER; *out = 0;
         if (!endpoint(which) || unit < TextUnit_Character || unit > TextUnit_Document) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -284,6 +314,8 @@ public:
         ReleaseSRWLockExclusive(&lock); return S_OK;
     }
     ZENIT_UIA_ENUM_INPUT HRESULT STDMETHODCALLTYPE Move(TextUnit unit, int count, int *out) override {
+        binding->activity();
+        demand_trace("Move");
         if (!out) return E_POINTER; *out = 0;
         if (unit < TextUnit_Character || unit > TextUnit_Document) return E_INVALIDARG;
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -318,6 +350,8 @@ public:
     }
     // All geometry reads use the current owned view.
     HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetBoundingRectangles");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); const Node *node = current(view);
         if (!node) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -374,9 +408,15 @@ public:
         }
         free(rects); *out = array; return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE AddToSelection() override { return single_selection_operation(); }
-    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override { return single_selection_operation(); }
+    HRESULT STDMETHODCALLTYPE AddToSelection() override {
+        binding->activity();
+        demand_trace("AddToSelection"); return single_selection_operation(); }
+    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override {
+        binding->activity();
+        demand_trace("RemoveFromSelection"); return single_selection_operation(); }
     HRESULT STDMETHODCALLTYPE ScrollIntoView(BOOL align_top) override {
+        binding->activity();
+        demand_trace("ScrollIntoView");
         View view(binding); if (!current(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         AcquireSRWLockShared(&lock); uint32_t first = start, last = end; ReleaseSRWLockShared(&lock);
         return binding->enqueue_text_range(id, first, last, snapshot->find(id)->value, 12, align_top ? 1 : 0);
@@ -572,17 +612,29 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown && iid != IID_ITextProvider) return E_NOINTERFACE;
         *out = static_cast<ITextProvider *>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { LONG count = InterlockedDecrement(&refs); if (!count) delete this; return (ULONG)count; }
-    HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **out) override { return TextReadView::selection(binding,id,out,true); }
-    HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **out) override { return TextReadView::visible(binding,id,out,true); }
-    HRESULT STDMETHODCALLTYPE RangeFromPoint(UiaPoint point, ITextRangeProvider **out) override { return TextReadView::point(binding,id,point,out,true); }
-    HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider **out) override { return TextReadView::document(binding,id,out,true); }
+    HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetSelection"); return TextReadView::selection(binding,id,out,true); }
+    HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetVisibleRanges"); return TextReadView::visible(binding,id,out,true); }
+    HRESULT STDMETHODCALLTYPE RangeFromPoint(UiaPoint point, ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("RangeFromPoint"); return TextReadView::point(binding,id,point,out,true); }
+    HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("get_DocumentRange"); return TextReadView::document(binding,id,out,true); }
     HRESULT STDMETHODCALLTYPE RangeFromChild(IRawElementProviderSimple *, ITextRangeProvider **out) override {
+        binding->activity();
+        demand_trace("RangeFromChild");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding);
         const Node *node = view.snapshot ? view.snapshot->find(id) : nullptr;
@@ -590,6 +642,8 @@ public:
         return E_INVALIDARG; // This plain text stream encloses no child object.
     }
     HRESULT STDMETHODCALLTYPE get_SupportedTextSelection(SupportedTextSelection *out) override {
+        binding->activity();
+        demand_trace("get_SupportedTextSelection");
         if (!out) return E_POINTER; *out = SupportedTextSelection_None;
         View view(binding);
         const Node *node = view.snapshot ? view.snapshot->find(id) : nullptr;

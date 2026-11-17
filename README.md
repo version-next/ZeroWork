@@ -137,11 +137,11 @@ or data-directory deletion until a real release. Accepted records still queued
 at the close deadline may be dropped and counted; the kernel call already in
 progress cannot be forcibly cancelled. File errors disable disk retries and
 stderr failures disable that mirror. Run focused regressions with
-`zig test src/applog_tests.zig -lc`.
+`zig build test-applog`.
 
 The isolated test wrapper creates a temporary canonical data directory and removes it on exit. Use it for test targets so recordings and configuration never enter the account’s real App data. Normal app data lives in `~/Library/Application Support/com.zerowork.app`, cache in `~/Library/Caches/com.zerowork.app`, and diagnostics in `~/Library/Logs/com.zerowork.app`; saved credentials use the app’s Keychain vault. Existing `~/.zerowork` is migrated on startup. Settings → Data & Logs → Export & Cleanup → Clear All Application Data… clears owned data and exits; deleting the `.app` alone keeps user data.
 
-For developer-only verification, the disposable SSH integration gate is `scripts/ssh_smoke.sh`; its environment inputs do not configure or enable features in the installed App. Password mode reads `ZEROWORK_SSH_PASSWORD`; public-key mode additionally reads `ZEROWORK_SSH_KEY` and treats the password value as an optional key passphrase; agent mode sets `ZEROWORK_SSH_AGENT=1`. Credentials are never stored in the repository. The Zig-owned Session smoke is `src/ssh_session_smoke.zig`; it uses the same environment-only credentials and validates the formal libssh2 Session owner against the disposable VM.
+For developer-only verification, the disposable SSH integration gate is `scripts/ssh_smoke.sh`; its environment inputs do not configure or enable features in the installed App. Password mode reads `ZEROWORK_SSH_PASSWORD`; public-key mode additionally reads `ZEROWORK_SSH_KEY` and treats the password value as an optional key passphrase; agent mode sets `ZEROWORK_SSH_AGENT=1`. Credentials are never stored in the repository. The Zig-owned Session smoke is `src/proto/ssh/acceptance/ssh_session_smoke.zig`; it uses the same environment-only credentials and validates the formal libssh2 Session owner against the disposable VM.
 
 The native Zenit app opens saved connections and Quick Connect targets through its UI. Configure AI providers, endpoints, models and API keys in Settings → AI; saved secrets use macOS Keychain. The installed App ignores application and framework environment overrides, uses the current macOS account’s standard data directories, and requires no shell setup or environment variables. Network connections begin only through the corresponding App action. Automated data isolation and framework diagnostics are compiled into explicit test-mode builds only.
 

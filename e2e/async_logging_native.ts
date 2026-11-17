@@ -1,10 +1,12 @@
 /** Real UI cleanup must wait for the asynchronous logger's release receipt. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, realpath, writeFile, open, readdir, rm, stat} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {settingsNav} from './settings_nav.ts';
 const binary = resolve(process.argv[2]), out = resolve(process.argv[3]);
 await mkdir(out, {recursive: false});
 const base = await realpath(await mkdtemp(join(tmpdir(), 'zw-async-log-ui-')));
@@ -23,13 +25,10 @@ const report: any = {passed: false, scope: 'isolated actual Metal UI, owned data
 try {
     await h.waitForServerReady(60000); await h.resizeWindow(1280, 800);
     await h.waitFor(async () => { try { return (await readdir(join(data, 'logs'))).some(n => n.endsWith('.log')) || null; } catch { return null; } }, 5000);
-    await click('toolbar.settings'); await click('settings.nav.data');
-    const viewport = await visible('settings.viewport');
-    const scrollDown = async () => { await h.scrollAt(viewport.rect.x + viewport.rect.w / 2, viewport.rect.y + viewport.rect.h / 2, 0, -1600); await h.sleep(150); };
-    await scrollDown();
-    if (!(await h.query('settings.data.clear_all')).some(shown)) await click('settings.data.actions.header');
-    await scrollDown();
-    await click('settings.data.clear_all'); await visible('data.cleanup.modal');
+    // Two-level settings (settings_nav.ts): 数据与日志 › 导出与清理 holds 清除全部数据… (no folding section header any more).
+    const nav = settingsNav();
+    await nav.toPane('settings.data.actions');
+    await nav.click('settings.data.clear_all'); await visible('data.cleanup.modal');
     await h.screenshot(join(out, 'cleanup-confirmation.png'));
     const start = Date.now(); await click('data.cleanup.confirm');
     await Promise.race([ended, h.sleep(10000)]);
@@ -46,6 +45,8 @@ try {
     await h.screenshot(join(out, 'failure.png')).catch(() => {}); process.exitCode = 1;
 } finally {
     if (app.exitCode === null && app.signalCode === null) { app.kill('SIGTERM'); await Promise.race([ended, h.sleep(2000)]); if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await ended; } }
+    // run.ts reads the verdict from report.status (this report only had `passed`, so it always read as status=none).
+    report.status = report.passed ? 'passed' : 'failed';
     await log.close(); await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2));
     await rm(base, {recursive: true, force: true});
 }

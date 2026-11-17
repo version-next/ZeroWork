@@ -1,10 +1,14 @@
 /** Real terminal history pagination and assistant close/minimize lifecycle. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const out=resolve(process.argv[2]??'/tmp/zw-ai-history-close-evidence');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-ai-history-close-'),data=join(iso,'data'),rpc=join(iso,'rpc');
@@ -16,7 +20,7 @@ const payload=(text:string)=>{const value=JSON.parse(text);for(const block of va
 const report:any={status:'running',checks:[],pages:[]};let failure:any=null,held:any=null;
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"history-close-fixture"}]}');
- let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
  res.writeHead(200,{'content-type':'text/event-stream'});
  const question=body.messages.findLast((m:any)=>m.role==='user')?.content;
  if(question==='SECOND_CONVERSATION')return res.end(frame({content:'SECOND_CONVERSATION_MARKER'})+'data: [DONE]\n\n');
@@ -53,6 +57,12 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const absent=(id:string)=>h.waitFor(async()=>!(await h.query(id)).some(shown)||null,15000);
 const click=async(id:string)=>{report.lastAction=id;await visible(id);assert((await h.clickTestId(id)).ok,id);};
 const text=(n:any):string=>Array.isArray(n)?n.map(text).join(' '):n?[n.text??'',...(n.children??[]).map(text)].join(' '):'';
+// 会话列表的 ↗（ai.session.jump.N）现在是“查看此 AI 会话”（只读历史弹窗 ai.history），回到某段已结束的对话要用“恢复”（ai.session.restore.N，
+// conversation_commands.zig restore）；当前 tab 已绑定对话时“新建 / 恢复”先确认结束当前对话（ai.session.close.confirmation）。
+// 欢迎页「最近会话」与 ai.sessions 弹层里有同名按钮，弹层里的按钮按坐标点击。
+const flatNodes=(n:any):any[]=>Array.isArray(n)?n.flatMap(flatNodes):n?[n,...(n.children??[]).flatMap(flatNodes)]:[];
+const menuClick=async(id:string)=>{report.lastAction='ai.sessions.menu › '+id;const node=await h.waitFor(async()=>flatNodes((await h.query('ai.sessions.menu')).find(shown)).find((n:any)=>n.test_id===id&&shown(n))??null,10000);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id);};
+const acceptEndIfAsked=async()=>{if(await h.waitFor(async()=>(await h.query('ai.session.close.confirmation')).some(shown)||null,1500).catch(()=>null)){await click('ai.session.close.accept');await absent('ai.session.close.confirmation');}};
 const send=async(value:string)=>{await click('ai.prompt');await h.type_(value);await click('ai.send');};
 const cap=async(name:string)=>{await h.mouseMove(1,1);assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.query('ai.panel'),null,2));};
 try{
@@ -61,39 +71,39 @@ try{
  // Wait for actual PTY output, rather than assuming shell startup/printing
  // finishes within a fixed delay before revision-bound pagination begins.
  await h.waitFor(async()=>text(await h.query('terminal.surface')).includes('HISTORY_ROW_016')||null,15000);
- const strip=await visible('ai.strip');await h.mouseMove(strip.rect.x+strip.rect.w/2,strip.rect.y+strip.rect.h/2);await visible('ai.panel');await send('READ_HISTORY');
+ await click('ai.launcher');await visible('ai.panel');await send('READ_HISTORY');
  await h.waitFor(async()=>failure||text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE')||null,30000);
  assert.equal(failure,null);await absent('ai.stop');await cap('01-history-pages');
  report.checks.push('Only host.read_terminal is advertised; real early and late terminal rows are read across distinct revision-bound pages');
  // Hover preview and @ai/context entry paths can start an unlisted conversation.
  // Closing must retain it even if the toolbar has never been clicked.
- await click('ai.close');await click('ai.close.confirmation.confirm');await absent('ai.panel');await click('toolbar.ai');await visible('ai.empty.configured');
- await click('ai.close');await absent('ai.panel');await absent('ai.close.confirmation');await click('toolbar.ai');await visible('ai.empty.configured');
+ await click('ai.close');await click('ai.close.confirmation.confirm');await absent('ai.panel');await click(await aiToggleId());await visible('ai.empty.configured');
+ await click('ai.close');await absent('ai.panel');await absent('ai.close.confirmation');await click(await aiToggleId());await visible('ai.empty.configured');
  report.checks.push('Configured welcome with retained history closes without confirmation and reopens without creating another conversation');
  await visible('ai.empty.recent');assert(text(await h.query('ai.empty.recent')).includes('READ_HISTORY'));
- await click('ai.sessions');await visible('ai.session.row.1');await click('ai.session.jump.1');await absent('ai.sessions.menu');
- assert(text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));
+ await click('ai.sessions');await visible('ai.session.row.1');await menuClick('ai.session.restore.1');await acceptEndIfAsked();await absent('ai.sessions.menu');
+ await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE')||null,10000);
  report.checks.push('A conversation started through hover preview is retained in the list and welcome recent history after X');
- await click('ai.collapse');await absent('ai.panel');await click('toolbar.ai');
+ await click('ai.collapse');await absent('ai.panel');await click(await aiToggleId());
  assert(text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));
  report.checks.push('Minus preserves the current conversation');
  // Keep a second conversation to catch accidental clearing of the whole list.
- await click('ai.session.new');await send('SECOND_CONVERSATION');
+ await click('ai.session.new');await acceptEndIfAsked();await send('SECOND_CONVERSATION');
  await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('SECOND_CONVERSATION_MARKER')||null,10000);await absent('ai.stop');
- await click('ai.sessions');await visible('ai.session.row.1');await visible('ai.session.row.3');await click('ai.session.jump.1');await absent('ai.sessions.menu');
- assert(text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));
+ await click('ai.sessions');await visible('ai.session.row.1');await visible('ai.session.row.3');await menuClick('ai.session.restore.1');await acceptEndIfAsked();await absent('ai.sessions.menu');
+ await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE')||null,10000);
  await click('ai.prompt');await h.type_('UNSENT_DRAFT');
  await click('ai.close');await visible('ai.close.confirmation');await cap('02-close-confirmation');
  await click('ai.close.confirmation.cancel');await absent('ai.close.confirmation');
  assert(text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));assert.equal((await h.inputState('ai.prompt')).buffer,'UNSENT_DRAFT');
- await click('ai.close');await click('ai.close.confirmation.confirm');await absent('ai.panel');await click('toolbar.ai');await visible('ai.empty.configured');
+ await click('ai.close');await click('ai.close.confirmation.confirm');await absent('ai.panel');await click(await aiToggleId());await visible('ai.empty.configured');
  assert(!text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));assert.equal((await h.inputState('ai.prompt')).buffer,'');
  await visible('ai.empty.recent');assert(text(await h.query('ai.empty.recent')).includes('READ_HISTORY'));assert(text(await h.query('ai.empty.recent')).includes('SECOND_CONVERSATION'));
  await cap('03-welcome-with-history');
  await click('ai.sessions');await visible('ai.session.row.1');await visible('ai.session.row.3');
- await cap('04-retained-conversation-list');await click('ai.session.jump.3');await absent('ai.sessions.menu');
- assert(text(await h.query('ai.conversation')).includes('SECOND_CONVERSATION_MARKER'));
- await click('ai.sessions');await click('ai.session.jump.4');await absent('ai.sessions.menu');await visible('ai.empty.configured');
+ await cap('04-retained-conversation-list');await menuClick('ai.session.jump.3');await visible('ai.history');
+ assert(text(await h.query('ai.history.body')).includes('SECOND_CONVERSATION_MARKER'),'viewing the second ended conversation shows its transcript');await click('ai.history.close');await absent('ai.history');
+ if((await h.query('ai.sessions.menu')).some(shown))await click('ai.sessions');await absent('ai.sessions.menu');await visible('ai.empty.configured');
  const recent=(await h.query('ai.session.row.1')).find((n:any)=>shown(n)&&text(n).includes('READ_HISTORY'));assert(recent,'ended conversation is in welcome recent history');
  await click('ai.session.restore.1');
  await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE')||null,10000);assert.equal((await h.inputState('ai.prompt')).buffer,'UNSENT_DRAFT');
@@ -103,13 +113,14 @@ try{
  report.checks.push('A follow-up after X sends the original transcript back to the provider');
  await send('HOLD_CURRENT_TURN');await h.waitFor(async()=>held||null,10000);await visible('ai.stop');
  await click('ai.prompt');await h.type_('RUNNING_UNSENT_DRAFT');
- await click('ai.collapse');await absent('ai.panel');await click('toolbar.ai');await visible('ai.stop');
+ await click('ai.collapse');await absent('ai.panel');await click(await aiToggleId());await visible('ai.stop');
  assert(text(await h.query('ai.conversation')).includes('RUNNING_HISTORY_MARKER'));
  await click('ai.close');assert.equal(text(await visible('ai.close.confirmation.title')).trim(),'停止并结束当前会话？');
- await click('ai.close.confirmation.confirm');await absent('ai.panel');await click('toolbar.ai');await visible('ai.empty.configured');await absent('ai.stop');
+ await click('ai.close.confirmation.confirm');await absent('ai.panel');await click(await aiToggleId());await visible('ai.empty.configured');await absent('ai.stop');
  assert(!text(await h.query('ai.conversation')).includes('RUNNING_HISTORY_MARKER'));assert.equal((await h.inputState('ai.prompt')).buffer,'');
- await visible('ai.empty.recent');assert(text(await h.query('ai.empty.recent')).includes('HOLD_CURRENT_TURN'));await cap('05-welcome-after-stop');
- await click('ai.sessions');await visible('ai.session.row.1');await visible('ai.session.row.3');await click('ai.session.jump.1');await absent('ai.sessions.menu');
+ // 会话标题每段对话只生成一次（conversation_title.zig），HOLD_CURRENT_TURN 发在已恢复的 READ_HISTORY 对话里，所以最近会话行标题仍是 READ_HISTORY，状态为“已暂停”。
+ await visible('ai.empty.recent');{const row=flatNodes(await h.query('ai.empty.recent')).find((n:any)=>/^ai\.session\.row\.\d+$/.test(n.test_id??'')&&shown(n)&&text(n).includes('READ_HISTORY'));assert(row,'stopped conversation listed in welcome recent history');assert(flatNodes(row).some((n:any)=>n.test_id==='ai.session.status.stopped'),'listed as stopped')}await cap('05-welcome-after-stop');
+ await click('ai.sessions');await visible('ai.session.row.1');await visible('ai.session.row.3');await menuClick('ai.session.restore.1');await acceptEndIfAsked();await absent('ai.sessions.menu');
  await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('RUNNING_HISTORY_MARKER')||null,10000);await absent('ai.stop');
  assert(text(await h.query('ai.conversation')).includes('HISTORY_READ_COMPLETE'));assert.equal((await h.inputState('ai.prompt')).buffer,'RUNNING_UNSENT_DRAFT');await cap('06-restored-stopped-history');
  report.checks.push('Minus leaves a running turn active; X stops it, opens a new welcome page and retains the ended conversation in recent history and the list, including partial output and draft');

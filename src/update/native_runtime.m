@@ -107,11 +107,11 @@ static Class fetchProtocol;
 static void StartFetch(ZWUpdateFetch *f,NSString *url);
 static void ProbeRelease(uint64_t generation,int probe){
     ZWUpdateFetch *f=[ZWUpdateFetch new];f.generation=generation;f.fd=-1;f.probe=probe;f.metadata=[NSMutableData data];
-    StartFetch(f,probe==1?@"https://api.github.com/repos/iskylite/ZeroWork/releases/latest":@"https://api.github.com/repos/iskylite/ZeroWork");
+    StartFetch(f,probe==1?@"https://api.github.com/repos/version-next/ZeroWork/releases/latest":@"https://api.github.com/repos/version-next/ZeroWork");
 }
 static BOOL ValidFetchURL(ZWUpdateFetch *f,NSURL *url){
     if(!f.probe)return ZWValidHTTPS(url,YES);
-    NSString *expected=f.probe==1?@"https://api.github.com/repos/iskylite/ZeroWork/releases/latest":@"https://api.github.com/repos/iskylite/ZeroWork";
+    NSString *expected=f.probe==1?@"https://api.github.com/repos/version-next/ZeroWork/releases/latest":@"https://api.github.com/repos/version-next/ZeroWork";
     return [url.absoluteString isEqual:expected];
 }
 static NSString *NetworkFailure(NSError *error){
@@ -169,7 +169,7 @@ static NSString *NetworkFailure(NSError *error){
             id object=[NSJSONSerialization JSONObjectWithData:self.metadata options:0 error:nil];
             if(![object isKindOfClass:NSDictionary.class])ZWFail(@"更新源返回 HTTP 404，发布状态响应格式无效");
             if(self.probe==2){
-                if(![object[@"full_name"] isEqual:@"iskylite/ZeroWork"] || ![object[@"private"] isEqual:@NO])ZWFail(@"无法确认公开更新源的发布状态");
+                if(![object[@"full_name"] isEqual:@"version-next/ZeroWork"] || ![object[@"private"] isEqual:@NO])ZWFail(@"无法确认公开更新源的发布状态");
                 PublishGeneration(self.generation,12,@"正式版通道尚未发布可用版本，当前未开始下载或安装。");
             }else{
                 if(![object[@"tag_name"] isKindOfClass:NSString.class] || ![object[@"draft"] isEqual:@NO] || ![object[@"prerelease"] isEqual:@NO] || ![object[@"assets"] isKindOfClass:NSArray.class])ZWFail(@"更新源返回 HTTP 404，正式版发布状态无效");

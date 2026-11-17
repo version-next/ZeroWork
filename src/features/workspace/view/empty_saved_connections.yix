@@ -1,0 +1,37 @@
+//! 空工作区的“已保存的连接”（Pencil hmCmB `vDyAK`）：空状态操作下方最多三条已保存连接。
+//!
+//! - 每行是原生 `W.Pressable`（焦点、回车 / 空格、按下与悬停状态由它负责）：图标、名称、路由（“SSH · 直连”）。
+//!   点击走与侧栏行“连接”相同的新会话路径（宿主 `Workspace.savedConnect`）。
+//! - 协议插件被禁用（PLUGIN_ARCH_PLAN 6.2.1 Q5）的主机按侧栏同一规则（qQaos）：图标与名称变淡，行尾用“已禁用”
+//!   代替路由，原因与恢复路径在原生 `W.Tooltip` 里；这一行 `disabled`，点击 / 回车都不发起连接。
+//! - 没有已保存的连接时整块隐藏。
+//! 行数据、挑选规则与文案在 `empty_saved_connections.zig`（纯函数 + 单测）；这里只读它、把点击交给它。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("empty_saved_connections.zig");
+const S = @import("empty_saved_connections.yss");
+
+fn rowIcon(row: m.Row) ui.SvgAsset {
+    return if (row.sftp) ui.icons.folder else ui.icons.server;
+}
+
+pub fn SavedConnections(vm: *m.ViewModel) View {
+    return (
+        <col testId={m.ids.root} style={S.root} visible={vm.shown()}>
+            <row style={S.heading}>
+                <text style={S.heading_text}>已保存的主机</text>
+            </row>
+            <col style={S.rows}>
+                {for (vm.rows()) |row| <W.Pressable key={row.key} testId={m.ids.row} a11yLabel={row.name} disabled={row.unavailable} onClick={vm.connect(row.index)} style={S.Row.of(.{ .unavailable = row.unavailable })}>
+                    <icon src={rowIcon(row)} style={S.Icon.of(.{ .unavailable = row.unavailable })} />
+                    <text style={S.Name.of(.{ .unavailable = row.unavailable })} box={S.name_box}>{row.name}</text>
+                    {if (row.unavailable) <box style={S.meta_box}>
+                        <W.Tooltip text={row.reason} position={.top} parts={.{ .content = m.ids.tooltip }}>
+                            <text testId={m.ids.unavailable} style={S.meta}>已禁用</text>
+                        </W.Tooltip>
+                    </box> else <text style={S.meta} box={S.meta_box}>{row.metaText()}</text>}
+                </W.Pressable>}
+            </col>
+        </col>
+    );
+}

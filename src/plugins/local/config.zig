@@ -26,7 +26,7 @@ pub fn initialDirectory(allocator: std.mem.Allocator, requested: ?[]const u8) ![
         try (sessions.SessionCreateSpec{ .local = .{ .initial_cwd = cwd } }).validate();
         return allocator.dupe(u8, cwd);
     }
-    const home = try @import("../../platform/account.zig").home(allocator);
+    const home = try @import("../../platform/user_dirs.zig").home(allocator);
     errdefer allocator.free(home);
     try (sessions.SessionCreateSpec{ .local = .{ .initial_cwd = home } }).validate();
     return home;

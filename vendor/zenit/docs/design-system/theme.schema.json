@@ -24,7 +24,8 @@
             "schema",
             "modes",
             "value",
-            "description"
+            "description",
+            "override"
           ]
         }
       },
@@ -40,6 +41,10 @@
           "fallback": {
             "type": "string",
             "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*$"
+          },
+          "$override": {
+            "const": true,
+            "description": "Replace a mode a lower theme layer declares."
           }
         },
         "required": [
@@ -57,8 +62,7 @@
     }
   },
   "required": [
-    "$version",
-    "tokens"
+    "$version"
   ],
   "additionalProperties": false,
   "$defs": {
@@ -113,6 +117,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -198,6 +206,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -283,6 +295,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -368,6 +384,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -454,6 +474,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -539,6 +563,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -624,6 +652,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -709,6 +741,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -795,6 +831,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -880,6 +920,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -965,6 +1009,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -1104,6 +1152,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [
@@ -1186,6 +1238,10 @@
             },
             "$description": {
               "type": "string"
+            },
+            "$override": {
+              "const": true,
+              "description": "Replace the same path declared by a lower theme layer (zenit-tokens generate BASE OVERLAY...)."
             }
           },
           "required": [

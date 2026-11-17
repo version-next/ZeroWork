@@ -4,7 +4,7 @@ import { assert, getSessionDir, run, test } from "./runner";
 async function controls() {
   const result = await request("POST", "/windows/native-input", { action: "uia-tree" });
   assert(result.ok, `native Value query failed: ${JSON.stringify(result)}`);
-  return result.nodes.filter((node: any) => node.framework === "Zenit");
+  return result.nodes.filter((node: any) => node.framework === "Zenit" && node.role === 50004);
 }
 async function setValue(name: string, value: string) {
   const result = await request("POST", "/windows/native-input", { action: "uia-set-value", name, value });
@@ -21,6 +21,10 @@ test("Windows system Value writes Unicode Input and preserves readonly/disabled/
   const before = await request("POST", "/windows/native-input", { action: "status" });
   await clickTestId("nav.input");
   await waitFor(async () => (await query("story.input.name"))[0] ?? null, 4000, 50);
+  const duplicates = await request("POST", "/windows/native-input", { action: "uia-tree" });
+  const named = duplicates.nodes.filter((node: any) => node.framework === "Zenit" && node.name === "Name");
+  assert(named.some((node: any) => node.role === 50020) && named.some((node: any) => node.role === 50004),
+    `fixture must expose both the readable caption and the same-named Edit: ${JSON.stringify(named)}`);
   const first = await controls();
   const name = first.find((node: any) => node.name === "Name");
   assert(name?.value_available && !name.value_readonly && name.value === "", `Name lacks writable Value: ${JSON.stringify(name)}`);

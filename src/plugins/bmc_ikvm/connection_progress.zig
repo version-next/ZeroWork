@@ -201,6 +201,8 @@ pub const Tracker = struct {
     ended_ms: ?u64 = null,
     was_cancelled: bool = false,
     context: ?Context = null,
+    /// The owning session's wake (set once by its controller before the worker starts).
+    wake: ?*const @import("presentation_wake.zig").Wake = null,
 
     pub fn init(route_hops: u8) Tracker {
         var result = initAt(route_hops, nowMs());
@@ -215,16 +217,17 @@ pub const Tracker = struct {
     }
     pub fn setStageAt(self: *Tracker, stage: Stage, now_ms: u64) void {
         self.lock();
-        defer self.unlock();
-        if (self.ended_ms != null or self.value.stage == stage) return;
-        self.transition(stage, self.clampTime(now_ms));
+        const before = self.value.revision;
+        if (self.ended_ms == null and self.value.stage != stage) self.transition(stage, self.clampTime(now_ms));
+        self.unlockPublishing(before);
     }
     pub fn note(self: *Tracker, detail: Detail) void {
         self.noteAt(detail, nowMs());
     }
     pub fn noteAt(self: *Tracker, detail: Detail, now_ms: u64) void {
         self.lock();
-        defer self.unlock();
+        const before = self.value.revision;
+        defer self.unlockPublishing(before);
         if (self.ended_ms != null) return;
         const current = self.clampTime(now_ms);
         const context = detail.context orelse self.context;
@@ -243,7 +246,8 @@ pub const Tracker = struct {
     }
     pub fn failAt(self: *Tracker, err: anyerror, now_ms: u64) void {
         self.lock();
-        defer self.unlock();
+        const before = self.value.revision;
+        defer self.unlockPublishing(before);
         if (self.ended_ms != null) return;
         const current = self.clampTime(now_ms);
         if (err == error.Cancelled) {
@@ -268,7 +272,9 @@ pub const Tracker = struct {
     }
     pub fn finishAt(self: *Tracker, cancelled: bool, now_ms: u64) void {
         self.lock();
-        defer self.unlock();
+        // Ending always publishes: it freezes the clocks even when the stage does not change.
+        const before = if (self.ended_ms == null) std.math.maxInt(u64) else self.value.revision;
+        defer self.unlockPublishing(before);
         if (self.ended_ms != null) return;
         const current = self.clampTime(now_ms);
         self.transition(if (self.value.failure_code != null) .failed else if (cancelled or self.was_cancelled) .cancelled else .released, current);
@@ -323,6 +329,14 @@ pub const Tracker = struct {
     }
     fn unlock(self: *Tracker) void {
         self.mutex.store(false, .release);
+    }
+    /// Release, then wake the presentation when this call published (the tracker is written by the
+    /// protocol worker; the owner's main-thread poll reads it on the next frame). `before` is the
+    /// revision when the lock was taken.
+    fn unlockPublishing(self: *Tracker, before: u64) void {
+        const published = self.value.revision != before;
+        self.unlock();
+        if (published) @import("presentation_wake.zig").notify(self.wake);
     }
 };
 

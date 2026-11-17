@@ -2,25 +2,42 @@
 //! focus trap / animation in mod.zig.
 const ui = @import("../../ui.zig");
 
-/// Dialog panel: fixed width, grows with content up to max-height; default background bg-secondary.
-/// Double-layer shadow: main theme shadow + large-extent ambient light soft shadow (simulates
-/// extreme modal elevation, MD3 style).
-style dialog($width: f32, $max_height: f32, $background: ?ui.Color = null) {
+/// Dialog panel: design radius.dialog, 1px border and shadow.lg.
+style dialog($width: f32, $max_height: f32, $height: ?f32 = null, $background: ?ui.Color = null) {
   width: $width;
-  height: {.{ .fit = .{ .max = $max_height } }};
-  background: $background ?? bg-secondary;
+  height: {dialogHeight($height, $max_height)};
+  background: $background ?? bg-primary;
   direction: column;
-  corner-radius: 8;
-  shadow: lg, 0 32 80 #00000019;
+  corner-radius: dialog;
+  border-overlay: true; border: 1 border;
+  shadow: lg;
 }
 
 /// Title bar: title + close button space-between
-style header { direction: row; justify: space-between; align-items: center; gap: 12; padding: 12 16; width: grow; border: 0 separator; }
-style title { color: fg-primary; font-size: 14; font-weight: 600; wrap: word; }
-/// Close button: 24x24
-style close_button { width: 24; height: 24; background: transparent; justify: center; align-items: center; corner-radius: 4; }
-/// Text X fallback when no icon asset (24x24, same geometry as close button, no corner radius)
-style close_glyph_box { width: 24; height: 24; background: transparent; justify: center; align-items: center; }
-style close_glyph { color: fg-secondary; font-size: 14; }
-style body { direction: column; width: grow; height: grow; padding: 16; }
-style close_icon { width: 14; height: 14; icon-color: fg-secondary; }
+style header { direction: row; justify: space-between; align-items: center; gap: space300; padding: 16 12 0 20; width: grow; background: transparent; border-overlay: true; border-bottom-width: 1; border-color: border; }
+pub fn title(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .color = t.tokens.color.fg_primary, .font_size = t.tokens.font_size.xl, .font_weight = 600, .line_height = 1.25, .wrap = .word_break };
+}
+/// The title bar's room for the close button (the button itself is laid out over it, see closePlace in modal.yix).
+style close_slot { width: 28; height: 28; flex-shrink: 0; }
+/// Close button (a native ghost icon Button): 28x28.
+style close_button { width: 28; height: 28; min-height: 0; padding: 0; }
+/// Body slot: default padding [8, 20, 20, 20] and gap space400, or the caller's (`body_padding` /
+/// `body_gap`). It takes what the title bar leaves and never more (`min-height: 0`): content taller
+/// than a fixed / capped dialog stays inside the body's box (a ScrollArea in the body scrolls)
+/// instead of stretching the body past the panel's bottom edge.
+style body($padding: ?ui.Padding = null, $gap: ?f32 = null) {
+  direction: column; width: grow; height: grow; min-height: 0;
+  padding: {$padding orelse ui.Padding{ .top = 8, .right = 20, .bottom = 20, .left = 20 }};
+  gap: {$gap orelse t.tokens.space.space400};
+}
+
+
+/// Fixed height, else fit up to the cap.
+pub fn dialogHeight(height: ?f32, max_height: f32) ui.Sizing {
+    return if (height) |h| .{ .px = h } else .{ .fit = .{ .max = max_height } };
+}
+
+pub fn headerCorners(t: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .corner_radii = .{ .each = .{ t.tokens.radius.dialog, t.tokens.radius.dialog, 0, 0 } } };
+}

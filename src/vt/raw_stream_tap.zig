@@ -1,4 +1,5 @@
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 
 pub const Checkpoint = struct { sequence: u64, timestamp_ms: i64, stream_offset: u64 };
 
@@ -68,17 +69,8 @@ pub const Tap = struct {
     pub fn saveCheckpoint(self: *const Tap, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !void {
         var bytes: [24]u8 = undefined;
         _ = try self.encodeCheckpoint(&bytes);
-        var atomic_buffer: [256]u8 = undefined;
-        var atomic = try dir.createFileAtomic(io, sub_path, .{
-            .permissions = @as(std.Io.File.Permissions, @fromBackingInt(@intCast(0o600))),
-            .make_path = true,
-            .replace = true,
-        });
-        defer atomic.deinit(io);
-        var writer = atomic.file.writer(io, &atomic_buffer);
-        try writer.interface.writeAll(&bytes);
-        try writer.interface.flush();
-        try atomic.replace(io);
+        // 检查点是录制恢复的依据：发布前必须落盘，否则崩溃后可能读到空的或不完整的记录。
+        try persist.writeAtomic(io, dir, sub_path, &bytes, .{ .make_path = true });
     }
 
     /// Loads one checkpoint record without changing the in-memory tap.
@@ -157,4 +149,18 @@ test "disk storage drops the payload allocation and ignores later appends" {
     try std.testing.expectEqual(@as(usize, 8), tap.len);
     var out: [8]u8 = undefined;
     try std.testing.expectError(error.DiskBackedTap, tap.snapshot(&out));
+}
+
+test "checkpoint is fsynced before it replaces the previous record" {
+    var tap = try Tap.init(std.testing.allocator, 8);
+    defer tap.deinit();
+    tap.append("abc");
+    tap.markCheckpoint(7);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    persist.testing.reset();
+    try tap.saveCheckpoint(std.testing.io, tmp.dir, "state/checkpoint.bin");
+    try std.testing.expectEqual(@as(usize, 1), persist.testing.data_syncs);
+    const decoded = try Tap.loadCheckpoint(std.testing.io, tmp.dir, std.testing.allocator, "state/checkpoint.bin");
+    try std.testing.expectEqual(@as(u64, 3), decoded.sequence);
 }

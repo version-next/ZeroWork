@@ -8,48 +8,164 @@ const Cx = core.Cx;
 const NodeHandle = core.NodeHandle;
 const Node = core.Node;
 
-test {
-    _ = @import("cx_runtime_index_tests.zig");
+/// ZENIT_HIT_SCENE_DEBUG: log every hit-index rebuild root and every full-rebuild fallback.
+pub fn hitTraceEnabled() bool {
+    return @import("debug_env.zig").hitSceneDebugEnabled();
+}
+
+pub fn traceNode(tag: []const u8, node: *const Node) void {
+    if (!hitTraceEnabled()) return;
+    const d = node.frame_state.state_bits.dirty;
+    std.debug.print("[hit-scene] {s} node={d} test_id={s} children={d} layout={} interaction={} runtime={} order={}\n", .{ tag, node.id, node.meta.ownership.meta.test_id orelse "-", node.children.items.len, d.core.layout, d.pipeline.interaction, d.runtime.dirty, d.pipeline.order });
 }
 
 fn rebuildInteractionIndex(self: *Cx) !void {
+    if (hitTraceEnabled()) std.debug.print("[hit-scene] FULL reason={s}\n", .{self.interaction_index.fallback_reason});
     self.perf.interaction_full_rebuild_count += 1;
+    self.input_perf.in_hit_full_rebuilds += 1;
     try self.interaction_index.rebuild(self.root, &self.node_registry);
-    if (self.root) |root| clearInteractionDirtyRecursive(self, root);
+    if (self.root) |root| {
+        clearInteractionDirtyRecursive(self, root);
+        // The index was just built from every current rect and translate: no placement change
+        // is left to reconcile, whichever path asked for the full rebuild.
+        dropPendingPlacement(root);
+    }
 }
 
 pub fn collectPartialInteractionRoots(self: *Cx, node: *Node, roots: *PartialInteractionRoots) void {
-    if ((!node.frame_state.state_bits.dirty.core.subtree_layout and !node.frame_state.state_bits.dirty.pipeline.subtree_interaction) or roots.overflow) return;
-    if (node.frame_state.state_bits.dirty.core.layout or node.frame_state.state_bits.dirty.pipeline.interaction) {
-        const candidate = partialInteractionRootForLayoutNode(node) orelse return;
-        roots.add(self, candidate);
-        return;
+    collectPartialInteractionRootsEx(self, node, roots, false);
+}
+
+/// `covered`: an ancestor root rebuilds this subtree, except below hit-layer nodes: a layer node's
+/// build keeps every child block whose inputs are unchanged (hit_runtime.blockReusable), so dirt
+/// inside a block must be a root of its own.
+fn collectPartialInteractionRootsEx(self: *Cx, node: *Node, roots: *PartialInteractionRoots, covered: bool) void {
+    const dirty = node.frame_state.state_bits.dirty;
+    if ((!dirty.core.subtree_layout and !dirty.pipeline.subtree_interaction) or roots.overflow) return;
+    // Structurally changed subtrees are runtime roots (collectRuntimeDirtyRoots); their nodes may
+    // not be registered yet.
+    if (dirty.runtime.dirty) return;
+    const self_dirty = dirty.core.layout or dirty.pipeline.interaction;
+    if (!covered and self_dirty) {
+        traceNode("dirty", node);
+        addRootsForDirtyNode(self, node, roots);
     }
+    const children_covered = covered or self_dirty;
     const roots_before = roots.len;
+    const opens_blocks = isHitLayerNode(node);
     for (node.children.items) |child| {
-        collectPartialInteractionRoots(self, child, roots);
+        collectPartialInteractionRootsEx(self, child, roots, children_covered and !opens_blocks);
         if (roots.overflow) return;
     }
     // Orphaned dirty flag fix: subtree_interaction_dirty bubbles up; partial rebuild
     // clears source interaction_dirty via clearInteractionDirtyRecursive, but ancestor
     // subtree_interaction_dirty stays set. Clear orphaned flag to prevent full rebuild
     // every frame.
-    if (roots.len == roots_before and node.frame_state.state_bits.dirty.pipeline.subtree_interaction and !node.frame_state.state_bits.dirty.core.subtree_layout) {
+    if (!children_covered and roots.len == roots_before and dirty.pipeline.subtree_interaction and !dirty.core.subtree_layout) {
         node.frame_state.state_bits.dirty.pipeline.subtree_interaction = false;
     }
 }
 
 fn collectPartialInteractionRootsFallback(self: *Cx, node: *Node, roots: *PartialInteractionRoots) void {
+    collectPartialInteractionRootsFallbackEx(self, node, roots, false);
+}
+
+fn collectPartialInteractionRootsFallbackEx(self: *Cx, node: *Node, roots: *PartialInteractionRoots, covered: bool) void {
     if (roots.overflow) return;
-    if (node.frame_state.state_bits.dirty.core.layout or node.frame_state.state_bits.dirty.pipeline.interaction) {
-        const candidate = partialInteractionRootForLayoutNode(node) orelse return;
-        roots.add(self, candidate);
-        return;
-    }
+    if (node.frame_state.state_bits.dirty.runtime.dirty) return;
+    const self_dirty = node.frame_state.state_bits.dirty.core.layout or node.frame_state.state_bits.dirty.pipeline.interaction;
+    if (!covered and self_dirty) addRootsForDirtyNode(self, node, roots);
+    const opens_blocks = isHitLayerNode(node);
     for (node.children.items) |child| {
-        collectPartialInteractionRootsFallback(self, child, roots);
+        collectPartialInteractionRootsFallbackEx(self, child, roots, (covered or self_dirty) and !opens_blocks);
         if (roots.overflow) return;
     }
+}
+
+/// A participating hit-layer node: each child is numbered and rebuilt as its own block
+/// (hit_runtime.HitBlock).
+fn isHitLayerNode(node: *const Node) bool {
+    return node.behavior.interaction.hit_layer and @import("interaction_semantics.zig").nodeParticipatesInHitTest(node);
+}
+
+/// A direct child of a hit-layer node (it roots a hit block).
+fn isHitBlockRoot(node: *const Node) bool {
+    const parent = node.parent orelse return false;
+    return isHitLayerNode(parent);
+}
+
+/// The root covering a node whose own layout or hit semantics changed: the node itself. What the
+/// change does to other nodes (siblings pushed by a resize, fit ancestors resized, a parent that
+/// re-centers its child) reaches the index as their own placement change: every rect layout
+/// writes differently is marked (node_dirty.markLayoutPlacementDirty) and reconciled by the same
+/// commit, so no root has to guess how far a change propagates.
+fn addRootsForDirtyNode(self: *Cx, node: *Node, roots: *PartialInteractionRoots) void {
+    roots.add(self, node);
+}
+
+/// Commit pending placement changes to the hit index: translate writes
+/// (node_dirty.markTranslationDirty) and every rect a layout pass changed
+/// (node_dirty.markLayoutPlacementDirty). Each moved node's stored geometry is moved in place
+/// (HitRuntime.translateSubtree), so a frame that only moves nodes makes no partial root and no
+/// full rebuild; a node whose placement ended where the index holds it costs one comparison.
+/// Runs after the commit's layout passes (the moved geometry reads this frame's rects) and before
+/// its partial / full rebuild
+/// (that rebuild then overwrites whatever moved inside the subtrees it covers). A node the index
+/// cannot move exactly takes the interaction path it would have taken before: it is marked
+/// interaction-dirty and its partial roots are added to `roots` (unregistered subtrees are the
+/// runtime rebuild's roots). Returns whether any node fell back: the caller then has interaction
+/// work to commit. Cost: the subtree_translation paths plus the moved subtrees.
+pub fn commitPendingTranslations(self: *Cx, roots: *PartialInteractionRoots) bool {
+    const root = self.root orelse return false;
+    if (!root.frame_state.state_bits.dirty.hit.subtree_translation) return false;
+    var fell_back = false;
+    // Nothing indexed yet: the coming full rebuild reads every current rect.
+    if (self.node_registry.entries.count() == 0) {
+        dropPendingPlacement(root);
+        return false;
+    }
+    commitTranslationsRecursive(self, root, roots, &fell_back);
+    return fell_back;
+}
+
+/// Clear pending placement marks below `node` without reconciling them: the subtree is about to be
+/// indexed from its current geometry anyway.
+fn dropPendingPlacement(node: *Node) void {
+    const hit = &node.frame_state.state_bits.dirty.hit;
+    if (!hit.subtree_translation) return;
+    hit.subtree_translation = false;
+    hit.translation = false;
+    for (node.children.items) |child| dropPendingPlacement(child);
+}
+
+fn commitTranslationsRecursive(self: *Cx, node: *Node, roots: *PartialInteractionRoots, fell_back: *bool) void {
+    const hit = &node.frame_state.state_bits.dirty.hit;
+    if (!hit.subtree_translation) return;
+    // A structurally changed subtree is a root of the runtime rebuild of this commit
+    // (collectRuntimeDirtyRoots): it is indexed from its current geometry, nothing stored in it
+    // is reconciled (its new nodes have nothing stored at all).
+    if (node.frame_state.state_bits.dirty.runtime.dirty) return dropPendingPlacement(node);
+    hit.subtree_translation = false;
+    if (hit.translation) {
+        hit.translation = false;
+        switch (self.interaction_index.translateSubtree(node)) {
+            .moved, .unchanged => {},
+            .fallback => {
+                traceNode("translation-fallback", node);
+                node.markInteractionDirty();
+                if (!node.frame_state.state_bits.dirty.runtime.dirty) addRootsForDirtyNode(self, node, roots);
+                fell_back.* = true;
+            },
+            .failed => {
+                self.interaction_index.fallback_reason = "translation_oom";
+                node.markInteractionDirty();
+                roots.overflow = true;
+                roots.len = 0;
+                fell_back.* = true;
+            },
+        }
+    }
+    for (node.children.items) |child| commitTranslationsRecursive(self, child, roots, fell_back);
 }
 
 pub fn collectPartialInteractionRootsWithFallback(self: *Cx, node: *Node, roots: *PartialInteractionRoots) void {
@@ -70,20 +186,48 @@ pub fn rebuildInteractionIndexWithPartialRoots(self: *Cx, roots: PartialInteract
     }
 
     if (roots.overflow or roots.len == 0) {
+        self.interaction_index.fallback_reason = if (roots.overflow) "roots_overflow" else "roots_empty";
         try rebuildInteractionIndex(self);
         return;
     }
 
-    for (roots.items[0..roots.len]) |handle| {
+    // Deepest roots first. Roots never cover one another except across a hit layer: a layer
+    // node's build keeps every child block whose inputs are unchanged (blockReusable), so a block
+    // root rebuilt before its layer is reused by it, while the other order builds that block
+    // twice.
+    var ordered = roots;
+    var depths: [ordered.items.len]u32 = undefined;
+    for (ordered.items[0..ordered.len], depths[0..ordered.len]) |handle, *depth| {
+        depth.* = 0;
+        var cur = if (self.node_registry.resolve(handle, null)) |n| n.parent else null;
+        while (cur) |n| : (cur = n.parent) depth.* += 1;
+    }
+    for (1..ordered.len) |i| {
+        var j = i;
+        while (j > 0 and depths[j - 1] < depths[j]) : (j -= 1) {
+            std.mem.swap(NodeHandle, &ordered.items[j - 1], &ordered.items[j]);
+            std.mem.swap(u32, &depths[j - 1], &depths[j]);
+        }
+    }
+
+    for (ordered.items[0..ordered.len]) |handle| {
         const node = self.node_registry.resolve(handle, null) orelse {
+            self.interaction_index.fallback_reason = "root_unresolved";
             try rebuildInteractionIndex(self);
             return;
         };
+        const bn0 = self.interaction_index.stat_build_nodes;
         if (!(try self.interaction_index.rebuildSubtree(node, &self.node_registry))) {
+            traceNode("partial-failed", node);
             try rebuildInteractionIndex(self);
             return;
         }
+        if (hitTraceEnabled()) {
+            traceNode("partial", node);
+            std.debug.print("[hit-scene]   built={d}\n", .{self.interaction_index.stat_build_nodes -% bn0});
+        }
         self.perf.interaction_partial_rebuild_count += 1;
+        self.input_perf.in_hit_partial_rebuilds += 1;
         clearInteractionDirtyRecursive(self, node);
     }
     // After partial rebuild, clear orphaned subtree_interaction_dirty on ancestor
@@ -93,22 +237,12 @@ pub fn rebuildInteractionIndexWithPartialRoots(self: *Cx, roots: PartialInteract
         clearStaleSubtreeInteractionDirty(self, root);
         // Layout may leave hit geometry outside the bubbled partial roots.
         // Consume that residual work too, or every idle host tick sees it.
-        if (subtreeHasLooseInteractionDirty(self, root)) try rebuildInteractionIndex(self);
+        if (subtreeHasLooseInteractionDirty(self, root)) {
+            self.interaction_index.fallback_reason = "loose_residual";
+            try rebuildInteractionIndex(self);
+        }
     }
     // After partial rebuild, rebuild spatial grid.
-}
-
-fn partialInteractionRootForLayoutNode(node: *Node) ?*Node {
-    // An in-flow child size change (e.g., Accordion content expand) **relayouts the
-    // parent** and shifts **all following siblings**. Rebuilding only the changed
-    // node's subtree leaves shifted siblings' hit areas at old positions, so hit-test
-    // uses the old layout. Hence the rebuild root is raised to the **parent**, covering
-    // all reflowed siblings. Only for in-flow: absolute/out-of-flow size changes don't
-    // affect sibling layout, so raising would waste coverage. No parent (root) -> self.
-    if (node.style.position != .absolute) {
-        if (node.parent) |parent| return parent;
-    }
-    return node;
 }
 
 /// The loose bits (pipeline.interaction / hit.geometry / hit.semantics) don't
@@ -137,6 +271,17 @@ fn subtreeHasLooseInteractionDirtyScan(node: *Node) bool {
     return false;
 }
 
+/// Whether rebuilding `ancestor` rebuilds `node`: `node` is in its subtree and not in a hit
+/// block below it (a layer node's build may keep a block, see collectPartialInteractionRootsEx).
+fn rootCovers(ancestor: *Node, node: *Node) bool {
+    var current: ?*Node = node;
+    while (current) |n| : (current = n.parent) {
+        if (n == ancestor) return true;
+        if (isHitBlockRoot(n)) return false;
+    }
+    return false;
+}
+
 fn isDescendantNode(node: *Node, ancestor: *Node) bool {
     var current: ?*Node = node;
     while (current) |n| {
@@ -147,21 +292,31 @@ fn isDescendantNode(node: *Node, ancestor: *Node) bool {
 }
 
 pub fn rebuildRuntimeIndexes(self: *Cx) !void {
+    return rebuildRuntimeIndexesWithRoots(self, .{});
+}
+
+/// `layout_roots`: partial roots for layout / interaction changes collected (before layout) by
+/// the caller next to the structural ones.
+pub fn rebuildRuntimeIndexesWithRoots(self: *Cx, layout_roots: PartialInteractionRoots) !void {
     const root = self.root orelse return;
     // Diagnostic flag: ZENIT_FULL_RUNTIME_REBUILD=1 forces full runtime index
     // rebuild every time (debug partial repaint order with still-subtree interleave).
     const needs_full_rebuild = self.node_registry.entries.count() == 0 or
         root.frame_state.state_bits.dirty.runtime.subtree_full_rebuild or
-        @import("zenit_environment").has("ZENIT_FULL_RUNTIME_REBUILD");
+        @import("zenit_environment").flag("ZENIT_FULL_RUNTIME_REBUILD");
     if (needs_full_rebuild) {
+        self.interaction_index.fallback_reason = "runtime_full";
         try fullRebuildRuntimeIndexes(self, root);
     } else {
         var partial_interaction_roots = PartialInteractionRoots{};
-        collectRuntimeDirtyRoots(self, root, &partial_interaction_roots);
+        try collectRuntimeDirtyRoots(self, root, &partial_interaction_roots);
         try rebuildDirtyRuntimeSubtrees(self, root);
+        partial_interaction_roots.merge(self, layout_roots);
         self.focus_manager.finalizeFocusOrder();
         reconcileFocusedAfterRuntimeRebuild(self);
         try rebuildInteractionIndexWithPartialRoots(self, partial_interaction_roots);
+        // After the indexes are whole: focus callbacks run against a consistent window.
+        self.focus_manager.settleScopeEntry();
     }
 }
 
@@ -199,6 +354,7 @@ pub fn fullRebuildRuntimeIndexes(self: *Cx, root: *Node) !void {
     self.focus_manager.finalizeFocusOrder();
     reconcileFocusedAfterRuntimeRebuild(self);
     try rebuildInteractionIndex(self);
+    self.focus_manager.settleScopeEntry();
 }
 
 fn rebuildDirtyRuntimeSubtrees(self: *Cx, node: *Node) !void {
@@ -235,9 +391,18 @@ fn rebuildDirtyRuntimeSubtrees(self: *Cx, node: *Node) !void {
     node.frame_state.state_bits.dirty.runtime.subtree_full_rebuild = false;
 }
 
-fn collectRuntimeDirtyRoots(self: *Cx, node: *Node, roots: *PartialInteractionRoots) void {
+fn collectRuntimeDirtyRoots(self: *Cx, node: *Node, roots: *PartialInteractionRoots) !void {
     if (!node.frame_state.state_bits.dirty.runtime.subtree_dirty or roots.overflow) return;
     if (node.frame_state.state_bits.dirty.runtime.dirty) {
+        traceNode("runtime-dirty", node);
+        if (isHitBlockRoot(node)) {
+            // A child of a hit layer is numbered in a block of its own (siblings keep theirs), so
+            // it is its own root; siblings it pushed carry their own placement change. The node
+            // may be new: name it by the identity its registration below will carry.
+            const generation = try self.node_registry.trackGeneration(node);
+            roots.addHandle(self, node, .{ .id = node.id, .generation = generation });
+            return;
+        }
         // A newly registered/reparented node has no authoritative global
         // paint range. Rebuilding it alone can reuse the default [0,0]
         // range, placing a new topmost sibling underneath existing nodes.
@@ -247,13 +412,38 @@ fn collectRuntimeDirtyRoots(self: *Cx, node: *Node, roots: *PartialInteractionRo
         return;
     }
     for (node.children.items) |child| {
-        collectRuntimeDirtyRoots(self, child, roots);
+        try collectRuntimeDirtyRoots(self, child, roots);
         if (roots.overflow) return;
     }
 }
 
 pub fn rebuildOrderIndexes(self: *Cx) !void {
-    const root = self.root orelse return;
+    return rebuildOrderIndexesWithRoots(self, .{});
+}
+
+/// `layout_roots` as in rebuildRuntimeIndexesWithRoots: committed after the order rebuild.
+pub fn rebuildOrderIndexesWithRoots(self: *Cx, layout_roots: PartialInteractionRoots) !void {
+    var rebuilt = PartialInteractionRoots{};
+    if (!(try rebuildOrderIndexesOnly(self, &rebuilt))) return;
+    if (layout_roots.overflow) {
+        self.interaction_index.fallback_reason = "roots_overflow";
+        return rebuildInteractionIndex(self);
+    }
+    // Layout / interaction changes outside the subtrees the order rebuild just covered.
+    var roots = PartialInteractionRoots{};
+    for (layout_roots.items[0..layout_roots.len]) |handle| {
+        const node = self.node_registry.resolve(handle, null) orelse continue;
+        const root = self.root orelse return;
+        if (!isDescendantNode(node, root)) continue;
+        if (rebuilt.overflow or rebuilt.coversNode(self, node)) continue;
+        roots.addHandle(self, node, handle);
+    }
+    if (roots.len > 0 or roots.overflow) try rebuildInteractionIndexWithPartialRoots(self, roots);
+}
+
+/// False when it fell back to a full interaction rebuild (which covers everything).
+fn rebuildOrderIndexesOnly(self: *Cx, rebuilt: *PartialInteractionRoots) !bool {
+    const root = self.root orelse return false;
     if (orderDirtyAffectsFocus(self, root)) {
         if (!(try rebuildDirtyFocusOrderIncremental(self, root))) {
             self.perf.focus_order_rebuild_count += 1;
@@ -261,12 +451,15 @@ pub fn rebuildOrderIndexes(self: *Cx) !void {
         }
         reconcileFocusedAfterRuntimeRebuild(self);
     }
-    if (!(try rebuildDirtyInteractionSubtrees(self, root))) {
+    const partial_ok = try rebuildDirtyInteractionSubtreesEx(self, root, false, rebuilt);
+    if (!partial_ok) {
+        self.interaction_index.fallback_reason = "order_partial_failed";
         try rebuildInteractionIndex(self);
-    } else {
-        // After partial subtree rebuild succeeds, rebuild spatial grid.
     }
     clearOrderDirtyRecursive(self, root);
+    // After the indexes are whole: focus callbacks run against a consistent window.
+    self.focus_manager.settleScopeEntry();
+    return partial_ok;
 }
 
 fn clearOrderDirtyRecursive(self: *Cx, node: *Node) void {
@@ -329,17 +522,25 @@ fn rebuildDirtyFocusOrderIncremental(self: *Cx, node: *Node) !bool {
     return true;
 }
 
-fn rebuildDirtyInteractionSubtrees(self: *Cx, node: *Node) !bool {
+/// `covered`: an ancestor's rebuild already covered this subtree except its hit blocks (see
+/// collectPartialInteractionRootsEx). Rebuilt roots are recorded in `rebuilt`.
+fn rebuildDirtyInteractionSubtreesEx(self: *Cx, node: *Node, covered: bool, rebuilt: *PartialInteractionRoots) !bool {
     if (!node.frame_state.state_bits.dirty.pipeline.subtree_order) return true;
-    if (node.frame_state.state_bits.dirty.pipeline.order) {
+    var children_covered = covered;
+    if (!covered and node.frame_state.state_bits.dirty.pipeline.order) {
+        traceNode("order-partial", node);
         if (!(try self.interaction_index.rebuildSubtree(node, &self.node_registry))) {
+            if (hitTraceEnabled()) std.debug.print("[hit-scene]   order partial failed: {s}\n", .{self.interaction_index.fallback_reason});
             return false;
         }
         self.perf.interaction_partial_rebuild_count += 1;
-        return true;
+        self.input_perf.in_hit_partial_rebuilds += 1;
+        rebuilt.add(self, node);
+        children_covered = true;
     }
+    const opens_blocks = isHitLayerNode(node);
     for (node.children.items) |child| {
-        if (!(try rebuildDirtyInteractionSubtrees(self, child))) return false;
+        if (!(try rebuildDirtyInteractionSubtreesEx(self, child, children_covered and !opens_blocks, rebuilt))) return false;
     }
     return true;
 }
@@ -401,6 +602,7 @@ fn reconcileFocusedAfterRuntimeRebuild(self: *Cx) void {
                 // clearFocus goes through setFocusWithReason -> on_focus_settled already
                 // flushed native gate; no need to repeat.
                 self.focus_manager.clearFocus();
+                self.focus_manager.refocusActiveTrapScope();
                 self.focused_node = null;
                 self.focused_handle = null;
                 return;
@@ -426,9 +628,11 @@ pub const PartialInteractionRoots = struct {
     overflow: bool = false,
 
     fn add(self: *PartialInteractionRoots, cx: *Cx, node: *Node) void {
-        if (self.overflow) return;
+        self.addHandle(cx, node, cx.node_registry.handleFor(node));
+    }
 
-        const handle = cx.node_registry.handleFor(node);
+    fn addHandle(self: *PartialInteractionRoots, cx: *Cx, node: *Node, handle: NodeHandle) void {
+        if (self.overflow) return;
 
         var i: usize = 0;
         while (i < self.len) {
@@ -439,8 +643,8 @@ pub const PartialInteractionRoots = struct {
                 continue;
             };
             if (existing == node) return;
-            if (isDescendantNode(node, existing)) return;
-            if (isDescendantNode(existing, node)) {
+            if (rootCovers(existing, node)) return;
+            if (rootCovers(node, existing)) {
                 self.items[i] = self.items[self.len - 1];
                 self.len -= 1;
                 continue;
@@ -455,5 +659,38 @@ pub const PartialInteractionRoots = struct {
         }
         self.items[self.len] = handle;
         self.len += 1;
+    }
+
+    /// Whether rebuilding one of these roots rebuilt `node`.
+    fn coversNode(self: *const PartialInteractionRoots, cx: *Cx, node: *Node) bool {
+        for (self.items[0..self.len]) |handle| {
+            const root = cx.node_registry.resolve(handle, null) orelse continue;
+            if (rootCovers(root, node)) return true;
+        }
+        return false;
+    }
+
+    /// Add `other`'s roots that still name a node attached under the current root.
+    pub fn merge(self: *PartialInteractionRoots, cx: *Cx, other: PartialInteractionRoots) void {
+        if (other.overflow) {
+            self.overflow = true;
+            self.len = 0;
+            return;
+        }
+        for (other.items[0..other.len]) |handle| {
+            const node = cx.node_registry.resolve(handle, null) orelse continue;
+            const root = cx.root orelse return;
+            if (!isDescendantNode(node, root)) continue;
+            self.addHandle(cx, node, handle);
+        }
+    }
+
+    /// Drop roots whose node was freed or left the tree (a before-render hook ran since they
+    /// were collected); the rest still describe changes the hook did not undo.
+    pub fn prune(self: *PartialInteractionRoots, cx: *Cx) void {
+        if (self.overflow) return;
+        const kept = self.*;
+        self.len = 0;
+        self.merge(cx, kept);
     }
 };

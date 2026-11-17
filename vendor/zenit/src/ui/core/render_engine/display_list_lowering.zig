@@ -37,7 +37,7 @@ pub const CONTROL_HEADER: ItemHeader = .{ .transform_id = INVALID_ID, .node_id =
 ///
 /// Control variants manage scopes. Literal controls are already lowered;
 /// node_local push_clip also carries geometry that must follow its paint transform.
-fn isControlItem(item: display_list_mod.DisplayItem) bool {
+fn isControlItem(item: *const display_list_mod.DisplayItem) bool {
     // Single criterion: share DisplayItem.isControl with core.zig bulk quad ownership scan;
     // separate name lists on both sides will eventually get out of sync.
     return item.isControl();
@@ -45,39 +45,63 @@ fn isControlItem(item: display_list_mod.DisplayItem) bool {
 
 /// inline payload (polygon / glass / icon_rep / path geometry) spill to frame_arena for stable
 /// addresses; cannot use main_paint internal address since later append may realloc.
-pub fn appendLoweredBoth(cx: *RenderContext, item: display_list_mod.DisplayItem) !void {
+/// `item` by pointer: a DisplayItem is 232 B and a by-value parameter was copied on every call.
+pub fn appendLoweredBoth(cx: *RenderContext, item: *const display_list_mod.DisplayItem) !void {
+    if (!cx.paint_pass_lowering) return;
     if (cx.capture_lowered) |sink| {
-        var frozen = item;
+        var frozen = item.*;
         frozen.headerPtr().* = .{ .already_lowered = true, .transform_id = INVALID_ID, .node_id = INVALID_ID };
+        // Referenced payloads may be the caller's temporaries: the sink outlives them.
+        switch (frozen) {
+            .push_clip => |*clip| if (clip.polygon) |p| {
+                const own = try cx.frame_allocator.create(display_list_mod.ClipPolygon);
+                own.* = p.*;
+                clip.polygon = own;
+            },
+            .begin_blur_layer => |*blur| {
+                const own = try cx.frame_allocator.create(@TypeOf(blur.glass.*));
+                own.* = blur.glass.*;
+                blur.glass = own;
+            },
+            else => {},
+        }
         try sink.append(cx.allocator, frozen);
     }
-    var paint_item = gpu_draw_shadow.lowerDisplayItem(item);
-    switch (item) {
-        .push_clip => |it| {
+    // Lower straight into the list's spare slot (PaintItem is 512 B): no temporary and no
+    // append copy. The slot is committed (len += 1) only after every fallible step below, so
+    // an error leaves the list exactly as an append-at-the-end would.
+    try cx.lowering_buffer_paint.ensureUnusedCapacity(cx.allocator, 1);
+    const paint_item = &cx.lowering_buffer_paint.allocatedSlice()[cx.lowering_buffer_paint.items.len];
+    gpu_draw_shadow.lowerDisplayItemInto(item, paint_item);
+    paint_item.paint_digest = loweredDigest(cx, item);
+    // Payloads by pointer: a capture by value copies the whole variant (a push_clip carries a
+    // 32-point polygon).
+    switch (item.*) {
+        .push_clip => |*it| {
             if (it.shape_kind == .polygon) {
                 const dup = try cx.frame_allocator.create(display_list_mod.ClipPolygon);
-                dup.* = it.polygon;
+                dup.* = display_list_mod.ClipPolygon.of(it.polygon);
                 paint_item.clip_polygon_ptr = dup;
             }
         },
-        .begin_blur_layer => |it| {
-            const dup = try cx.frame_allocator.create(@TypeOf(it.glass));
-            dup.* = it.glass;
+        .begin_blur_layer => |*it| {
+            const dup = try cx.frame_allocator.create(@TypeOf(it.glass.*));
+            dup.* = it.glass.*;
             paint_item.glass_ptr = dup;
         },
-        .icon_rep => |it| {
+        .icon_rep => |*it| {
             const dup = try cx.frame_allocator.create(@TypeOf(it.rep));
             dup.* = it.rep;
             paint_item.icon_rep_ptr = dup;
         },
-        .fill_path => |it| {
+        .fill_path => |*it| {
             const dup = try cx.frame_allocator.create(types.PathGeometry);
             dup.* = it.geometry.*;
             dup.commands = try cx.frame_allocator.dupe(types.PathCommand, it.geometry.commands);
             dup.owned = false;
             paint_item.path_geometry_ptr = dup;
         },
-        .stroke_path => |it| {
+        .stroke_path => |*it| {
             const dup = try cx.frame_allocator.create(types.PathGeometry);
             dup.* = it.geometry.*;
             dup.commands = try cx.frame_allocator.dupe(types.PathCommand, it.geometry.commands);
@@ -86,11 +110,52 @@ pub fn appendLoweredBoth(cx: *RenderContext, item: display_list_mod.DisplayItem)
         },
         else => {},
     }
-    try cx.lowering_buffer_paint.append(cx.allocator, paint_item);
+    // Web DOM host: the node each lowered item came from (fallible, so before the commit).
+    if (cx.lowered_nodes) |nodes| try nodes.append(cx.allocator, item.header().node_id);
+    cx.lowering_buffer_paint.items.len += 1;
+    if (cx.sprite_probe) |probe| probe.noteLowered(item.header().node_id, cx.lowering_buffer_paint.items.len - 1, isControlItem(item));
 }
+/// paint_table.DisplayItem.paint_digest of a lowered item: its recorded
+/// content fingerprint, the transform it was lowered through, its place among
+/// the items lowered from the same recorded one, and the text it resolved
+/// (text runs read this frame's blob store). 0 (unknown) outside a recorded
+/// item's lowering scope or without a fingerprint. Clip pops and group ends
+/// carry nothing but their kind and lower to a constant item: their digest is
+/// their kind's, wherever they are lowered.
+fn loweredDigest(cx: *RenderContext, item: *const display_list_mod.DisplayItem) u64 {
+    switch (item.*) {
+        .pop_clip, .end_opacity_layer, .end_blur_layer, .end_rounded_clip => {
+            // A field added to one of them would make this digest lie.
+            comptime for ([_][]const u8{ "pop_clip", "end_opacity_layer", "end_blur_layer", "end_rounded_clip" }) |name| {
+                if (@typeInfo(@FieldType(display_list_mod.DisplayItem, name)).@"struct".field_names.len != 1) @compileError(name ++ " carries content: digest it");
+            };
+            const tag: u32 = @backingInt(std.meta.activeTag(item.*));
+            return std.hash.Wyhash.hash(0x6d61726b6572, std.mem.asBytes(&tag)) | 1;
+        },
+        else => {},
+    }
+    const transform = cx.lowering_fp_transform orelse return 0;
+    const header = item.header();
+    if (header.local_fp == 0 or header.already_lowered) return 0;
+    // One-shot hashes of packed words: this runs for every paint item of every frame.
+    const Packed = extern struct { t: [6]f32, seq: u32, kind: u32 };
+    const words: Packed = .{
+        // + 0 folds -0 into 0: transforms composed along different paths
+        // (replay vs fresh) may differ only in a zero's sign.
+        .t = .{ transform.a + 0, transform.b + 0, transform.c + 0, transform.d + 0, transform.tx + 0, transform.ty + 0 },
+        .seq = cx.lowering_fp_seq,
+        .kind = @backingInt(std.meta.activeTag(item.*)),
+    };
+    cx.lowering_fp_seq += 1;
+    var digest = std.hash.Wyhash.hash(header.local_fp, std.mem.asBytes(&words));
+    if (item.* == .text_run) digest = @import("trace").work_counters.hashText(digest, item.text_run.content);
+    return if (digest == 0) 1 else digest;
+}
+
 /// Lower a node clip through exactly the same content/replay transform as its paint.
 /// The encoder subsequently applies the surface source-origin offset to both.
-pub fn lowerNodeClip(item: display_list_mod.DisplayItem, transform: Transform2D) display_list_mod.DisplayItem {
+/// A scaled polygon is written to `allocator` (the frame allocator).
+pub fn lowerNodeClip(allocator: std.mem.Allocator, item: display_list_mod.DisplayItem, transform: Transform2D) !display_list_mod.DisplayItem {
     var clip = item.push_clip;
     const rect = transform.transformRect(ComputedRect.init(clip.x, clip.y, clip.w, clip.h));
     const scale = transform.extractApproxScale();
@@ -98,10 +163,18 @@ pub fn lowerNodeClip(item: display_list_mod.DisplayItem, transform: Transform2D)
     clip.y = rect.y;
     clip.w = rect.w;
     clip.h = rect.h;
-    clip.radius *= scale;
-    for (clip.polygon.points[0..clip.polygon.point_count]) |*point| {
-        point[0] *= scale;
-        point[1] *= scale;
+    for (&clip.radii) |*radius| radius.* *= scale;
+    // Node-local corners land on the target-frame corners the transform maps them to (a mirrored
+    // or quarter-turned owner keeps each radius on its own corner).
+    clip.radii = transform.orientCornerRadii(clip.radii);
+    if (clip.polygon) |source| {
+        const scaled = try allocator.create(display_list_mod.ClipPolygon);
+        scaled.* = source.*;
+        for (scaled.points[0..scaled.point_count]) |*point| {
+            point[0] *= scale;
+            point[1] *= scale;
+        }
+        clip.polygon = scaled;
     }
     clip.node_local = false;
     return .{ .push_clip = clip };
@@ -140,6 +213,49 @@ pub fn paintClipIdForItem(cx: *RenderContext, header: display_list_mod.ItemHeade
     return header.clip_id;
 }
 
+/// The effect scopes and clips a lowering run holds open. Adjacent item groups that share a chain
+/// prefix keep it open, and so do the segments of one run (a subtree split between the prebuild
+/// prefix and the paint tail is lowered as one stream).
+const OpenScopes = struct {
+    // Effect scope prefix is preserved: adjacent groups sharing the same effect chain prefix keep
+    // the scope open **across groups**, only the open/close difference is emitted. Closing and
+    // reopening the full chain per group is wrong: begin_blur_layer in the encoder immediately
+    // composites the glass backdrop, so one blur island split by clip_id into N groups repaints the
+    // backdrop N times, each obscuring the previous group (only the last group is visible), and
+    // every reopen reruns the full blur capture + kawase chain.
+    // scopes/ids store the current open chain **outermost-first**.
+    scopes: [8]DisplayEffectBridgeScope = undefined,
+    ids: [8]u32 = undefined,
+    count: usize = 0,
+    // Clip prefix preserved across groups (same structure as the effect scope above).
+    // The main loop groups by (effect_id, clip_id); a virtual list has one clip_id per row.
+    // Resending the full ancestor chain per group pushes/pops the shared outermost clip (island
+    // corner) 150k times per scroll; each triggers flushAllPending (consumes an SDF uniform slot),
+    // 256 slots run out mid-frame, later commands are lost and encode jumps to 10-17ms. Only
+    // differences close/open.
+    clip_ids: [8]u32 = undefined,
+    clip_count: usize = 0,
+    // This switch is invariant during a synchronous lowering pass. Resolve it
+    // only if an effect group needs it, rather than locking the process
+    // environment for every item group (including passes without structure).
+    emit_in_effect: ?bool = null,
+
+    /// End of the run. Not downgradeable: a Begin is already in the stream, no End = unclosed
+    /// scope, and this runs from a defer that cannot propagate an error.
+    fn closeAll(self: *OpenScopes, cx: *RenderContext, include_structure: bool) void {
+        if (!include_structure) return;
+        // Clips first (the order the stream was opened in reverse: clips sit inside the effects).
+        if (self.clip_count > 0) {
+            effect_bridge.appendDisplayClipBridgeEnd(cx, self.clip_count) catch @panic("OOM: display clip bridge end (unbalanced scope)");
+            self.clip_count = 0;
+        }
+        if (self.count > 0) {
+            effect_bridge.appendDisplayEffectBridgeEnd(cx, self.scopes[0..self.count]) catch @panic("OOM: display effect bridge end (unbalanced scope)");
+            self.count = 0;
+        }
+    }
+};
+
 fn appendDisplayItemsToRenderListInternal(
     cx: *RenderContext,
     start: usize,
@@ -149,43 +265,27 @@ fn appendDisplayItemsToRenderListInternal(
     replay_node: ?*Node,
     replay_exec_state: ?*const NodeExecutionState,
 ) !void {
-    const slice = cx.display_list.items.items[start..@min(end, cx.display_list.items.items.len)];
-    // This switch is invariant during a synchronous lowering pass. Resolve it
-    // only if an effect group needs it, rather than locking the process
-    // environment for every item group (including passes without structure).
-    var emit_in_effect: ?bool = null;
+    var open: OpenScopes = .{};
+    defer open.closeAll(cx, include_structure);
+    try lowerDisplayItemRange(cx, &open, start, end, include_structure, active_parent_effect_id, replay_node, replay_exec_state);
+}
+
+fn lowerDisplayItemRange(
+    cx: *RenderContext,
+    open: *OpenScopes,
+    start: usize,
+    end: usize,
+    include_structure: bool,
+    active_parent_effect_id: u32,
+    replay_node: ?*Node,
+    replay_exec_state: ?*const NodeExecutionState,
+) !void {
+    const total = cx.display_list.items.items.len;
+    const slice = cx.display_list.items.items[@min(start, total)..@min(end, total)];
     const replay_base_inverse = if (replay_exec_state) |exec_state|
         exec_state.world_transform.invert()
     else
         Transform2D.identity();
-
-    // Effect scope prefix is preserved: adjacent groups sharing the same effect chain prefix keep
-    // the scope open **across groups**, only the open/close difference is emitted. Closing and
-    // reopening the full chain per group is wrong: begin_blur_layer in the encoder immediately
-    // composites the glass backdrop, so one blur island split by clip_id into N groups repaints the
-    // backdrop N times, each obscuring the previous group (only the last group is visible), and
-    // every reopen reruns the full blur capture + kawase chain.
-    // open_scopes/open_ids store the current open chain **outermost-first**.
-    var open_scopes: [8]DisplayEffectBridgeScope = undefined;
-    var open_ids: [8]u32 = undefined;
-    var open_count: usize = 0;
-    // Not downgradeable: Begin already in stream, no End = unclosed scope. defer can't propagate
-    // error -> panic (same strategy as old).
-    defer if (include_structure and open_count > 0) {
-        effect_bridge.appendDisplayEffectBridgeEnd(cx, open_scopes[0..open_count]) catch @panic("OOM: display effect bridge end (unbalanced scope)");
-    };
-
-    // Clip prefix preserved across groups (same structure as the effect scope above).
-    // Main loop groups by (effect_id, clip_id); a virtual list has one clip_id per row. Resending
-    // the full ancestor chain per group pushes/pops the shared outermost clip (island corner) 150k
-    // times per scroll; each triggers flushAllPending (consumes an SDF uniform slot), 256 slots run
-    // out
-    // mid-frame, later commands are lost and encode jumps to 10-17ms. Only differences close/open.
-    var open_clip_ids: [8]u32 = undefined;
-    var open_clip_count: usize = 0;
-    defer if (include_structure and open_clip_count > 0) {
-        effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count) catch @panic("OOM: display clip bridge end (unbalanced scope)");
-    };
 
     var i: usize = 0;
     while (i < slice.len) {
@@ -210,8 +310,8 @@ fn appendDisplayItemsToRenderListInternal(
             chain_len = count;
             // chain is innermost-first; compute outermost-first common prefix
             var common: usize = 0;
-            while (common < open_count and common < count and
-                open_ids[common] == chain[count - 1 - common].effect_id) common += 1;
+            while (common < open.count and common < count and
+                open.ids[common] == chain[count - 1 - common].effect_id) common += 1;
             // Clip prefix must close before any Begin/End of effect scope: encoder either skips
             // full begin..end range (GPU retained hit), or
             // restores clip stack snapshot at begin time, both paths assume self-consistent clip.
@@ -219,23 +319,23 @@ fn appendDisplayItemsToRenderListInternal(
             // scope (or left after old scope close), those clip layers permanently leak: tab clip
             // lingering on stack causes all subsequent frame
             // content clipped into tab (edit/hover frame full screen flash white root cause).
-            if ((open_count > common or open_count < count) and open_clip_count > 0) {
-                try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
-                open_clip_count = 0;
+            if ((open.count > common or open.count < count) and open.clip_count > 0) {
+                try effect_bridge.appendDisplayClipBridgeEnd(cx, open.clip_count);
+                open.clip_count = 0;
             }
             // Close no-longer-needed inner (innermost-first)
-            if (open_count > common) {
+            if (open.count > common) {
                 effect_scope_changed = true;
-                try effect_bridge.appendDisplayEffectBridgeEnd(cx, open_scopes[common..open_count]);
-                open_count = common;
+                try effect_bridge.appendDisplayEffectBridgeEnd(cx, open.scopes[common..open.count]);
+                open.count = common;
             }
             // Open missing (outermost -> innermost)
-            while (open_count < count) {
+            while (open.count < count) {
                 effect_scope_changed = true;
-                const entry = chain[count - 1 - open_count];
-                open_scopes[open_count] = try effect_bridge.appendDisplayEffectBridgeBeginEntry(cx, entry, replay_node, replay_exec_state);
-                open_ids[open_count] = entry.effect_id;
-                open_count += 1;
+                const entry = chain[count - 1 - open.count];
+                open.scopes[open.count] = try effect_bridge.appendDisplayEffectBridgeBeginEntry(cx, entry, replay_node, replay_exec_state);
+                open.ids[open.count] = entry.effect_id;
+                open.count += 1;
             }
         }
         // WARNING: with a non-empty effect chain (blur island interior) the clip chain is **not
@@ -250,19 +350,19 @@ fn appendDisplayItemsToRenderListInternal(
         // mod.zig).
         // Set ZENIT_ENABLE_EFFECT_CLIP_BRIDGE=1 explicitly to continue investigation.
         const innermost_effect_for_clip: u32 =
-            if (open_count > 0) open_ids[open_count - 1] else active_parent_effect_id;
+            if (open.count > 0) open.ids[open.count - 1] else active_parent_effect_id;
         const want_clip = include_structure and (chain_len == 0 or blk: {
-            if (emit_in_effect == null) emit_in_effect = @import("zenit_environment").has("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE");
-            break :blk emit_in_effect.?;
+            if (open.emit_in_effect == null) open.emit_in_effect = @import("zenit_environment").flag("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE");
+            break :blk open.emit_in_effect.?;
         });
 
         // On effect scope change clip must fully reopen: clip coordinates relative to
         // `innermost_effect_for_clip` projection (see
         // appendDisplayClipBridgeBeginSuffix active_parent_inverse), changing effect frame can't
         // reuse old push.
-        if (effect_scope_changed and open_clip_count > 0) {
-            try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
-            open_clip_count = 0;
+        if (effect_scope_changed and open.clip_count > 0) {
+            try effect_bridge.appendDisplayClipBridgeEnd(cx, open.clip_count);
+            open.clip_count = 0;
         }
 
         if (want_clip) {
@@ -270,11 +370,11 @@ fn appendDisplayItemsToRenderListInternal(
             const clip_len = effect_bridge.collectDisplayClipChainPublic(cx, group_clip_id, &clip_chain);
             // chain is innermost-first; compute outermost-first common prefix.
             var common: usize = 0;
-            while (common < open_clip_count and common < clip_len and
-                open_clip_ids[common] == clip_chain[clip_len - 1 - common]) common += 1;
-            if (open_clip_count > common) {
-                try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count - common);
-                open_clip_count = common;
+            while (common < open.clip_count and common < clip_len and
+                open.clip_ids[common] == clip_chain[clip_len - 1 - common]) common += 1;
+            if (open.clip_count > common) {
+                try effect_bridge.appendDisplayClipBridgeEnd(cx, open.clip_count - common);
+                open.clip_count = common;
             }
             if (clip_len > common) {
                 const emitted = try effect_bridge.appendDisplayClipBridgeBeginSuffix(
@@ -287,18 +387,21 @@ fn appendDisplayItemsToRenderListInternal(
                 // only_scroll filter may emit fewer than chain length; account by actual emit
                 // count, else End count won't match Begin.
                 var k: usize = 0;
-                while (k < emitted and open_clip_count < open_clip_ids.len) : (k += 1) {
-                    open_clip_ids[open_clip_count] = clip_chain[clip_len - 1 - common - k];
-                    open_clip_count += 1;
+                while (k < emitted and open.clip_count < open.clip_ids.len) : (k += 1) {
+                    open.clip_ids[open.clip_count] = clip_chain[clip_len - 1 - common - k];
+                    open.clip_count += 1;
                 }
             }
-        } else if (open_clip_count > 0) {
-            try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
-            open_clip_count = 0;
+        } else if (open.clip_count > 0) {
+            try effect_bridge.appendDisplayClipBridgeEnd(cx, open.clip_count);
+            open.clip_count = 0;
         }
 
-        for (slice[i..group_end]) |item| {
+        // By pointer: a by-value capture copies every item of the frame (a few hundred bytes each).
+        for (slice[i..group_end]) |*item_ref| {
+            const item = item_ref;
             const item_header = item.header();
+            cx.lowering_fp_transform = null;
 
             // Literal controls are already lowered, may have INVALID transform IDs. Node-local
             // clips must reach
@@ -310,7 +413,7 @@ fn appendDisplayItemsToRenderListInternal(
             // anchor. The
             // effect_bridge path is unaffected: it uses appendLoweredBoth and writes the paint list
             // directly.
-            if (item_header.already_lowered or (isControlItem(item) and !(item == .push_clip and item.push_clip.node_local))) {
+            if (item_header.already_lowered or (isControlItem(item) and !(item.* == .push_clip and item.push_clip.node_local))) {
                 // Clip prefix bridge can't cross layer boundary token: encoder either skips full
                 // begin..end range (GPU retained hit), or restores clip
                 // stack snapshot at begin, both paths assume self-consistent clip. If
@@ -319,7 +422,7 @@ fn appendDisplayItemsToRenderListInternal(
                 // subsequent frame content clipped into tab
                 // (edit/hover frame full screen flash white root cause). Hit boundary, close first,
                 // defer after current group reopen.
-                const is_layer_boundary = switch (item) {
+                const is_layer_boundary = switch (item.*) {
                     .begin_opacity_layer,
                     .end_opacity_layer,
                     .begin_blur_layer,
@@ -329,9 +432,9 @@ fn appendDisplayItemsToRenderListInternal(
                     => true,
                     else => false,
                 };
-                if (is_layer_boundary and open_clip_count > 0) {
-                    try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
-                    open_clip_count = 0;
+                if (is_layer_boundary and open.clip_count > 0) {
+                    try effect_bridge.appendDisplayClipBridgeEnd(cx, open.clip_count);
+                    open.clip_count = 0;
                 }
                 try appendLoweredBoth(cx, item);
                 if (is_layer_boundary and want_clip) {
@@ -346,9 +449,9 @@ fn appendDisplayItemsToRenderListInternal(
                             0,
                         );
                         var k: usize = 0;
-                        while (k < emitted and open_clip_count < open_clip_ids.len) : (k += 1) {
-                            open_clip_ids[open_clip_count] = boundary_chain[boundary_len - 1 - k];
-                            open_clip_count += 1;
+                        while (k < emitted and open.clip_count < open.clip_ids.len) : (k += 1) {
+                            open.clip_ids[open.clip_count] = boundary_chain[boundary_len - 1 - k];
+                            open.clip_count += 1;
                         }
                     }
                 }
@@ -375,10 +478,15 @@ fn appendDisplayItemsToRenderListInternal(
             // transform_id/clip_id/effect_id), but paint variant's x/y/w/h already lower-ed to
             // world coord, encoder no longer transforms twice.
             const lowered_header = item_header;
-            switch (item) {
-                .fill_rect => |it| {
+            // Everything below is a function of the recorded item and this transform
+            // (plus the text it resolves, hashed in appendLoweredBoth).
+            cx.lowering_fp_transform = item_transform;
+            cx.lowering_fp_seq = 0;
+            defer cx.lowering_fp_transform = null;
+            switch (item.*) {
+                .fill_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .fill_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -394,9 +502,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .stroke_rect => |it| {
+                .stroke_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .stroke_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -410,22 +518,22 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .border_side => |it| {
+                .border_side => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
                     const clip_rect = item_transform.transformRect(ComputedRect.init(it.clip_x, it.clip_y, it.clip_w, it.clip_h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .push_clip = .{
                             .header = CONTROL_HEADER,
                             .x = clip_rect.x,
                             .y = clip_rect.y,
                             .w = clip_rect.w,
                             .h = clip_rect.h,
-                            .radius = it.clip_radius * scale,
+                            .radii = scaleLocalRadii(it.clip_radii, scale),
                             .shape_kind = it.clip_shape_kind,
                             .polygon = it.clip_polygon,
                         },
                     });
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .stroke_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -437,11 +545,11 @@ fn appendDisplayItemsToRenderListInternal(
                             .radius = scaleLocalRadii(it.radius, scale),
                         },
                     });
-                    try appendLoweredBoth(cx, .{ .pop_clip = .{ .header = CONTROL_HEADER } });
+                    try appendLoweredBoth(cx, &.{ .pop_clip = .{ .header = CONTROL_HEADER } });
                 },
-                .border_per_side => |it| {
+                .border_per_side => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .border_per_side = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -454,9 +562,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .gradient_rect => |it| {
+                .gradient_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .gradient_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -477,9 +585,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .shadow_rect => |it| {
+                .shadow_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .shadow_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -495,9 +603,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .outline_rect => |it| {
+                .outline_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .outline_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -510,9 +618,11 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .text_run => |it| {
+                .text_run => |*it| {
                     const origin = item_transform.applyPoint(it.x, it.y);
-                    const resolved_content = display_list_mod.resolveTextRunContent(cx.text_blob_store, it);
+                    // The run's own bytes (the display list's payload): valid for as long as
+                    // the list, whatever became of the node that painted them.
+                    const resolved_content = it.content;
                     if (bracket_debug.bracketRenderDebugEnabled() and resolved_content.len == 1 and
                         (bracket_debug.bracketDebugNodeFilter() == null or item_header.node_id == bracket_debug.bracketDebugNodeFilter().?) and
                         bracket_debug.shouldLogBracketReplay(cx.scene_runtime.frame_epoch, item_header.node_id, it.blob_byte_start, it.blob_byte_end))
@@ -532,16 +642,15 @@ fn appendDisplayItemsToRenderListInternal(
                             },
                         );
                     }
-                    if (resolved_content.len == 0 and (it.content.len > 0 or it.blob_byte_end > it.blob_byte_start)) {
+                    if (resolved_content.len == 0 and it.blob_byte_end > it.blob_byte_start) {
                         const blob_exists = it.blob_id != INVALID_ID and cx.text_blob_store.get(it.blob_id) != null;
                         text_trace.log(
                             cx.scene_runtime.frame_epoch,
-                            "replay-empty-text node={d} blob={d} blob_exists={} raw_len={d} range=[{d}..{d}) scale={d:.2} clip={d} effect={d}",
+                            "replay-empty-text node={d} blob={d} blob_exists={} range=[{d}..{d}) scale={d:.2} clip={d} effect={d}",
                             .{
                                 item_header.node_id,
                                 it.blob_id,
                                 blob_exists,
-                                it.content.len,
                                 it.blob_byte_start,
                                 it.blob_byte_end,
                                 scale,
@@ -550,7 +659,7 @@ fn appendDisplayItemsToRenderListInternal(
                             },
                         );
                     }
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .text_run = .{
                             .header = lowered_header,
                             .x = origin.x,
@@ -569,26 +678,15 @@ fn appendDisplayItemsToRenderListInternal(
                             .font_smoothing = it.font_smoothing,
                             .spans = it.spans,
                             .blob_id = it.blob_id,
-                            .blob_content_hash = it.blob_content_hash,
-                            // blob_id must be transmitted together with its content_hash. blob_id
-                            // is a frame-local sequence
-                            // number (store clears and reallocates each frame);
-                            // resolveTextRunContent uses blob_content_hash
-                            // to detect "this sequence number changed owner". If it's never
-                            // transmitted it stays 0, the identity
-                            // check short-circuits to an always-true `run.blob_content_hash == 0`,
-                            // and a re-lowered item takes the
-                            // old sequence number and slices **another blob** in this frame's
-                            // bytes.
                             .raster_policy = it.raster_policy,
                             .fade_dx0 = it.fade_dx0 * scale,
                             .fade_dx1 = it.fade_dx1 * scale,
                         },
                     });
                 },
-                .image_quad => |it| {
+                .image_quad => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .image_quad = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -602,9 +700,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .icon_rep => |it| {
+                .icon_rep => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .icon_rep = .{
                             .header = lowered_header,
                             .icon_id = it.icon_id,
@@ -621,9 +719,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .arc => |it| {
+                .arc => |*it| {
                     const center = item_transform.applyPoint(it.cx, it.cy);
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .arc = .{
                             .header = lowered_header,
                             .cx = center.x,
@@ -636,9 +734,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .multi_gradient_rect => |it| {
+                .multi_gradient_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .multi_gradient_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -666,9 +764,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .noise_rect => |it| {
+                .noise_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .noise_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -684,9 +782,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .inset_shadow_rect => |it| {
+                .inset_shadow_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .inset_shadow_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -702,9 +800,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .shadow_dual_rect => |it| {
+                .shadow_dual_rect => |*it| {
                     const rect = item_transform.transformRect(ComputedRect.init(it.x, it.y, it.w, it.h));
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .shadow_dual_rect = .{
                             .header = lowered_header,
                             .x = rect.x,
@@ -724,9 +822,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .fill_path => |it| {
+                .fill_path => |*it| {
                     const origin = item_transform.applyPoint(it.offset_x, it.offset_y);
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .fill_path = .{
                             .header = lowered_header,
                             .geometry = it.geometry,
@@ -746,9 +844,9 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                .stroke_path => |it| {
+                .stroke_path => |*it| {
                     const origin = item_transform.applyPoint(it.offset_x, it.offset_y);
-                    try appendLoweredBoth(cx, .{
+                    try appendLoweredBoth(cx, &.{
                         .stroke_path = .{
                             .header = lowered_header,
                             .geometry = it.geometry,
@@ -762,14 +860,14 @@ fn appendDisplayItemsToRenderListInternal(
                     });
                 },
                 // Stage B R3f: effect/clip literal tokens 1:1 passthrough (fields already lower-ed)
-                .push_clip => try appendLoweredBoth(cx, lowerNodeClip(item, item_transform)),
-                .pop_clip => |it| try appendLoweredBoth(cx, .{ .pop_clip = it }),
-                .begin_opacity_layer => |it| try appendLoweredBoth(cx, .{ .begin_opacity_layer = it }),
-                .end_opacity_layer => |it| try appendLoweredBoth(cx, .{ .end_opacity_layer = it }),
-                .begin_blur_layer => |it| try appendLoweredBoth(cx, .{ .begin_blur_layer = it }),
-                .end_blur_layer => |it| try appendLoweredBoth(cx, .{ .end_blur_layer = it }),
-                .begin_rounded_clip => |it| try appendLoweredBoth(cx, .{ .begin_rounded_clip = it }),
-                .end_rounded_clip => |it| try appendLoweredBoth(cx, .{ .end_rounded_clip = it }),
+                .push_clip => try appendLoweredBoth(cx, &try lowerNodeClip(cx.frame_allocator, item.*, item_transform)),
+                .pop_clip => |*it| try appendLoweredBoth(cx, &.{ .pop_clip = it.* }),
+                .begin_opacity_layer => |*it| try appendLoweredBoth(cx, &.{ .begin_opacity_layer = it.* }),
+                .end_opacity_layer => |*it| try appendLoweredBoth(cx, &.{ .end_opacity_layer = it.* }),
+                .begin_blur_layer => |*it| try appendLoweredBoth(cx, &.{ .begin_blur_layer = it.* }),
+                .end_blur_layer => |*it| try appendLoweredBoth(cx, &.{ .end_blur_layer = it.* }),
+                .begin_rounded_clip => |*it| try appendLoweredBoth(cx, &.{ .begin_rounded_clip = it.* }),
+                .end_rounded_clip => |*it| try appendLoweredBoth(cx, &.{ .end_rounded_clip = it.* }),
             }
         }
         i = group_end;
@@ -786,8 +884,15 @@ pub const getNodeDisplayPayload = node_display_payload.getNodeDisplayPayload;
 /// lower-ed field DisplayItem stream) for encoder consumption. Currently only translation
 /// entry at end of cx.render().
 /// Freeze a displayed subtree without opening its ancestor effect scopes.
-pub fn appendSnapshotDisplayItems(cx: *RenderContext, start: usize, end: usize, parent_effect_id: u32) !void {
-    try appendDisplayItemsToRenderListInternal(cx, start, end, true, parent_effect_id, null, null);
+/// `segments` in paint order (SceneNodeRuntime.subtreeDisplaySegments): lowered as one stream,
+/// so a scope shared by the end of one segment and the start of the next stays open.
+pub fn appendSnapshotDisplayItems(cx: *RenderContext, segments: []const scene_runtime_mod.DisplayItemRange, parent_effect_id: u32) !void {
+    var open: OpenScopes = .{};
+    defer open.closeAll(cx, true);
+    for (segments) |segment| {
+        if (segment.count == 0) continue;
+        try lowerDisplayItemRange(cx, &open, segment.start, segment.end(), true, parent_effect_id, null, null);
+    }
 }
 
 pub fn appendAllDisplayItemsToRenderList(cx: *RenderContext) !void {
@@ -871,6 +976,9 @@ pub fn appendNodeDisplayPayloadToRenderListForReplay(
             );
         }
     }
+    // The replay's items are already in the display list; only the paint-pass lowering copy
+    // remains, which the caller does not want (see RenderContext.paint_pass_lowering).
+    if (!cx.paint_pass_lowering) return true;
     const start: usize = switch (scope) {
         .own => runtime.display_item_start,
         .subtree => runtime.subtree_display_item_start,

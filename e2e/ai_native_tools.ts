@@ -5,6 +5,7 @@
  * turns; --phase approval reuses a verified readonly proof to avoid repeating
  * an already observed df request. --diagnose-prepare 1 uses no-network mock.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -12,6 +13,7 @@ import { copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { waitForServerReady, waitFor, query, clickTestId, inputState, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
 
 const options: Record<string, string> = {}, args = process.argv.slice(2);
 for (let i = 0; i < args.length; i += 2) {
@@ -177,7 +179,7 @@ try {
   assert((await resizeWindow(1440, 900)).ok);
   await click("workspace.empty.local");
   await visible("terminal.surface");
-  await click("toolbar.ai");
+  await click(await aiToggleId());
   await visible("ai.prompt");
   assert(text(await visible("ai.composer.model")).includes("mimo-v2.6"), "UI resolves the configured actual model");
   await capture("00-local-ai-ready");

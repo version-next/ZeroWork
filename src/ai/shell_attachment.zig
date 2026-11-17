@@ -50,7 +50,7 @@ test "execution shell attachment validates observed evidence and rejects unknown
     const json = "{\"session_ref\":\"session\",\"request_key\":\"once\",\"shell_revision\":0,\"input_epoch\":2,\"output_sequence\":3,\"prompt_evidence\":\"bash$\"}";
     const arguments = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     defer arguments.deinit();
-    var invocation: host.Invocation = .{ .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .authority = .execution_control, .operation_id = 1, .turn_id = 1, .call_id = "attach", .tool_id = "host.attach_shell", .arguments = arguments.value, .arguments_json = json, .arguments_hash = execution.digest(json), .canonical_arguments_hash = try @import("canonical_arguments.zig").digest(a, arguments.value) };
+    var invocation: host.Invocation = .{ .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .authority = .execution_control, .operation_id = 1, .turn_id = 1, .call_id = "attach", .tool_id = "host.attach_shell", .arguments = arguments.value, .arguments_json = json, .arguments_hash = execution.digest(json), .canonical_arguments_hash = try @import("canonical_arguments.zig").digest(a, arguments.value) };
     const request = try parse(invocation);
     try std.testing.expectEqual(@as(?[32]u8, null), request.evidence.shell_id);
     try std.testing.expectEqual(@as(u64, 3), request.evidence.output_sequence);

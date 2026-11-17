@@ -224,3 +224,212 @@ test "component size matrices are not a theme category" {
     const diagnostic = doc.diagnostic orelse return error.ExpectedDiagnostic;
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "control") != null);
 }
+
+fn colorOf(doc: *const m.Document, mode: []const u8, path: []const u8) !u32 {
+    const c = (try value(doc, mode, path)).color;
+    return @as(u32, c.r) << 24 | @as(u32, c.g) << 16 | @as(u32, c.b) << 8 | c.a;
+}
+
+test "component roles a theme omits become aliases of their default target" {
+    const source =
+        \\{"$version":1,"tokens":{"color":{"blue":"#0000ff","red":"#ff0000"}},
+        \\"semantic":{"color":{"accent":{"$light":"{tokens.color.blue}","$dark":"#000080"},"fg_inverse":"#ffffff",
+        \\"danger":"{tokens.color.red}","checkbox-fg":"#123456","switch_track_on":"#abcdef"}}}
+    ;
+    var doc = try resolver.parse(a, source);
+    defer doc.deinit();
+    if (doc.diagnostic) |d| std.debug.print("{s} {s}\n", .{ d.pointer, d.message });
+    try std.testing.expect(doc.diagnostic == null);
+    // Filled per mode from the target.
+    try std.testing.expectEqual(@as(u32, 0x0000ffff), try colorOf(&doc, "light", "color.progress_fill"));
+    try std.testing.expectEqual(@as(u32, 0x000080ff), try colorOf(&doc, "dark", "color.progress_fill"));
+    try std.testing.expectEqual(@as(u32, 0x0000ffff), try colorOf(&doc, "light", "color.checkbox_checked_bg"));
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), try colorOf(&doc, "dark", "color.button_danger_bg"));
+    try std.testing.expectEqual(@as(u32, 0xffffffff), try colorOf(&doc, "light", "color.switch_thumb_on"));
+    // Declared roles win, in either spelling; no second spelling is added.
+    try std.testing.expectEqual(@as(u32, 0xabcdefff), try colorOf(&doc, "light", "color.switch_track_on"));
+    try std.testing.expectEqual(@as(u32, 0x123456ff), try colorOf(&doc, "light", "color.checkbox-fg"));
+    try std.testing.expectError(error.NotFound, value(&doc, "light", "color.checkbox_fg"));
+    // Roles whose target the theme lacks are not invented.
+    try std.testing.expectError(error.NotFound, value(&doc, "light", "color.range_track"));
+    try std.testing.expectError(error.NotFound, value(&doc, "light", "color.bg_focus"));
+    // Filled roles are semantic aliases with a stable source identity.
+    for (doc.tokens) |tok| if (std.mem.eql(u8, tok.path, "color.progress_fill")) {
+        try std.testing.expectEqualStrings("semantic.color.progress_fill", tok.source_path);
+        try std.testing.expectEqualStrings("/semantic/color/progress_fill", tok.pointer);
+    };
+}
+
+test "a theme without any role target gains no tokens" {
+    var doc = try resolver.parse(a, "{\"$version\":1,\"tokens\":{\"color\":{\"ink\":\"#000\"}}}");
+    defer doc.deinit();
+    try std.testing.expect(doc.diagnostic == null);
+    try std.testing.expectEqual(@as(usize, 1), doc.tokens.len);
+}
+
+// ---- Application theme layers ------------------------------------------------------------
+
+const base_layer =
+    \\{"$version":1,"$modes":{"hc":{"scheme":"dark","fallback":"dark"}},
+    \\"tokens":{"color":{"blue":{"500":"#0000ffff"}}},
+    \\"semantic":{"color":{"accent":{"$light":"{tokens.color.blue.500}","$dark":"#000080ff"},"link":"{semantic.color.accent}"}}}
+;
+
+fn layered(overlays: []const []const u8) !m.Document {
+    var layers: [4]resolver.Layer = undefined;
+    layers[0] = .{ .name = "base.json", .source = base_layer };
+    for (overlays, 1..) |src, i| layers[i] = .{ .name = if (i == 1) "app.json" else "app2.json", .source = src };
+    return resolver.parseLayers(a, layers[0 .. overlays.len + 1]);
+}
+
+fn expectDiagnostic(doc: *const m.Document, layer: usize, pointer: []const u8, needle: []const u8) !void {
+    const d = doc.diagnostic orelse return error.ExpectedDiagnostic;
+    if (std.mem.indexOf(u8, d.message, needle) == null) {
+        std.debug.print("diagnostic: {s} {s}\n", .{ d.pointer, d.message });
+        return error.WrongDiagnostic;
+    }
+    try std.testing.expectEqual(layer, d.layer);
+    try std.testing.expectEqualStrings(pointer, d.pointer);
+    // The offset is inside the named layer's source.
+    try std.testing.expect(d.offset < doc.layers[d.layer].source.len);
+}
+
+test "layers: overlays add tokens, groups and modes; overrides are explicit and re-resolve aliases" {
+    var doc = try layered(&.{
+        \\{"$version":1,"$modes":{"dim":{"scheme":"dark","fallback":"dark"}},
+        \\"tokens":{"color":{"blue":{"900":"#000011ff"}}},
+        \\"semantic":{"color":{"zw_ground":{"$light":"{tokens.color.blue.900}","$dim":"#010203ff"},
+        \\"accent":{"$override":true,"$value":{"$light":"#a23010ff","$dark":"#e07050ff"}}}}}
+    });
+    defer doc.deinit();
+    if (doc.diagnostic) |d| std.debug.print("{d} {s} {s}\n", .{ d.layer, d.pointer, d.message });
+    try std.testing.expect(doc.diagnostic == null);
+    try std.testing.expectEqual(@as(usize, 2), doc.layers.len);
+    // New semantic token referencing a base group that the overlay extended.
+    try std.testing.expectEqual(@as(u32, 0x000011ff), try colorOf(&doc, "light", "color.zw_ground"));
+    try std.testing.expectEqual(@as(u32, 0x0000ffff), try colorOf(&doc, "light", "color.blue.500"));
+    // New mode from the overlay; its fallback chain reaches dark then light.
+    try std.testing.expectEqual(@as(u32, 0x010203ff), try colorOf(&doc, "dim", "color.zw_ground"));
+    try std.testing.expectEqual(@as(u32, 0xe07050ff), try colorOf(&doc, "dim", "color.accent"));
+    // Override wins, and base aliases of the overridden token follow it.
+    try std.testing.expectEqual(@as(u32, 0xa23010ff), try colorOf(&doc, "light", "color.accent"));
+    try std.testing.expectEqual(@as(u32, 0xa23010ff), try colorOf(&doc, "light", "color.link"));
+    try std.testing.expectEqual(@as(u32, 0xe07050ff), try colorOf(&doc, "hc", "color.link"));
+    // Each token remembers the file that declared it last.
+    for (doc.tokens) |tok| {
+        const want: usize = if (std.mem.eql(u8, tok.path, "color.accent") or std.mem.eql(u8, tok.path, "color.zw_ground") or std.mem.eql(u8, tok.path, "color.blue.900")) 1 else 0;
+        try std.testing.expectEqual(want, tok.layer);
+    }
+}
+
+test "layers: redeclaring a lower layer's token without $override names both declarations" {
+    var doc = try layered(&.{
+        \\{"$version":1,"semantic":{"color":{"accent":"#ff0000ff"}}}
+    });
+    defer doc.deinit();
+    try expectDiagnostic(&doc, 1, "/semantic/color/accent", "color.accent is already declared at base.json#/semantic/color/accent");
+}
+
+test "layers: $override must replace something, must be true, and must stay in its layer" {
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"semantic":{"color":{"fresh":{"$override":true,"$value":"#ff0000ff"}}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/semantic/color/fresh", "no lower layer declares it");
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"semantic":{"color":{"accent":{"$override":false,"$value":"#ff0000ff"}}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/semantic/color/accent/$override", "$override must be true");
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"tokens":{"color":{"accent":{"$override":true,"$value":"#ff0000ff"}}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/tokens/color/accent", "an override must stay in the same layer");
+    }
+    {
+        // A single file (or the base) has nothing below it to override.
+        var doc = try resolver.parse(a,
+            \\{"$version":1,"tokens":{"color":{"x":{"$override":true,"$value":"#ff0000ff"}}}}
+        );
+        defer doc.deinit();
+        try std.testing.expect(doc.diagnostic != null);
+    }
+}
+
+test "layers: token/group conflicts and mode conflicts across files" {
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"tokens":{"color":{"blue":"#ff0000ff"}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/tokens/color/blue", "token/group conflict: color.blue; first declaration base.json#/tokens/color/blue");
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"$modes":{"hc":{"scheme":"light","fallback":"light"}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/$modes/hc", "mode hc is already declared at base.json#/$modes/hc");
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"$modes":{"hc":{"$override":true,"scheme":"light","fallback":"light"}}}
+        });
+        defer doc.deinit();
+        try std.testing.expect(doc.diagnostic == null);
+        for (doc.modes) |mode| if (std.mem.eql(u8, mode.name, "hc")) try std.testing.expectEqual(m.Scheme.light, mode.scheme);
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"$modes":{"new":{"$override":true,"scheme":"dark","fallback":"dark"}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 1, "/$modes/new", "no lower layer declares it");
+    }
+}
+
+test "layers: second overlay can override the first; errors point into the right file" {
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"semantic":{"color":{"zw":"#111111ff"}}}
+            ,
+            \\{"$version":1,"semantic":{"color":{"zw":{"$override":true,"$value":"#222222ff"}}}}
+        });
+        defer doc.deinit();
+        try std.testing.expect(doc.diagnostic == null);
+        try std.testing.expectEqual(@as(u32, 0x222222ff), try colorOf(&doc, "dark", "color.zw"));
+    }
+    {
+        var doc = try layered(&.{
+            \\{"$version":1,"semantic":{"color":{"zw":"#111111ff"}}}
+            ,
+            \\{"$version":1,"semantic":{"color":{"bad":"{semantic.color.nope}"}}}
+        });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 2, "/semantic/color/bad", "unknown token reference");
+    }
+    {
+        // Only the base must declare `tokens`.
+        var doc = try resolver.parseLayers(a, &.{ .{ .name = "base.json", .source = "{\"$version\":1}" } });
+        defer doc.deinit();
+        try expectDiagnostic(&doc, 0, "", "missing required field: tokens");
+    }
+}
+
+test "layers: allocation failures leave no leaks" {
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn probe(allocator: std.mem.Allocator) !void {
+            var doc = try resolver.parseLayers(allocator, &.{
+                .{ .name = "base.json", .source = base_layer },
+                .{ .name = "app.json", .source = "{\"$version\":1,\"semantic\":{\"color\":{\"zw\":\"{semantic.color.accent}\",\"accent\":{\"$override\":true,\"$value\":\"#123456\"}}}}" },
+            });
+            doc.deinit();
+        }
+    }.probe, .{});
+}

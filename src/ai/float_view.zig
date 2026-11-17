@@ -32,9 +32,9 @@ pub const Controller = struct {
         self.stream.deinit();
     }
 
-    pub fn snapshot(self: *Controller, pane: float.Rect, window: float.Rect) Snapshot {
+    pub fn snapshot(self: *Controller, origin: float.Origin, region: float.Rect) Snapshot {
         self.model.setCardCount(self.stream.count());
-        const rect = self.model.rect(pane, window);
+        const rect = self.model.rect(origin, region);
         return .{
             .visible = self.model.visible,
             .expanded = self.model.expanded,
@@ -101,7 +101,10 @@ test "AI float snapshot reflects cards, status and expanded geometry" {
     controller.clearInput();
     controller.toggle();
     _ = try controller.stream.append(.{ .text = "answer" });
-    const snapshot = controller.snapshot(.{ .x = 0, .y = 0, .width = 800, .height = 600 }, .{ .x = 0, .y = 0, .width = 900, .height = 700 });
+    const content: float.Rect = .{ .x = 0, .y = 44, .width = 900, .height = 656 };
+    const origin: float.Origin = .{ .corner = .bottom_right, .anchor = .{ .x = 828, .y = 632, .width = 48, .height = 48 }, .content = content };
+    const region = float.floatRegion(900, 700, 44, 0);
+    const snapshot = controller.snapshot(origin, region);
     try std.testing.expect(snapshot.visible);
     try std.testing.expectEqual(@as(usize, 1), snapshot.card_count);
     try std.testing.expectEqualStrings("inspect output", snapshot.prompt);
@@ -110,7 +113,7 @@ test "AI float snapshot reflects cards, status and expanded geometry" {
     try std.testing.expectEqualStrings("answer", card.body);
     try std.testing.expectEqualStrings("secondary", snapshot.status_color);
     controller.toggleExpanded();
-    const expanded = controller.snapshot(.{ .x = 0, .y = 0, .width = 800, .height = 600 }, .{ .x = 0, .y = 0, .width = 900, .height = 700 });
-    try std.testing.expectEqual(@as(f32, 600), expanded.width);
-    try std.testing.expectEqual(@as(f32, 456), expanded.height);
+    const expanded = controller.snapshot(origin, region);
+    try std.testing.expectEqual(@as(f32, 378), expanded.width); // #52: 900 × 0.42
+    try std.testing.expectEqual(@as(f32, 632), expanded.height); // 656 − 24
 }

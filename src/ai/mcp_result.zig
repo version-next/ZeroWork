@@ -30,7 +30,7 @@ fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u
     var dir = try std.Io.Dir.cwd().openDir(io, directory, .{});
     defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = name, .data = bytes, .flags = .{ .exclusive = true, .permissions = @fromBackingInt(0o600) } });
-    return .{ .name = name, .path = path, .mime_type = mime, .bytes = bytes.len, .size = try @import("extension_sizes.zig").format(a, bytes.len) };
+    return .{ .name = name, .path = path, .mime_type = mime, .bytes = bytes.len, .size = try @import("../shared/base/format.zig").allocBytes(a, bytes.len) };
 }
 fn gather(a: std.mem.Allocator, value: *std.json.Value, found: *std.ArrayList(*std.json.Value)) !void {
     if (value.* == .array) {

@@ -7,6 +7,7 @@
 /// not display_list tail) captured correctly, runtime range always points prebuilt location,
 /// contains child's real contributing items.
 const std = @import("std");
+const scene_runtime_mod = @import("../scene_runtime.zig");
 const node_mod = @import("../node.zig");
 const display_list_mod = @import("../display_list.zig");
 const render_context_mod = @import("render_context.zig");
@@ -29,7 +30,7 @@ var overlay_debug_cache: ?bool = null;
 
 fn overlayDebugEnabled() bool {
     return overlay_debug_cache orelse blk: {
-        const enabled = @import("zenit_environment").has("ZENIT_DEBUG_OVERLAY");
+        const enabled = @import("zenit_environment").flag("ZENIT_DEBUG_OVERLAY");
         overlay_debug_cache = enabled;
         break :blk enabled;
     };
@@ -60,23 +61,34 @@ fn nodeOwnItems(cx: *RenderContext, node_id: u32) []const DisplayItem {
     return cx.display_list.items.items[start..end];
 }
 
-/// slice child's contributing display items from child's runtime range. prefer subtree range; if
-/// subtree count=0 but own count>0, fall back to own range, covers leaf node own prebuild shortcut,
-/// zero growth during subtree paint.
-fn childSubtreeItems(cx: *RenderContext, child_id: u32) []const DisplayItem {
-    const runtime = cx.scene_runtime.get(child_id) orelse return &.{};
-    const total = cx.display_list.items.items.len;
+/// A child's contributing display items, from the child's runtime ranges, in paint order: the
+/// prefix part of a subtree split between the prebuild prefix and the paint-pass tail (empty
+/// otherwise), then its subtree range. If the subtree count is 0 but the own count is not, the own
+/// range (covers the leaf own-prebuild shortcut, zero growth during subtree paint).
+const ChildItems = struct {
+    parts: [2][]const DisplayItem = .{ &.{}, &.{} },
 
-    var start = @as(usize, runtime.subtree_display_item_start);
-    var count = @as(usize, runtime.subtree_display_item_count);
-    if (count == 0) {
-        start = @as(usize, runtime.display_item_start);
-        count = @as(usize, runtime.display_item_count);
-        if (count == 0) return &.{};
+    fn len(self: ChildItems) usize {
+        return self.parts[0].len + self.parts[1].len;
     }
-    if (start >= total) return &.{};
-    const end = @min(start + count, total);
-    return cx.display_list.items.items[start..end];
+
+    /// Copy into `buf` at `idx`; returns the count.
+    fn copyTo(self: ChildItems, buf: []DisplayItem, idx: usize) usize {
+        @memcpy(buf[idx .. idx + self.parts[0].len], self.parts[0]);
+        @memcpy(buf[idx + self.parts[0].len .. idx + self.len()], self.parts[1]);
+        return self.len();
+    }
+};
+
+fn childSubtreeItems(cx: *RenderContext, child_id: u32) ChildItems {
+    const runtime = cx.scene_runtime.get(child_id) orelse return .{};
+    const all = cx.display_list.items.items;
+    const segments = runtime.subtreeDisplaySegments();
+    if (segments[0].count == 0 and segments[1].count == 0) {
+        const own: scene_runtime_mod.DisplayItemRange = .{ .start = runtime.display_item_start, .count = runtime.display_item_count };
+        return .{ .parts = .{ &.{}, own.slice(DisplayItem, all) } };
+    }
+    return .{ .parts = .{ segments[0].slice(DisplayItem, all), segments[1].slice(DisplayItem, all) } };
 }
 
 /// splice cache command buffer:
@@ -124,19 +136,24 @@ fn assembleCacheCommands(
         }
     }
 
-    var total_count: usize = self_items.len;
+    var children_count: usize = 0;
     for (content_slices.regular_children.items) |cid| {
-        total_count += childSubtreeItems(cx, cid).len;
+        children_count += childSubtreeItems(cx, cid).len();
     }
     for (content_slices.sticky_children.items) |cid| {
-        total_count += childSubtreeItems(cx, cid).len;
+        children_count += childSubtreeItems(cx, cid).len();
     }
     for (content_slices.overlay_children.items) |cid| {
-        total_count += childSubtreeItems(cx, cid).len;
+        children_count += childSubtreeItems(cx, cid).len();
     }
+    var total_count: usize = self_items.len + children_count;
     const tail_count = content_slices.tail_end_idx - content_slices.tail_start_idx;
     total_count += tail_count;
-    const clip_band: u32 = if (content_slices.clip_wrapped) 1 else 0;
+    // The paint pass drops a clip scope that holds nothing (render_engine
+    // elideEmptyScrollClipScope), so the reference path never emits an empty pair. Keep the
+    // cached copy canonical the same way: a pair around zero child items would replay as a
+    // stale empty push_clip / pop_clip (a glass owner whose children paint nothing).
+    const clip_band: u32 = if (content_slices.clip_wrapped and children_count > 0) 1 else 0;
     total_count += 2 * @as(usize, clip_band);
 
     const buf = try allocator.alloc(DisplayItem, total_count);
@@ -154,27 +171,24 @@ fn assembleCacheCommands(
     var regular_child_slices = try allocator.alloc(ChildCommandSlice, content_slices.regular_children.items.len);
     var regular_count: u32 = 0;
     for (content_slices.regular_children.items, 0..) |cid, i| {
-        const items = childSubtreeItems(cx, cid);
-        @memcpy(buf[idx .. idx + items.len], items);
-        idx += items.len;
-        regular_count += @intCast(items.len);
-        regular_child_slices[i] = .{ .child_id = cid, .command_count = @intCast(items.len) };
+        const copied = childSubtreeItems(cx, cid).copyTo(buf, idx);
+        idx += copied;
+        regular_count += @intCast(copied);
+        regular_child_slices[i] = .{ .child_id = cid, .command_count = @intCast(copied) };
     }
 
     var sticky_count: u32 = 0;
     for (content_slices.sticky_children.items) |cid| {
-        const items = childSubtreeItems(cx, cid);
-        @memcpy(buf[idx .. idx + items.len], items);
-        idx += items.len;
-        sticky_count += @intCast(items.len);
+        const copied = childSubtreeItems(cx, cid).copyTo(buf, idx);
+        idx += copied;
+        sticky_count += @intCast(copied);
     }
 
     var overlay_count: u32 = 0;
     for (content_slices.overlay_children.items) |cid| {
-        const items = childSubtreeItems(cx, cid);
-        @memcpy(buf[idx .. idx + items.len], items);
-        idx += items.len;
-        overlay_count += @intCast(items.len);
+        const copied = childSubtreeItems(cx, cid).copyTo(buf, idx);
+        idx += copied;
+        overlay_count += @intCast(copied);
     }
 
     if (clip_band != 0) {
@@ -188,23 +202,11 @@ fn assembleCacheCommands(
         idx += tail.len;
     }
 
-    // cross-frame self-containment: blob-backed text_run blob_id points to **per-frame rebuilt**
-    // text_blob_store, next frame replay id mismatches -> resolveTextRunContent returns empty ->
-    // settle frame text vanishes. materialize on cache write: content points current frame blob
-    // bytes (cachePromotedRenderCommands -> duplicateDisplayItems deep-copies content.len>0 bytes),
-    // blob_id set INVALID cuts cross-frame reference. cache henceforth independent of frame-local
-    // sequence ids.
+    // Cross-frame self-containment: a cached text_run keeps its bytes (cachePromotedRenderCommands
+    // -> duplicateDisplayItems deep-copies them) and drops its number in the per-frame blob store.
     for (buf) |*item| {
         switch (item.*) {
-            .text_run => |*t| {
-                if (t.blob_id != INVALID_ID) {
-                    const resolved = display_list_mod.resolveTextRunContent(cx.text_blob_store, t.*);
-                    t.content = resolved;
-                    t.blob_id = INVALID_ID;
-                    t.blob_byte_start = 0;
-                    t.blob_byte_end = 0;
-                }
-            },
+            .text_run => |*t| display_list_mod.detachTextRunFromFrame(t),
             else => {},
         }
     }
@@ -358,6 +360,10 @@ fn markPromotedCacheRebuilt(cx: *RenderContext, node: *Node, exec_state: *const 
         // downstream regression: clip_id previously missed stamp/compare, pure clip count shift
         // (transform/effect unchanged) could hide, replay misindexes to other node's clip rect.
         cache.cached_clip_id = exec_state.retained_ids.clip_id;
+        // Raster policy / icon snap baked into the items (render_engine
+        // dropCachesWithStaleTextRasterState). An old self segment spliced in was recorded under
+        // the same state: a cache from the other state is dropped before this frame renders.
+        cache.cached_force_linear_text = exec_state.subtree_force_linear_text;
         // glass params baked-by-value in cache's begin_blur token; param write doesn't bump
         // content_version, dirty consumed early by ancestor subtree replay, needs independent stamp
         // (GlassBox interactive hover real machine freeze root cause). maxInt sentinel = this write
@@ -441,6 +447,7 @@ pub fn finalizeNodeCachesBorrowed(
             exec_state.world_origin.y,
         );
         if (node.meta.per_frame.caches.commands.own) |*cache| {
+            cache.cached_force_linear_text = exec_state.subtree_force_linear_text;
             cache.self_content_command_count = assembled.self_count;
             cache.descendant_content_command_count = @intCast(assembled.commands.len - assembled.self_count);
         }

@@ -8,7 +8,13 @@
 /// - Signal-first: `value: Model(?SimpleDate)`, `month: Model(?YearMonth)` (null = follow selection
 ///   / today)
 const std = @import("std");
-const c = @import("calendar_time");
+const is_wasm = @import("builtin").cpu.arch.isWasm();
+// Browser (Web DOM host): no libc time; the host provides wall clock + local offset.
+const c = if (is_wasm) struct {} else @import("calendar_time");
+const web_time = struct {
+    extern "zenit" fn real_ns() u64;
+    extern "zenit" fn utc_offset_minutes(epoch_seconds: f64) i32;
+};
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
 const Cx = core.Cx;
@@ -297,14 +303,14 @@ pub const CalendarBuilder = struct {
         const t = cx.tokens;
         const p = self.props;
 
-        const min_inner_width: f32 = 260;
-        const panel_width = @max(min_inner_width + 40, p.cell_size * 7 + 40);
+        // RxE0k: seven 36px cells plus 12px panel insets = 276px.
+        const panel_width = p.cell_size * 7 + 24;
 
         // ---- structure: Header (left-arrow Month Year right-arrow) / weekday titles / date grid
         // ----
         const Parts = struct { prev: *Node = undefined, month_label: *Node = undefined, next: *Node = undefined, grid: *Node = undefined };
         var parts: Parts = .{};
-        const weekdays = [_][]const u8{ "S", "M", "T", "W", "T", "F", "S" };
+        const weekdays = [_][]const u8{ "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
         // nav click contexts precede the view (Button takes on_event via props); state is filled
         // in once built. scope-owned: an error before bind is swept by my_scope.dispose.
         const prev_ctx = try createNavCtx(my_scope, .prev);
@@ -514,10 +520,10 @@ fn dayOfWeek(year: u16, month: u8, day: u8) u8 {
 
 const WeekdayTextProps = struct { style: core.TextStyle };
 const WeekdayCellProps = struct { style: core.BoxStyle };
-const WeekdayCell = view.Attrs(WeekdayCellProps, view.Text(WeekdayTextProps, []const u8));
+const WeekdayCell = view.Box(WeekdayCellProps, view.Text(WeekdayTextProps, []const u8), null);
 
 fn weekdayCell(t: *const theme.ThemeTokens, wd: []const u8) WeekdayCell {
-    return view.attrs(WeekdayCellProps{ .style = styles.weekdayCellStyle(t) }, view.text(WeekdayTextProps{ .style = styles.weekdayTextStyle(t) }, wd));
+    return view.box(WeekdayCellProps{ .style = styles.weekdayCellStyle(t) }, view.text(WeekdayTextProps{ .style = styles.weekdayTextStyle(t) }, wd));
 }
 
 const DayCellProps = struct { style: core.BoxStyle, a11y: core.A11yProps, on_hover: core.HandlerRef, on_leave: core.HandlerRef };
@@ -729,6 +735,14 @@ fn buildCalendarCells(year: u16, month: u8, out: *[42]CalendarCell) usize {
 }
 
 pub fn currentLocalDate() ?SimpleDate {
+    if (comptime is_wasm) {
+        const secs: i64 = @intCast(web_time.real_ns() / std.time.ns_per_s);
+        const local = secs + @as(i64, web_time.utc_offset_minutes(@floatFromInt(secs))) * 60;
+        const days = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(local, 0)) };
+        const yd = days.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        return .{ .year = @intCast(yd.year), .month = @intCast(md.month.numeric()), .day = @intCast(md.day_index + 1) };
+    }
     var now: c.time_t = undefined;
     _ = c.time(&now);
     var local_tm: c.struct_tm = undefined;

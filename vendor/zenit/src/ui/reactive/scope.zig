@@ -22,14 +22,24 @@ pub const ALIVE_SENTINEL: u32 = 0x5C0E_A11E;
 pub const DEAD_SENTINEL: u32 = 0x5C0E_DEAD;
 
 pub const Scope = struct {
+    /// Only the template oracle uses this provenance. Ordinary scopes are never
+    /// inferred to be transparent from their shape or their resource counts.
+    pub const TestPreviewBoundary = enum { none, region_view, slot_setup };
+    test_preview_boundary: if (@import("builtin").is_test) TestPreviewBoundary else void = if (@import("builtin").is_test) .none else {},
     allocator: Allocator,
     parent: ?*Scope,
     children: std.ArrayList(*Scope),
     signals: std.ArrayList(*SignalBase),
     effects: std.ArrayList(*EffectBase),
+    // Append-only while alive; synchronous component rebuild tickets may remove
+    // their own tail-era entry after callbacks settle. No compaction/reordering
+    // or removal by other code is allowed before disposal consumes the list.
     cleanups: std.ArrayList(CleanupEntry),
     resources: std.ArrayList(ResourceEntry),
     owner: *SignalOwner,
+    /// Nesting depth (root = 0). Effects created here carry it into the graph so drains run
+    /// owners before the rows / branches they own (graph.drainPendingEffects).
+    depth: u32 = 0,
     disposed: bool = false,
     dispose_pending: bool = false,
     /// alive sentinel, semantics match Node.alive_sentinel:
@@ -55,6 +65,9 @@ pub const Scope = struct {
     pub const ResourceEntry = struct {
         ptr: *anyopaque,
         destroyFn: ResourceDestroyFn,
+        // Complete memo ownership provenance for the test graph oracle, erased
+        // from non-test layouts; no UI/template dependency in reactive modules.
+        test_graph_node_raw: if (@import("builtin").is_test) ?u32 else void = if (@import("builtin").is_test) null else {},
     };
 
     /// create Scope
@@ -73,6 +86,7 @@ pub const Scope = struct {
             .cleanups = .empty,
             .resources = .empty,
             .owner = owner,
+            .depth = if (parent) |p| p.depth +| 1 else 0,
         };
 
         // register to parent Scope
@@ -110,6 +124,27 @@ pub const Scope = struct {
         }
         self.dispose_pending = true;
         self.owner.deferDisposal(&self.deferred_disposal, @ptrCast(self), &finishDeferredDispose);
+        // A drain may still be running under the callback that deferred this (a list reconcile
+        // inside an event handler's batch): the subtree's effects must not run with the state
+        // that removed them.
+        self.retireEffects();
+    }
+
+    fn retireEffects(self: *Scope) void {
+        for (self.effects.items) |effect| {
+            if (effect.graph_node_raw != 0xFFFFFFFF) self.owner.graph.retire(@bitCast(effect.graph_node_raw));
+        }
+        for (self.children.items) |child| child.retireEffects();
+    }
+
+    /// Recompute `depth` after the scope moved to another parent (preview relocation), for this
+    /// subtree and its effects' drain order. No allocation or callbacks.
+    pub fn refreshDepth(self: *Scope) void {
+        self.depth = if (self.parent) |p| p.depth +| 1 else 0;
+        for (self.effects.items) |effect| {
+            if (effect.graph_node_raw != 0xFFFFFFFF) self.owner.graph.setOwnerDepth(@bitCast(effect.graph_node_raw), self.depth);
+        }
+        for (self.children.items) |child| child.refreshDepth();
     }
 
     fn finishDeferredDispose(ptr: *anyopaque) void {
@@ -215,6 +250,17 @@ pub const Scope = struct {
         return Scope.init(self.allocator, self, self.owner);
     }
 
+    /// Framework safe-point teardown of an owned child. The surrounding callback
+    /// guard pins the owner while child cleanups run; requests to destroy the
+    /// owner are deferred until the caller has stopped using it. Unlike dispose,
+    /// this retires the child before a replacement view starts binding refs.
+    pub fn disposeChildAtSafePoint(self: *Scope, child: *Scope) void {
+        std.debug.assert(child.parent == self);
+        std.debug.assert(self.owner.reactive_callback_depth > 0);
+        std.debug.assert(!self.owner.inReactiveComputation());
+        child.disposeNow();
+    }
+
     /// create Signal in this Scope
     pub fn createSignal(self: *Scope, comptime T: type, initial: T) !*Signal(T) {
         const signal = try Signal(T).createInScope(self, initial);
@@ -279,7 +325,7 @@ pub const Scope = struct {
         const Store = @import("signal.zig").SliceStore(E);
         const ts = try self.allocator.create(Store);
         errdefer self.allocator.destroy(ts);
-        ts.* = .{ .allocator = self.allocator };
+        ts.* = .{ .allocator = self.allocator, .epoch = @import("signal.zig").nextEpoch() };
         const cap = @max(initial.len, capacity);
         if (cap > 0) ts.bufs[0] = try self.allocator.alloc(E, cap);
         errdefer ts.deinit();
@@ -597,6 +643,102 @@ test "Scope: reactive callbacks defer disposal until their facade returns" {
         }
     }.compute);
     try std.testing.expectEqual(@as(u32, 42), memo.get());
+}
+
+const SettledProbe = struct {
+    owner: *SignalOwner,
+    entry: SignalOwner.SettledTask = .{},
+    runs: usize = 0,
+    ran_inside_computation: bool = false,
+
+    fn request(self: *SettledProbe) void {
+        self.owner.runOutsideComputation(&self.entry, @ptrCast(self), run);
+    }
+
+    fn run(ptr: *anyopaque) void {
+        const self: *SettledProbe = @ptrCast(@alignCast(ptr));
+        self.runs += 1;
+        if (self.owner.inReactiveComputation()) self.ran_inside_computation = true;
+    }
+};
+
+test "SignalOwner.runOutsideComputation: 计算内的请求在写入的 effect drain 结束后运行，计算外立即运行" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(allocator, null, owner);
+    defer scope.dispose();
+
+    var probe = SettledProbe{ .owner = owner };
+    probe.request(); // no computation on the stack: runs now
+    try std.testing.expectEqual(@as(usize, 1), probe.runs);
+
+    const trigger = try scope.createSignal(u32, 0);
+    const chained = try scope.createSignal(u32, 0);
+    var seen_in_effect: usize = 0;
+    // first effect requests twice (coalesced) and writes a signal that runs a second effect
+    try scope.createEffect(.{ .trigger = trigger, .chained = chained, .probe = &probe }, struct {
+        fn run(c: anytype) void {
+            const v = c.trigger.get();
+            if (v == 0) return;
+            c.probe.request();
+            c.probe.request();
+            c.chained.set(v);
+        }
+    }.run);
+    // second effect checks the task has not run while effects are still draining
+    try scope.createEffect(.{ .chained = chained, .probe = &probe, .seen = &seen_in_effect }, struct {
+        fn run(c: anytype) void {
+            if (c.chained.get() != 0) c.seen.* = c.probe.runs;
+        }
+    }.run);
+
+    trigger.set(1);
+    try std.testing.expectEqual(@as(usize, 1), seen_in_effect);
+    try std.testing.expectEqual(@as(usize, 2), probe.runs);
+    try std.testing.expect(!probe.ran_inside_computation);
+
+    // batch: effects drain at endBatch, the task right after
+    owner.beginBatch();
+    trigger.set(2);
+    try std.testing.expectEqual(@as(usize, 2), probe.runs);
+    owner.endBatch();
+    try std.testing.expectEqual(@as(usize, 3), probe.runs);
+    try std.testing.expect(!probe.ran_inside_computation);
+}
+
+test "SignalOwner.runOutsideComputation: effect 首跑与 untrack 内的请求；取消后不运行" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(allocator, null, owner);
+    defer scope.dispose();
+
+    var probe = SettledProbe{ .owner = owner };
+    // initial run of a new effect: settles when createEffect returns; untrack does not hide the
+    // computation below its sentinel
+    try scope.createEffect(&probe, struct {
+        fn run(p: *SettledProbe) void {
+            p.owner.untrack(SettledProbe.request, p);
+            if (p.runs != 0) p.ran_inside_computation = true;
+        }
+    }.run);
+    try std.testing.expectEqual(@as(usize, 1), probe.runs);
+    try std.testing.expect(!probe.ran_inside_computation);
+
+    // a cancelled request (its owner went away) never runs
+    var gone = SettledProbe{ .owner = owner };
+    const trigger = try scope.createSignal(u32, 0);
+    try scope.createEffect(.{ .trigger = trigger, .gone = &gone }, struct {
+        fn run(c: anytype) void {
+            if (c.trigger.get() == 0) return;
+            c.gone.request();
+            c.gone.entry.cancel();
+        }
+    }.run);
+    trigger.set(1);
+    try std.testing.expectEqual(@as(usize, 0), gone.runs);
+    try std.testing.expect(owner.settled_tasks.head == null);
 }
 
 test "Scope: nested scopes dispose correctly" {
@@ -1149,4 +1291,94 @@ test "Scope: child cleanup disposing sibling during parent teardown runs once" {
     try parent.onCleanup(Probe, &probe, Probe.parentCleanup);
     parent.dispose();
     try std.testing.expectEqual(@as([4]u32, @splat(1)), probe.calls);
+}
+
+// ZeroWork G21: an effect that disposes a child scope (a list reconcile, a branch switch) and an
+// effect inside that child read the same signal at the same topological depth. The child's
+// effect was created first, so by topological order alone it runs first, with the state that is
+// about to remove it. Owners run before what they own.
+const DoomedChild = struct {
+    n: *Signal(u8),
+    child: ?*Scope = null,
+    stale: u32 = 0,
+    child_runs: u32 = 0,
+
+    fn build(self: *DoomedChild, parent: *Scope) !void {
+        const child = try parent.childScope();
+        self.child = child;
+        try child.createEffect(self, struct {
+            fn run(s: *DoomedChild) void {
+                // Valid only while n == 3: the owner removes this scope below that.
+                if (s.n.get() < 3) s.stale += 1;
+                s.child_runs += 1;
+            }
+        }.run);
+        try parent.createEffect(self, struct {
+            fn run(s: *DoomedChild) void {
+                if (s.n.get() < 3) if (s.child) |c| {
+                    s.child = null;
+                    c.dispose();
+                };
+            }
+        }.run);
+    }
+};
+
+test "Scope: an owner's effect runs before effects in the child scope it disposes" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const root = try Scope.init(allocator, null, owner);
+    defer root.dispose();
+    var d: DoomedChild = .{ .n = try root.createSignal(u8, 3) };
+    try d.build(root);
+    try std.testing.expectEqual(@as(u32, 1), d.child_runs);
+    d.n.set(1);
+    try std.testing.expect(d.child == null);
+    try std.testing.expectEqual(@as(u32, 0), d.stale);
+    try std.testing.expectEqual(@as(u32, 1), d.child_runs);
+}
+
+test "Scope: effects of a scope queued for disposal do not run in the ongoing drain" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const root = try Scope.init(allocator, null, owner);
+    defer root.dispose();
+    var d: DoomedChild = .{ .n = try root.createSignal(u8, 3) };
+    try d.build(root);
+    // An event handler: disposal is deferred until the callback unwinds, the drain is not.
+    owner.beginReactiveCallback();
+    d.n.set(1);
+    try std.testing.expect(d.child == null);
+    try std.testing.expectEqual(@as(u32, 0), d.stale);
+    d.n.set(0);
+    try std.testing.expectEqual(@as(u32, 0), d.stale);
+    owner.endReactiveCallback();
+    try std.testing.expectEqual(@as(u32, 1), d.child_runs);
+}
+
+test "Scope: depth follows nesting and a moved subtree's effects" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const root = try Scope.init(allocator, null, owner);
+    defer root.dispose();
+    const a = try root.childScope();
+    const b = try a.childScope();
+    const c = try b.childScope();
+    try std.testing.expectEqual(@as(u32, 0), root.depth);
+    try std.testing.expectEqual(@as(u32, 3), c.depth);
+    var d: DoomedChild = .{ .n = try root.createSignal(u8, 3) };
+    try d.build(c);
+    const effect_node = owner.graph.getNode(@bitCast(c.effects.items[0].graph_node_raw)).?;
+    try std.testing.expectEqual(@as(u32, 3), effect_node.owner_depth);
+    // Relocate c under root (the preview transfer path does this without callbacks).
+    _ = b.children.orderedRemove(0);
+    try root.children.append(allocator, c);
+    c.parent = root;
+    c.refreshDepth();
+    try std.testing.expectEqual(@as(u32, 1), c.depth);
+    try std.testing.expectEqual(@as(u32, 2), d.child.?.depth);
+    try std.testing.expectEqual(@as(u32, 1), owner.graph.getNode(@bitCast(c.effects.items[0].graph_node_raw)).?.owner_depth);
 }

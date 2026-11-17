@@ -1,0 +1,17 @@
+//! 跳板引导（`jump_guide.yix`）的布局与文字：按钮、告警、通知栈都是 zenit 原生默认外观，这里只排盒子与文字层级（颜色只用 token）。
+//! 尺寸照 Pencil RDiob › Li7pX：空态卡片在本机与目标之间，内边距 24，内容居中。
+const ui = @import("ui");
+
+/// 模板根：空态卡片；通知栈挂到窗口浮层根（portal），不占位。
+style holder { width: fill; direction: column; }
+style empty { width: fill; direction: column; align-items: center; gap: 8; padding: 20 24 20 24; background: bg-secondary; corner-radius: 10; }
+style badge { width: 32; height: 32; corner-radius: 16; align-items: center; justify: center; background: accent-subtle; }
+style badge_icon { width: 16; height: 16; icon-color: accent; }
+style title { font-size: 13; font-weight: 600; color: fg-primary; }
+style detail { font-size: 12; color: fg-secondary; text-align: center; wrap: word; }
+style detail_box { width: fill; }
+style actions { direction: row; align-items: center; gap: 8; padding: 4 0 0 0; }
+style banner { width: fill; padding: 0 0 8 0; }
+style footer { width: fill; direction: row; align-items: center; gap: 8; padding: 12 16 12 16; border-top-width: 1; border-color: border; }
+style hint { font-size: 12; color: fg-secondary; }
+style hint_box { width: grow; min-width: 0; }

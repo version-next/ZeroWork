@@ -1,0 +1,154 @@
+//! 窗口级通知（NATIVE_AUDIT 清单 4“Notification / Toast”）：两个 zenit 原生 `<W.NotificationHost>`，按用途分流
+//! （用户判定：一个右上角，一个标准 Toast 在中下方）。外观、动效、计时、悬停暂停 / 展开、关闭、滑动关闭、详情展开
+//! （上游 G49）、三个动作（G50）、焦点暂停（G51）、遮挡时隐藏（G52）都是原生的，不加任何样式覆盖。请求与事件归
+//! view-model（`model/view_model.zig`）的两条通道，哪条消息进哪个栈由 view-model 的 `laneFor` 决定（不带动作的成功 /
+//! 信息类走轻提示，带动作或需要处理的走卡片），这里只做类型换算：view-model 不引用视图层类型。
+//!
+//! - 右上角卡片栈（`notifications.viewport`，`cards` 通道）：被宿主浮层盖住时隐藏、计时保持（`suppressed`）。
+//!   - 全局提醒：`notifications.toast.0` 等 test_id 原样保留（上游 G53 的部件 test_id）：倒计时 `notifications.countdown` 是原生生命条，
+//!     `notifications.message.viewport` 是详情的有界滚动框。旧实现的 `.toast.1/.2`、`.dismiss.1/.2`
+//!     （三槽位里从未显示的两格）已删除：协调器每窗口只给一条提醒。
+//!   - 命令失败提示：`terminal.ai-error-hint`（标题含退出码 `.exit`，命令行 `.command`，输出预览是展开的详情 `.output`，
+//!     生命条 `.countdown`，动作“询问 AI”是 `.open`，关闭是 `.dismiss`）。
+//! - 中下方轻提示栈（`notifications.toasts`，`toasts` 通道，zenit 默认位置 `.bottom_center`、默认边距）：永远在
+//!   最上层，不接 `suppressed`——被浮层盖住时既不隐藏也不暂停计时（zenit toast 层高于宿主的菜单、面板与对话框）。
+//!   - 本地回执（成功标记）与插件 / 内置内容的无动作反馈（信息样式）：原生文字提示，`notifications.local`。
+//!   - 撤销提示（`notifications.undo`，文字 `notifications.undo.title`，按钮“撤销” `notifications.undo.action`）：带一个原生
+//!     动作按钮的文字提示（`shared/ui/confirm` 的 `undoable`）；这个栈接 `onNotification`，只把撤销提示的结局交回 view-model。
+//!   - 一次性使用提示（`notifications.tip`，文字 `notifications.tip.title`；信息样式、不带动作，例如首次窄窗口的
+//!     “可以收起侧栏”）：同一种原生文字提示，时长由 view-model 给。
+//!
+//! 外层 box 只是挂载点：两个原生栈都挂到窗口的浮层根上（portal），自己在模板里不留节点（组件根不能为空）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+
+const TestIds = @FieldType(W.Notification, "test_ids");
+
+/// 原生栈的文案（本地化，不涉及外观）。
+const strings: W.NotificationStrings = .{
+    .now = "刚刚",
+    .minutes_ago = "{d} 分钟前",
+    .hours_ago = "{d} 小时前",
+    .days_ago = "{d} 天前",
+    .undo = "撤销",
+    .reply_placeholder = "回复…",
+    .send = "发送",
+    .close = "关闭提示",
+    .show_details = "展开详情",
+    .hide_details = "收起详情",
+    .more = "还有 {d} 条 · 悬停展开",
+    .paused = "悬停时暂停",
+    .clear_all = "全部清除",
+};
+
+/// 卡片栈停靠在标签栏下方：右上角，距窗口顶 40 + 原生边距。轻提示栈用 zenit 默认边距。
+const insets: @FieldType(W.NotifierOptions, "content_insets") = .{ .top = 40 };
+
+fn ids(kind: m.Kind) TestIds {
+    return switch (kind) {
+        .banner => .{
+            .root = "notifications.toast.0",
+            .title = "notifications.title",
+            .body = "notifications.metadata",
+            .detail = "notifications.detail",
+            .detail_frame = "notifications.message.viewport",
+            .detail_toggle = "notifications.expand",
+            .footer = "notifications.footer",
+            .life_bar = "notifications.countdown",
+            .close = "notifications.dismiss.0",
+            .action = "notifications.action",
+        },
+        .command => .{
+            .root = "terminal.ai-error-hint",
+            .title = "terminal.ai-error-hint.exit",
+            .body = "terminal.ai-error-hint.command",
+            .detail = "terminal.ai-error-hint.output",
+            .life_bar = "terminal.ai-error-hint.countdown",
+            .close = "terminal.ai-error-hint.dismiss",
+            .action = "terminal.ai-error-hint.open",
+        },
+    };
+}
+
+fn tone(t: m.Tone) W.NotificationTone {
+    return switch (t) {
+        .info => .info,
+        .success => .success,
+        .warning => .warning,
+        .failure => .@"error",
+    };
+}
+
+/// 动作按钮的换算缓冲：原生栈在收到请求时（同一次求值里）复制，之后不再读它。
+threadlocal var action_buffer: [m.max_actions]W.NotificationAction = undefined;
+
+fn card(c: m.Card) W.Notification {
+    for (c.actions[0..c.action_count], 0..) |label, i| action_buffer[i] = .{ .label = label, .primary = i == 0 };
+    return .{
+        .id = c.id,
+        .tone = tone(c.tone),
+        .title = c.title,
+        .body = c.body,
+        .detail = c.detail,
+        .detail_expanded = c.detail_expanded,
+        .actions = action_buffer[0..c.action_count],
+        .duration_ms = c.duration_ms,
+        .test_ids = ids(c.kind),
+    };
+}
+
+/// 卡片通道的请求换成 zenit 的 `NotificationPost`。
+fn cardPost(vm: *m.ViewModel) W.NotificationPost {
+    const ask = vm.cardAsk();
+    if (ask.seq == 0) return .{};
+    return .{ .seq = ask.seq, .op = switch (ask.op) {
+        .none => .none,
+        .dismiss => |id| .{ .dismiss = id },
+        .card => |c| .{ .show = card(c) },
+    } };
+}
+
+/// 轻提示通道的请求换成 zenit 的 `NotificationPost`。
+fn toastPost(vm: *m.ViewModel) W.NotificationPost {
+    const ask = vm.toastAsk();
+    if (ask.seq == 0) return .{};
+    return .{ .seq = ask.seq, .op = switch (ask.op) {
+        .none => .none,
+        .dismiss => |id| .{ .dismiss = id },
+        .notice => |n| .{ .hint = .{ .id = n.id, .text = n.text, .mark = if (n.tone == .success) .success else .none, .action = if (n.undo) .{ .label = m.undo_label, .primary = true } else null, .duration_ms = n.duration_ms, .test_ids = noticeIds(n) } },
+    } };
+}
+
+fn noticeIds(n: m.Notice) TestIds {
+    if (n.undo) return .{ .root = "notifications.undo", .title = "notifications.undo.title", .action = "notifications.undo.action" };
+    if (n.tip) return .{ .root = "notifications.tip", .title = "notifications.tip.title" };
+    return .{ .root = "notifications.local" };
+}
+
+fn event(e: W.NotificationEvent) m.Event {
+    return .{ .id = e.id, .index = e.index, .kind = switch (e.kind) {
+        .action => .action,
+        .dismissed => .dismissed,
+        .expired => .expired,
+        .removed => .removed,
+        .undo, .reply => .other,
+    } };
+}
+
+fn cardNotified(vm: *m.ViewModel, e: W.NotificationEvent) void {
+    vm.cardNotified(event(e));
+}
+
+fn toastNotified(vm: *m.ViewModel, e: W.NotificationEvent) void {
+    vm.toastNotified(event(e));
+}
+
+pub fn ToastStack(vm: *m.ViewModel) View {
+    return (
+        <box testId="notifications.presenter">
+            <W.NotificationHost testId="notifications.viewport" post={cardPost(vm)} position={.top_right} contentInsets={insets} strings={strings} suppressed={vm.cardsSuppressed()} onNotification={|e| cardNotified(vm, e)} />
+            <W.NotificationHost testId="notifications.toasts" post={toastPost(vm)} strings={strings} onNotification={|e| toastNotified(vm, e)} />
+        </box>
+    );
+}

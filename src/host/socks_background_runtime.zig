@@ -2,6 +2,7 @@
 //! native Session belongs to this worker; upstream Sessions keep Route Relay
 //! owners. Controllers receive facades and immutable snapshots, never sockets.
 const std = @import("std");
+const shared_retry = @import("../shared/base/retry.zig");
 const sessions = @import("session_host.zig");
 const identity = @import("identity.zig");
 const operations = @import("operation.zig");
@@ -10,9 +11,9 @@ const routing = @import("file_route_factory.zig");
 const ssh = @import("../proto/ssh/session.zig");
 const Forward = @import("../proto/ssh/forward_service.zig");
 pub const auth = @import("../proto/ssh/auth_challenge.zig");
-pub const host_key = @import("../ui/host_key_confirmation.zig");
+pub const host_key = @import("host_key_confirmation.zig");
 const hosts = @import("../config/hosts.zig");
-const Frozen = @import("../ui/session_lifecycle.zig").Snapshot;
+const Frozen = @import("session_lifecycle.zig").Snapshot;
 const realtime = @import("../platform/realtime.zig");
 const Totp = @import("../proto/ssh/totp_prefill.zig");
 const c = @import("generated_ssh_session");
@@ -21,11 +22,16 @@ pub const Phase = enum(u8) { connecting, ready, paused, failed, closing, cleanup
 pub const Policy = struct {
     presentation: auth.Presentation = .protected_form,
     presentation_config_revision: u64 = 1,
-    timeout_ms: u32 = 15_000,
+    timeout_ms: u32 = shared_retry.ssh_connect_timeout_ms,
     totp_autofill: bool = false,
     automatic_reconnect: bool = true,
-    reconnect_max: u8 = 5,
-    reconnect_backoff: [5]u8 = .{ 1, 2, 4, 8, 16 },
+    reconnect_max: u8 = shared_retry.ssh_reconnect_max,
+    reconnect_backoff: [5]u8 = shared_retry.ssh_reconnect_seconds,
+
+    /// 断线重连退避（共享 `Backoff`，与 SSH 终端同一套秒表）。
+    pub fn reconnectBackoff(self: *const Policy) shared_retry.Backoff {
+        return .{ .max_retries = self.reconnect_max, .schedule = .{ .seconds = &self.reconnect_backoff } };
+    }
 };
 pub const Snapshot = struct {
     owner: identity.SessionHandle,
@@ -195,8 +201,9 @@ pub const Host = struct {
                 if (state.lifecycle == .ready) _ = try self.domain.transportLost(owner, key, failure) else if (state.lifecycle == .creating) _ = try self.domain.failed(owner, key, failure);
                 entry.failure_published = true;
                 const policy = runtime.policy;
-                if (!runtime.closing.load(.acquire) and reason != error.Cancelled and policy.automatic_reconnect and entry.reconnect_count < policy.reconnect_max and entry.reconnect_count < policy.reconnect_backoff.len)
-                    entry.reconnect_deadline_ns = realtime.monotonicNs() + @as(i128, policy.reconnect_backoff[entry.reconnect_count]) * std.time.ns_per_s;
+                if (!runtime.closing.load(.acquire) and reason != error.Cancelled and policy.automatic_reconnect) {
+                    if (policy.reconnectBackoff().delaySeconds(entry.reconnect_count)) |seconds| entry.reconnect_deadline_ns = shared_retry.Deadline.afterSeconds(realtime.monotonicNs(), seconds).at_ns;
+                }
                 state = self.domain.queryState(owner).?;
             }
             if (!entry.ready_published and entry.replacement_failure == null and runtime.source.value.create_key.eql(key) and runtime.ready.load(.acquire) and !runtime.failed.load(.acquire) and !runtime.closing.load(.acquire) and state.lifecycle == .creating) {

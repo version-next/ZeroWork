@@ -1,9 +1,12 @@
 /** One-time conversation titles against an owned local SSE fixture. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const h=await import(join(prefix,'share/zenit/harness/client.ts'));
@@ -16,7 +19,7 @@ const held=new Map<string,any>();const requests:any[]=[];
 const frame=(content:string)=>'data: '+JSON.stringify({choices:[{index:0,delta:{content}}]})+'\n\ndata: [DONE]\n\n';
 const server=createServer(async(req,res)=>{
  if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'title-fixture'}]}));return;}
- let bytes='';for await(const chunk of req)bytes+=chunk;const body=JSON.parse(bytes);
+ const body=await readRequestJson(req);
  const system=body.messages.find((m:any)=>m.role==='system')?.content??'';
  const title=system.startsWith('将用户的问题概括为简短的会话标题');
  requests.push({title,body});
@@ -41,28 +44,36 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok,id)};
 const send=async(value:string)=>{await click('ai.prompt');await h.type_(value);await click('ai.send');await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,15000);await visible('ai.turn.complete')};
 const row=async(id:number,value:string)=>h.waitFor(async()=>{const node=(await h.query(`ai.session.row.${id}`)).find(shown);return node&&text(node).includes(value)?node:null},10000);
+// M10: "new conversation" ends the current one after a native confirmation.
+const newConversation=async()=>{await click('ai.session.new');await click('ai.session.close.accept');await h.waitFor(async()=>!(await h.query('ai.session.close.confirmation')).some(shown)||null,10000)};
 const titleCount=()=>requests.filter(r=>r.title).length;
 const report:any={status:'running',checks:[],isolated};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await send(questions.first);await h.waitFor(async()=>held.has(questions.first)||null,5000);
  await click('ai.sessions');await row(1,questions.first);await click('ai.sessions.close');
  report.checks.push('The main reply completes while title generation is held; the list displays the first-question fallback');
- await click('ai.session.new');await send(questions.second);await click('ai.sessions');await row(2,titles.second);
+ await newConversation();await send(questions.second);await click('ai.sessions');await row(2,titles.second);
  held.get(questions.first).end(frame(titles.first));await row(1,titles.first);await row(2,titles.second);
  assert((await h.screenshot(join(out,'01-generated-titles.png'))).ok);
  report.checks.push('A late title updates its original conversation while another conversation is selected and the list is open');
  await click('ai.sessions.close');await send('继续');assert.equal(titleCount(),2);
- await click('ai.sessions');await row(2,titles.second);await click('ai.session.jump.1');await send('好的');assert.equal(titleCount(),2);
- await click('ai.sessions');await row(1,titles.first);await click('ai.sessions.close');await click('ai.session.new');
+ await click('ai.sessions');await row(2,titles.second);await click('ai.session.jump.1');
+ // M10: the ended first conversation opens in the read-only history viewer under its generated title.
+ await visible('ai.history');assert((await h.query('ai.history')).some((n:any)=>shown(n)&&text(n).includes(titles.first)));await click('ai.history.close');
+ await send('好的');assert.equal(titleCount(),2);
+ await click('ai.sessions');await row(1,titles.first);await click('ai.sessions.close');await newConversation();
  const recent=await h.query('ai.session.title');assert(recent.some((n:any)=>n.text===titles.first));assert(recent.some((n:any)=>n.text===titles.second));
  assert((await h.screenshot(join(out,'02-welcome-titles.png'))).ok);
  report.checks.push('Followups trigger no extra title requests; titles survive switching and match the welcome recent-conversation links');
  await send(questions.failed);await h.waitFor(async()=>titleCount()===3||null,5000);await h.sleep(300);await send('继续');assert.equal(titleCount(),3);
  await click('ai.sessions');await row(3,questions.failed);await click('ai.sessions.close');
  report.checks.push('A failed title request retains the original fallback and is not retried by a followup');
- await click('ai.session.new');await send(questions.deleted);await h.waitFor(async()=>held.has(questions.deleted)||null,5000);
- await click('ai.sessions');await click('ai.session.delete.4');await h.waitFor(async()=>!(await h.query('ai.session.row.4')).some(shown)||null,5000);
+ await newConversation();await send(questions.deleted);await h.waitFor(async()=>held.has(questions.deleted)||null,5000);
+ // M10: only an ended (unbound) conversation offers delete; end it while its title is still held.
+ await newConversation();
+ // The ended row is listed among the welcome recent links; delete it there (native confirmation).
+ await click('ai.session.delete.4');await click('ai.session.close.accept');await h.waitFor(async()=>!(await h.query('ai.session.row.4')).some(shown)||null,5000);
  held.get(questions.deleted).end(frame('不得出现的过期标题'));await h.sleep(300);
  assert(!(await h.query('ai.session.row.4')).some(shown));assert.equal(titleCount(),4);
  report.checks.push('Deleting a conversation discards its pending title without recreating a row or overwriting another conversation');

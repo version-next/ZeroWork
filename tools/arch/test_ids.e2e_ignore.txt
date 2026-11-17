@@ -1,0 +1,66 @@
+# e2e 脚本里形似 test_id、但不按“悬空引用”处理的字符串（tools/arch/README.md「e2e 悬空引用」）。
+# 每行一个 id（或 `prefix:<前缀>.`），前面的注释写明理由。只收两类：
+#   1. 回归断言——脚本有意断言这个 id 已经不存在；
+#   2. 根本不是 test_id 的字符串。
+# 某条不再悬空（源码里又有了，或没有脚本再引用）时 check-arch 会要求把它删掉。
+
+# 不是 test_id：sftp_conflict_native 物理拖拽用的临时 .app bundle id（local.zerowork.physical-drag.<pid>）。
+prefix:local.zerowork.physical-drag.
+
+# 回归断言（ai_launcher_native）：PL4c 删除了标题栏 AI 按钮与 AI 条（466ed589）、AI 停靠模式及其分隔条（8eb4409d），
+# AI 入口只剩浮动图标 ai.launcher；脚本断言这四个节点不存在。
+toolbar.ai
+ai.strip
+ai.dock
+ai.pane.resize
+
+# 回归断言（v02_ui_fixes_native）：侧栏底部按钮外面不再有单独的边框容器（0.4.0，1a02cc05 起没有这个节点）。
+sidebar.footer.frame
+
+# 回归断言（ai_extensions_native）：技能设置里多余的“路径 / 导入 / 选文件 / 选文件夹”控件已删（1bd83627），入口只剩
+# settings.skills.add 与拖放区；脚本断言这四个节点不存在。
+settings.skills.path
+settings.skills.import
+settings.skills.file
+settings.skills.folder
+
+# 回归断言（ai_step_aggregation_native）：步骤组展开区不再有上下渐隐边（143c4c7b 换成原生组件后删除）。
+ai.step_group.edge.top
+ai.step_group.edge.bottom
+
+# 回归断言（ai_v3_unconfigured_native）：未配置模型的空状态只有一个“配置 AI 服务”入口，Ollama 快捷入口已删（355b4694）。
+ai.empty.ollama
+
+# 回归断言（command_annotations_ai_native、command_annotations_native）：命令标注里不再有单独的状态节点，
+# 退出码 / 耗时 / AI 标记共用一个 terminal.command.metadata 标签（04750679）。
+terminal.command.status
+
+# 回归断言（confirm_undo_native、panel_contract_native）：会话记录删除不再弹行内确认气泡，改为直接执行 + 撤销提示（cabb8e5a）。
+history.confirmation
+
+# 回归断言（tabs_v3_native）：从新建会话菜单选了“本地终端”之后不留提示气泡；源码里没有这个节点（git log -S 查无）。
+session.menu.local_tooltip
+
+# 回归断言（panel_contract_native）：本地终端关闭确认打开时不弹提示气泡；确认框没有带提示的 dismiss 控件。
+local.close.dismiss.tooltip
+
+# 回归断言（settings_followup_native）：数据位置页的“打开配置目录”动作已删除。
+settings.data.open_config_dir
+
+# 回归断言（plugin_settings_v3_native）：协议插件页没有主从列表窗格（旧界面 ffd61ae7 删除）。
+settings.plugins.list
+
+# 回归断言（settings_save_feedback_native）：保存失败时只有页脚状态与字段错误，没有单独的保存反馈节点。
+settings.save_feedback
+
+# 回归断言（transfer_entrypoints_native）：标题栏传输按钮不带数字角标（标题栏工具组 957aef2f 起没有这个节点），
+# 脚本各阶段都断言角标为 0 / 不存在。
+toolbar.transfers.badge
+
+# 回归断言（wizard_discard_native）：取消 / 关闭连接向导直接关窗，不弹“放弃修改”确认。
+wizard.discard.confirm
+
+# 回归断言（compact_popovers_native）：输入区模型芯片是原生 ghost sm 按钮（模型名 · 档位 + chevron），
+# 品牌 logo（cfbcdf60）与识图小图标（32e4c26b）都已删除；脚本断言两个节点不存在。
+ai.composer.model.logo
+ai.composer.model.vision

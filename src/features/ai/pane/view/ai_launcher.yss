@@ -1,0 +1,12 @@
+//! 浮动 AI 图标的布局：只排位置与层级（不写颜色 / 圆角 / 阴影 / 尺寸以外的外观）。图标本身是原生 GlassButton 默认外观。
+const ui = @import("ui");
+
+/// 图标外框（48 × 48，GlassButton 纯图标默认尺寸）：相对窗口根绝对定位，坐标由宿主按 tab 内容区与停放的角算出。
+/// 层级在卡片内容之上、浮动 AI 面板（200）与菜单之下（wqZ1s）。
+style anchor($x: f32, $y: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = $x }, .top = .{ .px = $y } }}; width: 48; height: 48; z-index: 199; }
+/// 角标：8 pt 圆点贴在圆形右上缘（tfmv1：x 36、y 4），不参与命中。
+style dot { position: absolute; inset: {ui.Inset{ .left = .{ .px = 36 }, .top = .{ .px = 4 } }}; width: 8; height: 8; hit-behavior: pass-through; }
+/// 待审批脉冲：与角标重合的第二颗圆点（图标外框 + 36 / + 4），静止时透明；宿主的 ping 把它放大到 16 pt 并淡出。
+style ring($x: f32, $y: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = $x + 36 }, .top = .{ .px = $y + 4 } }}; width: 8; height: 8; opacity: 0; z-index: 199; hit-behavior: pass-through; }
+/// e2e 读取的状态名：零尺寸、裁掉、不参与命中。
+style state { position: absolute; width: 0; height: 0; overflow: hidden; opacity: 0; hit-behavior: pass-through; }

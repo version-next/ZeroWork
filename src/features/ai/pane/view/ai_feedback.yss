@@ -1,0 +1,8 @@
+//! AI 反馈条的布局：提示本身是原生 `W.Alert` 默认外观，这里只排位置与宽度（不写颜色 / 圆角 / 阴影）。
+const ui = @import("ui");
+
+/// 滚动区里的一行：宽度跟随对话列，左右与消息同一边距（16，Kaf7E ③），上方一个块间距（10），不收缩。
+style holder { width: fill; height: fit; padding: 10 16 10 16; flex-shrink: 0; }
+/// 提示与关闭钮一行：提示吃掉剩余宽度（长路径在提示里换行），关闭钮贴右上。
+style line { width: fill; height: fit; direction: row; align-items: start; gap: 4; }
+style alert { flex: 1; min-width: 0; }

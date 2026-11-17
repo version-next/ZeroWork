@@ -5,16 +5,12 @@ tree, reactive state, flexbox-style layout, and a component library.
 
 Manual and component gallery: [ui.surf/zenit](https://ui.surf/zenit/)
 
-This development branch targets Zig **0.17.0** and includes a compatible ZLS source
-dependency. See [the compatibility guide](docs/ZIG_0_17_COMPAT.md) for setup,
-validation commands and protocol limits.
-
 ## Status
 
 | | |
 |---|---|
 | **Maturity** | Alpha (`0.1.0-alpha`). The API will break before v1, so pin a revision. |
-| **Platforms** | macOS (Metal); experimental Windows x64/ARM64 (D3D12 or D3D11), see [Windows build](docs/WINDOWS_BUILD.md); experimental Linux Wayland (Vulkan, or OpenGL with `-Dgpu-backend=opengl`). |
+| **Platforms** | macOS (Metal); Windows x64/ARM64 (D3D12), see [Windows build](docs/WINDOWS_BUILD.md). |
 | **Accessibility** | Not supported. See [Accessibility](#accessibility). |
 | **Zig** | `0.17.0` |
 

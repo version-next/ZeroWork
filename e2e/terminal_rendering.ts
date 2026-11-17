@@ -5,13 +5,15 @@
  * Functional assertions do not certify pixels. Review the saved PNGs separately.
  * Harness type_ is not native keyboard, clipboard, or real IME evidence.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { waitForServerReady, waitFor, query, clickTestId, key, type_, resizeWindow, scrollAt, screenshot, sleep, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, clickTestId, key, type_, resizeWindow, scrollAt, screenshot, sleep, request, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
 
 const args = process.argv.slice(2), options: Record<string, string> = {};
 for (let i = 0; i < args.length; i += 2) {
@@ -97,7 +99,7 @@ async function waitText(marker: string): Promise<Row[]> {
   return waitFor(async () => { const value = rows(await surface()); return value.some((row) => row.text.includes(marker)) ? value : null; });
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -142,9 +144,9 @@ async function capture(name: string, review: string): Promise<void> {
   (report.captures as unknown[]).push({ name, screenshot: join(output, `${name}.png`), query: join(output, `${name}.surface.json`), query_method: node.observation, pixel_review: "pending", review });
 }
 async function grid(): Promise<{ cols: number; rows: number }> {
-  const label = allText(await visible("local.status.grid")), match = label.match(/(\d+)×(\d+)/);
-  assert(match, `Missing actual grid: ${label}`);
-  return { cols: Number(match[1]), rows: Number(match[2]) };
+  const {grid} = await request('POST', '/zerowork/terminal', {action: 'metrics'});
+  assert(grid?.cols > 0 && grid?.rows > 0, 'Missing terminal projection grid');
+  return grid;
 }
 async function verifyPtyGrid(expected: { cols: number; rows: number }): Promise<void> {
   await command("printf '__TTY_%s__\\n' \"$(stty size)\"");

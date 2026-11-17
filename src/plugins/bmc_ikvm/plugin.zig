@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const registry = @import("../../host/plugin_registry.zig");
+const card_types = registry.card_types;
 const sessions = @import("../../host/session_host.zig");
 const contract = @import("../../host/plugin_ui_contract.zig");
 const probes = @import("../../host/probe_contract.zig");
@@ -49,6 +50,8 @@ pub const Plugin = struct {
     owner_thread: std.Thread.Id,
     shutting_down: bool = false,
     test_driver: if (builtin.is_test) ?@import("controller.zig").Driver else void = if (builtin.is_test) null else {},
+    /// 本插件定义的 `kvm` 卡片类型；摘要回调借用本实例，所以存放在实例里（manifest() 填写）。
+    card_defs: [1]registry.CardTypeDef = undefined,
 
     /// The backend may read/recover its durable file here. create never reads
     /// this file or performs network IO. init does not silently use HOME.
@@ -102,17 +105,29 @@ pub const Plugin = struct {
         const a = self.allocator;
         a.destroy(self);
     }
+    /// 不初始化插件就能读到的元数据（“已链接插件表”，PLUGIN_ARCH_PLAN 6.2.1 Q5 / PL1 第 6 条）；`manifest()` 用同一份。
+    pub const linked: @import("../../host/plugin_enablement.zig").Linked = .{
+        .id = model.protocol_id,
+        .display_name = "BMC · iKVM",
+        // 每一项都有声明的服务支撑：framebuffer / console（远程画面）、remote_input（键鼠）、power、boot。
+        .summary = "远程画面、键鼠输入、电源与启动管理",
+        .plugin_version = "0.3.2",
+        .origin = .bundled,
+        .icons = .{ .settings = "monitor", .protocol = "monitor", .tab = "monitor" },
+        .dependencies = &dependencies,
+    };
     pub fn manifest(self: *Plugin) registry.PluginManifest {
         return .{
-            .id = model.protocol_id,
-            .display_name = "BMC · iKVM",
-            .plugin_version = "0.3.2",
-            .origin = .bundled,
+            .id = linked.id,
+            .display_name = linked.display_name,
+            .summary = linked.summary,
+            .plugin_version = linked.plugin_version,
+            .origin = linked.origin,
             .host_api_version = 2,
             .order = 30,
-            .dependencies = &dependencies,
-            .icons = .{ .settings = "monitor", .protocol = "monitor", .tab = "monitor" },
-            .integration = .{ .ai = true, .transport_loss = true, .retry_after_end = true },
+            .dependencies = linked.dependencies,
+            .icons = linked.icons,
+            .integration = .{ .transport_loss = true, .retry_after_end = true },
             .connection = .{ .create_kind = .saved_or_temporary, .payload_version = 1, .validate_payload = model.validatePayload, .editor_factory = .{ .context = self, .mount = @import("editor.zig").mountEditor }, .encode = codec.encode, .decode = codec.decode, .migrate = codec.migrate, .credential_references = codec.credentialReferences, .probe_factory = .{ .context = self, .begin = beginProbe, .poll = pollProbe, .cancel = cancelProbe } },
             .workspace_kind = model.workspace_kind,
             .content_renderer = model.workspace_kind,
@@ -123,10 +138,39 @@ pub const Plugin = struct {
             .notifications = &.{.{ .id = "bmc_ikvm.connection", .category = .connection_change }},
             .tool_definitions = &tools.definitions,
             .tools = &tool_bindings,
-            .ai_context = .{ .identity = "BMC console with read-only management, approved remote-frame observation and exclusive bounded input", .context = self, .summarize = summarize },
+            .card_type = card_types.ids.kvm,
+            .cards = self.cardTypes(),
             .session_factory = .{ .context = self, .vtable = &factory_vtable, .poll = poll },
         };
     }
+    /// `kvm` 卡片（PLUGIN_ARCH_PLAN 2.5.4 / 2.5.8）：会话卡片，可独立成 tab、可进分屏、可浮动（cards-float：
+    /// 画面随同一个内容节点搬动，缩放跟随卡片尺寸，输入捕获照常）；
+    /// AI 上下文是本插件的摘要（不含像素），工具只列本插件登记的 BMC 工具。
+    fn cardTypes(self: *Plugin) []const registry.CardTypeDef {
+        self.card_defs = .{.{
+            .id = card_types.ids.kvm,
+            // 窗口移交：卡片类型层面允许（插件渲染器呈现的会话卡片）；渲染器的 `supports_window_transfer` 另行判定。
+            .supports_window_transfer = true,
+            .title = "KVM 画面",
+            .binding = .session,
+            .placements = .{ .standalone_tab = true, .split = true, .float = true },
+            .default_placement = .standalone_tab,
+            .float = card_types.sessionFloat(card_types.ids.kvm, card_types.float_sizes.kvm),
+            .ai = .{
+                .summary = .{ .provider = .{ .identity = "BMC console with read-only management, approved remote-frame observation and exclusive bounded input", .context = self, .summarize = summarize } },
+                .tools = .{ .own = &tool_ids },
+                // host.tab_context 的查询参数：KVM 卡片只给元信息（BMC 名称、视频状态、画面尺寸，不含像素），
+                // 没有可截取的历史或可分页的列表，所以 max_lines / limit / cursor 都不支持。
+                .query = .{ .note = "KVM cards only return metadata (BMC name, video state, frame size; no pixels) and take no query parameters. Use bmc_ikvm.describe_frame or bmc_ikvm.read_power_state for details, and bmc_ikvm.screenshot (needs approval) to see the picture." },
+            },
+        }};
+        return &self.card_defs;
+    }
+    const tool_ids = blk: {
+        var result: [tools.definitions.len][]const u8 = undefined;
+        for (tools.definitions, &result) |definition, *id| id.* = definition.id;
+        break :blk result;
+    };
     pub fn renderer(self: *Plugin) contract.RendererDefinition {
         return .{ .kind = model.workspace_kind, .context = self, .mount = @import("views.zig").mount, .supports_window_transfer = false };
     }

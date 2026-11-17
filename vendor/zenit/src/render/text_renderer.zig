@@ -4,7 +4,10 @@
 /// GPU-instanced render for high-perf text drawing.
 const std = @import("std");
 const builtin = @import("builtin");
+const idle_storage = @import("idle_storage.zig");
+const SlotBuffer = @import("slot_buffer.zig").SlotBuffer;
 const gpu = @import("gpu");
+const shape_clip_pair = @import("shape_clip_pair.zig");
 const text_module = @import("text");
 const grapheme = @import("text_core").grapheme;
 const Font = text_module.Font;
@@ -14,6 +17,12 @@ const GlyphAtlas = atlas_mod.GlyphAtlas;
 const font_stack_mod = @import("font_fallback_stack.zig");
 const FontFallbackStack = font_stack_mod.FontFallbackStack;
 const text_trace = @import("trace").text_flicker;
+
+/// Application-wide platform font smoothing (zenit_app.setPlatformFontSmoothing). false rasterizes
+/// every glyph without platform smoothing, as if each TextProps.font_smoothing were false; true
+/// (default) leaves the per-text setting in charge. Read at rasterization; part of the atlas key
+/// through Font.smooth_fonts.
+pub var platform_font_smoothing: bool = true;
 
 /// Text shader source (single source of truth).
 const text_shader_source: []const u8 = @import("shader_sources.zig").text;
@@ -32,18 +41,32 @@ const Uniforms = extern struct {
     scale_factor: f32,
     clip_shape_kind: u32 = 0,
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
-    clip_radius: f32 = 0,
+    clip_radii: [4]f32 = .{ 0, 0, 0, 0 },
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
+    /// Keeps the polygon arrays on a 16-byte (cbuffer register) boundary after `clip_radii`.
+    _clip_pad: u32 = 0,
     clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
     clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
     dwrite_gamma: if (builtin.os.tag == .windows) [4]f32 else [0]f32 = undefined,
     dwrite_settings: if (builtin.os.tag == .windows) [4]f32 else [0]f32 = undefined,
+    /// Second shape clip (shape_clip_pair.zig); zero-sized off Metal.
+    clip2: shape_clip_pair.Field = shape_clip_pair.none,
 };
 
+// Shared clip header ABI (Metal struct / HLSL cbuffer / GLSL std140): per-corner radii sit on their own
+// 16-byte register and the polygon arrays start at the next one.
 comptime {
-    if (builtin.os.tag == .windows and (@offsetOf(Uniforms, "dwrite_gamma") != 336 or @offsetOf(Uniforms, "dwrite_settings") != 352 or @sizeOf(Uniforms) != 368))
+    std.debug.assert(@offsetOf(Uniforms, "clip_rect") == 16);
+    std.debug.assert(@offsetOf(Uniforms, "clip_radii") == 32);
+    std.debug.assert(@offsetOf(Uniforms, "clip_fill_rule") == 48);
+    std.debug.assert(@offsetOf(Uniforms, "clip_polygon_end_points") == 64);
+    std.debug.assert(@offsetOf(Uniforms, "clip_polygon_points") == 96);
+}
+
+comptime {
+    if (builtin.os.tag == .windows and (@offsetOf(Uniforms, "dwrite_gamma") != 352 or @offsetOf(Uniforms, "dwrite_settings") != 368 or @sizeOf(Uniforms) != 384))
         @compileError("DirectWrite runtime uniforms do not match text.hlsl cbuffer layout");
 }
 
@@ -100,17 +123,19 @@ const LegacyGlyphMetadata = extern struct {
 
 const GlyphMetadata = if (gpu.backend_kind == .metal) MetalGlyphMetadata else LegacyGlyphMetadata;
 
-// UV packing and the shader decoder share this exact atlas size.
-// Changing the atlas requires reviewing the wire format and shader together.
+// The wire uses a fixed 4096 normalized-UV grid, independent of physical pages.
+// Both power-of-two page sizes divide that grid: 2048 texels encode as even
+// coordinates. Keep shader decoding and instance layout unchanged.
 comptime {
-    if (atlas_mod.GlyphAtlas.ATLAS_SIZE != 4096)
-        @compileError("glyph UV compression requires GlyphAtlas.ATLAS_SIZE == 4096");
+    for (.{ atlas_mod.GlyphAtlas.ATLAS_SIZE, atlas_mod.GlyphAtlas.SMALL_ATLAS_SIZE, atlas_mod.GlyphAtlas.FIRST_PAGE_SIZE }) |size| {
+        if (size == 0 or 4096 % size != 0 or (size & (size - 1)) != 0)
+            @compileError("atlas page must be a power-of-two divisor of 4096 UV grid");
+    }
 }
 const atlas_size_f: f32 = 4096.0;
 
-/// Metal UV compression: exact integer texels in [0, 4096] stored as u16 (8 bytes vs 16).
-/// Atlas emission always yields uv = texel / 4096 with texel an exact f32 integer, so
-/// texel = uv * 4096 round-trips exactly; no rounding, no UNORM, no half floats.
+/// Metal UV compression: normalized UV multiplied by 4096 stored as u16.
+/// These are physical texels only for 4096 pages; 2048 texels map to even values.
 const MetalGlyphUV = extern struct {
     texels: [4]u16,
 
@@ -120,7 +145,7 @@ const MetalGlyphUV = extern struct {
                 std.debug.assert(std.math.isFinite(u));
                 std.debug.assert(u >= 0.0 and u <= 1.0);
                 const t = u * atlas_size_f;
-                // Integer grid: atlas UVs are always texel/4096; reject anything else early.
+                // Integer wire grid: every supported physical texel lands exactly on it.
                 std.debug.assert(t == @trunc(t));
             }
         }
@@ -169,12 +194,10 @@ const GlyphInstance = extern struct {
     metadata: GlyphMetadata = GlyphMetadata.init(0, 0, true),
 };
 
-/// Single-frame instance buffer capacity (all frame flushes share one buffer). Editor ~1000 +
-/// minimap text mode
-/// ~12000 + UI ~100 = ~13100 glyphs/frame. Metal command buffer deferred-exec, wraparound overwrite
-/// breaks
-/// prior draw call data refs.
-const MAX_INSTANCES = 32768;
+/// Starting per-slot instance capacity; slots grow with the frame's glyph count
+/// (all flushes of a frame append to one buffer, never wrapping, because
+/// deferred command execution would read overwritten ranges).
+const MIN_INSTANCE_BYTES = @sizeOf(GlyphInstance) * 1024;
 const MAX_UNIFORM_UPDATES = 512;
 // D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots.
@@ -286,6 +309,22 @@ const LongSegmentCache = struct {
         return true;
     }
 
+    /// Drop entries last used before `frame`.
+    fn trimBefore(self: *LongSegmentCache, allocator: std.mem.Allocator, frame: u64) void {
+        var stale: [max_entries]SegmentCacheKey = undefined;
+        var count: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.frame < frame and count < stale.len) {
+                stale[count] = entry.key_ptr.*;
+                count += 1;
+            }
+        }
+        for (stale[0..count]) |key| {
+            if (self.entries.fetchRemove(key)) |old| release(allocator, old.value);
+        }
+    }
+
     fn deinit(self: *LongSegmentCache, allocator: std.mem.Allocator) void {
         var it = self.entries.valueIterator();
         while (it.next()) |entry| release(allocator, entry.*);
@@ -341,6 +380,147 @@ const WidthCache = struct {
     fn deinit(self: *WidthCache, allocator: std.mem.Allocator) void {
         self.clear(allocator);
         self.entries.deinit(allocator);
+    }
+};
+
+// Streaming text appends tokens to a long paragraph; layout then remeasures
+// every line suffix of it, each one the previous frame's string plus the new
+// tail. Keep, per long query (> APPEND_MIN_BYTES), the exact bytes measured
+// last time, their exact total, and a resume checkpoint: a segment start `s`
+// and the running total before it. When a later query extends those bytes,
+// the loop restarts at `s` with that total and only walks the tail.
+//
+// Why the result is bit-identical to a full measurement:
+// - segmentText decides each boundary from at most CHECKPOINT_MARGIN - 1
+//   bytes past the next non-space byte (keycap/scalar decode lookahead), plus
+//   runs of spaces. A checkpoint is only taken at a segment start that is not a
+//   space and has CHECKPOINT_MARGIN bytes after it, so every segment before it
+//   was decided without reaching end-of-text and is the same in any extension.
+// - The loop is restartable at any segment start (MAX_SEGMENTS chunking
+//   already restarts it), and widths are added glyph by glyph in source
+//   order, so starting from the stored partial total performs exactly the same
+//   f32 additions as walking from byte 0.
+// - Per-segment advances are a function of (segment bytes, font, size, scale,
+//   italic, fixed advance) plus renderer state. The parameters are the key;
+//   state changes bump `append_epoch` (shape entry eviction/replacement,
+//   fallback wrapper destruction, stack switch, idle trim). Explicit fallback
+//   stacks can be edited in place and are excluded, as for round-9 reuse.
+// Only long queries pay for the lookup; shorter text keeps the exact old path.
+const APPEND_MIN_BYTES = 512;
+const CHECKPOINT_MARGIN = 32;
+
+/// `at` is a segment start of `text`. Every segment before it is final in
+/// any extension of `text`: their decisions read at most a space run plus 7
+/// bytes (scalar/surrogate decode, keycapLen) past the following non-space
+/// byte, and the first byte here is that non-space byte.
+inline fn isAppendCheckpoint(text: []const u8, at: u32) bool {
+    return at + CHECKPOINT_MARGIN <= text.len and text[at] != ' ';
+}
+const AppendWidthCache = struct {
+    const ways = 2;
+    const sets = 256;
+    const max_text_bytes = 4 * 1024 * 1024;
+    const head_bytes = 64;
+    const Entry = struct {
+        valid: bool = false,
+        epoch: u64 = 0,
+        key: WidthCache.Key = undefined,
+        head: u64 = 0,
+        last_used: u64 = 0,
+        text: std.ArrayListUnmanaged(u8) = .empty,
+        total: f32 = 0,
+        resume_offset: u32 = 0,
+        resume_total: f32 = 0,
+    };
+    entries: [sets * ways]Entry = @splat(.{}),
+    bytes: usize = 0,
+    clock: u64 = 0,
+
+    /// Set selector: drawing parameters plus the first bytes, which a
+    /// streamed suffix keeps while its tail grows.
+    fn headHash(key: WidthCache.Key, text: []const u8) u64 {
+        const params = [_]u64{ @as(u64, key.font), @as(u64, key.size) << 32 | key.physical_size, @as(u64, key.scale) << 32 | key.advance, @intFromBool(key.italic) };
+        var h = std.hash.Wyhash.init(0x6a09e667f3bcc909);
+        h.update(std.mem.asBytes(&params));
+        h.update(text[0..@min(text.len, head_bytes)]);
+        return h.final();
+    }
+
+    fn sameParams(a: WidthCache.Key, b: WidthCache.Key) bool {
+        return a.font == b.font and a.size == b.size and a.physical_size == b.physical_size and
+            a.scale == b.scale and a.advance == b.advance and a.italic == b.italic;
+    }
+
+    fn set(self: *AppendWidthCache, head: u64) []Entry {
+        const base = @as(usize, @intCast(head % sets)) * ways;
+        return self.entries[base..][0..ways];
+    }
+
+    /// The entry whose bytes are a prefix of `text`, measured under `epoch`.
+    fn find(self: *AppendWidthCache, epoch: u64, key: WidthCache.Key, head: u64, text: []const u8) ?*Entry {
+        for (self.set(head)) |*entry| {
+            if (!entry.valid or entry.epoch != epoch or entry.head != head or !sameParams(entry.key, key)) continue;
+            const old = entry.text.items;
+            if (old.len > text.len or !std.mem.eql(u8, old, text[0..old.len])) continue;
+            self.clock += 1;
+            entry.last_used = self.clock;
+            return entry;
+        }
+        return null;
+    }
+
+    /// Record a measurement. `reuse` is the entry the query resumed from (its
+    /// bytes are a prefix of `text`, so only the tail is copied). Allocation
+    /// failure only drops the record.
+    fn store(self: *AppendWidthCache, allocator: std.mem.Allocator, reuse: ?*Entry, epoch: u64, key: WidthCache.Key, head: u64, text: []const u8, total: f32, resume_offset: u32, resume_total: f32) void {
+        const entry = reuse orelse blk: {
+            const ways_slice = self.set(head);
+            var victim = &ways_slice[0];
+            for (ways_slice) |*candidate| {
+                if (!candidate.valid) {
+                    victim = candidate;
+                    break;
+                }
+                if (candidate.last_used < victim.last_used) victim = candidate;
+            }
+            break :blk victim;
+        };
+        // `bytes` counts allocated capacity, so the budget bounds real memory.
+        var old_capacity = entry.text.capacity;
+        const keep = if (reuse != null) entry.text.items.len else 0;
+        entry.valid = false;
+        if (text.len > max_text_bytes -| (self.bytes - old_capacity)) return self.drop(allocator, entry);
+        // A replaced record does not keep a larger buffer than it needs.
+        if (reuse == null) {
+            if (old_capacity > 2 * text.len) {
+                // Freed now: uncount it so a failed append below (drop) cannot leave it counted.
+                entry.text.clearAndFree(allocator);
+                self.bytes -= old_capacity;
+                old_capacity = 0;
+            } else entry.text.clearRetainingCapacity();
+        }
+        entry.text.appendSlice(allocator, text[keep..]) catch return self.drop(allocator, entry);
+        self.bytes = self.bytes - old_capacity + entry.text.capacity;
+        self.clock += 1;
+        entry.valid = true;
+        entry.epoch = epoch;
+        entry.key = key;
+        entry.head = head;
+        entry.last_used = self.clock;
+        entry.total = total;
+        entry.resume_offset = resume_offset;
+        entry.resume_total = resume_total;
+    }
+
+    fn drop(self: *AppendWidthCache, allocator: std.mem.Allocator, entry: *Entry) void {
+        self.bytes -= entry.text.capacity;
+        entry.text.deinit(allocator);
+        entry.* = .{};
+    }
+
+    fn deinit(self: *AppendWidthCache, allocator: std.mem.Allocator) void {
+        for (&self.entries) |*entry| entry.text.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -612,16 +792,14 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
         // Cache boundaries must not detach a combining suffix from its base.
         // In particular, ASCII scanning stops before U+0301: shaping "e" and
         // the mark separately positions the accent at the following cell.
-        // Reuse the existing Unicode properties and preserve every source byte;
-        // skipped control bytes must not join a mark to an earlier segment.
+        // Only extend a segment that ends exactly here, so skipped control
+        // bytes never join a mark to an earlier segment.
         if (seg_count > 0 and out[seg_count - 1].end == i) {
             while (i < len and text[i] >= 0x80) {
-                const suffix_len = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-                if (i + suffix_len > len) break;
-                const suffix_cp = std.unicode.utf8Decode(text[i..][0..suffix_len]) catch break;
-                const prop = grapheme.propOf(suffix_cp);
+                const suffix = storageScalar(text, i) orelse break;
+                const prop = grapheme.propOf(suffix.cp);
                 if (prop != .extend and prop != .spacing_mark) break;
-                i += suffix_len;
+                i += suffix.len;
                 out[seg_count - 1].end = i;
             }
         }
@@ -643,6 +821,32 @@ pub var text_uniform_overflow_total: u64 = 0;
 /// Healthy state on order of 'distinct (font,size,traits) combinations' (dozens or less).
 /// Steady growth = fallback identity key regression to pointer-based, character loss recurs.
 pub var fallback_wrappers_created_total: u64 = 0;
+
+/// A glyph instance's quad as the text vertex shader places it (logical pixels: x0, y0, x1, y1):
+/// position..position+size, the synthetic-italic skew on the top edge, padded by one logical pixel
+/// for the shader's snap of the position to a physical pixel (at most half of one).
+pub fn glyphQuad(g: anytype) [4]f32 {
+    const skew = g.skew_x;
+    return .{
+        g.position[0] + @min(skew, 0) - 1,
+        g.position[1] - 1,
+        g.position[0] + g.size[0] + @max(skew, 0) + 1,
+        g.position[1] + g.size[1] + 1,
+    };
+}
+
+/// Accumulator of TextRenderer.probeInk: the union of glyphQuad over the instances the draw
+/// would emit, and whether any glyph's raster metrics were unknown (not resident in the atlas).
+pub const InkProbe = struct {
+    lo: [2]f32 = .{ std.math.inf(f32), std.math.inf(f32) },
+    hi: [2]f32 = .{ -std.math.inf(f32), -std.math.inf(f32) },
+    missed: bool = false,
+
+    fn add(self: *InkProbe, q: [4]f32) void {
+        self.lo = .{ @min(self.lo[0], q[0]), @min(self.lo[1], q[1]) };
+        self.hi = .{ @max(self.hi[0], q[2]), @max(self.hi[1], q[3]) };
+    }
+};
 
 pub const TextRenderer = struct {
     pub const FontRangeRequest = struct {
@@ -706,30 +910,17 @@ pub const TextRenderer = struct {
     /// Slot exhaustion must not fail the batch: a flush failure doesn't clear instances, the next
     /// batch overflows again, and the frame renders nothing from then on (symptom: large text
     /// vanishes with gaps and flickers while node tree/layout rects stay correct).
-    /// Mirrors overflow_buffers (instance side): out of slots -> grow on demand in a cross-frame
-    /// retained overflow buffer. Enough capacity -> reuse, short -> rebuild once. Slots rotate
-    /// with current_buffer, so in-flight data is not overwritten.
-    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
-    uniform_overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
+    /// Out of slots -> grow on demand in a per-slot buffer retained across frames
+    /// (see SlotBuffer). Slots rotate with current_buffer, so in-flight data is
+    /// not overwritten.
+    uniform_overflow: SlotBuffer(BUFFER_COUNT) = .init("Zenit.Text.OverflowUniforms", UNIFORM_STRIDE * 64),
     /// Overflow uniform slots consumed in this frame
     uniform_overflow_used: usize = 0,
     /// Peak flush count this frame (diagnostic, exported to /perf)
     uniform_peak_slots: usize = 0,
-    /// Triple-buffered instance buffers
-    instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
+    /// Triple-buffered instance storage, sized by demand.
+    instance_buffers: SlotBuffer(BUFFER_COUNT) = .init("Zenit.Text.InstanceBuffer", MIN_INSTANCE_BYTES),
     current_buffer: usize = 0,
-
-    /// Overflow instance buffer (one per frame per slot, grows and is retained).
-    /// Destroying the buffer after every batch once MAX_INSTANCES is exhausted makes heavy-text
-    /// frames trigger multiple driver allocations (via driver, not malloc), so the buffer is a
-    /// per-frame-slot growable one: capacity enough -> reuse, short -> rebuild once.
-    /// Slots rotate with current_buffer, so GPU in-flight data is not overwritten.
-    /// Same pattern as the sdf_renderer retention pool.
-    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
-    overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
-    /// This frame's overflow buffer write cursor (bytes) within slot,
-    /// ensures multiple batches don't overwrite each other.
-    overflow_write_offset: usize = 0,
 
     // Fonts and atlases
     atlas: GlyphAtlas,
@@ -741,6 +932,10 @@ pub const TextRenderer = struct {
     font_ranges_context: ?*anyopaque = null,
     /// Borrowed only during a single encoder draw; never enters segment caches.
     active_font_ranges: ?*const text_module.FontRanges = null,
+    /// Borrowed only during a single encoder draw: the instance the drawn font's own glyphs
+    /// rasterize from (FontSelector `ResolvedFonts.raster`, animated raster). Shaping, and so
+    /// every advance and pen position, stays with the drawn font.
+    raster_font: ?*Font = null,
 
     /// (primary font, codepoint) -> is covered. selectSegmentFont hot-path cache:
     /// hit -> each non-ASCII segment pays hash lookup once, no CoreText FFI again.
@@ -752,6 +947,9 @@ pub const TextRenderer = struct {
     /// (shrinkRetainingCapacity), encoding text almost twice. With this flag emitGlyphInstance
     /// returns the advance after atlas insertion, skipping all instance construction and append.
     glyph_only: bool = false,
+    /// Ink probe (probeInk): emitGlyphInstance records each instance's quad here instead of
+    /// appending it, and reads the atlas without inserting.
+    ink_probe: ?*InkProbe = null,
     prewarm_layered: bool = false,
     prewarm_scales: [9]f32 = @splat(0),
     prewarm_scale_count: usize = 0,
@@ -764,14 +962,30 @@ pub const TextRenderer = struct {
     /// changed / page evicted) -> full prewarm.
     prewarm_signature: u64 = 0,
     prewarm_signature_valid: bool = false,
+    /// Prewarm passes that ran (signature changed) rather than skipped, for perf traces.
+    prewarm_full_passes: u64 = 0,
+    /// Text items (prewarmItemKey) the last completed prewarm pass covered, and the set this pass
+    /// fills: an item seen by the last pass has its glyphs resident unless the atlas collected
+    /// pages since (gc generation), so only new items are prewarmed.
+    prewarm_known: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    prewarm_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
     prewarm_gc_generation: u32 = 0,
-    shaper: TextShaper,
+    /// null: a renderer that is never handed text (initWithoutShaper).
+    shaper: ?TextShaper,
 
     // Segment-level shaping cache, word/CJK-single-char granularity, inline-stored no-alloc
     segment_cache: std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry),
     segment_cache_hits: u64 = 0,
     segment_cache_misses: u64 = 0,
     width_cache: WidthCache = .{},
+    /// Cross-frame append continuation for long width queries (see AppendWidthCache).
+    /// Allocated on the first long query, so short-text windows never carry it.
+    append_widths: ?*AppendWidthCache = null,
+    /// Bumped whenever a shaped answer or font selection may change; entries of
+    /// an older epoch are never resumed.
+    append_epoch: u64 = 1,
+    /// Long queries answered by resuming or repeating an append record.
+    append_width_hits: u64 = 0,
     cache_long_segments: bool = false,
     long_segment_cache: LongSegmentCache = .{},
     // Full-line fallback cache, used when segment overflows.
@@ -785,12 +999,16 @@ pub const TextRenderer = struct {
     // Current frame's instance data
     instances_nearest: std.ArrayList(GlyphInstance),
     instances_linear: std.ArrayList(GlyphInstance),
+    /// Advances whenever the pending instances are dropped (flush, new frame): a holder of
+    /// facts about "the pending glyphs" (the encoder's ink set) knows they are stale.
+    pending_generation: u64 = 0,
     viewport_width: f32,
     viewport_height: f32,
     scale_factor: f32,
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
-    clip_radius: f32 = 0,
+    clip_radii: [4]f32 = .{ 0, 0, 0, 0 },
     clip_shape_kind: u32 = 0,
+    clip2: shape_clip_pair.Uniform = .{},
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
@@ -827,6 +1045,17 @@ pub const TextRenderer = struct {
 
     /// Initialize Text Renderer
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !TextRenderer {
+        return initShaping(allocator, device, true);
+    }
+
+    /// A text renderer that is never handed text: the encoder's pipelines,
+    /// buffers and atlas, no shaper. The Web DOM host runs zenit's glass
+    /// pipeline with one (src/ui/web/glass.zig); the browser draws all text.
+    pub fn initWithoutShaper(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !TextRenderer {
+        return initShaping(allocator, device, false);
+    }
+
+    fn initShaping(allocator: std.mem.Allocator, device: *gpu.Backend.Device, with_shaper: bool) !TextRenderer {
         var raster_context: ?*anyopaque = null;
         var params: [8]f32 = @splat(0);
         if (comptime builtin.os.tag == .windows) {
@@ -835,7 +1064,7 @@ pub const TextRenderer = struct {
             if (NativeRaster.zenit_dwrite_raster_context_refresh(raster_context, null, 0, &params) < 0) return error.TextRenderingParamsFailed;
         }
         errdefer if (comptime builtin.os.tag == .windows) NativeRaster.zenit_dwrite_raster_context_destroy(raster_context);
-        const lcd_enabled = params[7] != 0 and !@import("zenit_environment").has("ZENIT_TEXT_BASELINE_GRAYSCALE");
+        const lcd_enabled = params[7] != 0 and !@import("zenit_environment").flag("ZENIT_TEXT_BASELINE_GRAYSCALE");
         const source = text_shader_source;
         var shader = try gpu.Backend.ShaderModule.initFromSource(device, source);
         defer shader.deinit();
@@ -880,28 +1109,13 @@ pub const TextRenderer = struct {
             uniform_created += 1;
         }
 
-        // Create triple-buffered instance buffers
-        var instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer = undefined;
-        var instance_created: usize = 0;
-        errdefer for (instance_buffers[0..instance_created]) |*ib| ib.destroy();
-        for (&instance_buffers, 0..) |*buf, i| {
-            const label = try std.fmt.allocPrint(allocator, "Zenit.Text.InstanceBuffer[{d}]", .{i});
-            defer allocator.free(label);
-            buf.* = try device.createBuffer(allocator, .{
-                .label = label,
-                .size = @sizeOf(GlyphInstance) * MAX_INSTANCES,
-                .usage = .{ .vertex = true, .map_write = true },
-            });
-            instance_created += 1;
-        }
-
         // Create glyph atlas
         var atlas = try GlyphAtlas.init(allocator, device);
         errdefer atlas.deinit();
         atlas.raster_context = raster_context;
 
         // Create text shaper
-        const shaper = try TextShaper.init(allocator);
+        const shaper: ?TextShaper = if (with_shaper) try TextShaper.init(allocator) else null;
 
         if (comptime builtin.os.tag == .windows) std.debug.print("TEXT_RASTER_PIPELINE glyph-coverage phase_bins=4 dynamic-monitor-params\n", .{});
         std.log.info("[TextRenderer] Initialized", .{});
@@ -914,7 +1128,6 @@ pub const TextRenderer = struct {
             .dwrite_params = params,
             .pipeline = pipeline,
             .uniform_buffers = uniform_buffers,
-            .instance_buffers = instance_buffers,
             .atlas = atlas,
             .shaper = shaper,
             .segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator),
@@ -929,7 +1142,42 @@ pub const TextRenderer = struct {
     }
 
     /// Destroy
+    /// Per-slot scratch storage is rewritten every frame; see idle_storage.
+    pub fn setScratchVolatile(self: *TextRenderer, make_volatile: bool) void {
+        idle_storage.setBuffersVolatile(&self.uniform_buffers, make_volatile);
+        self.uniform_overflow.setVolatile(make_volatile);
+        self.instance_buffers.setVolatile(make_volatile);
+    }
+
+    /// Drop demand-sized scratch so the next frame regrows it to what it
+    /// draws. Only while no submitted frame is executing.
+    pub fn releaseScratch(self: *TextRenderer) void {
+        self.instance_buffers.release();
+        self.uniform_overflow.release();
+    }
+
+    /// Idle: keep only the shaped segments the latest frame drew (what is on
+    /// screen). Everything else a scroll or an edit shaped since is reshaped
+    /// on demand; held across windows it adds up (5 editors after a 300k-line
+    /// scroll each: ~16 MiB of shaped glyphs).
+    pub fn trimIdleCaches(self: *TextRenderer) void {
+        self.releaseAppendWidths();
+        const keep_after = self.current_frame -| 1;
+        var stale: std.ArrayList(SegmentCacheKey) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.segment_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.frame_last_used < keep_after) stale.append(self.allocator, entry.key_ptr.*) catch break;
+        }
+        for (stale.items) |key| {
+            if (self.segment_cache.fetchRemove(key)) |kv| releaseSegmentEntry(self.allocator, kv.value);
+        }
+        self.long_segment_cache.trimBefore(self.allocator, keep_after);
+    }
+
     pub fn deinit(self: *TextRenderer) void {
+        self.prewarm_known.deinit(self.allocator);
+        self.prewarm_seen.deinit(self.allocator);
         var seg_iter = self.segment_cache.iterator();
         while (seg_iter.next()) |entry| {
             releaseSegmentEntry(self.allocator, entry.value_ptr.*);
@@ -937,6 +1185,7 @@ pub const TextRenderer = struct {
         self.segment_cache.deinit();
         self.long_segment_cache.deinit(self.allocator);
         self.width_cache.deinit(self.allocator);
+        self.releaseAppendWidths();
         var fallback_font_iter = self.fallback_font_cache.iterator();
         while (fallback_font_iter.next()) |entry| {
             entry.value_ptr.font.deinit();
@@ -945,17 +1194,12 @@ pub const TextRenderer = struct {
         self.primary_coverage_cache.deinit();
         self.instances_nearest.deinit(self.allocator);
         self.instances_linear.deinit(self.allocator);
-        self.shaper.deinit();
+        if (self.shaper) |*sh| sh.deinit();
         self.atlas.deinit();
         if (comptime builtin.os.tag == .windows) NativeRaster.zenit_dwrite_raster_context_destroy(self.raster_context);
-        for (&self.instance_buffers) |*buf| buf.destroy();
+        self.instance_buffers.deinit(self.allocator);
         for (&self.uniform_buffers) |*ubuf| ubuf.destroy();
-        for (&self.overflow_buffers) |*maybe_buf| {
-            if (maybe_buf.*) |*buf| buf.destroy();
-        }
-        for (&self.uniform_overflow_buffers) |*maybe_buf| {
-            if (maybe_buf.*) |*buf| buf.destroy();
-        }
+        self.uniform_overflow.deinit(self.allocator);
         self.pipeline.deinit();
         std.log.info("[TextRenderer] Destroyed", .{});
     }
@@ -964,7 +1208,7 @@ pub const TextRenderer = struct {
         if (comptime builtin.os.tag != .windows) return false;
         const changed = NativeRaster.zenit_dwrite_raster_context_refresh(self.raster_context, window, 0, &self.dwrite_params);
         if (changed < 0) return error.TextRenderingParamsFailed;
-        self.cleartype_enabled = self.dwrite_params[7] != 0 and !@import("zenit_environment").has("ZENIT_TEXT_BASELINE_GRAYSCALE");
+        self.cleartype_enabled = self.dwrite_params[7] != 0 and !@import("zenit_environment").flag("ZENIT_TEXT_BASELINE_GRAYSCALE");
         if (changed != 0) {
             self.atlas.invalidateRaster();
             self.prewarm_signature_valid = false;
@@ -972,20 +1216,31 @@ pub const TextRenderer = struct {
         return changed != 0;
     }
 
-    /// Start new frame. width/height: logical pixels; scale: DPI scale factor (Retina=2.0)
+    /// Start a GPU frame. width/height: logical pixels; scale: DPI scale factor (Retina=2.0)
     pub fn beginFrame(self: *TextRenderer, width: f32, height: f32, scale: f32) void {
+        self.beginFrameFor(width, height, scale, true);
+    }
+
+    /// `gpu_frame` false: a CPU patch encode (cpu_flat), which reads only the
+    /// CPU-side batches: the triple-buffered GPU slots keep rotating with GPU
+    /// frames alone, so a slot an in-flight frame reads is never reused.
+    /// Only GPU frames advance `current_frame`: idle trim keeps the segments the
+    /// latest GPU frame drew, which a patch drawing one line must not age out.
+    pub fn beginFrameFor(self: *TextRenderer, width: f32, height: f32, scale: f32, gpu_frame: bool) void {
         self.instances_nearest.clearRetainingCapacity();
         self.instances_linear.clearRetainingCapacity();
+        self.pending_generation +%= 1;
         self.buffer_write_offset = 0;
-        self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
+        if (gpu_frame) {
+            self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
+            self.instance_buffers.beginSlot(self.current_buffer);
+            self.uniform_overflow.beginSlot(self.current_buffer);
+        }
         self.uniform_write_offset = 0;
-        // Overflow buffer of new slot starts writing from beginning
-        // (this slot's last use was BUFFER_COUNT frames ago)
-        self.overflow_write_offset = 0;
         self.uniform_overflow_used = 0;
         self.uniform_peak_slots = 0;
         self.width_cache.clear(self.allocator);
-        self.current_frame += 1;
+        if (gpu_frame) self.current_frame += 1;
         // DPI changed (drag window across screens) -> glyph raster size and subpixel
         // bin key change; prewarm skip baseline invalidated.
         if (self.scale_factor != scale) self.prewarm_signature_valid = false;
@@ -994,8 +1249,9 @@ pub const TextRenderer = struct {
         self.viewport_height = height * scale;
         self.scale_factor = scale;
         self.clip_rect = .{ 0, 0, 0, 0 };
-        self.clip_radius = 0;
+        self.clip_radii = .{ 0, 0, 0, 0 };
         self.clip_shape_kind = 0;
+        self.clip2 = .{};
         self.clip_fill_rule = 0;
         self.clip_point_count = 0;
         self.clip_contour_count = 0;
@@ -1022,8 +1278,10 @@ pub const TextRenderer = struct {
         // stale texture references
         self.atlas_gc_happened = false;
 
-        // Segment cache cleanup: lower frequency + longer retention window, reduce jitter
-        if (self.current_frame % 900 == 0) {
+        // Segment cache cleanup: lower frequency + longer retention window, reduce jitter.
+        // GPU frames only: CPU patch frames hold current_frame, and one held on a
+        // multiple of 900 would rerun this scan on every patch.
+        if (gpu_frame and self.current_frame % 900 == 0) {
             self.evictStaleSegments();
             self.evictStaleFallbackFonts();
             // After fallback font release, atlas GlyphKey.font_ptr may be reused by next Font at
@@ -1043,10 +1301,15 @@ pub const TextRenderer = struct {
         self.clip_x_max = width;
     }
 
-    pub fn setClipMask(self: *TextRenderer, shape_kind: u32, rect: ?[4]f32, radius: f32, fill_rule: u32, point_count: u32, contour_count: u32, contour_end_points: [MAX_CLIP_POLYGON_CONTOURS]u8, polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32) void {
+    /// Second shape clip intersected with the primary one (shape_clip_pair.zig).
+    pub fn setPartnerClip(self: *TextRenderer, clip: shape_clip_pair.Uniform) void {
+        self.clip2 = clip;
+    }
+
+    pub fn setClipMask(self: *TextRenderer, shape_kind: u32, rect: ?[4]f32, radii: [4]f32, fill_rule: u32, point_count: u32, contour_count: u32, contour_end_points: [MAX_CLIP_POLYGON_CONTOURS]u8, polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32) void {
         if (rect) |mask_rect| {
             self.clip_rect = mask_rect;
-            self.clip_radius = radius;
+            self.clip_radii = radii;
             self.clip_shape_kind = shape_kind;
             self.clip_fill_rule = fill_rule;
             self.clip_point_count = point_count;
@@ -1055,8 +1318,9 @@ pub const TextRenderer = struct {
             self.clip_polygon_points = polygon_points;
         } else {
             self.clip_rect = .{ 0, 0, 0, 0 };
-            self.clip_radius = 0;
+            self.clip_radii = .{ 0, 0, 0, 0 };
             self.clip_shape_kind = 0;
+            self.clip2 = .{};
             self.clip_fill_rule = 0;
             self.clip_point_count = 0;
             self.clip_contour_count = 0;
@@ -1085,6 +1349,19 @@ pub const TextRenderer = struct {
         }
     }
 
+    /// Any shaped answer may change: no append record from before resumes.
+    fn invalidateAppendWidths(self: *TextRenderer) void {
+        self.append_epoch +%= 1;
+    }
+
+    fn releaseAppendWidths(self: *TextRenderer) void {
+        self.invalidateAppendWidths();
+        const cache = self.append_widths orelse return;
+        cache.deinit(self.allocator);
+        self.allocator.destroy(cache);
+        self.append_widths = null;
+    }
+
     /// Clean up segment-cache entries unused over 1800 frames (approx 30 sec @60fps)
     fn evictStaleSegments(self: *TextRenderer) void {
         const evict_threshold = 1800;
@@ -1100,6 +1377,7 @@ pub const TextRenderer = struct {
                 }
             }
         }
+        if (remove_count > 0) self.invalidateAppendWidths();
         for (keys_buf[0..remove_count]) |key| {
             if (self.segment_cache.fetchRemove(key)) |kv| {
                 releaseSegmentEntry(self.allocator, kv.value);
@@ -1108,6 +1386,7 @@ pub const TextRenderer = struct {
     }
 
     fn destroyFallbackFontEntry(self: *TextRenderer, entry: FallbackFontCacheEntry) void {
+        self.invalidateAppendWidths();
         // Atlas keyed by Font heap address; after wrapper release address gets reused by next
         // wrapper, must remove entry first or new font hits old font's bitmap (wrong glyph).
         self.atlas.forgetFont(@intFromPtr(entry.font));
@@ -1138,6 +1417,7 @@ pub const TextRenderer = struct {
 
     /// When segment cache full: evict first delete >300-frame-unused; if still full, clear half
     fn evictSegmentCacheOnFull(self: *TextRenderer) void {
+        self.invalidateAppendWidths();
         // Pass 1: delete entries unused >300 frames
         const threshold = 300;
         var keys_buf: [256]SegmentCacheKey = undefined;
@@ -1307,6 +1587,7 @@ pub const TextRenderer = struct {
     pub fn setFallbackStack(self: *TextRenderer, stack: ?*FontFallbackStack) void {
         if (self.fallback_stack == stack) return;
         self.fallback_stack = stack;
+        self.invalidateAppendWidths();
         self.primary_coverage_cache.clearRetainingCapacity();
         // Font selection changed -> prewarm 'glyphs from last frame must be resident' baseline
         // invalidated.
@@ -1357,6 +1638,7 @@ pub const TextRenderer = struct {
         var seg_p = p;
         seg_p.font = seg_font;
         seg_p.fallback_font = seg_font;
+        seg_p.raster_font = null;
         const seg_px = seg_font.pixelSize();
         if (p.requested_size > 0 and seg_px > 0) {
             seg_p.layout_scale = p.requested_size / seg_px;
@@ -1378,7 +1660,7 @@ pub const TextRenderer = struct {
         if (glyph.is_synthetic_italic and p.fallback_font != null) {
             return p.fallback_font.?;
         }
-        return p.font;
+        return p.raster_font orelse p.font;
     }
 
     fn releaseGlyphFallbackFontRefs(glyphs: []const text_module.ShapedGlyph) void {
@@ -1460,6 +1742,8 @@ pub const TextRenderer = struct {
         fixed_advance: f32 = 0,
         explicit_range_raster: bool = false,
         resolved_font: ?*Font = null,
+        /// Raster instance for glyphs of `font` itself (TextRenderer.raster_font).
+        raster_font: ?*Font = null,
     };
 
     /// Take glyphs[i] cluster_span = next_cluster - cur_cluster, last glyph uses
@@ -1536,6 +1820,65 @@ pub const TextRenderer = struct {
         }
     }
 
+    /// Every emitted glyph instance goes through here: appended for drawing, or, under an ink
+    /// probe, only its quad recorded.
+    inline fn pushInstance(self: *TextRenderer, list: *std.ArrayList(GlyphInstance), instance: GlyphInstance) !void {
+        if (self.ink_probe) |probe| return probe.add(glyphQuad(&instance));
+        try list.append(self.allocator, instance);
+    }
+
+    /// Ink of a text draw without drawing it: the union of glyphQuad over every glyph instance
+    /// drawTextWithOptions (spans == null) or drawTextWithSpans would emit for these arguments at
+    /// render scale `scale`, as (x0, y0, x1, y1) in the same logical space as x/y. It runs the
+    /// draw's own segmentation, shaping (segment cache), font selection and placement code; only
+    /// the atlas is read without inserting and the instances are not stored. The horizontal clip
+    /// (clip_x_min/max), which only drops glyphs, is ignored.
+    ///
+    /// Null when a glyph's raster metrics are unknown (not resident in the atlas: the draw would
+    /// rasterize it), on shaping failure, and where the draw is not one deterministic function of
+    /// these arguments (Windows: ClearType backdrop decisions and provider font ranges). Text
+    /// without ink returns a zero-size rect at (x, y).
+    pub fn probeInk(
+        self: *TextRenderer,
+        text: []const u8,
+        x: f32,
+        y: f32,
+        font: *Font,
+        requested_size: f32,
+        use_italic: bool,
+        fallback_font: ?*Font,
+        force_linear: bool,
+        shader_snap: bool,
+        fixed_advance: f32,
+        spans: ?[]const ColorSpan,
+        scale: f32,
+        smooth_fonts: bool,
+    ) ?[4]f32 {
+        if (comptime builtin.os.tag == .windows) return null;
+        if (self.active_font_ranges != null or self.ink_probe != null or !(scale > 0)) return null;
+        var probe: InkProbe = .{};
+        const saved = .{ self.scale_factor, self.clip_x_min, self.clip_x_max, self.smooth_fonts, self.glyph_only };
+        self.ink_probe = &probe;
+        self.scale_factor = scale;
+        self.clip_x_min = -std.math.inf(f32);
+        self.clip_x_max = std.math.inf(f32);
+        self.smooth_fonts = smooth_fonts;
+        self.glyph_only = false;
+        defer {
+            self.ink_probe = null;
+            self.scale_factor, self.clip_x_min, self.clip_x_max, self.smooth_fonts, self.glyph_only = saved;
+        }
+        const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
+        if (spans) |s| {
+            self.drawTextWithSpansInternal(text, x, y, font, black, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance, s) catch return null;
+        } else {
+            self.drawTextWithOptionsInternal(text, x, y, font, black, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance) catch return null;
+        }
+        if (probe.missed) return null;
+        if (probe.lo[0] > probe.hi[0]) return .{ x, y, x, y };
+        return .{ probe.lo[0], probe.lo[1], probe.hi[0], probe.hi[1] };
+    }
+
     fn emitGlyphInstance(
         self: *TextRenderer,
         glyph: text_module.ShapedGlyph,
@@ -1564,7 +1907,7 @@ pub const TextRenderer = struct {
         // atlas keys glyphs by it.
         if (p.scale > 0 and render_font.scale_factor != p.scale) render_font.setScaleFactor(p.scale);
         // and with the command's font smoothing (TextProps.font_smoothing; atlas-keyed)
-        render_font.smooth_fonts = self.smooth_fonts;
+        render_font.smooth_fonts = self.smooth_fonts and platform_font_smoothing;
         if (comptime builtin.os.tag == .windows) render_font.cleartype = self.cleartype_enabled and self.cleartype_allowed and p.use_subpixel and !glyph.is_synthetic_italic and glyph_color.a == 1;
         const layout_scale = p.layout_scale;
         const render_font_px = render_font.pixelSize();
@@ -1590,12 +1933,15 @@ pub const TextRenderer = struct {
             const pen = atlas_mod.subpixelPen(phys_x);
             const bin_packed = atlas_mod.packSubpixelBin(pen.bin, 0);
 
-            var region = self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch {
+            var region = if (self.ink_probe) |probe| self.atlas.peekSubpixel(render_font, glyph.glyph_index, bin_packed) orelse {
+                probe.missed = true;
+                return glyphAdvance(glyph, cluster_span, p);
+            } else self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch {
                 return glyphAdvance(glyph, cluster_span, p);
             };
-            self.prewarmGlyphVariants(render_font, glyph.glyph_index, bin_packed);
+            if (self.ink_probe == null) self.prewarmGlyphVariants(render_font, glyph.glyph_index, bin_packed);
             if (comptime builtin.os.tag == .windows) {
-                if (!self.glyph_only and region.is_cleartype) {
+                if (!self.glyph_only and self.ink_probe == null and region.is_cleartype) {
                     const left = clampFixedAdvanceGlyphX(subpixelGlyphLeftPx(pen, @as(f32, @floatFromInt(region.bearing_x))) / p.scale, cursor_x, glyph, p);
                     const top = cursor_y + glyph.y_offset * layout_scale - @as(f32, @floatFromInt(region.bearing_y)) / p.scale;
                     const x = if (p.shader_snap or p.snap_to_device_pixels) @round(left * p.scale) / p.scale else left;
@@ -1628,7 +1974,7 @@ pub const TextRenderer = struct {
 
             const region_w: f32 = @floatFromInt(region.width);
             const region_h: f32 = @floatFromInt(region.height);
-            try p.instance_list.append(self.allocator, .{
+            try self.pushInstance(p.instance_list, .{
                 .position = .{ snap_x, snap_y },
                 .size = .{
                     (region_w / render_font.scale_factor) * bitmap_scale,
@@ -1645,8 +1991,11 @@ pub const TextRenderer = struct {
                 .metadata = GlyphMetadata.init(region.page_index, if (region.is_color) 1 else if (region.is_cleartype) 2 else 0, p.shader_snap),
             });
         } else {
-            const region = try self.atlas.getOrInsert(render_font, glyph.glyph_index);
-            self.prewarmGlyphVariants(render_font, glyph.glyph_index, null);
+            const region = if (self.ink_probe) |probe| self.atlas.peek(render_font, glyph.glyph_index) orelse {
+                probe.missed = true;
+                return glyphAdvance(glyph, cluster_span, p);
+            } else try self.atlas.getOrInsert(render_font, glyph.glyph_index);
+            if (self.ink_probe == null) self.prewarmGlyphVariants(render_font, glyph.glyph_index, null);
             if (region.width == 0 or region.height == 0) {
                 return glyphAdvance(glyph, cluster_span, p);
             }
@@ -1663,7 +2012,7 @@ pub const TextRenderer = struct {
 
             const region_w: f32 = @floatFromInt(region.width);
             const region_h: f32 = @floatFromInt(region.height);
-            try cur_instance_list.append(self.allocator, .{
+            try self.pushInstance(cur_instance_list, .{
                 .position = .{ snap_x, snap_y },
                 .size = .{
                     (region_w / render_font.scale_factor) * bitmap_scale,
@@ -1727,11 +2076,15 @@ pub const TextRenderer = struct {
 
         // cache miss, shape this segment
         self.segment_cache_misses += 1;
-        const shaped = try self.shaper.shapeWithOptions(seg_text, font, use_italic);
+        const shaper = if (self.shaper) |*sh| sh else return error.TextShapingUnavailable;
+        @import("trace").work_counters.add(.text_shape_bytes, seg_text.len);
+        const shaped = try shaper.shapeWithOptions(seg_text, font, use_italic);
 
         // When inline capacity exceeded, try bounded long-segment cache; failure still hands
         // caller ownership.
         if (shaped.len > MAX_SEGMENT_GLYPHS) {
+            // Adoption may replace or evict another long entry.
+            if (self.cache_long_segments) self.invalidateAppendWidths();
             const cached = self.cache_long_segments and self.long_segment_cache.adopt(self.allocator, cache_key, seg_text, shaped, self.current_frame);
             return .{ .glyphs = shaped, .owned = !cached };
         }
@@ -1749,7 +2102,10 @@ pub const TextRenderer = struct {
     /// Reserve metadata before eviction; committing the adopted slice cannot fail.
     fn adoptShortSegment(self: *TextRenderer, key: SegmentCacheKey, glyphs: []text_module.ShapedGlyph) bool {
         self.segment_cache.ensureUnusedCapacity(1) catch return false;
-        if (self.segment_cache.fetchRemove(key)) |old| releaseSegmentEntry(self.allocator, old.value);
+        if (self.segment_cache.fetchRemove(key)) |old| {
+            self.invalidateAppendWidths();
+            releaseSegmentEntry(self.allocator, old.value);
+        }
         if (self.segment_cache.count() >= SEGMENT_CACHE_MAX) self.evictSegmentCacheOnFull();
         self.segment_cache.putAssumeCapacity(key, .{ .glyphs = glyphs, .frame_last_used = self.current_frame });
         return true;
@@ -1778,6 +2134,18 @@ pub const TextRenderer = struct {
         use_italic: bool,
         fixed_advance: f32,
     ) !f32 {
+        return self.measureTextWidthAsDrawnImpl(text, font, requested_size, use_italic, fixed_advance, true);
+    }
+
+    fn measureTextWidthAsDrawnImpl(
+        self: *TextRenderer,
+        text: []const u8,
+        font: *Font,
+        requested_size: f32,
+        use_italic: bool,
+        fixed_advance: f32,
+        comptime reuse_single_glyphs: bool,
+    ) !f32 {
         if (text.len == 0) return 0;
         const font_physical_size = font.pixelSize();
         const width_key: WidthCache.Key = .{
@@ -1795,16 +2163,73 @@ pub const TextRenderer = struct {
         else
             1.0;
 
+        // Query-local only: no source/font ownership or invalidation survives
+        // this synchronous call. Its font/size/italic/stack inputs are fixed;
+        // identical segment bytes select the same font and shaped glyphs.
+        // Cache one glyph's advance, never a sum, so additions keep the exact
+        // original order (including negative/zero advances).
+        const SingleWidth = struct { key: u32 = 0, advance: f32 = 0 };
+        var single_widths: [64]SingleWidth = undefined;
+        const reuse = reuse_single_glyphs and text.len > 512;
+        if (reuse) @memset(&single_widths, .{});
         var total: f32 = 0;
-        var seg_buf: [MAX_SEGMENTS]Segment = undefined;
         var text_pos: u32 = 0;
+        // Append continuation (see AppendWidthCache): long default-cascade
+        // queries only; the decision before the lookup is O(1).
+        const append = reuse_single_glyphs and text.len > APPEND_MIN_BYTES and self.fallback_stack == null;
+        const append_epoch = self.append_epoch;
+        var append_head: u64 = 0;
+        var append_hit: ?*AppendWidthCache.Entry = null;
+        var checkpoint: u32 = 0;
+        var checkpoint_total: f32 = 0;
+        if (append) {
+            if (self.append_widths == null) {
+                const cache = self.allocator.create(AppendWidthCache) catch null;
+                if (cache) |c| c.* = .{};
+                self.append_widths = cache;
+            }
+            if (self.append_widths) |cache| {
+                append_head = AppendWidthCache.headHash(width_key, text);
+                append_hit = cache.find(append_epoch, width_key, append_head, text);
+                if (append_hit) |entry| {
+                    self.append_width_hits += 1;
+                    if (entry.text.items.len == text.len) {
+                        self.width_cache.put(self.allocator, width_key, text, entry.total);
+                        return entry.total;
+                    }
+                    text_pos = entry.resume_offset;
+                    total = entry.resume_total;
+                    checkpoint = entry.resume_offset;
+                    checkpoint_total = entry.resume_total;
+                }
+            }
+        }
+        var seg_buf: [MAX_SEGMENTS]Segment = undefined;
         while (text_pos < text.len) {
             const remaining = text[text_pos..];
             const seg_count = segmentText(remaining, &seg_buf);
             const effective_count = @min(seg_count, MAX_SEGMENTS);
             for (seg_buf[0..effective_count]) |seg| {
+                if (append) {
+                    // Latest safe restart: a non-space segment start with
+                    // CHECKPOINT_MARGIN bytes after it, before this segment adds.
+                    const at = text_pos + seg.start;
+                    if (isAppendCheckpoint(text, at)) {
+                        checkpoint = at;
+                        checkpoint_total = total;
+                    }
+                }
                 const seg_text = remaining[seg.start..seg.end];
                 const seg_end_byte: u32 = @intCast(seg_text.len);
+                const single_key: u32 = if (reuse and seg_text.len == 3)
+                    @as(u32, std.mem.readInt(u24, seg_text[0..3], .little)) | (1 << 24)
+                else
+                    0;
+                const single_slot = (single_key ^ (single_key >> 8) ^ (single_key >> 16)) & 63;
+                if (single_key != 0 and single_widths[single_slot].key == single_key) {
+                    total += single_widths[single_slot].advance;
+                    continue;
+                }
                 // Explicit font stack: **same** selectSegmentFont as draw emit loop.
                 // Single-path buy-in = measured and drawn use different font, .fit container
                 // clips tail, old bug recurs.
@@ -1819,12 +2244,13 @@ pub const TextRenderer = struct {
                     releaseGlyphFallbackFontRefs(shaped.glyphs);
                     self.allocator.free(shaped.glyphs);
                 };
+                var single_advance: f32 = 0;
                 for (shaped.glyphs, 0..) |g, i| {
                     const span = clusterSpanAt(shaped.glyphs, i, seg_end_byte);
                     // glyphAdvance only uses layout_scale / fixed_advance, other emit fields
                     // unrelated
                     // to width, pass zero.
-                    total += glyphAdvance(g, span, .{
+                    const advance = glyphAdvance(g, span, .{
                         .requested_size = requested_size,
                         .layout_scale = seg_scale,
                         .scale = self.scale_factor,
@@ -1837,13 +2263,21 @@ pub const TextRenderer = struct {
                         .instance_list = &self.instances_nearest,
                         .fixed_advance = fixed_advance,
                     });
+                    total += advance;
+                    single_advance = advance;
                 }
+                if (single_key != 0 and shaped.glyphs.len == 1)
+                    single_widths[single_slot] = .{ .key = single_key, .advance = single_advance };
             }
             if (effective_count > 0) {
                 text_pos += seg_buf[effective_count - 1].end;
             } else break;
             if (seg_count <= MAX_SEGMENTS) break;
         }
+        // An epoch change during this query (its own shaping evicted entries)
+        // must not be stamped as current.
+        if (append and self.append_epoch == append_epoch) if (self.append_widths) |cache|
+            cache.store(self.allocator, append_hit, append_epoch, width_key, append_head, text, total, checkpoint, checkpoint_total);
         self.width_cache.put(self.allocator, width_key, text, total);
         return total;
     }
@@ -1899,7 +2333,7 @@ pub const TextRenderer = struct {
         fixed_advance: f32,
     ) !void {
         if (comptime builtin.os.tag == .windows) {
-            if (@import("zenit_environment").has("ZENIT_TEXT_DIAGNOSTICS") and !self.glyph_only) {
+            if (@import("zenit_environment").flag("ZENIT_TEXT_DIAGNOSTICS") and !self.glyph_only) {
                 const record = try std.json.Stringify.valueAlloc(self.allocator, .{ .text = text, .x = x, .baseline = y, .size = requested_size, .weight = font.weight, .color = color.toArray(), .scale = self.scale_factor, .cleartype = self.cleartype_enabled and self.cleartype_allowed and !force_linear, .force_linear = force_linear }, .{});
                 defer self.allocator.free(record);
                 std.debug.print("TEXT_DRAW {s}\n", .{record});
@@ -1933,6 +2367,7 @@ pub const TextRenderer = struct {
             .fallback_font = fallback_font,
             .instance_list = instance_list,
             .fixed_advance = fixed_advance,
+            .raster_font = self.raster_font,
         };
 
         if (try self.emitFontRanges(text, x, y, color, use_italic, emit_params, &.{})) return;
@@ -1973,7 +2408,7 @@ pub const TextRenderer = struct {
         }
 
         const instances_after = self.instances_nearest.items.len + self.instances_linear.items.len;
-        if (text.len > 0 and instances_after == instances_before) {
+        if (self.ink_probe == null and text.len > 0 and instances_after == instances_before) {
             text_trace.log(
                 self.current_frame,
                 "draw-text-no-instances hash=0x{x} len={d} x={d:.1} y={d:.1} size={d:.1} linear={} clip=[{d:.1},{d:.1}]",
@@ -1994,7 +2429,9 @@ pub const TextRenderer = struct {
     fn emitFontRanges(self: *TextRenderer, content: []const u8, x: f32, y: f32, color: Color, italic: bool, params: EmitParams, spans: []const ColorSpan) !bool {
         if (comptime builtin.os.tag != .windows) return false;
         const ranges = self.active_font_ranges orelse return false;
-        const glyphs = try self.shaper.shapeWithRanges(content, params.font, italic, ranges);
+        const shaper = if (self.shaper) |*sh| sh else return error.TextShapingUnavailable;
+        @import("trace").work_counters.add(.text_shape_bytes, content.len);
+        const glyphs = try shaper.shapeWithRanges(content, params.font, italic, ranges);
         defer self.allocator.free(glyphs);
         defer releaseGlyphFallbackFontRefs(glyphs);
         var cursor = x;
@@ -2151,6 +2588,7 @@ pub const TextRenderer = struct {
             .fallback_font = fallback_font,
             .instance_list = instance_list,
             .fixed_advance = fixed_advance,
+            .raster_font = self.raster_font,
         };
 
         if (try self.emitFontRanges(text, x, y, base_color, use_italic, emit_params, spans)) return;
@@ -2274,7 +2712,7 @@ pub const TextRenderer = struct {
         // again with stale instances, and the frame renders **nothing** from that point.
         //
         // Correct: keep drawing. Out of slots -> switch to a grow-on-demand cross-frame retained
-        // overflow buffer, same as the instance-side overflow_buffers.
+        // overflow buffer.
         const uniform_buffer, const uniform_byte_offset = blk: {
             if (self.uniform_write_offset < MAX_UNIFORM_UPDATES) {
                 const slot = self.uniform_write_offset;
@@ -2294,8 +2732,9 @@ pub const TextRenderer = struct {
             .viewport_size = .{ self.viewport_width, self.viewport_height },
             .scale_factor = self.scale_factor,
             .clip_shape_kind = self.clip_shape_kind,
+            .clip2 = shape_clip_pair.field(self.clip2),
             .clip_rect = self.clip_rect,
-            .clip_radius = self.clip_radius,
+            .clip_radii = self.clip_radii,
             .clip_fill_rule = self.clip_fill_rule,
             .clip_point_count = self.clip_point_count,
             .clip_contour_count = self.clip_contour_count,
@@ -2337,30 +2776,12 @@ pub const TextRenderer = struct {
         // Clear instance buffer, continue collecting subsequent text
         self.instances_nearest.clearRetainingCapacity();
         self.instances_linear.clearRetainingCapacity();
+        self.pending_generation +%= 1;
     }
 
     /// Ensure this frame's slot overflow uniform buffer can hold at least `slots` Uniforms.
-    /// Same as instance-side overflow_buffers: geometric grow, cross-frame retain, capacity
-    /// enough -> reuse.
     fn ensureUniformOverflowCapacity(self: *TextRenderer, slots: usize) !*gpu.Backend.Buffer {
-        const needed = slots * UNIFORM_STRIDE;
-        if (self.uniform_overflow_capacities[self.current_buffer] < needed) {
-            var new_capacity = @max(
-                self.uniform_overflow_capacities[self.current_buffer],
-                UNIFORM_STRIDE * 64,
-            );
-            while (new_capacity < needed) new_capacity *= 2;
-            // Keep the owned buffer intact if replacement allocation fails.
-            const replacement = try self.device.createBuffer(self.allocator, .{
-                .label = "Zenit.Text.OverflowUniforms",
-                .size = new_capacity,
-                .usage = .{ .vertex = true, .map_write = true },
-            });
-            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
-            self.uniform_overflow_buffers[self.current_buffer] = replacement;
-            self.uniform_overflow_capacities[self.current_buffer] = new_capacity;
-        }
-        return &self.uniform_overflow_buffers[self.current_buffer].?;
+        return (try self.uniform_overflow.ensure(self.allocator, self.device, self.current_buffer, slots * UNIFORM_STRIDE)).buffer;
     }
 
     /// Per page_index bucket flush one instance list. Iterate instances, find contiguous
@@ -2418,54 +2839,21 @@ pub const TextRenderer = struct {
             // Write instance buffer and draw. Note: Metal command buffer deferred execution,
             // can't wrap-overwrite in same frame, else prior draw call's referenced offset
             // already overwritten at commit
-            var seg_offset = batch_start;
-            while (seg_offset < batch_end) {
-                const remaining_total = batch_end - seg_offset;
-                const remaining = MAX_INSTANCES - self.buffer_write_offset;
-                const batch = if (remaining == 0)
-                    remaining_total
-                else
-                    @min(remaining_total, remaining);
-                const instance_size = @sizeOf(GlyphInstance) * batch;
-                if (remaining == 0) {
-                    // Reuse this frame slot's overflow buffer; capacity short -> rebuild
-                    // (geometric grow, avoid thrash).
-                    const needed = self.overflow_write_offset + instance_size;
-                    if (self.overflow_capacities[self.current_buffer] < needed) {
-                        var new_capacity = @max(self.overflow_capacities[self.current_buffer], instance_size);
-                        while (new_capacity < needed) new_capacity *= 2;
-                        // Keep the owned buffer intact if replacement allocation fails.
-                        const replacement = try self.device.createBuffer(self.allocator, .{
-                            .label = "Zenit.Text.OverflowInstanceBuffer",
-                            .size = new_capacity,
-                            .usage = .{ .vertex = true, .map_write = true },
-                        });
-                        if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
-                        self.overflow_buffers[self.current_buffer] = replacement;
-                        self.overflow_capacities[self.current_buffer] = new_capacity;
-                    }
-                    const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
-                    const overflow_data = try overflow_buffer.getMappedRange(self.overflow_write_offset, instance_size);
-                    @memcpy(overflow_data, std.mem.sliceAsBytes(items[seg_offset .. seg_offset + batch]));
-                    gpu.setVertexBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
-                    gpu.setFragmentBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
-                    self.overflow_write_offset += instance_size;
-                } else {
-                    const byte_offset = self.buffer_write_offset * @sizeOf(GlyphInstance);
-                    const instance_data = try self.instance_buffers[self.current_buffer].getMappedRange(byte_offset, instance_size);
-                    @memcpy(instance_data, std.mem.sliceAsBytes(items[seg_offset .. seg_offset + batch]));
-                    gpu.setVertexBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
-                    gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
-                    self.buffer_write_offset += batch;
-                }
-                if (comptime gpu.backend_kind == .metal) {
-                    render_pass.drawTriangleStrip(4, @intCast(batch), 0, 0);
-                } else {
-                    render_pass.draw(6, @intCast(batch), 0, 0);
-                }
-                text_draw_calls += 1;
-                seg_offset += batch;
+            const batch = batch_end - batch_start;
+            const instance_size = @sizeOf(GlyphInstance) * batch;
+            const byte_offset = self.buffer_write_offset * @sizeOf(GlyphInstance);
+            const slot = try self.instance_buffers.ensure(self.allocator, self.device, self.current_buffer, byte_offset + instance_size);
+            const instance_data = try slot.buffer.getMappedRange(byte_offset, instance_size);
+            @memcpy(instance_data, std.mem.sliceAsBytes(items[batch_start..batch_end]));
+            gpu.setVertexBufferRange(render_pass, 1, slot.buffer, @intCast(byte_offset), @intCast(instance_size));
+            gpu.setFragmentBufferRange(render_pass, 1, slot.buffer, @intCast(byte_offset), @intCast(instance_size));
+            self.buffer_write_offset += batch;
+            if (comptime gpu.backend_kind == .metal) {
+                render_pass.drawTriangleStrip(4, @intCast(batch), 0, 0);
+            } else {
+                render_pass.draw(6, @intCast(batch), 0, 0);
             }
+            text_draw_calls += 1;
 
             batch_start = batch_end;
         }
@@ -2617,6 +3005,7 @@ test "segmentText: combining suffix stays with its original base bytes" {
         .{ .source = "界\u{301}か\u{3099}", .expected = &.{ "界\u{301}", "か\u{3099}" } },
         .{ .source = "e\u{301}🧪", .expected = &.{ "e\u{301}", "🧪" } },
         .{ .source = "\u{301}", .expected = &.{"\u{301}"} },
+        .{ .source = "a\t\u{301}", .expected = &.{ "a", "\u{301}" } },
     }) |case| {
         var segments: [MAX_SEGMENTS]Segment = undefined;
         const count = segmentText(case.source, &segments);
@@ -2624,7 +3013,6 @@ test "segmentText: combining suffix stays with its original base bytes" {
         for (case.expected, segments[0..count]) |expected, segment| {
             try std.testing.expectEqualStrings(expected, case.source[segment.start..segment.end]);
         }
-        try expectFullCoverage(case.source);
     }
 }
 
@@ -2809,6 +3197,9 @@ test "long segment cache preserves real shaped glyphs including fallback fonts" 
 fn fallbackOnlyRendererForTest(allocator: std.mem.Allocator) TextRenderer {
     var tr: TextRenderer = undefined;
     tr.allocator = allocator;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
     tr.current_frame = 0;
     tr.fallback_font_cache = std.AutoHashMap(u64, FallbackFontCacheEntry).init(allocator);
     tr.atlas.cache = @TypeOf(tr.atlas.cache).init(std.testing.allocator);
@@ -2970,6 +3361,9 @@ test "segmentText: WTF8 pairs and joined emoji keep original storage spans" {
 fn checkShortSegmentAdoptionOom(allocator: std.mem.Allocator) !void {
     var tr: TextRenderer = undefined;
     tr.allocator = allocator;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
     tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator);
     tr.current_frame = 1;
     defer {
@@ -2995,6 +3389,9 @@ test "short segment cache retains exact payload and frees stale and full entries
     const allocator = std.testing.allocator;
     var tr: TextRenderer = undefined;
     tr.allocator = allocator;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
     tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator);
     tr.current_frame = 1;
     defer {
@@ -3070,4 +3467,678 @@ test "glyph UV wire round trips every 4096 atlas texel boundary exactly" {
         const uv = UV.init(arbitrary);
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&arbitrary), std.mem.asBytes(&uv));
     }
+}
+
+test "2048 atlas physical boundaries preserve fixed 4096 UV wire exactly" {
+    for (0..2049) |i| {
+        const u: f32 = @as(f32, @floatFromInt(i)) / 2048;
+        const encoded_uv = MetalGlyphUV.init(.{ u, 0, u, 1 });
+        try std.testing.expectEqual(@as(u16, @intCast(i * 2)), encoded_uv.texels[0]);
+        try std.testing.expectEqual(u, encoded_uv.normalized()[0]);
+    }
+}
+
+test "idle trim keeps only the segments the latest frame drew" {
+    const allocator = std.testing.allocator;
+    var tr: TextRenderer = undefined;
+    tr.allocator = allocator;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator);
+    tr.long_segment_cache = .{};
+    defer {
+        var it = tr.segment_cache.valueIterator();
+        while (it.next()) |entry| TextRenderer.releaseSegmentEntry(allocator, entry.*);
+        tr.segment_cache.deinit();
+        tr.long_segment_cache.deinit(allocator);
+    }
+    const shaped = struct {
+        fn make(a: std.mem.Allocator) ![]text_module.ShapedGlyph {
+            const glyphs = try a.alloc(text_module.ShapedGlyph, 2);
+            @memset(glyphs, .{ .glyph_index = 1, .cluster = 0, .x_advance = 4, .y_advance = 0, .x_offset = 0, .y_offset = 0 });
+            return glyphs;
+        }
+    };
+    // Shaped long ago (scrolled past), and on the latest frame (on screen).
+    tr.current_frame = 1;
+    try std.testing.expect(tr.adoptShortSegment(.{ .content_hash = 1, .font_ptr = 0, .flags = 0 }, try shaped.make(allocator)));
+    try std.testing.expect(tr.long_segment_cache.adopt(allocator, .{ .content_hash = 3, .font_ptr = 0, .flags = 0 }, "old long line", try shaped.make(allocator), 1));
+    tr.current_frame = 40;
+    try std.testing.expect(tr.adoptShortSegment(.{ .content_hash = 2, .font_ptr = 0, .flags = 0 }, try shaped.make(allocator)));
+    try std.testing.expect(tr.long_segment_cache.adopt(allocator, .{ .content_hash = 4, .font_ptr = 0, .flags = 0 }, "visible long line", try shaped.make(allocator), 40));
+    tr.trimIdleCaches();
+    try std.testing.expect(tr.segment_cache.get(.{ .content_hash = 1, .font_ptr = 0, .flags = 0 }) == null);
+    try std.testing.expect(tr.segment_cache.get(.{ .content_hash = 2, .font_ptr = 0, .flags = 0 }) != null);
+    try std.testing.expectEqual(@as(u32, 1), tr.long_segment_cache.entries.count());
+    try std.testing.expect(tr.long_segment_cache.get(.{ .content_hash = 4, .font_ptr = 0, .flags = 0 }, "visible long line", 40) != null);
+}
+
+test "work counters: a segment shaped on a cache miss counts its bytes once" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const work = @import("trace").work_counters;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr: TextRenderer = undefined;
+    tr.allocator = a;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.current_frame = 0;
+    tr.cache_long_segments = false;
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(a);
+    tr.segment_cache_hits = 0;
+    tr.segment_cache_misses = 0;
+    tr.shaper = try TextShaper.init(a);
+    defer tr.shaper.?.deinit();
+    defer tr.releaseAppendWidths();
+    defer {
+        var it = tr.segment_cache.valueIterator();
+        while (it.next()) |entry| TextRenderer.releaseSegmentEntry(a, entry.*);
+        tr.segment_cache.deinit();
+    }
+    const font = try fs.findFont(.{ .family = "Menlo", .size = 14 });
+    defer font.deinit();
+    const segment = "counted";
+    const before = work.snapshot().get(.text_shape_bytes);
+    const first = try tr.lookupOrShapeSegment(segment, font, false);
+    try std.testing.expect(!first.owned);
+    try std.testing.expectEqual(before + segment.len, work.snapshot().get(.text_shape_bytes));
+    // A cache hit shapes nothing.
+    _ = try tr.lookupOrShapeSegment(segment, font, false);
+    try std.testing.expectEqual(before + segment.len, work.snapshot().get(.text_shape_bytes));
+    try std.testing.expectEqual(@as(u64, 1), tr.segment_cache_hits);
+}
+
+test "long drawn width reuses single glyphs within one query without changing float sums" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr: TextRenderer = undefined;
+    tr.allocator = a;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
+    tr.current_frame = 0;
+    tr.scale_factor = 1.5;
+    tr.fallback_stack = null;
+    tr.cache_long_segments = false;
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(a);
+    tr.segment_cache_hits = 0;
+    tr.segment_cache_misses = 0;
+    tr.width_cache = .{};
+    tr.shaper = try TextShaper.init(a);
+    defer tr.shaper.?.deinit();
+    defer tr.width_cache.deinit(a);
+    defer tr.releaseAppendWidths();
+    defer {
+        var it = tr.segment_cache.valueIterator();
+        while (it.next()) |entry| TextRenderer.releaseSegmentEntry(a, entry.*);
+        tr.segment_cache.deinit();
+    }
+    // Keep every font alive through both queries; include the explicit
+    // per-codepoint fallback path as well as the native cascade.
+    const fonts = [_]*Font{
+        try fs.findFont(.{ .family = "Helvetica", .size = 14 }),
+        try fs.findFont(.{ .family = "Menlo", .size = 14 }),
+    };
+    defer for (fonts) |font| font.deinit();
+    const cjk = try fs.findFont(.{ .family = "PingFang SC", .size = 14 });
+    defer cjk.deinit();
+    var stack = FontFallbackStack.init(a);
+    defer stack.deinit();
+    stack.addFont(stack.addFamily("PingFang SC", .han_kana).?, cjk);
+    tr.primary_coverage_cache = @TypeOf(tr.primary_coverage_cache).init(a);
+    defer tr.primary_coverage_cache.deinit();
+    const unit = "中文排版文字 日本語 한글 ASCII ffi中 abc日 3️⃣ 👩‍💻 ";
+    const sample = @as([unit.len * 40]u8, @bitCast(@as([40][unit.len]u8, @splat(unit.*))));
+    for ([_]bool{ false, true }) |explicit_stack| {
+        tr.fallback_stack = if (explicit_stack) &stack else null;
+        for (fonts) |font| {
+            for ([_]f32{ 11.25, 14, 19.5 }) |size| for ([_]bool{ false, true }) |italic| for ([_]f32{ 0, 7.25 }) |fixed| {
+                tr.width_cache.clear(a);
+                const before = tr.segment_cache_hits;
+                const expected = try tr.measureTextWidthAsDrawnImpl(&sample, font, size, italic, fixed, false);
+                const reference_hits = tr.segment_cache_hits - before;
+                tr.width_cache.clear(a);
+                const old = tr.segment_cache_hits;
+                const actual = try tr.measureTextWidthAsDrawn(&sample, font, size, italic, fixed);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+                try std.testing.expect(tr.segment_cache_hits - old < reference_hits);
+            };
+        }
+    }
+}
+
+/// Renderer for native width tests: only measure-path fields are live.
+fn measureOnlyRendererForTest(a: std.mem.Allocator) !TextRenderer {
+    var tr: TextRenderer = undefined;
+    tr.allocator = a;
+    tr.append_widths = null;
+    tr.append_epoch = 1;
+    tr.append_width_hits = 0;
+    tr.current_frame = 0;
+    tr.scale_factor = 1;
+    tr.fallback_stack = null;
+    tr.cache_long_segments = false;
+    tr.long_segment_cache = .{};
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(a);
+    tr.segment_cache_hits = 0;
+    tr.segment_cache_misses = 0;
+    tr.width_cache = .{};
+    tr.primary_coverage_cache = @TypeOf(tr.primary_coverage_cache).init(a);
+    tr.shaper = try TextShaper.init(a);
+    return tr;
+}
+
+fn deinitMeasureOnlyRendererForTest(tr: *TextRenderer) void {
+    tr.releaseAppendWidths();
+    tr.width_cache.deinit(tr.allocator);
+    var it = tr.segment_cache.valueIterator();
+    while (it.next()) |entry| TextRenderer.releaseSegmentEntry(tr.allocator, entry.*);
+    tr.segment_cache.deinit();
+    tr.long_segment_cache.deinit(tr.allocator);
+    tr.primary_coverage_cache.deinit();
+    tr.shaper.?.deinit();
+}
+
+/// Streaming-like corpus: every segmentText branch, sequences that change
+/// segmentation when completed (keycap, ZWJ, VS16, RTL + spaces, combining
+/// marks), newlines/tabs and Markdown syntax. Valid UTF-8 only: callers trim
+/// to a valid prefix and CoreText rejects WTF-8 halves; byte cuts still land
+/// inside sequences and leave a truncated tail.
+fn appendCorpusForTest(buf: []u8, seed: u64) []u8 {
+    const pieces = [_][]const u8{
+        "中文排版文字",
+        " 日本語",
+        " 한글 ",
+        "glyph ",
+        "native ",
+        "render ",
+        "🚀 ",
+        "版件型能能口 ",
+        "ffi中 ",
+        "abc日",
+        " 3\u{FE0F}\u{20E3} ",
+        "1\u{FE0F}\u{20E3}",
+        "#\u{20E3}",
+        "👩\u{200D}💻",
+        " 🇨🇳",
+        "\u{2764}\u{FE0F}",
+        "\u{200D}",
+        "العربية عربي",
+        "     ",
+        "עִבְרִית ",
+        "مرحبا  ",
+        "\n",
+        "\n\n",
+        "\t",
+        "**bold** ",
+        "_it_ ",
+        "`code` ",
+        "[link](https://x.y) ",
+        "# 标题\n",
+        "- item\n",
+        "```\nfn f() {}\n```\n",
+        "e\u{0301} ",
+        " ",
+        "，标点“引号”。",
+        "😀",
+        "Ａ全角",
+        "→ ",
+    };
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    var len: usize = 0;
+    while (true) {
+        const piece = pieces[r.uintLessThan(usize, pieces.len)];
+        if (len + piece.len > buf.len) break;
+        @memcpy(buf[len..][0..piece.len], piece);
+        len += piece.len;
+    }
+    return buf[0..len];
+}
+
+/// Opening of the S2 streaming benchmark fixture (gpu-ui-bench stream.txt).
+const s2_stream_excerpt =
+    \\布版台界平件 glyph native render 🚀 版件型能能口 证能无面代 native window text 🚀 台计框程入输 型程模件 layout
+    \\障画渲 字工能 布染台碍架 无模 设画跨内型版 程版 代字障跨 布框 设面证能 frame 动平字框 布界 台设文组口 画文内性架
+    \\atlas 无渲台局内动 态法排 signal 证代平 agent shader 程计模入入设 frame layout shader render window 染师程平
+    \\局文状平组 glyph 工组版 文窗染布法 agent frame shader 法窗版 框版 atlas text 障模组计染设 口面性法平 frame
+    \\frame 码能 frame 架计渲界码 🚀 输计平碍 signal 程工无架设 布程存师 window 画平 窗工模碍无 状渲无件码 工布渲文
+    \\组台文 widget widget glyph native agent 内内台存染碍 shader 框能证染输 跨画画状口输 口师证 组框能 widget 碍模存
+    \\🚀 frame 局障设程入能 平平组 🚀 型排程染字碍 跨窗型入口文 shader 代代内工障 工面版件布 文内台文程师 atlas 平内版法版局 widget
+    \\widget widget render 染平画染口文 工窗框入 口态证 动台排工 布能 atlas agent 无输程 frame 状局件局计 台内口
+    \\glyph 平能跨 native 态件 验架设 计码状口计布 文内程工状画 证计入 框局存 证状 码码动输渲代 口台存 性验染染 输输件
+    \\代程局渲代排 widget 状框台设验动 平设存型字 代输口架局染 状平件动态 窗排 界台型版组入 window glyph 版文内 render 能设跨 组师程设局模
+    \\window 组排窗 text 型工口碍 口障法入 window 无布法架碍工 native 存设组证 🧠 text signal 口输口 设能型计
+    \\😀 平架工 师组 排台型染存 件法面窗局 跨工存存排码 无窗输证 布法架验代局 shader text signal text 🧠 验版平跨设
+    \\无框态台 染存 证字输 agent shader 输架染排输型 动能局 text 字渲 window native 窗排窗能 window 面法师码内师
+    \\程师 无碍面 layout 证框口计 入口工 版界面 状平 渲局 面存输 无能型能 无代字 无证程 性无程计 frame
+    \\型代设 验字件界 局性界组法输 内程局口程设 widget 程设跨染面界 输界 widget 跨模组 text frame atlas 窗窗版内 能验染跨
+    \\shader 存验 布障入架平能 证工无染 signal native 证界 染组验件 计台版 工师 型证染法入 window frame 码字染程面证
+    \\性渲字码版件 存码组计动 版能染文 法存面设版动 架设能口 输件性组 台工 widget frame 存碍渲跨 atlas window 台态能状内 signal
+    \\signal frame render 输程内文局 frame 模框 native 布障码模师 能型 布架设架跨 师染验窗法 atlas 面染动染入 window
+;
+
+/// Full-walk reference: no WidthCache answer and no append resume.
+fn referenceWidthForTest(tr: *TextRenderer, text: []const u8, font: *Font, size: f32, italic: bool, fixed: f32) !u32 {
+    tr.width_cache.clear(tr.allocator);
+    const w = try tr.measureTextWidthAsDrawnImpl(text, font, size, italic, fixed, false);
+    tr.width_cache.clear(tr.allocator);
+    return @bitCast(w);
+}
+
+test "append width continuation matches full measurement bit for bit on streamed prefixes" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr = try measureOnlyRendererForTest(a);
+    defer deinitMeasureOnlyRendererForTest(&tr);
+    const fonts = [_]*Font{
+        try fs.findFont(.{ .family = "Helvetica", .size = 15 }),
+        try fs.findFont(.{ .family = "PingFang SC", .size = 15, .weight = .bold }),
+        try fs.findFont(.{ .family = "Menlo", .size = 13 }),
+    };
+    defer for (fonts) |font| font.deinit();
+    const Params = struct { font: usize, size: f32, italic: bool, fixed: f32, scale: f32, seed: u64 };
+    const params = [_]Params{
+        .{ .font = 0, .size = 15, .italic = false, .fixed = 0, .scale = 1, .seed = 1 },
+        .{ .font = 1, .size = 15, .italic = false, .fixed = 0, .scale = 1.5, .seed = 2 },
+        .{ .font = 0, .size = 19.5, .italic = true, .fixed = 0, .scale = 2, .seed = 3 },
+        .{ .font = 2, .size = 13, .italic = false, .fixed = 7.25, .scale = 1, .seed = 4 },
+        .{ .font = 1, .size = 11.25, .italic = true, .fixed = 0, .scale = 1.25, .seed = 5 },
+    };
+    var corpus_buf: [6144]u8 = undefined;
+    var comparisons: usize = 0;
+    var resumed_queries: usize = 0;
+    for (params) |p| {
+        tr.scale_factor = p.scale;
+        const corpus = appendCorpusForTest(&corpus_buf, p.seed);
+        var prng = std.Random.DefaultPrng.init(p.seed *% 0x9e3779b97f4a7c15);
+        const r = prng.random();
+        // Line-suffix starts, as wrapping measures them, plus byte 0 (intrinsic).
+        const starts = [_]usize{ 0, 1, 37, 300, 701 };
+        var end: usize = 600;
+        var frame: usize = 0;
+        while (end <= corpus.len) : (frame += 1) {
+            // A new frame: the per-frame WidthCache forgets everything.
+            tr.width_cache.clear(a);
+            for (starts) |line_start| {
+                // Wrapped lines start on scalar boundaries.
+                var start = line_start;
+                while ((corpus[start] & 0xC0) == 0x80) start += 1;
+                if (end <= start + APPEND_MIN_BYTES) continue;
+                const query = corpus[start..end];
+                const expected = try referenceWidthForTest(&tr, query, fonts[p.font], p.size, p.italic, p.fixed);
+                const hits = tr.append_width_hits;
+                const actual: u32 = @bitCast(try tr.measureTextWidthAsDrawn(query, fonts[p.font], p.size, p.italic, p.fixed));
+                if (expected != actual) {
+                    std.debug.print("append width mismatch start={d} end={d} expected={x} actual={x}\n", .{ start, end, expected, actual });
+                    return error.WidthBitsChanged;
+                }
+                resumed_queries += tr.append_width_hits - hits;
+                comparisons += 1;
+            }
+            // Token sizes include 0 (same text again) and cuts inside UTF-8
+            // sequences, ZWJ/keycap sequences and space runs.
+            end += r.uintAtMost(usize, 41);
+            if (frame % 7 == 6) end += 1;
+        }
+    }
+    try std.testing.expect(comparisons > 1500);
+    // Every query after the first per (start, params) has a prefix record.
+    try std.testing.expect(resumed_queries * 10 >= comparisons * 9);
+}
+
+test "append width continuation never resumes across invalidation or edits" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr = try measureOnlyRendererForTest(a);
+    defer deinitMeasureOnlyRendererForTest(&tr);
+    const font = try fs.findFont(.{ .family = "Helvetica", .size = 14 });
+    defer font.deinit();
+    const cjk = try fs.findFont(.{ .family = "PingFang SC", .size = 14 });
+    defer cjk.deinit();
+    var stack = FontFallbackStack.init(a);
+    defer stack.deinit();
+    stack.addFont(stack.addFamily("PingFang SC", .han_kana).?, cjk);
+    var buf: [2048]u8 = undefined;
+    const corpus = appendCorpusForTest(&buf, 99);
+    const Step = enum { evict_full, stack_on, stack_off, idle_trim, edit_middle, other_params, short };
+    var edited: [2048]u8 = undefined;
+    for (std.enums.values(Step)) |step| {
+        tr.width_cache.clear(a);
+        _ = try tr.measureTextWidthAsDrawn(corpus[0..1200], font, 14, false, 0);
+        tr.width_cache.clear(a);
+        var query: []const u8 = corpus[0..1300];
+        var size: f32 = 14;
+        switch (step) {
+            .evict_full => tr.evictSegmentCacheOnFull(),
+            .stack_on => tr.setFallbackStack(&stack),
+            .stack_off => {
+                tr.setFallbackStack(&stack);
+                tr.setFallbackStack(null);
+            },
+            .idle_trim => tr.trimIdleCaches(),
+            .edit_middle => {
+                @memcpy(edited[0..1300], corpus[0..1300]);
+                edited[600] = if (edited[600] == 'x') 'y' else 'x';
+                query = edited[0..1300];
+            },
+            .other_params => size = 14.5,
+            .short => query = corpus[0..APPEND_MIN_BYTES],
+        }
+        const hits = tr.append_width_hits;
+        const actual: u32 = @bitCast(try tr.measureTextWidthAsDrawn(query, font, size, false, 0));
+        try std.testing.expectEqual(hits, tr.append_width_hits);
+        try std.testing.expectEqual(try referenceWidthForTest(&tr, query, font, size, false, 0), actual);
+        tr.setFallbackStack(null);
+    }
+    // Control: the same sequence without any of the above does resume.
+    tr.width_cache.clear(a);
+    _ = try tr.measureTextWidthAsDrawn(corpus[0..1200], font, 14, false, 0);
+    tr.width_cache.clear(a);
+    const hits = tr.append_width_hits;
+    _ = try tr.measureTextWidthAsDrawn(corpus[0..1300], font, 14, false, 0);
+    try std.testing.expectEqual(hits + 1, tr.append_width_hits);
+}
+
+// Layout's wrap loop shape: per line, measure the whole remaining suffix
+// first (text_layout.findLineBreak fast path), then search the break.
+const WrapForTest = struct {
+    fn measure(t: *TextRenderer, f: *Font, text: []const u8, reference: bool) !f32 {
+        if (reference) return @bitCast(try referenceWidthForTest(t, text, f, 15, false, 0));
+        return t.measureTextWidthAsDrawn(text, f, 15, false, 0);
+    }
+    fn lines(t: *TextRenderer, f: *Font, text: []const u8, width: f32, reference: bool, out: *[256]u32) !usize {
+        var n: usize = 0;
+        var start: usize = 0;
+        while (start < text.len and n < out.len) {
+            const rest = text[start..];
+            const full = try measure(t, f, rest, reference);
+            var end = text.len;
+            if (full > width) {
+                // Largest scalar boundary whose prefix fits (binary search).
+                var lo: usize = start + 1;
+                while (lo < text.len and (text[lo] & 0xC0) == 0x80) lo += 1;
+                var hi: usize = text.len;
+                while (lo < hi) {
+                    var mid = lo + (hi - lo + 1) / 2;
+                    while (mid < text.len and (text[mid] & 0xC0) == 0x80) mid += 1;
+                    if (mid >= hi) {
+                        hi -= 1;
+                        continue;
+                    }
+                    const w = try measure(t, f, text[start..mid], reference);
+                    if (w <= width) lo = mid else hi = mid - 1;
+                }
+                end = lo;
+            }
+            out[n] = @intCast(end);
+            n += 1;
+            start = end;
+        }
+        return n;
+    }
+};
+
+test "append width continuation keeps streamed line breaks identical" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr = try measureOnlyRendererForTest(a);
+    defer deinitMeasureOnlyRendererForTest(&tr);
+    const font = try fs.findFont(.{ .family = "PingFang SC", .size = 15 });
+    defer font.deinit();
+    var buf: [5000]u8 = undefined;
+    const corpus = appendCorpusForTest(&buf, 7);
+    var expected_lines: [256]u32 = undefined;
+    var actual_lines: [256]u32 = undefined;
+    var end: usize = 700;
+    var prng = std.Random.DefaultPrng.init(77);
+    var frames: usize = 0;
+    while (end <= corpus.len) : (end += 1 + prng.random().uintLessThan(usize, 160)) {
+        tr.width_cache.clear(a);
+        const n_expected = try WrapForTest.lines(&tr, font, corpus[0..end], 420, true, &expected_lines);
+        tr.width_cache.clear(a);
+        const n_actual = try WrapForTest.lines(&tr, font, corpus[0..end], 420, false, &actual_lines);
+        try std.testing.expectEqualSlices(u32, expected_lines[0..n_expected], actual_lines[0..n_actual]);
+        frames += 1;
+    }
+    try std.testing.expect(frames > 20);
+    try std.testing.expect(tr.append_width_hits > 0);
+}
+
+test "append width continuation recomputes lookahead-sensitive tails" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr = try measureOnlyRendererForTest(a);
+    defer deinitMeasureOnlyRendererForTest(&tr);
+    const font = try fs.findFont(.{ .family = "Helvetica", .size = 15 });
+    defer font.deinit();
+    const spaces: [40]u8 = @splat(' ');
+    // Each tail changes how the bytes before it segment once completed: RTL
+    // absorbs a space run only if RTL follows it; ASCII/space runs and
+    // keycap/ZWJ/VS16 sequences extend across the append point.
+    const Case = struct { head: []const u8, tail: []const u8 };
+    const cases = [_]Case{
+        .{ .head = "عربي" ++ spaces, .tail = "عربي و" },
+        .{ .head = "abc" ++ spaces, .tail = "def ghi" },
+        .{ .head = "中" ++ spaces, .tail = "文字" },
+        .{ .head = "x 1", .tail = "\u{FE0F}\u{20E3} y" },
+        .{ .head = "x 👩", .tail = "\u{200D}💻 y" },
+        .{ .head = "x \u{2764}", .tail = "\u{FE0F} y" },
+        .{ .head = "x \u{05D0}", .tail = "\u{05B8} y" },
+        .{ .head = "word", .tail = "continues" },
+    };
+    var filler_buf: [1024]u8 = undefined;
+    const filler = appendCorpusForTest(&filler_buf, 11);
+    var buf: [2048]u8 = undefined;
+    for (cases) |c| {
+        const head_len = filler.len + c.head.len;
+        @memcpy(buf[0..filler.len], filler);
+        @memcpy(buf[filler.len..][0..c.head.len], c.head);
+        @memcpy(buf[head_len..][0..c.tail.len], c.tail);
+        tr.width_cache.clear(a);
+        const before: u32 = @bitCast(try tr.measureTextWidthAsDrawn(buf[0..head_len], font, 15, false, 0));
+        try std.testing.expectEqual(try referenceWidthForTest(&tr, buf[0..head_len], font, 15, false, 0), before);
+        // Every byte cut of the tail, including inside multi-byte scalars.
+        for (1..c.tail.len + 1) |cut| {
+            const query = buf[0 .. head_len + cut];
+            tr.width_cache.clear(a);
+            const hits = tr.append_width_hits;
+            const actual: u32 = @bitCast(try tr.measureTextWidthAsDrawn(query, font, 15, false, 0));
+            try std.testing.expectEqual(hits + 1, tr.append_width_hits);
+            try std.testing.expectEqual(try referenceWidthForTest(&tr, query, font, 15, false, 0), actual);
+        }
+    }
+}
+
+/// Segments in absolute offsets, produced exactly like the measure/draw loop
+/// (MAX_SEGMENTS chunks restarted at the last segment end).
+fn collectSegmentsForTest(text: []const u8, out: *std.ArrayList(Segment), a: std.mem.Allocator) !void {
+    out.clearRetainingCapacity();
+    var seg_buf: [MAX_SEGMENTS]Segment = undefined;
+    var text_pos: u32 = 0;
+    while (text_pos < text.len) {
+        const seg_count = segmentText(text[text_pos..], &seg_buf);
+        const effective_count = @min(seg_count, MAX_SEGMENTS);
+        for (seg_buf[0..effective_count]) |seg| try out.append(a, .{ .start = text_pos + seg.start, .end = text_pos + seg.end });
+        if (effective_count > 0) text_pos += seg_buf[effective_count - 1].end else break;
+        if (seg_count <= MAX_SEGMENTS) break;
+    }
+}
+
+test "append checkpoints keep every earlier segment final under any extension" {
+    // The lemma behind AppendWidthCache: pure segmentation, no shaping, so
+    // differences that shaping happens to hide (equal widths) still fail.
+    const a = std.testing.allocator;
+    var before: std.ArrayList(Segment) = .empty;
+    defer before.deinit(a);
+    var after: std.ArrayList(Segment) = .empty;
+    defer after.deinit(a);
+    const spaces: [40]u8 = @splat(' ');
+    const tails = [_][]const u8{
+        "عربي و",
+        "\u{05D0}\u{05B8} y",
+        "abc",
+        " " ++ spaces,
+        "\u{FE0F}\u{20E3}",
+        "\u{200D}💻",
+        "\u{FE0F}",
+        "中文",
+        "\n",
+        "\t",
+        "#",
+        "1",
+        "\xED\xB8\x80",
+        "😀",
+        "e\u{0301}",
+    };
+    const heads = [_][]const u8{ "عربي" ++ spaces, "مرحبا", "abc" ++ spaces, "x 1", "x 👩", "x \u{2764}", "\xED\xA0\xBD", "中" ++ spaces };
+    var corpus_buf: [3000]u8 = undefined;
+    var text_buf: [4096]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x51ab);
+    const r = prng.random();
+    var checked: usize = 0;
+    for (0..6) |seed| {
+        const corpus = appendCorpusForTest(&corpus_buf, seed + 40);
+        for (0..120) |iteration| {
+            // Old text: a corpus prefix (any byte cut) optionally ending in a
+            // lookahead-sensitive head; new text: old plus a tail.
+            var len = r.uintLessThan(usize, corpus.len);
+            @memcpy(text_buf[0..len], corpus[0..len]);
+            if (iteration % 2 == 0) {
+                const head = heads[r.uintLessThan(usize, heads.len)];
+                @memcpy(text_buf[len..][0..head.len], head);
+                len += head.len;
+            }
+            const old_text = text_buf[0..len];
+            try collectSegmentsForTest(old_text, &before, a);
+            var checkpoint: ?u32 = null;
+            for (before.items) |seg| {
+                if (isAppendCheckpoint(old_text, seg.start)) checkpoint = seg.start;
+            }
+            const cp = checkpoint orelse continue;
+            for (tails) |tail| {
+                @memcpy(text_buf[len..][0..tail.len], tail);
+                try collectSegmentsForTest(text_buf[0 .. len + tail.len], &after, a);
+                var i: usize = 0;
+                while (i < before.items.len and before.items[i].start < cp) : (i += 1) {
+                    try std.testing.expect(i < after.items.len);
+                    try std.testing.expectEqual(before.items[i], after.items[i]);
+                }
+                try std.testing.expect(i < after.items.len);
+                try std.testing.expectEqual(cp, after.items[i].start);
+                checked += 1;
+            }
+        }
+    }
+    // Real streaming: old and new texts are two cuts of one corpus, so the
+    // append point also lands inside keycap/ZWJ/VS16/scalar sequences.
+    for (0..6) |seed| {
+        const corpus = appendCorpusForTest(&corpus_buf, seed + 80);
+        var cut: usize = 1;
+        while (cut + 48 < corpus.len) : (cut += 1 + r.uintLessThan(usize, 9)) {
+            try collectSegmentsForTest(corpus[0..cut], &before, a);
+            var checkpoint: ?u32 = null;
+            for (before.items) |seg| {
+                if (isAppendCheckpoint(corpus[0..cut], seg.start)) checkpoint = seg.start;
+            }
+            const cp = checkpoint orelse continue;
+            for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 9, 13, 48 }) |grow| {
+                try collectSegmentsForTest(corpus[0 .. cut + grow], &after, a);
+                var i: usize = 0;
+                while (i < before.items.len and before.items[i].start < cp) : (i += 1) {
+                    try std.testing.expect(i < after.items.len);
+                    try std.testing.expectEqual(before.items[i], after.items[i]);
+                }
+                try std.testing.expect(i < after.items.len);
+                try std.testing.expectEqual(cp, after.items[i].start);
+                checked += 1;
+            }
+        }
+    }
+    try std.testing.expect(checked > 10000);
+}
+
+test "append width continuation replays the S2 token stream with identical widths and breaks" {
+    // SKIP-REASON: native CoreText shaping oracle; GPU resources are not needed.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fs = try text_module.FontSystem.init(a, std.testing.io);
+    defer fs.deinit();
+    var tr = try measureOnlyRendererForTest(a);
+    defer deinitMeasureOnlyRendererForTest(&tr);
+    const font = try fs.findFont(.{ .family = "PingFang SC", .size = 15 });
+    defer font.deinit();
+    // Markdown flattens the soft line breaks of the streamed paragraph.
+    var flat: [s2_stream_excerpt.len]u8 = s2_stream_excerpt.*;
+    for (&flat) |*byte| if (byte.* == '\n') {
+        byte.* = ' ';
+    };
+    var expected_lines: [256]u32 = undefined;
+    var actual_lines: [256]u32 = undefined;
+    var tokens: usize = 0;
+    var in_word = false;
+    for (flat, 0..) |byte, i| {
+        // The benchmark's tokenizer: a token ends where the next word starts.
+        const space = std.ascii.isWhitespace(byte);
+        defer in_word = !space;
+        if (space or in_word or i == 0) continue;
+        tokens += 1;
+        if (i <= APPEND_MIN_BYTES) continue;
+        tr.width_cache.clear(a);
+        const n_expected = try WrapForTest.lines(&tr, font, flat[0..i], 600, true, &expected_lines);
+        tr.width_cache.clear(a);
+        const n_actual = try WrapForTest.lines(&tr, font, flat[0..i], 600, false, &actual_lines);
+        try std.testing.expectEqualSlices(u32, expected_lines[0..n_expected], actual_lines[0..n_actual]);
+    }
+    try std.testing.expect(tokens > 200);
+    try std.testing.expect(tr.append_width_hits > tokens);
+}
+
+test "append width records stay within their byte budget and release every buffer" {
+    const a = std.testing.allocator;
+    const cache = try a.create(AppendWidthCache);
+    cache.* = .{};
+    defer a.destroy(cache);
+    defer cache.deinit(a);
+    const big = try a.alloc(u8, 300 * 1024);
+    defer a.free(big);
+    for (big, 0..) |*byte, i| byte.* = @truncate(i *% 31);
+    const key: WidthCache.Key = .{ .hash = 0, .font = 1, .size = 2, .physical_size = 3, .scale = 4, .advance = 0, .italic = false };
+    // Distinct heads fill many sets; growth by append reuses the record.
+    var stored: usize = 0;
+    for (0..64) |i| {
+        const text = big[i * 97 ..][0 .. 200 * 1024];
+        const head = AppendWidthCache.headHash(key, text);
+        cache.store(a, null, 1, key, head, text[0 .. 100 * 1024], 1, 0, 0);
+        if (cache.find(1, key, head, text)) |entry| {
+            cache.store(a, entry, 1, key, head, text, 2, 64, 1);
+            stored += 1;
+        }
+        try std.testing.expect(cache.bytes <= AppendWidthCache.max_text_bytes + 200 * 1024);
+    }
+    try std.testing.expect(stored >= 10);
+    // Replacing a large record with a small one frees the large buffer.
+    const text = big[0..1024];
+    const head = AppendWidthCache.headHash(key, text);
+    for (0..AppendWidthCache.ways + 1) |_| cache.store(a, null, 1, key, head, text, 3, 0, 0);
+    try std.testing.expectEqual(@as(f32, 3), cache.find(1, key, head, text).?.total);
+    try std.testing.expect(cache.find(2, key, head, text) == null);
 }

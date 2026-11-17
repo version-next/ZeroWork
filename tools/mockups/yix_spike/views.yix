@@ -1,0 +1,129 @@
+//! yix_spike 的 Yix 视图：每个组件对应一个 V 项。
+const std = @import("std");
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("styles.yss");
+const m = @import("vm.zig");
+
+// ── V-2：选择器函数，参数是 *ViewModel，内部 .get() 读信号 ──
+fn titleOf(vm: *m.ViewModel) []const u8 {
+    vm.selector_runs += 1;
+    return vm.title.get();
+}
+fn cannotBack(vm: *m.ViewModel) bool { return !vm.can_back.get(); }
+fn modeOf(vm: *m.ViewModel) m.Mode { return vm.mode.get(); }
+
+// 注意：Yix 不支持多值分支 `.panes, .search =>`（yix gen 报 "unexpected token"），拆开写或用 else。
+// 另外 `//` 注释写在标签内部会变成文本节点，注释只能放在模板外。
+pub fn SelectorPanel(vm: *m.ViewModel) View {
+    return (
+        <col testId="spike.v2" style={S.section}>
+            <text style={S.heading}>V-2 选择器(vm)</text>
+            <text testId="spike.v2.title" style={S.body_text}>{titleOf(vm)}</text>
+            <box testId="spike.v2.back_hint" visible={cannotBack(vm)}><text style={S.muted}>已在最前</text></box>
+            {switch (modeOf(vm)) {
+                .overview => <text testId="spike.v2.mode" style={S.muted}>overview</text>,
+                .panes => <text testId="spike.v2.mode" style={S.muted}>panes</text>,
+                .search => <text testId="spike.v2.mode" style={S.muted}>search</text>,
+            }}
+        </col>
+    );
+}
+
+// ── V-3：事件里调用带参数的函数，实参含枚举字面量 / 带载荷的 Intent ──
+// 注意：实参里写结构体字面量 `.{ .set_count = 5 }` 或 `m.Intent{ .set_count = 5 }` 会被 yix gen 拒绝
+// （"field writes and nested event statements are not implemented"），载荷用 @unionInit 或构造函数。
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.send_calls += 1;
+    vm.dispatch(intent);
+}
+
+pub fn EventPanel(vm: *m.ViewModel) View {
+    return (
+        <col testId="spike.v3" style={S.section}>
+            <text style={S.heading}>V-3 onClick={"{send(vm, .back)}"}</text>
+            <row style={S.section_row}>
+                <W.Button testId="spike.v3.back" label="后退" disabled={cannotBack(vm)} onClick={send(vm, .back)} />
+                <W.Button testId="spike.v3.forward" label="前进" onClick={send(vm, .forward)} />
+                <W.Button testId="spike.v3.add" label="+5" onClick={send(vm, @unionInit(m.Intent, "set_count", 5))} />
+                <box testId="spike.v3.host" onClick={send(vm, .toggle_flag)}><text style={S.body_text}>宿主 box</text></box>
+            </row>
+        </col>
+    );
+}
+
+// ── V-4：模板里直接写 vm.<信号字段> ──
+// 原先前五行是反例：{vm.field} 能编译，但渲染出 Signal / Memo 结构体的调试转储。zenit 现在在编译期拒绝
+// 把响应式源直接插进 {…}（view.zig：“the interpolated value is a reactive source”），反例已无法编译，改为内联 .get()。
+// 直接写进 visible / if / switch / for / 组件属性同样编译失败；可用写法是内联 .get()。
+pub fn DirectPanel(vm: *m.ViewModel) View {
+    return (
+        <col testId="spike.v4" style={S.section}>
+            <text style={S.heading}>V-4 直接写 vm.field</text>
+            <text testId="spike.v4.title" style={S.body_text}>{vm.title.get()}</text>
+            <text testId="spike.v4.count" style={S.body_text}>count={vm.count.get()}</text>
+            <text testId="spike.v4.doubled" style={S.body_text}>doubled={vm.doubled.get()}</text>
+            <text testId="spike.v4.mode" style={S.body_text}>mode={vm.mode.get()}</text>
+            <text testId="spike.v4.flag" style={S.body_text}>can_back={vm.can_back.get()}</text>
+            <box testId="spike.v4.visible" visible={vm.can_back.get()}><text style={S.muted}>visible={"{vm.can_back.get()}"}</text></box>
+            <W.Button testId="spike.v4.disabled" label="disabled={vm.can_back.get()}" disabled={vm.can_back.get()} />
+            <text testId="spike.v4.inline_get" style={S.body_text}>{vm.count.get() + 100}</text>
+        </col>
+    );
+}
+
+// V-4 控制流：条件 / switch（含 else 分支）/ 可选捕获 / 列表，用内联 .get()（直接写 vm.field 编译失败）
+pub fn DirectIf(vm: *m.ViewModel) View {
+    return <col testId="spike.v4.if_root">{if (vm.can_back.get()) <text testId="spike.v4.if">yes</text> else <text testId="spike.v4.if">no</text>}</col>;
+}
+pub fn DirectSwitch(vm: *m.ViewModel) View {
+    return <col testId="spike.v4.switch_root">{switch (vm.mode.get()) { .overview => <text testId="spike.v4.switch">overview</text>, .panes => <text testId="spike.v4.switch">panes</text>, else => <text testId="spike.v4.switch">search</text> }}</col>;
+}
+pub fn DirectOptional(vm: *m.ViewModel) View {
+    return <col testId="spike.v4.opt_root">{if (vm.note.get()) |n| <text testId="spike.v4.opt">{n}</text> else <text testId="spike.v4.opt">none</text>}</col>;
+}
+pub fn DirectFor(vm: *m.ViewModel) View {
+    return <col testId="spike.v4.for_root">{for (vm.rows.get()) |r| <text key={r.id}>{r.title}</text> else <text>empty</text>}</col>;
+}
+
+// ── V-1：import 子目录组件（parts/count_row.yix 内部再用 ../ 引回上层） ──
+const Rows = @import("parts/count_row.yix");
+pub fn ImportPanel(vm: *m.ViewModel) View {
+    return (
+        <col testId="spike.v1" style={S.section}>
+            <text style={S.heading}>V-1 子目录组件 + ../ import</text>
+            <Rows.CountRow vm={vm} label="count（来自 parts/count_row.yix）" />
+        </col>
+    );
+}
+
+// ── V-5：旧命令式面板经 ComponentOf 嵌入，放在可卸载的条件分支里 ──
+const legacy = @import("legacy.zig");
+fn legacyShown(vm: *m.ViewModel) bool { return vm.legacy_shown.get(); }
+fn legacyOuterShown(vm: *m.ViewModel) bool { return vm.legacy_outer_shown.get(); }
+fn toggleLegacy(vm: *m.ViewModel) void { vm.legacy_shown.set(!vm.legacy_shown.peek()); }
+pub fn LegacyHost(vm: *m.ViewModel) View {
+    return (
+        <col testId="spike.v5" style={S.section}>
+            <text style={S.heading}>V-5 ComponentOf(旧 mountContent)</text>
+            <W.Button testId="spike.v5.toggle" label="挂载 / 卸载旧面板" onClick={toggleLegacy(vm)} />
+            {if (legacyShown(vm)) <legacy.LegacyPanel label="旧面板（子 scope）" />}
+            {if (legacyOuterShown(vm)) <legacy.LegacyPanelOuterScope label="旧面板（外部 scope，反例）" />}
+        </col>
+    );
+}
+
+// ── V-11：windowRegion 属性 ──
+fn noop() void {}
+pub fn ChromeHeader() View {
+    return (
+        <row testId="spike.v11.header" windowRegion={.drag} style={S.header}>
+            <text style={S.body_text}>V-11 windowRegion=.drag</text>
+            <W.Button testId="spike.v11.button" label="按钮" onClick={noop()} />
+            <box testId="spike.v11.client" windowRegion={.client} style={S.chip}><text style={S.muted}>.client</text></box>
+            <box testId="spike.v11.plain" style={S.chip}><text style={S.muted}>inherit</text></box>
+            <spacer />
+            <box testId="spike.v11.close" windowRegion={.close} style={S.chip}><text style={S.muted}>.close</text></box>
+        </row>
+    );
+}

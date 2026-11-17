@@ -2,6 +2,7 @@
 //! boundary; this file has no Runtime, Controller, credential or token access.
 const std = @import("std");
 const ui = @import("ui");
+const panel_header = @import("../../shared/ui/components/panel_header/panel_header.zig");
 const contract = @import("../../host/plugin_ui_contract.zig");
 const typed = @import("../../host/plugin_services.zig");
 const console = @import("console_service.zig");
@@ -11,13 +12,48 @@ const services = @import("services.zig");
 const mapping = @import("input_mapping.zig");
 const vm = @import("view_model.zig");
 const S = @import("styles.zig");
+const Rows = @import("_progress_rows.yss.zig");
+const app_menu = @import("../../features/shell/mod.zig").app_menu;
 const performance = @import("../../host/frame_performance.zig");
-const LogS = @import("../../ui/connection_logs_styles.zig");
+const LogS = @import("../../features/connections/progress/view/connection_logs_styles.zig");
+const OM = @import("overlay_model.zig");
+const OV = @import("overlay_view.zig");
+const ai_control = @import("ai_control.zig");
 const Menu = vm.Menu;
-const Popover = ui.widgets.popover.PopoverResult;
 const Option = ui.widgets.SelectOption;
-const WaitingBounds = struct { width: f32, height: f32, theme: u32 };
-const LogBounds = struct { width: f32, height: f32, route_height: f32, compact: bool, theme: u32 };
+const WaitingBounds = struct { width: f32, height: f32, theme: u32, launcher: ?contract.LauncherPlacement };
+/// Everything the view's geometry is computed from, read at the layout safety point. Equal key =
+/// nothing to recompute. Rects are this view's own boxes (it owns their placement); `waiting`
+/// is the connection card's applied size, which a theme replay of its recipe can reset.
+const LayoutKey = struct {
+    viewport: ui.ComputedRect,
+    card: ui.ComputedRect,
+    toolbar_width: f32,
+    window: [2]f32,
+    picture: [2]u32,
+    mode: mapping.Mode,
+    theme: u32,
+    launcher: ?contract.LauncherPlacement,
+    status_shown: bool,
+    waiting: [2]f32,
+    hud_height: f32,
+    alert_height: f32,
+    scrollbar_y: bool,
+    /// Laid-out width of the toolbar's native controls (see `toolsWidth`).
+    tools_width: f32,
+};
+/// Monotonic wall-clock milliseconds. The view's timed behaviour (hint timeout, HUD reveal,
+/// elapsed readouts) runs on real time: the window's frame clock stands still while nothing is
+/// drawn, and this view no longer draws frames just to keep a clock moving.
+fn wallClockMs() f64 {
+    return @floatFromInt(@divTrunc(@import("../../platform/realtime.zig").monotonicNs(), std.time.ns_per_ms));
+}
+const LogBounds = struct { width: f32, height: f32, above: f32, footer: f32, compact: bool, theme: u32 };
+const max_order_rows = 256;
+const scale_items = [_]ui.widgets.tabs.TabItem{
+    .{ .id = @tagName(mapping.Mode.fit), .label = "适应窗口", .test_id = "bmc.display.fit" },
+    .{ .id = @tagName(mapping.Mode.original), .label = "100%", .test_id = "bmc.display.original" },
+};
 pub const CaptureAuthority = struct {
     binding_generation: u64,
     input_epoch: u64,
@@ -40,7 +76,7 @@ fn geometryReady(snapshot: input.Snapshot, frame_generation: u64) bool {
 
 const menu_names = [_][]const u8{ "控制", "按键", "显示", "电源", "启动" };
 const menu_ids = [_][]const u8{ "bmc.control", "bmc.keys", "bmc.display", "bmc.power", "bmc.boot" };
-const menu_icons = [_]ui.SvgAsset{ ui.icons.mouse_pointer_2, ui.icons.keyboard, ui.icons.monitor, ui.icons.power, ui.icons.arrow_up_right };
+const menu_icons = [_]ui.SvgAsset{ ui.icons.mouse_pointer_2, ui.icons.keyboard, ui.icons.monitor_cog, ui.icons.power, ui.icons.rocket }; // Pencil TcJSa menu icons
 const power_actions = [_]services.PowerAction{ .on, .graceful_shutdown, .graceful_restart, .force_off, .force_restart, .power_cycle };
 const target_values = [_][]const u8{ "Disabled", "Pxe", "Hdd", "Cd", "Diags", "BiosSetup", "Usb", "None" };
 const target_names = [_][]const u8{ "恢复默认（关闭覆盖）", "网络 PXE", "硬盘", "CD / DVD", "诊断", "BIOS 设置", "USB", "None（设备返回）" };
@@ -56,13 +92,13 @@ pub const View = struct {
     root: ?*ui.Node = null,
     toolbar: ?*ui.Node = null,
     connection_icon: ?*ui.Node = null,
+    /// This view's box holding the title icon and title.
+    connection_identity: ?*ui.Node = null,
     connection_title: ?*ui.Node = null,
-    connection_state: ?*ui.Node = null,
     disconnect_node: ?*ui.Node = null,
     disconnect_disabled: *ui.Signal(bool) = undefined,
-    disconnect_style: *ui.Signal(ui.BoxStyle) = undefined,
+    disconnect_slot: ?*ui.Node = null,
     disconnect_icon_only: *ui.Signal(bool) = undefined,
-    disconnect_hint: ?*ui.Signal(bool) = null,
     connection_symbol: *ui.Signal(?ui.SvgAsset) = undefined,
     connection_tint: *ui.Signal(?ui.Color) = undefined,
     connection_hint: *ui.Signal([]const u8) = undefined,
@@ -70,6 +106,7 @@ pub const View = struct {
     disconnect_confirm_open: *ui.Signal(bool) = undefined,
     disconnect_confirm_title: *ui.Signal([]const u8) = undefined,
     disconnect_confirm_action: *ui.Signal([]const u8) = undefined,
+    disconnect_confirm_message: *ui.Signal([]const u8) = undefined,
     disconnect_confirm_dialog: ?*ui.Node = null,
     disconnect_confirm_target: ?*ui.Node = null,
     disconnect_confirm_detail: ?*ui.Node = null,
@@ -77,31 +114,40 @@ pub const View = struct {
     connection_hovered: ?*ui.Signal(bool) = null,
     connection_focused: ?*ui.Signal(bool) = null,
     tool_nodes: [5]?*ui.Node = @splat(null),
-    tool_styles: [5]*ui.Signal(ui.BoxStyle) = undefined,
+    /// This view's boxes around the native toolbar controls: placement and show / hide.
+    tool_slots: [5]?*ui.Node = @splat(null),
     tool_labels: [5]*ui.Signal([]const u8) = undefined,
     tool_icon_only: *ui.Signal(bool) = undefined,
-    tool_hints: [5]?*ui.Signal(bool) = @splat(null),
-    more: ?Popover = null,
+    /// The native Button's dropdown chevron: shown beside a label, not on the icon-only toolbar.
+    tool_chevron: *ui.Signal(bool) = undefined,
+    /// Natural widths of the toolbar controls (disconnect + five menus) as zenit laid them out,
+    /// labelled and icon-only: the toolbar folds when its width cannot hold them.
+    tools_labelled_width: ?f32 = null,
+    tools_icon_width: ?f32 = null,
+    /// “更多 KVM 操作”（窄工具栏时收起的电源 / 启动）：原生 `W.Menu`，经菜单唯一入口（app_menu，menus 包）挂载。
+    more: ?*app_menu.AppMenu = null,
+    more_slot: ?*ui.Node = null,
     more_node: ?*ui.Node = null,
     more_open: ?*ui.Signal(bool) = null,
-    more_style: ?*ui.Signal(ui.BoxStyle) = null,
-    more_row_style: *ui.Signal(ui.BoxStyle) = undefined,
-    more_chevrons: [2]?*ui.Node = @splat(null),
-    more_rows: [2]?*ui.Node = @splat(null),
-    more_focus_pending: bool = false,
-    tool_hover: *ui.Signal(?ui.BoxStyle) = undefined,
-    key_style: *ui.Signal(ui.BoxStyle) = undefined,
-    last_theme_version: u32 = std.math.maxInt(u32),
+    /// Raised by the window when the theme is published.
+    theme_watch: @import("../../shared/ui/theme/theme_watch.zig").ThemeWatch = .{},
     last_compact: ?bool = null,
     last_overflow: bool = false,
     viewport: ?*ui.Node = null,
     scroll: ?ui.widgets.ScrollAreaResult = null,
     image_node: ?*ui.Node = null,
+    /// The scrolled extent inside the picture ScrollArea (this view's box).
+    canvas: ?*ui.Node = null,
     waiting: ?*ui.Node = null,
     waiting_header: ?*ui.Node = null,
     waiting_title: ?*ui.Node = null,
     waiting_detail: ?*ui.Node = null,
     waiting_body: ?ui.widgets.ScrollAreaResult = null,
+    /// This view's boxes around / inside the progress ScrollArea: the height and the content.
+    waiting_viewport: ?*ui.Node = null,
+    waiting_list: ?*ui.Node = null,
+    progress_scroll_y: *ui.Signal(f32) = undefined,
+    progress_expanded: [vm.progress_group_count]*ui.Signal(bool) = undefined,
     waiting_actions: ?*ui.Node = null,
     progress_active: bool = false,
     progress_projection: vm.ProgressProjection = .{},
@@ -117,7 +163,6 @@ pub const View = struct {
     progress_notice: ?*ui.Node = null,
     progress_steps: ?*ui.Node = null,
     progress_rows: [vm.progress_group_count]?*ui.Node = @splat(null),
-    progress_buttons: [vm.progress_group_count]?*ui.Node = @splat(null),
     progress_details: [vm.progress_group_count]?*ui.Node = @splat(null),
     progress_chevrons: [vm.progress_group_count]?*ui.Node = @splat(null),
     progress_icons: [vm.progress_group_count]?*ui.Node = @splat(null),
@@ -134,6 +179,12 @@ pub const View = struct {
     log_modal: ?ui.widgets.ModalResult = null,
     log_footer: ?*ui.Node = null,
     log_scroll: ?ui.widgets.ScrollAreaResult = null,
+    log_scroll_y: *ui.Signal(f32) = undefined,
+    log_width: *ui.Signal(f32) = undefined,
+    log_max_height: *ui.Signal(f32) = undefined,
+    log_content: ?*ui.Node = null,
+    log_list: ?*ui.Node = null,
+    log_viewport: ?*ui.Node = null,
     log_detail: ?*ui.Node = null,
     log_empty: ?*ui.Node = null,
     log_rows: [vm.log_capacity]?*ui.Node = @splat(null),
@@ -177,22 +228,57 @@ pub const View = struct {
     frame_revision: u64 = 0,
     frame_generation: u64 = 0,
     show_fps: *ui.Signal(bool) = undefined,
-    fps_hud: ?*ui.Node = null,
-    fps_display: ?*ui.Node = null,
-    fps_decode: ?*ui.Node = null,
+    /// Pencil j8WXoF card overlays (O1 status, O2 HUD, O3 hint, O4 waiting, O5 AI frame).
+    overlays: ?*OV.Overlays = null,
+    video_card: ?*ui.Node = null,
+    /// Where the tab's AI launcher rests when this card occupies its corner (host-published).
+    launcher: ?contract.LauncherPlacement = null,
+    hud: OM.HudReveal = .{},
+    /// The pointer is over the picture: the picture node's native hover, the only hover source.
+    picture_hovered: ?*ui.Signal(bool) = null,
+    hud_inside: bool = false,
+    hint: OM.Hint = .{},
+    /// The owner's change tokens this view last projected (console_service.Pulse).
+    seen: ?console.Pulse = null,
+    /// Re-read the console snapshot on the next frame: set by this view's own actions and clocks
+    /// (the owner's publications arrive through `seen`).
+    stale: bool = true,
+    management_stale: bool = true,
+    /// Recompute the card overlays (O1–O5) on the next frame.
+    overlays_stale: bool = true,
+    layout_key: ?LayoutKey = null,
+    /// Wall-clock deadlines (monotonic ms), each armed only while its readout is on screen.
+    progress_due_ms: ?f64 = null,
+    performance_due_ms: ?f64 = null,
+    overlay_due_ms: ?f64 = null,
+    /// The connection attempt is still running (its elapsed readouts move).
+    progress_running: bool = false,
+    /// Tooltips of the icon-only toolbar: compact and no menu open.
+    hints_enabled: *ui.Signal(bool) = undefined,
+    clock: *const fn () f64 = wallClockMs,
+    display_fps: ?f32 = null,
+    decode_fps: ?f32 = null,
+    /// O4 "waiting for picture" is up (power running or no signal); the progress card yields.
+    picture_waiting: bool = false,
+    no_signal: bool = false,
+    /// The connection / failure card is up (O2 hides under it).
+    progress_shown: bool = false,
+    /// The power action this view submitted and when it started running (monotonic ms).
+    power_action: ?services.PowerAction = null,
+    power_started_ms: ?f64 = null,
     fps_detail: ?*ui.Node = null,
     fps_gap_value: ?*ui.Node = null,
     fps_age_value: ?*ui.Node = null,
     decoded_meter: performance.Meter = .{},
     decoded_total: ?u64 = null,
     decoded_generation: u64 = 0,
-    last_fps_ms: u64 = 0,
     width: u32 = 0,
     height: u32 = 0,
-    last_poll_ms: f64 = -1000,
-    last_management_ms: f64 = -1000,
     after_layout_registered: bool = false,
-    menus: [5]?Popover = @splat(null),
+    menus: [5]?ui.widgets.popover.PopoverResult = @splat(null),
+    /// Per menu: this view's scroll viewport box (its height) and body box (its content).
+    menu_viewports: [5]?*ui.Node = @splat(null),
+    menu_bodies: [5]?*ui.Node = @splat(null),
     menu_scrolls: [5]?ui.widgets.ScrollAreaResult = @splat(null),
     open: [5]*ui.Signal(bool) = undefined,
     menu_signal_count: usize = 0,
@@ -233,21 +319,21 @@ pub const View = struct {
     boot_pending_label: ?*ui.Node = null,
     boot_hint: ?*ui.Node = null,
     boot_details: ?*ui.Node = null,
-    boot_switch: ?*ui.Node = null,
-    switch_patched: bool = false,
-    switch_checked: bool = false,
-    switch_theme_version: u32 = std.math.maxInt(u32),
     mode_row: ?*ui.Node = null,
     order_rows: ?*ui.Node = null,
+    /// The boot-order rows this view has built so far (reused across refreshes).
+    order_nodes: [max_order_rows]?*ui.Node = @splat(null),
+    order_node_count: usize = 0,
     order_mapping_warning: ?*ui.Node = null,
     order_open: ?*ui.Signal(bool) = null,
     order_modal: ?ui.widgets.ModalResult = null,
     order_scroll: ?ui.widgets.ScrollAreaResult = null,
-    fit_style: *ui.Signal(ui.BoxStyle) = undefined,
-    original_style: *ui.Signal(ui.BoxStyle) = undefined,
+    order_viewport: ?*ui.Node = null,
+    /// 适应窗口 / 100%：the native segmented Tabs' active id (`@tagName(mapping.Mode)`).
+    scale_value: *ui.Signal(?[]const u8) = undefined,
+    original_hint: ?*ui.Node = null,
     fullscreen_label: *ui.Signal([]const u8) = undefined,
     message: ?*ui.Node = null,
-    input_hint: ?*ui.Node = null,
 
     const Borrowed = struct { binding: typed.Binding, table: *const console.Interface };
     fn borrowConsole(self: *View) !Borrowed {
@@ -268,38 +354,20 @@ pub const View = struct {
         return false;
     }
     fn closeMenus(self: *View) void {
-        self.more_focus_pending = false;
-        self.returnMoreFocus();
-        if (self.more_open) |open| {
-            open.set(false);
-            self.syncMoreStyle();
-        }
+        if (self.more_open) |open| open.set(false);
         for (self.open[0..self.menu_signal_count]) |signal| signal.set(false);
         if (self.order_open) |open| open.set(false);
         if (self.log_open) |open| open.set(false);
     }
-    fn returnMoreFocus(self: *View) void {
-        const popup = self.more orelse return;
-        const focused = self.mount_request.cx.focus_manager.getFocused() orelse return;
-        if (focused.isDescendantOf(popup.content)) self.mount_request.cx.setFocus(self.more_node);
-    }
-    fn syncMoreStyle(self: *View) void {
-        const source = self.more_style orelse return;
-        var style = S.iconTool();
-        if (self.more_open.?.peek()) {
-            style.background = S.theme.popupSelection();
-            style.text_color = S.theme.current().accent_ink;
-        }
-        source.set(style);
-    }
-    fn syncHint(self: *View, open: *ui.Signal(bool), node: *ui.Node) void {
-        const cx = self.mount_request.cx;
-        const rect = node.globalRect();
-        // Retained nested triggers can miss leave/re-enter while a portal
-        // detaches. Keep hints tied to the current visible button bounds.
-        open.set((self.last_compact orelse false) and node.isDisplayedInTree() and !self.anyMenu() and cx.mouse_x >= rect.x and cx.mouse_x < rect.x + rect.w and cx.mouse_y >= rect.y and cx.mouse_y < rect.y + rect.h);
+    /// Something this view shows changed by its own doing (not through the owner's pulse):
+    /// project again on the next frame.
+    fn invalidate(self: *View) void {
+        self.stale = true;
+        self.overlays_stale = true;
+        self.mount_request.cx.requestRedraw();
     }
     fn releaseInput(self: *View, cause: input.ReleaseCause) void {
+        if (self.captured or self.pending_capture or self.hint.active) self.invalidate();
         self.captured = false;
         self.capture_authority = null;
         self.pending_capture = false;
@@ -308,7 +376,7 @@ pub const View = struct {
         self.pending_pointer = null;
         self.keyboard.clear();
         self.wheel.clear();
-        if (self.input_hint) |node| node.setDisplay(.none);
+        self.hint.clear();
         if (self.pointer_captured) self.mount_request.cx.releasePointerCapture();
         self.pointer_captured = false;
         if (self.lookup(input.definition) catch null) |binding| {
@@ -322,10 +390,15 @@ pub const View = struct {
     }
     fn showMessage(self: *View, text: []const u8) void {
         if (self.message) |node| node.setTextContent(self.mount_request.cx.allocator, text) catch {};
-        if (self.input_hint) |node| {
-            node.setTextContent(self.mount_request.cx.allocator, text) catch {};
-            node.setDisplay(if (text.len > 0) .flex else .none);
-        }
+        // O3: an error / refusal stays until the user's next action.
+        self.hint.show(text, .until_action, self.clock());
+        self.overlays_stale = true;
+        self.mount_request.cx.requestRedraw();
+    }
+    /// 操作失败的提示：用户文案取 shared/base/error_text.zig（唯一目录），原始错误名只进应用日志。
+    fn showFailure(self: *View, err: anyerror) void {
+        @import("../../platform/applog.zig").warn(.app, "bmc console action failed: {s}", .{@errorName(err)});
+        self.showMessage(@import("../../shared/base/error_text.zig").lineOr(err, "操作未完成，请重试；详情见应用日志"));
     }
     fn beginCapture(self: *View, requested: ?CaptureAuthority) void {
         if (self.closed or self.texture == null or self.watch_only_selected or !self.window_focused or !self.mount_request.cx.window_active or self.anyMenu() or self.mount_request.cx.overlay_stack.topmost() != null) return;
@@ -350,7 +423,7 @@ pub const View = struct {
         };
         if (requested) |authority| if (!authority.sameEpoch(binding.generation, snapshot.value.input, self.frame_generation)) return;
         service.table.set_focus(service.binding.context, service.binding, true) catch |err| {
-            self.showMessage(@errorName(err));
+            self.showFailure(err);
             return;
         };
         const current = table.snapshot(binding.context, binding) catch {
@@ -370,7 +443,10 @@ pub const View = struct {
         self.view_only = false;
         self.capture_authority = authority;
         self.captured = true;
+        // O3: a transient hint fades after 3 s; O1 keeps the captured state in the toolbar.
+        self.hint.show("已捕获键鼠，按 " ++ mapping.release_hint ++ " 释放", .transient, self.clock());
         if (self.viewport) |node| self.mount_request.cx.focus_manager.setFocus(node);
+        self.invalidate();
     }
     fn submit(self: *View, event: input.Event) bool {
         if (self.closed or !self.captured or self.view_only) return false;
@@ -418,10 +494,12 @@ pub const View = struct {
         const node = self.viewport orelse return null;
         const rect = node.globalRect();
         const scroll = self.scroll orelse return null;
-        // ScrollArea snaps its painted translation to the backing-pixel grid.
-        // Read that logical translation rather than the unsnapped accumulator,
-        // otherwise fractional local scrolling can shift a click by one pixel.
-        return mapping.Geometry.calculate(.{ .x = rect.x, .y = rect.y, .width = rect.w, .height = rect.h }, self.width, self.height, self.mode, .{ .x = -scroll.content.style.translate_x, .y = -scroll.content.style.translate_y });
+        // The scroll offset as painted: where this view's canvas sits relative to the viewport
+        // (ScrollArea snaps the painted translation to the backing-pixel grid; the unsnapped
+        // accumulator could shift a click by one pixel under fractional local scrolling).
+        _ = scroll;
+        const canvas = (self.canvas orelse return null).globalRect();
+        return mapping.Geometry.calculate(.{ .x = rect.x, .y = rect.y, .width = rect.w, .height = rect.h }, self.width, self.height, self.mode, .{ .x = rect.x - canvas.x, .y = rect.y - canvas.y });
     }
     fn pointer(self: *View, x: f32, y: f32, mask: u8, dragging: bool) bool {
         const g = self.geometry() orelse return false;
@@ -460,6 +538,11 @@ pub const View = struct {
     fn handle(event: ui.events.Event, raw: ?*anyopaque) ui.events.EventResult {
         const self: *View = @ptrCast(@alignCast(raw orelse return .ignored));
         if (self.closed) return .ignored;
+        if ((event == .mouse_down or event == .key_down) and self.hint.active and self.hint.kind == .until_action) {
+            self.hint.userAction();
+            self.overlays_stale = true;
+            self.mount_request.cx.requestRedraw();
+        }
         switch (event) {
             .mouse_down => |value| {
                 if (self.anyMenu()) return .ignored;
@@ -543,47 +626,11 @@ pub const View = struct {
         if (!mapping.isReleaseShortcut(@backingInt(value.key), .{ .ctrl = value.modifiers.ctrl, .alt = value.modifiers.alt })) return .ignored;
         return handle(event, raw);
     }
-    fn beforeRender(node: *ui.Node) void {
-        const self: *View = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.anim_state orelse return));
-        if (self.closed) return;
-        if ((self.captured or self.pending_capture) and (!self.mount_request.cx.window_active or (self.captured and self.mount_request.cx.overlay_stack.topmost() != null))) self.releaseInput(.lost_focus);
-        const now = self.mount_request.cx.frame_time_ms;
-        if (now - self.last_poll_ms >= 30 or now < self.last_poll_ms) {
-            self.last_poll_ms = now;
-            self.refresh(now) catch |err| self.showMessage(@errorName(err));
-        }
-        self.updateGeometry();
-        for (self.tool_hints, 0..) |maybe, index| if (maybe) |open| {
-            self.syncHint(open, self.tool_nodes[index].?);
-        };
-        if (self.disconnect_hint) |open| self.syncHint(open, self.disconnect_node.?);
-        self.syncConnectionIndicator();
-        _ = self.updatePopovers();
-        self.flushPointerWhenDue();
-        if (self.mount_request.frame_sink) |sink| {
-            // The host confirms this candidate only after a successful native
-            // frame submission. Repainting the HUD never increments video FPS.
-            if (self.texture != null and self.texture == sink.texture and self.frame_generation == sink.frame_generation)
-                sink.presentation.stage(self.mount_request.cx.frame_count, sink.frame_generation, sink.revision);
-        }
-        if (self.pending_capture and !self.anyMenu() and self.mount_request.cx.overlay_stack.topmost() == null) {
-            const requested = self.pending_capture_authority;
-            self.pending_capture = false;
-            self.pending_capture_authority = null;
-            if (requested) |authority| self.beginCapture(authority);
-        }
-        if (self.boot_switch) |switch_node| {
-            const checked = self.boot_continuous.peek();
-            if (!self.switch_patched or self.switch_checked != checked or self.switch_theme_version != self.mount_request.cx.theme_version) {
-                patchSwitch(self, switch_node);
-                self.switch_patched = true;
-                self.switch_checked = checked;
-                self.switch_theme_version = self.mount_request.cx.theme_version;
-            }
-        }
-        self.mount_request.cx.scheduleRedrawAfterNs(if (self.window_focused and self.mount_request.cx.window_active) 33 * std.time.ns_per_ms else 250 * std.time.ns_per_ms);
-    }
-    fn refresh(self: *View, now: f64) !void {
+    /// Re-read the owner's console snapshot and project it. Runs when the owner's pulse moved,
+    /// after this view's own actions (`stale`), and while a running clock is on screen.
+    fn refresh(self: *View) !void {
+        self.stale = false;
+        self.overlays_stale = true;
         const service = try self.borrowConsole();
         var next = try service.table.snapshot(service.binding.context, service.binding, self.mount_request.cx.allocator);
         var retained = false;
@@ -622,46 +669,80 @@ pub const View = struct {
         self.disconnect_disabled.set(self.cancel_pending or service.table.cancel == null or value.cleanup != .not_started or value.route == .closed or value.route == .failed);
         self.syncConnectionIndicator();
         if (self.mount_request.content_context) |context| self.fullscreen_label.set(if (context.fullscreen()) "退出全屏" else "进入全屏");
-        if (value.cleanup == .not_started and value.route != .closed and (now - self.last_management_ms >= 1000 or now < self.last_management_ms)) {
-            self.last_management_ms = now;
-            try self.refreshManagement();
-        }
     }
+    /// Read the owner's change tokens and re-read only what moved. The owner publishes; nothing
+    /// here runs on a timer.
+    fn consumePulse(self: *View) !void {
+        const service = try self.borrowConsole();
+        const pulse = try service.table.pulse(service.binding.context, service.binding);
+        const before = self.seen;
+        self.seen = pulse;
+        if (before == null or before.?.state != pulse.state) self.stale = true;
+        if (before == null or before.?.management != pulse.management) self.management_stale = true;
+        self.sampleDecoded(pulse.decoded_frames);
+    }
+    /// Count newly decoded frames for the decode-rate readout (rates are refreshed by their own clock).
+    fn sampleDecoded(self: *View, decoded_frames: u64) void {
+        const total = self.decoded_total orelse {
+            self.decoded_total = decoded_frames;
+            if (decoded_frames != 0 and self.texture != null) self.decoded_meter.record(@intFromFloat(@max(0, self.clock())), 1);
+            return;
+        };
+        if (decoded_frames == total) return;
+        if (decoded_frames < total) self.decoded_meter = .{} else if (self.texture != null) self.decoded_meter.record(@intFromFloat(@max(0, self.clock())), decoded_frames - total);
+        self.decoded_total = decoded_frames;
+        // New frames: the rate readouts move again.
+        self.framesMoved();
+    }
+    /// A video frame was decoded or shown: (re)start the 500 ms clock of the rate readouts if it
+    /// is not running. It stops by itself once the readouts have settled (`updatePerformance`).
+    fn framesMoved(self: *View) void {
+        if (self.performance_due_ms == null and self.show_fps.peek()) self.performance_due_ms = self.clock() + 500;
+    }
+    /// Refresh the rate readouts (O2 HUD line and the display menu's statistics). They are live
+    /// values on a 500 ms clock that runs only while a readout is on screen and still moving:
+    /// with no new frame the one-second rates settle at 0 and the clock stops; the "since last
+    /// frame" statistics keep counting only while the display menu is open.
     fn updatePerformance(self: *View, value: console.Snapshot) !void {
-        const now: u64 = @intCast(@max(0, @import("../../platform/realtime.zig").monotonicNs()) / std.time.ns_per_ms);
+        const now_f = self.clock();
+        const now: u64 = @intFromFloat(@max(0, now_f));
         const live = value.video == .streaming and self.texture != null;
-        if (self.fps_hud) |hud| hud.setDisplay(if (self.show_fps.peek() and live) .flex else .none);
         if (self.fps_detail) |detail| detail.setDisplay(if (self.show_fps.peek()) .flex else .none);
-        if (self.decoded_generation != value.frame_generation or (self.decoded_total != null and value.decoded_frames < self.decoded_total.?)) {
+        if (self.decoded_generation != value.frame_generation) {
             self.decoded_meter = .{};
-            self.decoded_total = null;
             self.decoded_generation = value.frame_generation;
         }
-        if (live) {
-            const delta = if (self.decoded_total) |total| value.decoded_frames -| total else @as(u64, @intFromBool(value.decoded_frames != 0));
-            self.decoded_meter.record(now, delta);
-        }
-        self.decoded_total = value.decoded_frames;
-        if (now >= self.last_fps_ms and now - self.last_fps_ms < 500) return;
-        self.last_fps_ms = now;
         const meter = if (self.mount_request.frame_sink) |sink| &sink.presentation.meter else null;
+        self.display_fps = if (live and meter != null) (if (meter.?.fps(now)) |fps| @as(f32, @floatCast(fps)) else null) else null;
+        self.decode_fps = if (live) (if (self.decoded_meter.fps(now)) |fps| @as(f32, @floatCast(fps)) else null) else null;
+        self.syncHudText();
         var buf: [160]u8 = undefined;
-        try setText(self, self.fps_display, if (live and meter != null and meter.?.fps(now) != null)
-            try std.fmt.bufPrint(&buf, "显示 {d:.1} FPS", .{meter.?.fps(now).?})
-        else
-            "显示 — FPS");
-        try setText(self, self.fps_decode, if (live and self.decoded_meter.fps(now) != null)
-            try std.fmt.bufPrint(&buf, "解码 {d:.1} FPS", .{self.decoded_meter.fps(now).?})
-        else
-            "解码 — FPS");
         const has_stats = live and meter != null and meter.?.last_ms != null;
         try setText(self, self.fps_gap_value, if (has_stats) try std.fmt.bufPrint(&buf, "{d} ms", .{meter.?.maxGap(now)}) else "— ms");
         try setText(self, self.fps_age_value, if (has_stats) try std.fmt.bufPrint(&buf, "{d} ms", .{now -| meter.?.last_ms.?}) else "— ms");
+        // Keep the clock only while a shown readout can still change.
+        const shown = self.show_fps.peek() and live;
+        const menu_open = shown and self.open[@backingInt(Menu.display)].peek();
+        const last_frame: ?u64 = blk: {
+            const displayed = if (meter) |m| m.last_ms else null;
+            const decoded = self.decoded_meter.last_ms;
+            break :blk if (displayed != null and decoded != null) @max(displayed.?, decoded.?) else displayed orelse decoded;
+        };
+        // A one-second window needs ~1.1 s after the last frame to read 0; warm-up (null) ends by then too.
+        const settling = shown and (if (last_frame) |at| now -| at < 1200 else false);
+        self.performance_due_ms = if (menu_open or settling) now_f + 500 else null;
+    }
+    /// O2 text: one line with the resolution (full) or just the display rate (narrow picture).
+    fn syncHudText(self: *View) void {
+        const overlays = self.overlays orelse return;
+        const width = if (self.viewport) |node| node.globalRect().w else 0;
+        var buf: [128]u8 = undefined;
+        overlays.setHudText(OM.hudText(&buf, OM.hudMode(width), self.width, self.height, self.display_fps, self.decode_fps));
     }
     fn fpsChanged(self: *View, enabled: bool) void {
         self.show_fps.set(enabled);
-        self.last_fps_ms = 0;
         if (self.snapshot) |snapshot| self.updatePerformance(snapshot.value) catch {};
+        self.overlays_stale = true;
         self.mount_request.cx.requestRedraw();
     }
     fn presentFrame(self: *View, value: console.Snapshot) !void {
@@ -686,16 +767,25 @@ pub const View = struct {
                         node.setImage(.{ .texture_id = sink.texture.? });
                         node.markRenderDirty();
                     }
+                    self.framesMoved();
                 }
             }
         }
         const current_texture = self.texture != null and self.frame_generation == value.frame_generation;
         const title = vm.statusTitle(value, current_texture);
         const interrupted = current_texture and value.route != .closed and (value.route == .failed or value.video == .failed) and value.cleanup != .awaiting and value.cleanup != .unknown;
+        // O4 "waiting for picture" (j8WXoF): a running power action or a lost signal after a
+        // picture was shown. The old picture stays underneath; the connection card yields unless
+        // it has something else to say (failure, cleanup, cancel).
+        const no_signal = current_texture and value.rfb_ready and value.route == .connected and value.video == .awaiting_frame and value.cleanup == .not_started and value.progress.failure_code == null;
+        const blocking = title.len != 0 and !no_signal;
+        self.no_signal = no_signal;
+        self.picture_waiting = (no_signal or self.powerRunning()) and !blocking;
+        self.progress_shown = title.len != 0 and !self.picture_waiting;
         if (self.waiting) |node| {
-            node.setDisplay(if (title.len == 0) .none else .flex);
+            node.setDisplay(if (self.progress_shown) .flex else .none);
         }
-        if (self.image_node) |node| node.setDisplay(if (current_texture and (title.len == 0 or interrupted)) .flex else .none);
+        if (self.image_node) |node| node.setDisplay(if (current_texture and (title.len == 0 or interrupted or self.picture_waiting)) .flex else .none);
         if (self.viewport) |node| node.setBackground(ui.Color.BLACK);
         try setText(self, self.waiting_title, title);
     }
@@ -764,7 +854,7 @@ pub const View = struct {
         } else if (progress.stage == .cancelled) {
             try writer.writer.writeAll("本次连接已取消，目标与路由配置已保留。");
         } else if (!self.progress_active) {
-            try writer.writer.writeAll(if (value.video == .awaiting_frame) "连接仍在线；等待目标发送完整视频帧。" else value.route_summary);
+            try writer.writer.writeAll(if (value.video == .awaiting_frame) "连接仍保持；等待目标发送完整视频帧。" else value.route_summary);
         }
         try setText(self, self.waiting_detail, writer.written());
         if (self.waiting_detail) |node| node.setDisplay(if (writer.written().len == 0) .none else .flex);
@@ -794,10 +884,8 @@ pub const View = struct {
                 const fill = if (current) S.progressCurrentFill() else ui.Color.TRANSPARENT;
                 if (!std.meta.eql(row.getBackground(), fill)) row.setBackground(fill);
             }
-            if (self.progress_buttons[index]) |button| if (button.behavior.interaction.a11y) |*a11y| {
-                a11y.expanded = self.progress_disclosure.isOpen(group);
-            };
             const expanded = self.progress_disclosure.isOpen(group);
+            self.progress_expanded[index].set(expanded);
             if (self.progress_details[index]) |node| node.setDisplay(if (expanded) .flex else .none);
             try setText(self, self.progress_chevrons[index], if (expanded) "⌄" else "›");
             if (self.log_revision == null or self.log_revision.? != progress.revision) {
@@ -818,6 +906,11 @@ pub const View = struct {
         try setText(self, self.log_route_text, if (value.route_summary.len != 0) value.route_summary else value.target);
         const failed = value.route == .failed or value.video == .failed or failure_code != null;
         const terminal = failed or progress.stage == .cancelled or value.route == .closed or value.video == .closed or value.cleanup == .released;
+        // The elapsed readouts are the only values here that move by themselves: while the card
+        // is on screen and the attempt is still running, re-read at the precision they show
+        // (tenths below a minute, whole seconds after).
+        self.progress_running = self.progress_active and value.cleanup != .released and value.route != .closed and progress.stage != .streaming;
+        self.progress_due_ms = if (self.progress_shown and self.progress_running) self.clock() + @as(f64, if (progress.elapsed_ms < 60_000) 100 else 1000) else null;
         if (self.retry_node) |node| node.setDisplay(if (failed or progress.stage == .cancelled) .flex else .none);
         self.retry_disabled.set(value.cleanup != .released);
         const service = self.borrowConsole() catch null;
@@ -850,57 +943,186 @@ pub const View = struct {
             self.log_layout_pending = true;
         }
     }
-    /// PluginWindowHost's earlier hook drains uploaded textures. Read the sink
-    /// again in this same safe phase, before display-list emission, so a resize
-    /// cannot paint an ID that the host has just retired.
+    /// The view's only per-frame entry, at the layout safety point. A frame in which nothing
+    /// changed costs: the owner's change tokens (two compares), the frame sink's texture identity
+    /// (the host's earlier hook uploads textures; reading it here, before display-list emission,
+    /// means a resize cannot paint an ID the host has just retired), the layout key (this view's
+    /// own boxes) and its armed deadlines. Everything else runs only for the change that asks for
+    /// it. The view never schedules frames to keep itself polled: the owner's worker wakes the
+    /// presentation when it publishes, and each on-screen clock arms its own deadline.
     fn afterLayout(raw: *anyopaque, _: u8, _: bool) ui.AfterLayoutResult {
         const self: *View = @ptrCast(@alignCast(raw));
         if (self.closed) return .done;
-        const snapshot = self.snapshot orelse return .done;
-        const prior_width = self.width;
-        const prior_height = self.height;
-        self.presentFrame(snapshot.value) catch |err| self.showMessage(@errorName(err));
-        self.updateGeometry();
-        const popup_changed = self.updatePopovers();
-        if (self.more_focus_pending) {
-            if (self.more_rows[0]) |row| if (row.isDisplayedInTree() and row.globalRect().h > 0) {
-                self.more_focus_pending = false;
-                self.mount_request.cx.setFocus(row);
-            };
+        const cx = self.mount_request.cx;
+        // Remote input never outlives the window's focus or a layer above the picture.
+        if ((self.captured or self.pending_capture) and (!cx.window_active or (self.captured and cx.overlay_stack.topmost() != null))) self.releaseInput(.lost_focus);
+        var relayout = false;
+        self.consumePulse() catch |err| {
+            // A provider that cannot answer is re-read through the ordinary path (and reported once).
+            if (self.seen != null) self.showFailure(err);
+            self.seen = null;
+        };
+        const now: ?f64 = if (self.progress_due_ms != null or self.performance_due_ms != null or self.overlay_due_ms != null) self.clock() else null;
+        if (now) |t| self.fireDeadlines(t);
+        // Layout: this view's own boxes, the picture size and the theme.
+        const key = self.layoutKey();
+        const layout_changed = self.layout_key == null or !std.meta.eql(self.layout_key.?, key);
+        if (layout_changed) {
+            // Colours projected from the palette follow a theme change.
+            if (self.layout_key == null or self.layout_key.?.theme != key.theme) self.stale = true;
+            self.layout_key = key;
+            self.overlays_stale = true;
         }
-        const progress_scrolled = if (!popup_changed) self.scrollToProgressStep() else false;
-        const log_changed = self.updateLogLayout();
-        const bounds_changed = self.bounds_layout_pending;
-        self.bounds_layout_pending = false;
-        return if (prior_width != self.width or prior_height != self.height or popup_changed or progress_scrolled or log_changed or bounds_changed) .needs_layout else .done;
+        if (self.management_stale) {
+            self.management_stale = false;
+            self.refreshManagement() catch |err| self.showFailure(err);
+            relayout = true;
+        }
+        if (self.stale) {
+            self.refresh() catch |err| self.showFailure(err);
+            relayout = true;
+        }
+        if (self.snapshot) |snapshot| {
+            const prior = .{ self.width, self.height, self.texture };
+            self.presentFrame(snapshot.value) catch |err| self.showFailure(err);
+            if (prior[0] != self.width or prior[1] != self.height or (prior[2] == null) != (self.texture == null)) {
+                self.overlays_stale = true;
+                relayout = true;
+            }
+        }
+        self.stagePresentation();
+        if (layout_changed or relayout) {
+            self.updateGeometry();
+            relayout = true;
+        }
+        // Follow the content of what is open (a few rect reads while it is open).
+        if (self.progress_shown or self.anyMenu()) relayout = self.updatePopovers() or relayout;
+        if (self.progress_failure_scroll != null or self.progress_stage_scroll != null) relayout = self.scrollToProgressStep() or relayout;
+        relayout = self.updateLogLayout() or relayout;
+        if (self.bounds_layout_pending) {
+            self.bounds_layout_pending = false;
+            relayout = true;
+        }
+        // O2: the pointer over the picture is the picture node's native hover (one source).
+        const inside = cx.window_active and (if (self.picture_hovered) |hovered| hovered.peek() else false);
+        if (inside != self.hud_inside) {
+            self.hud_inside = inside;
+            self.hud.pointer(inside, now orelse self.clock());
+            self.overlays_stale = true;
+        }
+        if (self.overlays_stale) self.updateOverlays(now orelse self.clock());
+        self.flushPointerWhenDue();
+        if (self.pending_capture) {
+            if (!self.anyMenu() and cx.overlay_stack.topmost() == null) {
+                const requested = self.pending_capture_authority;
+                self.pending_capture = false;
+                self.pending_capture_authority = null;
+                if (requested) |authority| self.beginCapture(authority);
+            } else {
+                // The menu that asked for capture is still closing: look again on the next frame.
+                cx.requestRedraw();
+            }
+        }
+        self.armDeadlines();
+        if (!relayout) return .done;
+        // Geometry was written from rects measured before this round's changes: one more frame
+        // settles it (that frame finds nothing to do).
+        cx.requestRedraw();
+        return .needs_layout;
     }
+    fn layoutKey(self: *View) LayoutKey {
+        const cx = self.mount_request.cx;
+        const zero: ui.ComputedRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        const waiting: [2]f32 = if (self.waiting) |node| .{ if (node.style.width == .px) node.style.width.px else -1, if (node.style.height == .px) node.style.height.px else -1 } else .{ 0, 0 };
+        return .{
+            .viewport = if (self.viewport) |node| node.globalRect() else zero,
+            .card = if (self.video_card) |node| node.globalRect() else zero,
+            .toolbar_width = if (self.toolbar) |node| node.globalRect().w else 0,
+            .window = .{ cx.viewport.width, cx.viewport.height },
+            .picture = if (self.texture != null) .{ self.width, self.height } else .{ 0, 0 },
+            .mode = self.mode,
+            .theme = cx.theme_version,
+            .launcher = self.launcher,
+            .status_shown = if (self.overlays) |o| o.status_shown.peek() else false,
+            .waiting = waiting,
+            .hud_height = if (self.overlays) |o| o.hudHeight() else 0,
+            .alert_height = if (self.overlays) |o| o.waitingHeight() orelse 0 else 0,
+            .scrollbar_y = if (self.scroll) |area| self.mode == .original and area.state.maxScrollY() > 0 else false,
+            .tools_width = self.toolsWidth(),
+        };
+    }
+    /// Tell the host which video revision this UI frame shows, until the host has counted it
+    /// (it confirms only after a successful native frame submission). A hidden view stages nothing.
+    fn stagePresentation(self: *View) void {
+        const sink = self.mount_request.frame_sink orelse return;
+        if (self.texture == null or self.texture != sink.texture or self.frame_generation != sink.frame_generation) return;
+        if (sink.presentation.generation == sink.frame_generation and sink.presentation.revision >= sink.revision) return;
+        if (self.root) |root| if (!root.isDisplayedInTree()) return;
+        sink.presentation.stage(self.mount_request.cx.frame_count, sink.frame_generation, sink.revision);
+    }
+    /// Run what has come due. A clock whose readout is no longer on screen is dropped here and
+    /// re-armed by the projection that shows it again.
+    fn fireDeadlines(self: *View, now: f64) void {
+        const displayed = if (self.root) |root| root.isDisplayedInTree() else false;
+        if (self.progress_due_ms) |at| if (now >= at) {
+            self.progress_due_ms = null;
+            if (displayed and self.progress_shown) self.stale = true;
+        };
+        if (self.performance_due_ms) |at| if (now >= at) {
+            self.performance_due_ms = null;
+            if (displayed) if (self.snapshot) |snapshot| self.updatePerformance(snapshot.value) catch {};
+        };
+        if (self.overlay_due_ms) |at| if (now >= at) {
+            self.overlay_due_ms = null;
+            if (displayed) self.overlays_stale = true;
+        };
+    }
+    /// One native timer serves the whole window and keeps only its earliest request, so pending
+    /// deadlines are re-requested on every frame that leaves them pending.
+    fn armDeadlines(self: *View) void {
+        var next: ?f64 = null;
+        for ([_]?f64{ self.progress_due_ms, self.performance_due_ms, self.overlay_due_ms }) |maybe| if (maybe) |at| {
+            next = if (next) |value| @min(value, at) else at;
+        };
+        const at = next orelse return;
+        const delay_ms = @max(1, at - self.clock());
+        self.mount_request.cx.scheduleRedrawAfterNs(@as(u64, @intFromFloat(@ceil(delay_ms))) * std.time.ns_per_ms);
+    }
+    /// Geometry comes from this view's own boxes (viewport box, list box, rows) as laid out in
+    /// this pass; the offset is written through the ScrollArea's controlled `scroll_y`, which
+    /// applies it once the area has this frame's extents.
     fn scrollToProgressStep(self: *View) bool {
         const index = self.progress_failure_scroll orelse self.progress_stage_scroll orelse return false;
         const body = self.waiting_body orelse return false;
+        const viewport = self.waiting_viewport orelse return false;
+        const list = self.waiting_list orelse return false;
         const row = self.progress_rows[index] orelse return false;
-        if (body.container.globalRect().h <= 0 or row.globalRect().h <= 0) return false;
-        body.state.content_height = body.content.globalRect().h;
-        body.state.viewport_height = body.container.globalRect().h;
-        const top = body.state.scroll_y + row.globalRect().y - body.container.globalRect().y;
+        const view_height = viewport.globalRect().h;
+        if (view_height <= 0 or row.globalRect().h <= 0) return false;
+        const top = row.globalRect().y - list.globalRect().y;
         var height = row.globalRect().h;
         if (self.progress_details[index]) |detail| if (detail.style.display != .none) {
             // Show the step header and the beginning of its expanded detail;
             // a long diagnostic remains independently scrollable in the body.
             height += 4 + @min(detail.globalRect().h, 16 + 2 * 18.7);
         };
+        height = @min(height, view_height);
         const before = body.state.scroll_y;
-        ui.widgets.scroll_area.scrollRectIntoView(body.state, body.content, top, @min(height, body.state.viewport_height), if (self.progress_failure_scroll != null) .start else .nearest);
+        const wanted: f32 = if (self.progress_failure_scroll != null or top < before) top else if (top + height > before + view_height) top + height - view_height else before;
+        const target = std.math.clamp(wanted, 0, @max(0, list.globalRect().h - view_height));
+        self.progress_scroll_y.set(target);
         self.progress_failure_scroll = null;
         self.progress_stage_scroll = null;
-        return @abs(before - body.state.scroll_y) > 0.1;
+        return @abs(before - target) > 0.1;
     }
     fn captureLogPosition(self: *View) void {
         if (self.log_open == null or !self.log_open.?.peek()) return;
         const scroll = self.log_scroll orelse return;
+        const list = self.log_list orelse return;
         self.log_follow_latest = scroll.state.scroll_y >= scroll.state.maxScrollY() - 1;
         self.log_anchor = null;
         if (self.log_follow_latest or self.log_count == 0) return;
-        const content_top = scroll.content.globalRect().y;
+        const content_top = list.globalRect().y;
         var visible: usize = 0;
         for (self.log_rows[0..self.log_count], 0..) |maybe_row, index| {
             const row = maybe_row orelse continue;
@@ -920,25 +1142,26 @@ pub const View = struct {
         if (!open) return false;
         const detail = self.log_detail orelse return false;
         const scroll = self.log_scroll orelse return false;
-        const modal = self.log_modal orelse return false;
+        const viewport = self.log_viewport orelse return false;
+        const list = self.log_list orelse return false;
         if (newly_open) {
             self.log_follow_latest = true;
             self.log_anchor = null;
         }
         if (!newly_open and !self.log_layout_pending) {
             if (!self.log_scroll_pending) return false;
-            scroll.state.content_height = scroll.content.globalRect().h;
-            scroll.state.viewport_height = scroll.container.globalRect().h - scroll.container.style.padding.vertical();
-            var target = if (self.log_follow_latest) scroll.state.maxScrollY() else scroll.state.scroll_y;
+            // This pass's extents, from this view's own boxes.
+            const max = @max(0, list.globalRect().h - viewport.globalRect().h);
+            var target = if (self.log_follow_latest) max else scroll.state.scroll_y;
             if (!self.log_follow_latest) if (self.log_anchor) |anchor| {
                 target = anchor.fallback;
                 for (self.log_sequences[0..self.log_count], 0..) |sequence, index| if (sequence == anchor.sequence) {
                     const row = self.log_rows[index] orelse continue;
-                    target = row.globalRect().y - scroll.content.globalRect().y + anchor.inside;
+                    target = row.globalRect().y - list.globalRect().y + anchor.inside;
                     break;
                 };
             };
-            ui.widgets.scroll_area.setScrollY(scroll.state, scroll.content, target);
+            self.log_scroll_y.set(std.math.clamp(target, 0, max));
             self.log_scroll_pending = false;
             self.log_anchor = null;
             return false;
@@ -948,72 +1171,78 @@ pub const View = struct {
             message.markSizingDirty();
         };
         detail.markSizingDirty();
-        scroll.content.markSizingDirty();
-        scroll.container.markSizingDirty();
-        modal.body.markSizingDirty();
-        modal.dialog.markSizingDirty();
-        modal.overlay.markSizingDirty();
+        list.markSizingDirty();
         self.log_layout_pending = false;
         self.log_scroll_pending = true;
         return true;
     }
     fn updatePopovers(self: *View) bool {
         var changed = self.updateProgressBounds();
-        for (self.menus, self.menu_scrolls, 0..) |maybe_popup, maybe_scroll, index| {
+        for (self.menu_viewports, self.menu_bodies, 0..) |maybe_viewport, maybe_body, index| {
             if (!self.open[index].peek()) continue;
-            const popup = maybe_popup orelse continue;
-            const scroll = maybe_scroll orelse continue;
-            const natural_height = popup.content.globalRect().h;
+            const viewport = maybe_viewport orelse continue;
+            const body = maybe_body orelse continue;
+            const natural_height = body.globalRect().h;
             if (natural_height <= 0) continue;
             const header_height = if (index == @backingInt(Menu.display)) S.display_header_height else S.popup_header_height;
-            const cap = @max(1, @min(self.mount_request.cx.viewport.height - 24, popup.chrome.style.max_height()) - header_height);
-            const wanted = @max(1, @min(natural_height, cap));
-            const current = switch (scroll.container.style.height) {
-                .px => |value| value,
-                else => @as(f32, -1),
+            // The panel takes the room its placement leaves (the native Popover sits below its trigger,
+            // offset 8, 12 from the window edge, and flips above when the whole panel only fits there):
+            // the header stays, the rows scroll in what remains.
+            const cx = self.mount_request.cx;
+            const room = blk: {
+                const trigger = MenuAction.anchorRectOf(self, @fromBackingInt(@intCast(index))) orelse break :blk cx.viewport.height - 24;
+                const below = cx.viewport.height - S.popup_viewport_padding - (trigger.y + trigger.h + S.popup_offset);
+                const above = trigger.y - S.popup_offset - S.popup_viewport_padding;
+                const whole = header_height + natural_height;
+                break :blk if (whole <= below) below else if (whole <= above) above else @max(below, above);
             };
-            if (@abs(current - wanted) > 0.1) {
-                scroll.container.setStyleInline(self.mount_request.cx.allocator, .{ .height = .{ .px = wanted }, .flex_shrink = 0 });
-                changed = true;
-            }
+            const cap = @max(1, @min(room, S.popup_max_height) - header_height);
+            changed = setHeight(cx, viewport, @max(1, @min(natural_height, cap))) or changed;
         }
         return changed;
     }
     fn updateProgressBounds(self: *View) bool {
         const cx = self.mount_request.cx;
         var changed = false;
-        if (self.waiting) |waiting| if (self.waiting_body) |body| {
+        if (self.waiting) |waiting| if (self.waiting_viewport) |viewport| {
             const route_height = if (self.progress_route) |route| route.globalRect().h else 0;
-            const body_height = @max(0, waiting.globalRect().h - S.progress_padding * 2 - S.progress_header_height - S.progress_action_height - S.progress_gap * 3 - route_height);
-            changed = setHeight(cx, body.container, body_height) or changed;
+            const actions_height = if (self.waiting_actions) |actions| actions.globalRect().h else 0;
+            const body_height = @max(0, waiting.globalRect().h - S.progress_padding * 2 - S.progress_header_height - actions_height - S.progress_gap * 3 - route_height);
+            changed = setHeight(cx, viewport, body_height) or changed;
             // Collapsing diagnostics can make the content shorter than the
             // viewport. Drop the old offset before it clips the first row.
-            body.state.content_height = body.content.globalRect().h;
-            body.state.viewport_height = body.container.globalRect().h;
-            if (body.state.scroll_y > body.state.maxScrollY()) {
-                ui.widgets.scroll_area.setScrollY(body.state, body.content, body.state.maxScrollY());
-                changed = true;
-            }
+            if (self.waiting_body) |body| if (self.waiting_list) |list| {
+                const max = @max(0, list.globalRect().h - viewport.globalRect().h);
+                if (body.state.scroll_y > max) {
+                    self.progress_scroll_y.set(max);
+                    changed = true;
+                }
+            };
         };
-        if (self.log_modal) |modal| {
+        if (self.log_modal) |modal| if (self.log_viewport) |viewport| {
             const compact = cx.viewport.height < 600;
             const width = @min(S.log_width, @max(1, cx.viewport.width - 32));
-            const route_height = if (self.log_route_text) |route| route.globalRect().h else 0;
-            const bounds: LogBounds = .{ .width = width, .height = cx.viewport.height, .route_height = route_height, .compact = compact, .theme = cx.theme_version };
+            const max_height = @max(1, cx.viewport.height - 32);
+            // What zenit's Modal puts above the list (title bar) and this view's own rows above
+            // it, as laid out while the dialog is open; the footer below it.
+            var above = if (self.log_bounds) |old| old.above else 0;
+            var footer_height = if (self.log_bounds) |old| old.footer else 0;
+            if (self.log_open.?.peek() and viewport.globalRect().h > 0 and modal.dialog.globalRect().h > 0) {
+                above = viewport.globalRect().y - modal.dialog.globalRect().y;
+                if (self.log_footer) |footer| footer_height = footer.globalRect().h;
+            }
+            const bounds: LogBounds = .{ .width = width, .height = cx.viewport.height, .above = above, .footer = footer_height, .compact = compact, .theme = cx.theme_version };
             if (self.log_bounds) |old| if (std.meta.eql(old, bounds)) return changed;
             self.log_bounds = bounds;
             self.bounds_layout_pending = true;
-            modal.dialog.setStyleInline(cx.allocator, .{ .width = .{ .px = width }, .height = .{ .fit = .{ .max = @max(1, cx.viewport.height - 32) } }, .flex_shrink = 0, .background = S.theme.current().overlay, .glass = S.theme.overlayGlass(), .border = .{ .radius = 14 } });
-            if (modal.dialog.children.items.len != 0) modal.dialog.children.items[0].setStyleInline(cx.allocator, .{ .width = .fill(), .height = .{ .fit = .{} }, .padding = if (compact) .{ .left = 18, .right = 18, .top = 12, .bottom = 12 } else .{ .left = 20, .right = 20, .top = 14, .bottom = 14 }, .flex_shrink = 0 });
-            modal.body.setStyleInline(cx.allocator, .{ .width = .fill(), .height = .{ .fit = .{} }, .padding = if (compact) .{ .left = 18, .right = 34, .bottom = 12 } else .{ .left = 24, .right = 40, .bottom = 20 }, .gap = 0, .min_height = 0, .flex_shrink = 0 });
+            self.log_width.set(width);
+            self.log_max_height.set(max_height);
+            if (self.log_content) |content| content.setStyleInline(cx.allocator, S.logContent(compact));
             if (self.log_footer) |footer| footer.setStyleInline(cx.allocator, S.logFooter(compact));
-            if (self.log_scroll) |scroll| {
-                scroll.container.setBackground(S.theme.current().well);
-                const cap = @max(1, cx.viewport.height - 32 - (if (compact) @as(f32, 130.5) else @as(f32, 150.5)) - route_height - 12 - 28);
-                const height = @min(if (compact) @as(f32, 200) else @as(f32, 320), cap);
-                changed = setHeight(cx, scroll.container, height) or changed;
-            }
-        }
+            const cap = @max(1, max_height - above - S.logContentBottom(compact) - footer_height);
+            const height = @min(if (compact) @as(f32, 200) else @as(f32, 320), cap);
+            changed = setHeight(cx, viewport, height) or changed;
+        };
         return changed;
     }
     fn refreshManagement(self: *View) !void {
@@ -1071,9 +1300,10 @@ pub const View = struct {
         self.power_options.set(self.power_storage[slot][0..power_count]);
         const locked = self.managementLocked();
         const power_ready = if (self.power_snapshot) |snapshot| vm.writeAllowed(snapshot.value.capability) and snapshot.value.capability.secondary_auth == .disabled else false;
-        // Selecting a local draft is harmless in a read-only session. Only the
-        // execute button consumes operation authority and field readiness.
-        self.power_disabled.set(locked or power_unmapped or power_count == 0);
+        // A session without write authority (neither granted nor requestable) is read-only
+        // as a whole: the draft controls are disabled together with the execute button, so
+        // nothing is edited that this session could not execute.
+        self.power_disabled.set(locked or power_unmapped or power_count == 0 or !power_ready);
         self.power_execute_disabled.set(locked or !power_ready or (if (self.power_snapshot) |snapshot| !vm.powerAllowed(snapshot.value, self.power_choice) else true));
         var target_count: usize = 0;
         var mode_count: usize = 0;
@@ -1104,11 +1334,12 @@ pub const View = struct {
         self.boot_options.set(self.target_storage[slot][0..target_count]);
         self.mode_options.set(self.mode_storage[slot][0..mode_count]);
         const boot_ready = if (self.boot_snapshot) |snapshot| vm.writeAllowed(snapshot.value.capability) and snapshot.value.capability.secondary_auth == .disabled else false;
-        self.boot_disabled.set(locked or boot_unmapped or target_count == 0);
-        self.mode_disabled.set(locked or boot_unmapped or mode_count == 0);
+        // Read-only session: the Boot draft (target, mode, 持续生效) is read-only like 执行.
+        self.boot_disabled.set(locked or boot_unmapped or target_count == 0 or !boot_ready);
+        self.mode_disabled.set(locked or boot_unmapped or mode_count == 0 or !boot_ready);
         self.boot_execute_disabled.set(locked or !boot_ready or (if (self.boot_snapshot) |snapshot| !self.draft.canApply(snapshot.value) else true));
         const enabled_ready = if (self.boot_snapshot) |snapshot| snapshot.value.enabled_evidence.permitsWrite() and snapshot.value.allowed_enabled.evidence.permitsWrite() else false;
-        self.switch_disabled.set(locked or boot_unmapped or !enabled_ready or self.draft.disabled());
+        self.switch_disabled.set(locked or boot_unmapped or !boot_ready or !enabled_ready or self.draft.disabled());
         self.target_value.set(if (self.draft.disabled()) "Disabled" else canonicalTarget(self.draft.value.target.get()));
         self.mode_value.set(canonicalMode(self.draft.value.mode.get()));
         self.boot_continuous.set(self.draft.continuous());
@@ -1127,102 +1358,222 @@ pub const View = struct {
         try setText(self, self.power_hint, power_hint);
         const boot_reason = if (self.boot_snapshot) |snapshot| self.draft.unavailableReason(snapshot.value) else @as(?[]const u8, "管理通道当前不可用。");
         try setText(self, self.boot_hint, if (result != null and operation != null and operation.?.boot) vm.resultLabel(result.?) else if (boot_unmapped) "仅查看该管理资源的启动覆盖与顺序，不会写入或重启。" else if (boot_reason) |reason| reason else "仅设置启动覆盖，不会自动重启。USB / 光驱指目标机已有设备，不提供镜像挂载。");
+        // A running power action drives O1 / O4, and an unverified mapping the connection indicator.
+        self.syncConnectionIndicator();
+        self.overlays_stale = true;
+        self.mount_request.cx.requestRedraw();
     }
     fn updateGeometry(self: *View) void {
         const alloc = self.mount_request.cx.allocator;
         const viewport = self.viewport orelse return;
         const rect = viewport.globalRect();
         const area = self.scroll orelse return;
+        const canvas = self.canvas orelse return;
         const g = self.geometry();
         if (g) |geometry_value| {
             const dw = geometry_value.image.width;
             const dh = geometry_value.image.height;
-            area.content.setStyleInline(alloc, .{ .width = .{ .px = @max(rect.w, dw) }, .height = .{ .px = @max(rect.h, dh) }, .flex_shrink = 0 });
+            canvas.setStyleInline(alloc, S.canvas(@max(rect.w, dw), @max(rect.h, dh)));
             if (self.image_node) |node| node.setStyleInline(alloc, .{ .width = .{ .px = dw }, .height = .{ .px = dh }, .position = .absolute, .inset = .{ .left = .{ .px = @max(0, (rect.w - dw) / 2) }, .top = .{ .px = @max(0, (rect.h - dh) / 2) } } });
             if (self.mode == .fit) {
-                area.state.scroll_x = 0;
-                area.state.bonus_x = 0;
-                area.state.bonus_velocity_x = 0;
-                area.state.bounce_active_x = false;
+                // Nothing to scroll in fit mode: back to the origin through the ScrollArea's own setters.
+                ui.widgets.scroll_area.setScrollX(area.state, area.content, 0);
                 ui.widgets.scroll_area.setScrollY(area.state, area.content, 0);
-                area.content.setStyleInline(alloc, .{ .translate_x = 0, .translate_y = 0 });
             }
-        } else area.content.setStyleInline(alloc, .{ .width = .{ .px = @max(1, rect.w) }, .height = .{ .px = @max(1, rect.h) } });
+        } else canvas.setStyleInline(alloc, S.canvas(@max(1, rect.w), @max(1, rect.h)));
         if (self.waiting) |node| {
-            const width = @min(@max(rect.w - 32, 0), S.progress_width);
-            const height = @min(@max(rect.h - 24, 0), S.progress_height);
-            const bounds: WaitingBounds = .{ .width = rect.w, .height = rect.h, .theme = self.mount_request.cx.theme_version };
+            // O4 (j8WXoF D): bottom-corner icon -> height cap - 80; top-corner icon -> below it
+            // when the card reaches into the icon column.
+            const card = OM.centerCard(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h }, S.progress_width, S.progress_height, null, self.launcher);
+            const width = card.w;
+            const height = card.h;
+            const bounds: WaitingBounds = .{ .width = rect.w, .height = rect.h, .theme = self.mount_request.cx.theme_version, .launcher = self.launcher };
             // setTheme invokes the root's before-render hook before replaying
             // descendant recipes. That replay can restore the recipe's base
             // height after this cache was filled; repair only that mismatch.
             const size_changed = node.style.width != .px or @abs(node.style.width.px - width) > 0.1 or node.style.height != .px or @abs(node.style.height.px - height) > 0.1;
             if (self.waiting_bounds == null or !std.meta.eql(self.waiting_bounds.?, bounds) or size_changed) {
                 self.waiting_bounds = bounds;
-                node.setStyleInline(alloc, .{ .width = .{ .px = width }, .height = .{ .px = height }, .inset = .{ .left = .{ .px = @max(0, (rect.w - width) / 2) }, .top = .{ .px = @max(12, (rect.h - height) / 2) } } });
+                node.setStyleInline(alloc, .{ .width = .{ .px = width }, .height = .{ .px = height }, .inset = .{ .left = .{ .px = card.x - rect.x }, .top = .{ .px = card.y - rect.y } } });
                 self.bounds_layout_pending = true;
             }
         }
         if (self.toolbar != null) {
             const width = self.toolbar.?.globalRect().w;
-            const compact = width < S.expanded_toolbar_width;
-            const overflow = width < S.icon_toolbar_width;
-            if (self.last_compact == null or self.last_compact.? != compact or self.last_overflow != overflow or self.last_theme_version != self.mount_request.cx.theme_version) {
+            // The native controls' widths are zenit's: record them as laid out in the current
+            // mode and fold when the toolbar cannot hold them (never assume a control's size).
+            const tools = self.toolsWidth();
+            if (tools > 0) {
+                if (self.last_compact == false) self.tools_labelled_width = tools;
+                if (self.last_compact == true and !self.last_overflow) self.tools_icon_width = tools;
+            }
+            // j8WXoF O1: while the status slot is up the menus fold earlier, never under it.
+            const reserve: f32 = if (self.overlays) |o| (if (o.status_shown.peek()) S.status_reserve_width else 0) else 0;
+            // Not measured yet: show the labelled toolbar (then the icon toolbar) once to measure it.
+            const compact = if (self.tools_labelled_width) |need| width < S.toolbar_labelled_reserve + need + reserve else false;
+            const overflow = compact and (if (self.tools_icon_width) |need| width < S.toolbar_icon_reserve + need + reserve else false);
+            const themed = self.theme_watch.take();
+            if (self.last_compact == null or self.last_compact.? != compact or self.last_overflow != overflow or themed) {
                 if (self.last_compact != null and (self.last_compact.? != compact or self.last_overflow != overflow)) self.closeMenus();
                 self.last_compact = compact;
                 self.last_overflow = overflow;
-                self.last_theme_version = self.mount_request.cx.theme_version;
-                if (self.connection_icon) |icon| _ = icon.setTint(S.theme.current().fg_2);
-                const style = if (compact) S.iconTool() else S.tool();
-                for (self.tool_styles) |source| source.set(style);
+                if (self.connection_icon) |icon| _ = icon.setTint(S.theme.current().accent);
                 for (self.tool_labels, menu_names) |source, name| source.set(if (compact) "" else name);
                 self.tool_icon_only.set(compact);
-                for (self.menus[3..]) |maybe| if (maybe) |popup| popup.wrapper.setDisplay(if (overflow) .none else .flex);
-                if (self.more) |popup| {
-                    popup.wrapper.setDisplay(if (overflow) .flex else .none);
-                    var popup_style = S.popup();
-                    popup_style.padding = ui.Padding.all(4);
-                    popup.chrome.setStyleInline(alloc, popup_style);
-                }
-                self.syncMoreStyle();
-                self.more_row_style.set(S.moreRow());
-                for (self.more_rows) |maybe| if (maybe) |row| row.setStyleInline(alloc, .{ .justify = .start });
-                for (self.more_chevrons) |maybe| {
-                    if (maybe) |node| _ = node.setTint(S.theme.current().fg_2);
-                }
-                self.tool_hover.set(S.toolHover());
-                self.key_style.set(S.keyButton());
+                self.tool_chevron.set(!compact);
+                for (self.tool_slots[@backingInt(Menu.power)..]) |maybe| if (maybe) |slot| slot.setDisplay(if (overflow) .none else .flex);
+                if (self.more_slot) |slot| slot.setDisplay(if (overflow) .flex else .none);
                 self.disconnect_icon_only.set(compact);
-                self.disconnect_style.set(if (compact) S.iconTool() else S.disconnect());
-                if (self.disconnect_confirm_dialog) |dialog| dialog.setStyleInline(alloc, .{ .background = S.theme.current().overlay });
-                self.fit_style.set(S.segment(self.mode == .fit));
-                self.original_style.set(S.segment(self.mode == .original));
-                for (self.menus) |maybe| if (maybe) |popup| popup.chrome.setStyleInline(alloc, S.popup());
-                if (self.order_modal) |modal| modal.dialog.setStyleInline(alloc, .{ .background = S.theme.current().overlay, .glass = S.theme.overlayGlass() });
+                self.syncConnectionIndicator();
+                self.overlays_stale = true;
                 self.bounds_layout_pending = true;
             }
         }
     }
+    /// Laid-out width of the toolbar's native controls (disconnect + the shown menus), gaps included.
+    fn toolsWidth(self: *View) f32 {
+        var total: f32 = 0;
+        var count: f32 = 0;
+        if (self.disconnect_slot) |slot| {
+            const w = slot.globalRect().w;
+            if (w <= 0) return 0;
+            total += w;
+            count += 1;
+        }
+        for (self.tool_slots) |maybe| if (maybe) |slot| {
+            if (slot.style.display == .none) continue;
+            const w = slot.globalRect().w;
+            if (w <= 0) return 0;
+            total += w;
+            count += 1;
+        };
+        return total + S.toolbar_gap * @max(0, count - 1);
+    }
     fn update(raw: *anyopaque, value: contract.ContentUpdate) !void {
         const self: *View = @ptrCast(@alignCast(raw));
         if (self.closed or !value.owner.eql(self.mount_request.owner)) return error.StaleBinding;
-        try self.refresh(self.mount_request.cx.frame_time_ms);
+        // The host says the content changed: re-read everything now rather than on the next frame.
+        self.management_stale = false;
+        try self.refreshManagement();
+        try self.refresh();
     }
     fn connectionStatus(raw: *anyopaque) contract.ConnectionStatus {
         const self: *View = @ptrCast(@alignCast(raw));
         return self.connectionState();
+    }
+    fn rectOf(r: ui.ComputedRect) contract.LauncherRect {
+        return .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    }
+    /// The card's side of the AI launcher (j8WXoF D): bounds, toolbar bottom (top anchor =
+    /// toolbar + 12) and the captured picture (the launcher yields over it).
+    fn launcherContext(raw: *anyopaque) contract.LauncherContext {
+        const self: *View = @ptrCast(@alignCast(raw));
+        if (self.closed) return .{};
+        const root = self.root orelse return .{};
+        if (!root.isDisplayedInTree()) return .{};
+        const r = root.globalRect();
+        if (r.w <= 0 or r.h <= 0) return .{};
+        const bar = if (self.toolbar) |node| node.globalRect() else r;
+        return .{
+            .bounds = rectOf(r),
+            .top_chrome_bottom = if (self.toolbar != null) bar.y + bar.h else null,
+            .captured = if (self.captured) if (self.viewport) |vp| rectOf(vp.globalRect()) else null else null,
+        };
+    }
+    /// The launcher rests in this card's corner (or not); the card's overlays give way to it.
+    fn placeLauncher(raw: *anyopaque, placement: ?contract.LauncherPlacement) void {
+        const self: *View = @ptrCast(@alignCast(raw));
+        if (self.closed or std.meta.eql(self.launcher, placement)) return;
+        self.launcher = placement;
+        self.overlays_stale = true;
+        self.mount_request.cx.requestRedraw();
+    }
+    fn powerRunning(self: *const View) bool {
+        const operation = self.management_operation orelse return false;
+        if (operation.boot) return false;
+        const result = self.management_result orelse return false;
+        return OM.powerRunning(result.value.phase);
+    }
+    /// One pass over the card overlays (O1–O5) from the controller snapshot and picture geometry.
+    /// Runs when one of its inputs changed (`overlays_stale`) or one of its clocks came due; `now`
+    /// is monotonic wall-clock ms. Leaves `overlay_due_ms` at the next moment it must run again.
+    fn updateOverlays(self: *View, now: f64) void {
+        self.overlays_stale = false;
+        self.overlay_due_ms = null;
+        const overlays = self.overlays orelse return;
+        const card_node = self.video_card orelse return;
+        const vp_node = self.viewport orelse return;
+        const cr = card_node.globalRect();
+        const vr = vp_node.globalRect();
+        const card: OM.Rect = rectOf(cr);
+        const vp: OM.Rect = rectOf(vr);
+        const value: ?console.Snapshot = if (self.snapshot) |owned| owned.value else null;
+        // O1
+        const power = self.powerRunning();
+        if (power) {
+            if (self.power_started_ms == null or now < self.power_started_ms.?) self.power_started_ms = now;
+        } else self.power_started_ms = null;
+        const elapsed_s: u64 = if (self.power_started_ms) |start| @intFromFloat(@max(0, (now - start) / 1000)) else 0;
+        const ai: OM.AiActivity = if (value) |v| switch (v.ai) {
+            .none => .none,
+            .observing => .observing,
+            .operating => .operating,
+        } else .none;
+        const status = OM.status(power, ai, self.captured);
+        var label: [96]u8 = undefined;
+        overlays.setStatus(status, OM.statusLabel(&label, status, self.last_compact orelse false, self.power_action, elapsed_s));
+        // The power readouts (O1 tag, O4 message) count whole seconds: next run at the next second.
+        if (power) self.dueAt(self.power_started_ms.? + @as(f64, @floatFromInt(elapsed_s + 1)) * 1000);
+        // O5
+        overlays.setAiFrame(ai == .operating, cr.w, cr.h);
+        // O4 waiting for picture
+        if (self.picture_waiting) {
+            const box = OM.centerCard(vp, S.progress_width, S.progress_height, overlays.waitingHeight() orelse 96, self.launcher);
+            var title: [128]u8 = undefined;
+            var message: [256]u8 = undefined;
+            const verb = OM.powerVerb(self.power_action orelse .graceful_restart);
+            const t = if (power) std.fmt.bufPrint(&title, "主机正在{s}，等待视频信号", .{verb}) catch "等待视频信号" else "等待视频信号";
+            const m = if (power) std.fmt.bufPrint(&message, "已向 BMC 提交「{s}」，已 {d} s。画面恢复后自动继续。", .{ vm.powerLabel(self.power_action orelse .graceful_restart), elapsed_s }) catch "" else "视频通道仍连接，远端暂未输出新画面；恢复后自动继续。";
+            overlays.setWaiting(true, box.x - cr.x, box.y - cr.y, box.w, t, m);
+        } else overlays.setWaiting(false, 0, 0, 0, "", "");
+        // O2
+        const live = if (value) |v| v.video == .streaming and self.texture != null else false;
+        self.hud.due(now);
+        if (self.hud.deadline()) |at| self.dueAt(at);
+        const faded = self.hud.faded();
+        const scrollbar_y = if (self.scroll) |area| self.mode == .original and area.state.maxScrollY() > 0 else false;
+        const insets = OM.hudInsets(card, vp, self.launcher, overlays.hudHeight(), scrollbar_y);
+        self.syncHudText();
+        overlays.setHud(self.show_fps.peek() and live and !self.captured and !self.progress_shown and !self.picture_waiting and OM.hudMode(vr.w) != .hidden, insets.right, insets.top, faded);
+        // O3
+        const band = OM.hintBand(card, vp);
+        overlays.setHint(if (self.hint.visible(now)) self.hint.slice() else null, band.left, band.width, band.bottom, now);
+        if (self.hint.deadline()) |at| self.dueAt(at);
+        if (overlays.hintDeadline()) |at| self.dueAt(at);
+    }
+    fn dueAt(self: *View, at: f64) void {
+        self.overlay_due_ms = if (self.overlay_due_ms) |current| @min(current, at) else at;
+    }
+    fn takeover(self: *View) void {
+        // Host stop / takeover is always callable: it revokes the AI lease and cancels queued
+        // automation input. Without the typed AI service, take the content lease back directly.
+        if (self.lookup(ai_control.definition) catch null) |binding| {
+            if (binding.borrow(ai_control.Interface, ai_control.key, self.mount_request.owner)) |table| {
+                table.stop(binding.context, binding) catch |err| self.showFailure(err);
+                return;
+            } else |_| {}
+        }
+        if (self.mount_request.content_context) |context| context.takeHumanControl();
     }
     fn showConnectionDetails(raw: *anyopaque) void {
         const self: *View = @ptrCast(@alignCast(raw));
         self.showLog();
     }
     fn syncConnectionIndicator(self: *View) void {
-        if (self.connection_state) |node| if (node.behavior.interaction.a11y) |*a11y| {
-            a11y.disabled = self.disconnect_disabled.peek();
-        };
         const status = self.connectionState();
-        const indicator_cx = self.mount_request.cx;
-        const rect = if (self.disconnect_node) |node| node.globalRect() else ui.ComputedRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        const hovered = (if (self.connection_hovered) |signal| signal.peek() else false) and indicator_cx.mouse_x >= rect.x and indicator_cx.mouse_x < rect.x + rect.w and indicator_cx.mouse_y >= rect.y and indicator_cx.mouse_y < rect.y + rect.h;
+        // Hover is the button's native hover and nothing else (zenit re-resolves hover under a
+        // resting pointer when the scene changes; no geometry test here).
+        const hovered = if (self.connection_hovered) |signal| signal.peek() else false;
         const focused = if (self.connection_focused) |signal| signal.peek() else false;
         const hot = (hovered or focused) and !self.disconnect_disabled.peek();
         const asset: ui.SvgAsset = if (hot) ui.icons.unplug else switch (status.state) {
@@ -1264,8 +1615,8 @@ pub const View = struct {
         if (value.video == .streaming) {
             const power_unmapped = if (self.power_snapshot) |resource| resource.value.system_uri.len != 0 and !resource.value.capability.system_mapping_verified else false;
             const boot_unmapped = if (self.boot_snapshot) |resource| resource.value.system_uri.len != 0 and !resource.value.capability.system_mapping_verified else false;
-            if (self.texture != null and self.frame_generation == value.frame_generation and (power_unmapped or boot_unmapped)) return .{ .state = .degraded, .label = "视频在线 · 管理条件待核实" };
-            return .{ .state = .online, .label = if (value.management == .unavailable) "视频在线 · 管理不可用" else "视频在线" };
+            if (self.texture != null and self.frame_generation == value.frame_generation and (power_unmapped or boot_unmapped)) return .{ .state = .degraded, .label = "视频已连接 · 管理条件待核实" };
+            return .{ .state = .online, .label = if (value.management == .unavailable) "视频已连接 · 管理不可用" else "视频已连接" };
         }
         return .{ .state = .connecting, .label = if (value.progress.revision != 0) console.progress.stageLabel(value.progress.stage) else switch (value.video) {
             .authenticating => "正在验证视频会话",
@@ -1282,20 +1633,27 @@ pub const View = struct {
             self.closeMenus();
             self.releaseInput(.lost_focus);
         }
-        self.mount_request.cx.requestRedraw();
+        // Also the moment a hidden view may be shown again: project afresh and re-arm its clocks.
+        self.invalidate();
     }
     fn unmount(raw: *anyopaque) void {
         const self: *View = @ptrCast(@alignCast(raw));
         self.release();
     }
+    /// Tell the owner which window shows this session (0 = none): its worker wakes that window.
+    fn bindPresentation(self: *View, shown: bool) void {
+        const target = @import("../../platform/presentation_wakeup.zig").targetForWindow(@intFromPtr(self.mount_request.cx));
+        // An unregistered window has no target of its own: leave the owner on "every window".
+        if (target == 0) return;
+        const service = self.borrowConsole() catch return;
+        const bind = service.table.bind_presentation orelse return;
+        bind(service.binding.context, service.binding, target, shown) catch {};
+    }
     fn release(self: *View) void {
         if (self.closed) return;
+        self.bindPresentation(false);
         self.closeMenus();
         self.releaseInput(.closed);
-        if (self.root) |node| {
-            node.removeBeforeRender(beforeRender);
-            node.meta.per_frame.hooks.slots.anim_state = null;
-        }
         if (self.after_layout_registered) self.mount_request.cx.removeAfterLayoutHook(self);
         self.after_layout_registered = false;
         self.closed = true;
@@ -1318,11 +1676,13 @@ pub const View = struct {
         self.toolbar = null;
         self.more = null;
         self.more_node = null;
-        self.more_chevrons = @splat(null);
-        self.more_rows = @splat(null);
         self.connection_icon = null;
+        self.connection_identity = null;
+        self.tool_slots = @splat(null);
+        self.disconnect_slot = null;
+        self.more_slot = null;
+        self.canvas = null;
         self.connection_title = null;
-        self.connection_state = null;
         self.connection_hovered = null;
         self.connection_focused = null;
         self.disconnect_node = null;
@@ -1338,6 +1698,8 @@ pub const View = struct {
         self.waiting_title = null;
         self.waiting_detail = null;
         self.waiting_body = null;
+        self.waiting_viewport = null;
+        self.waiting_list = null;
         self.waiting_actions = null;
         self.progress_timing = null;
         self.progress_durations = @splat(null);
@@ -1346,7 +1708,6 @@ pub const View = struct {
         self.progress_notice = null;
         self.progress_steps = null;
         self.progress_rows = @splat(null);
-        self.progress_buttons = @splat(null);
         self.progress_details = @splat(null);
         self.progress_chevrons = @splat(null);
         self.progress_icons = @splat(null);
@@ -1359,6 +1720,9 @@ pub const View = struct {
         self.log_open = null;
         self.log_modal = null;
         self.log_footer = null;
+        self.log_content = null;
+        self.log_list = null;
+        self.log_viewport = null;
         self.log_scroll = null;
         self.log_detail = null;
         self.log_empty = null;
@@ -1379,30 +1743,37 @@ pub const View = struct {
         self.boot_pending_label = null;
         self.boot_hint = null;
         self.boot_details = null;
-        self.boot_switch = null;
         self.mode_row = null;
         self.order_rows = null;
+        self.order_nodes = @splat(null);
+        self.order_node_count = 0;
         self.order_mapping_warning = null;
         self.order_open = null;
         self.order_modal = null;
         self.order_scroll = null;
+        self.order_viewport = null;
+        self.original_hint = null;
         self.message = null;
-        self.input_hint = null;
-        self.fps_hud = null;
-        self.fps_display = null;
-        self.fps_decode = null;
+        self.overlays = null;
+        self.video_card = null;
+        self.launcher = null;
         self.fps_detail = null;
         self.fps_gap_value = null;
         self.fps_age_value = null;
         self.menus = @splat(null);
+        self.menu_viewports = @splat(null);
+        self.menu_bodies = @splat(null);
         self.menu_scrolls = @splat(null);
         self.tool_nodes = @splat(null);
+        self.picture_hovered = null;
+        self.layout_key = null;
     }
     fn requestControl(self: *View) void {
         self.releaseInput(.released);
         const service = self.borrowConsole() catch return;
-        service.table.request_control(service.binding.context, service.binding) catch |err| self.showMessage(@errorName(err));
+        service.table.request_control(service.binding.context, service.binding) catch |err| self.showFailure(err);
         self.watch_only_selected = false;
+        self.invalidate();
     }
     fn capture(self: *View) void {
         self.closeMenus();
@@ -1414,6 +1785,7 @@ pub const View = struct {
         // visible attempt instead of silently recapturing a later connection.
         self.pending_capture_authority = .{ .binding_generation = binding.generation, .input_epoch = snapshot.input_epoch, .control_generation = snapshot.control_generation, .transport_generation = snapshot.transport_generation, .frame_generation = self.frame_generation };
         self.pending_capture = true;
+        self.invalidate();
     }
     fn releaseCapture(self: *View) void {
         self.releaseInput(.released);
@@ -1424,6 +1796,7 @@ pub const View = struct {
         self.view_only = true;
         self.watch_only_selected = true;
         self.closeMenus();
+        self.invalidate();
     }
     fn fit(self: *View) void {
         self.setMode(.fit);
@@ -1431,39 +1804,45 @@ pub const View = struct {
     fn original(self: *View) void {
         self.setMode(.original);
     }
+    fn scaleChanged(self: *View, id: []const u8) void {
+        self.setMode(std.meta.stringToEnum(mapping.Mode, id) orelse return);
+    }
     fn setMode(self: *View, mode: mapping.Mode) void {
         self.releaseInput(.released);
         self.mode = mode;
-        self.fit_style.set(S.segment(mode == .fit));
-        self.original_style.set(S.segment(mode == .original));
-        self.mount_request.cx.requestRedraw();
+        self.scale_value.set(@tagName(mode));
+        if (self.original_hint) |node| node.setDisplay(if (mode == .original) .flex else .none);
+        self.invalidate();
     }
     fn fullscreen(self: *View) void {
         self.releaseInput(.released);
         const context = self.mount_request.content_context orelse return;
-        context.requestFullscreen(!context.fullscreen()) catch |err| self.showMessage(@errorName(err));
+        context.requestFullscreen(!context.fullscreen()) catch |err| self.showFailure(err);
     }
     fn refreshVideo(self: *View) void {
         self.releaseInput(.released);
         const service = self.borrowConsole() catch return;
-        service.table.refresh(service.binding.context, service.binding) catch |err| self.showMessage(@errorName(err));
+        service.table.refresh(service.binding.context, service.binding) catch |err| self.showFailure(err);
+        self.invalidate();
     }
     fn retry(self: *View) void {
         self.releaseInput(.released);
         const service = self.borrowConsole() catch return;
-        service.table.retry(service.binding.context, service.binding) catch |err| self.showMessage(@errorName(err));
+        service.table.retry(service.binding.context, service.binding) catch |err| self.showFailure(err);
+        self.invalidate();
     }
     fn disconnectConnection(self: *View) void {
         if (self.closed or self.disconnect_disabled.peek() or self.disconnect_confirm_open.peek()) return;
         const connecting = self.connectionState().state == .connecting;
         self.disconnect_confirm_title.set(if (connecting) "取消连接？" else "断开连接？");
-        self.disconnect_confirm_action.set(if (connecting) "取消连接" else "断开连接");
+        // 动词 + 对象 (shared/ui/confirm).
+        self.disconnect_confirm_action.set(if (connecting) "停止连接" else "断开连接");
         setText(self, self.disconnect_confirm_target, if (self.connection_title) |node| node.getText().?.content else "KVM 控制台") catch return;
-        setText(self, self.disconnect_confirm_detail, if (connecting) "将取消当前 KVM 连接尝试。" else "将结束当前 KVM 会话并释放键盘鼠标，主机将继续运行。") catch return;
+        self.disconnect_confirm_message.set(if (connecting) "将取消当前 KVM 连接尝试。" else "将结束当前 KVM 会话并释放键盘鼠标，主机将继续运行。");
         self.releaseInput(.released);
         self.closeMenus();
+        // Focus lands on 取消 (the confirmation's autoFocus target).
         self.disconnect_confirm_open.set(true);
-        if (self.disconnect_confirm_return) |node| self.mount_request.cx.setFocus(node);
         self.mount_request.cx.requestRedraw();
     }
     fn dismissDisconnect(self: *View) void {
@@ -1480,21 +1859,21 @@ pub const View = struct {
         const service = self.borrowConsole() catch return;
         const callback = service.table.cancel orelse return;
         callback(service.binding.context, service.binding) catch |err| {
-            self.showMessage(@errorName(err));
+            self.showFailure(err);
             return;
         };
         self.cancel_pending = true;
         self.cancel_disabled.set(true);
         self.disconnect_disabled.set(true);
         self.closeMenus();
-        self.mount_request.cx.requestRedraw();
+        self.invalidate();
     }
     fn showLog(self: *View) void {
         if (self.closed) return;
         self.releaseInput(.released);
         self.closeMenus();
         if (self.log_open) |open| open.set(true);
-        if (self.log_scroll) |scroll| self.mount_request.cx.focus_manager.setFocus(scroll.container);
+        if (self.log_viewport) |node| self.mount_request.cx.focus_manager.setFocus(node);
         self.mount_request.cx.requestRedraw();
     }
     fn closeLog(self: *View) void {
@@ -1563,6 +1942,10 @@ pub const View = struct {
         switch (request_management(borrowed.binding.context, borrowed.binding, request)) {
             .accepted => |key| {
                 self.management_operation = .{ .key = key, .boot = request == .boot };
+                if (request == .power) {
+                    self.power_action = request.power.action;
+                    self.power_started_ms = null;
+                }
                 if (self.management_result) |*old| old.deinit();
                 self.management_result = services.Owned(services.Result).init(self.mount_request.cx.allocator, .{ .operation = key, .phase = .awaiting_approval }) catch null;
                 self.projectManagement() catch {};
@@ -1597,32 +1980,34 @@ pub const View = struct {
         const rows = self.order_rows orelse return;
         const cx = self.mount_request.cx;
         const references = order orelse &.{};
-        const count = @max(1, @min(references.len, 256));
+        const count = @max(1, @min(references.len, max_order_rows));
         var writer: std.Io.Writer.Allocating = .init(cx.allocator);
         defer writer.deinit();
         for (0..count) |index| {
             // Separate native text nodes give every option its own measured
             // row; a newline inside one shaped text run is not a row boundary.
-            if (index == rows.children.items.len) {
+            if (index == self.order_node_count) {
                 const row = try ui.textStyled(cx, S.orderText, "");
                 row.setStyleInline(cx.allocator, S.orderRow());
                 var id: [48]u8 = undefined;
                 row.meta.ownership.meta.test_id = try ownedText(self.mount_request.scope, try std.fmt.bufPrint(&id, "bmc.boot.order_row.{d:0>2}", .{index + 1}));
                 try rows.appendChild(cx.allocator, row);
+                self.order_nodes[index] = row;
+                self.order_node_count += 1;
             }
             writer.clearRetainingCapacity();
             if (references.len == 0) try writer.writer.writeAll("设备尚未返回启动顺序。") else try writer.writer.print("{d:0>2}  {s}", .{ index + 1, references[index] });
-            const row = rows.children.items[index];
+            const row = self.order_nodes[index].?;
             try setText(self, row, writer.written());
             row.setDisplay(.flex);
         }
-        for (rows.children.items[count..]) |row| row.setDisplay(.none);
+        for (self.order_nodes[count..self.order_node_count]) |row| row.?.setDisplay(.none);
     }
     fn showOrder(self: *View) void {
         self.releaseInput(.released);
         self.closeMenus();
         if (self.order_open) |open| open.set(true);
-        if (self.order_scroll) |scroll| self.mount_request.cx.focus_manager.setFocus(scroll.container);
+        if (self.order_viewport) |node| self.mount_request.cx.focus_manager.setFocus(node);
     }
     fn orderKey(event: ui.events.Event, raw: ?*anyopaque) ui.events.EventResult {
         const self: *View = @ptrCast(@alignCast(raw orelse return .ignored));
@@ -1648,9 +2033,13 @@ const MenuAction = struct {
     menu: Menu,
     fn anchor(raw: *anyopaque) ui.widgets.popover.AnchorRect {
         const self: *MenuAction = @ptrCast(@alignCast(raw));
-        const node = if (self.view.last_overflow) self.view.more_node else self.view.tool_nodes[@backingInt(self.menu)];
-        const rect = (node orelse return .{ .x = 0, .y = 0, .w = 0, .h = 0 }).globalRect();
+        const rect = anchorRectOf(self.view, self.menu) orelse return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         return .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h };
+    }
+    /// The control a menu opens from: its tool, or “更多” while the toolbar is folded.
+    fn anchorRectOf(view: *View, menu: Menu) ?ui.ComputedRect {
+        const node = if (view.last_overflow) view.more_node else view.tool_nodes[@backingInt(menu)];
+        return (node orelse return null).globalRect();
     }
     fn toggle(self: *MenuAction) void {
         const index = @backingInt(self.menu);
@@ -1676,14 +2065,15 @@ const MoreAction = struct {
         self.releaseInput(.released);
         self.closeMenus();
         self.more_open.?.set(should_open);
-        self.more_focus_pending = should_open;
-        self.syncMoreStyle();
     }
-    fn changed(self: *View, open: bool) void {
-        if (open) self.releaseInput(.released);
-        if (!open) self.returnMoreFocus();
-        self.more_focus_pending = open;
-        self.syncMoreStyle();
+    /// 电源 / 启动：打开对应面板（锚在“更多”按钮上，同工具栏按钮的点击）。The menu item ids are the
+    /// `Menu` tag names.
+    fn selected(raw: *anyopaque, id: []const u8) void {
+        const self: *View = @ptrCast(@alignCast(raw));
+        const menu = std.meta.stringToEnum(Menu, id) orelse return;
+        if (menu != .power and menu != .boot) return;
+        var action: MenuAction = .{ .view = self, .menu = menu };
+        action.toggle();
     }
 };
 const ChordAction = struct {
@@ -1716,7 +2106,7 @@ const ReplyAction = struct {
         var snapshot = service.table.snapshot(service.binding.context, service.binding, self.view.mount_request.cx.allocator) catch return;
         defer snapshot.deinit();
         const request = snapshot.value.control_request orelse return;
-        service.table.reply_control(service.binding.context, service.binding, request, self.reply) catch |err| self.view.showMessage(@errorName(err));
+        service.table.reply_control(service.binding.context, service.binding, request, self.reply) catch |err| self.view.showFailure(err);
     }
 };
 
@@ -1741,14 +2131,15 @@ pub fn mount(_: ?*anyopaque, request: contract.ContentMount) !contract.RendererI
         state.menu_signal_count += 1;
     }
     state.keys_disabled = try scope.createSignal(bool, true);
-    for (&state.tool_styles) |*source| source.* = try scope.createSignal(ui.BoxStyle, S.tool());
     for (&state.tool_labels, menu_names) |*source, name| source.* = try scope.createSignal([]const u8, name);
     state.tool_icon_only = try scope.createSignal(bool, false);
-    state.more_open = try scope.createSignal(bool, false);
-    state.more_style = try scope.createSignal(ui.BoxStyle, S.iconTool());
-    state.more_row_style = try scope.createSignal(ui.BoxStyle, S.moreRow());
-    state.tool_hover = try scope.createSignal(?ui.BoxStyle, S.toolHover());
-    state.key_style = try scope.createSignal(ui.BoxStyle, S.keyButton());
+    state.hints_enabled = try scope.createSignal(bool, false);
+    state.tool_chevron = try scope.createSignal(bool, true);
+    state.progress_scroll_y = try scope.createSignal(f32, 0);
+    state.log_scroll_y = try scope.createSignal(f32, 0);
+    state.log_width = try scope.createSignal(f32, S.log_width);
+    state.log_max_height = try scope.createSignal(f32, 600);
+    state.scale_value = try scope.createSignal(?[]const u8, @tagName(mapping.Mode.fit));
     state.request_disabled = try scope.createSignal(bool, true);
     state.capture_disabled = try scope.createSignal(bool, true);
     state.power_disabled = try scope.createSignal(bool, true);
@@ -1769,7 +2160,6 @@ pub fn mount(_: ?*anyopaque, request: contract.ContentMount) !contract.RendererI
     state.log_open = try scope.createSignal(bool, false);
     state.cancel_disabled = try scope.createSignal(bool, false);
     state.disconnect_disabled = try scope.createSignal(bool, true);
-    state.disconnect_style = try scope.createSignal(ui.BoxStyle, S.disconnect());
     state.disconnect_icon_only = try scope.createSignal(bool, false);
     state.connection_symbol = try scope.createSignal(?ui.SvgAsset, ui.icons.loader_circle);
     state.connection_tint = try scope.createSignal(?ui.Color, S.theme.current().accent_ink);
@@ -1778,9 +2168,8 @@ pub fn mount(_: ?*anyopaque, request: contract.ContentMount) !contract.RendererI
     state.disconnect_confirm_open = try scope.createSignal(bool, false);
     state.disconnect_confirm_title = try scope.createSignal([]const u8, "断开连接？");
     state.disconnect_confirm_action = try scope.createSignal([]const u8, "断开连接");
+    state.disconnect_confirm_message = try scope.createSignal([]const u8, "");
     state.retry_disabled = try scope.createSignal(bool, true);
-    state.fit_style = try scope.createSignal(ui.BoxStyle, S.segment(true));
-    state.original_style = try scope.createSignal(ui.BoxStyle, S.segment(false));
     state.fullscreen_label = try scope.createSignal([]const u8, "进入全屏");
     const root = try ui.vstackStyled(cx, S.workspaceRoot, .{});
     root.meta.ownership.meta.test_id = "bmc.content";
@@ -1794,130 +2183,132 @@ pub fn mount(_: ?*anyopaque, request: contract.ContentMount) !contract.RendererI
     state.toolbar = bar;
     const identity = try ui.hstackStyled(cx, S.connectionIdentity, .{});
     try bar.appendChild(cx.allocator, identity);
-    const connection_icon = try ui.iconTint(cx, ui.icons.monitor, S.theme.current().fg_2, .{ .width = .{ .px = 18 }, .height = .{ .px = 18 }, .flex_shrink = 0 });
+    state.connection_identity = identity;
+    const connection_icon = try ui.iconTint(cx, ui.icons.monitor, S.theme.current().accent, S.connectionIcon());
     connection_icon.meta.ownership.meta.test_id = "bmc.title.icon";
     try identity.appendChild(cx.allocator, connection_icon);
     state.connection_icon = connection_icon;
     const connection_title = try ui.textStyled(cx, S.connectionTitle, "KVM 控制台");
-    connection_title.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0 });
+    connection_title.setStyleInline(cx.allocator, .{ .width = .{ .fit = .{} }, .min_width = 0, .flex_shrink = 1 });
     connection_title.meta.ownership.meta.test_id = "bmc.title";
     try identity.appendChild(cx.allocator, connection_title);
     state.connection_title = connection_title;
-    const disconnect = try ui.widgets.Button(.{ .label = state.connection_label, .icon_only = state.disconnect_icon_only, .variant = .ghost, .icon_asset = state.connection_symbol, .icon_tint = state.connection_tint, .icon_size = @as(f32, 14), .a11y_label = state.connection_hint, .base_style = state.disconnect_style, .hover_style = state.tool_hover, .on_click = cx.on(View, state, View.disconnectConnection) }).mount(scope, cx);
+    // Native ghost Button: the label / glyph / tint are the connection status (data), the frame and
+    // its hover / pressed / disabled states are zenit's.
+    const disconnect = try ui.widgets.Button(.{ .label = state.connection_label, .icon_only = state.disconnect_icon_only, .variant = .ghost, .size = .sm, .icon_asset = state.connection_symbol, .icon_tint = state.connection_tint, .a11y_label = state.connection_hint, .disabled = state.disconnect_disabled, .on_click = cx.on(View, state, View.disconnectConnection) }).mount(scope, cx);
     disconnect.meta.ownership.meta.test_id = "bmc.disconnect";
-    const connection_tooltip = try @import("../../ui/control_hint.zig").mount(cx, scope, disconnect, state.connection_hint, .{ .id = "bmc.disconnect.tooltip", .enabled = state.tool_icon_only });
-    state.disconnect_hint = connection_tooltip.open;
-    try bar.appendChild(cx.allocator, connection_tooltip.wrapper);
+    const connection_tooltip = try @import("../../shared/ui/components/control_hint/control_hint.zig").mount(cx, scope, disconnect, state.connection_hint, .{ .id = "bmc.disconnect.tooltip", .enabled = state.hints_enabled });
+    const disconnect_slot = try ui.boxStyled(cx, S.toolSlot, .{});
+    try disconnect_slot.appendChild(cx.allocator, connection_tooltip.wrapper);
+    try bar.appendChild(cx.allocator, disconnect_slot);
+    state.disconnect_slot = disconnect_slot;
+    // j8WXoF O1: the toolbar status slot; picture overlays (O2–O5) mount on the video card below.
+    const overlays = try OV.Overlays.mount(cx, scope, cx.on(View, state, View.takeover));
+    state.overlays = overlays;
+    try bar.appendChild(cx.allocator, overlays.status);
+    // TcJSa: title, status, then a spacer that pushes the menus right.
+    try bar.appendChild(cx.allocator, try ui.spacer(cx));
     state.disconnect_node = disconnect;
-    state.connection_state = disconnect;
     state.connection_hovered = try ui.hooks.useHover(scope, disconnect);
     state.connection_focused = (try ui.hooks.useFocusState(scope, cx, disconnect)).focused;
     for (menu_names, menu_ids, menu_icons, 0..) |name, id, icon, index| {
-        const action = try cx.bindState(MenuAction, .{ .view = state, .menu = @fromBackingInt(@intCast(index)) });
-        var popup = try ui.widgets.Popover(.{ .trigger = .manual, .open = state.open[index], .position = @as(ui.widgets.popover.PopoverPosition, if (index >= 3) .bottom_end else .bottom_start), .anchor = if (index >= 3) ui.widgets.popover.Anchor{ .virtual = .{ .ctx = action, .getRect = MenuAction.anchor } } else null, .width = if (index == 4) S.boot_width else S.popup_width, .max_width = if (index == 4) S.boot_width else S.popup_width, .constrain_width_to_viewport = true, .max_height = @as(f32, 730), .viewport_padding = @as(f32, 12), .shift_main_axis = true, .offset = .{ .static = 8 }, .size_policy = .fit_content, .enter_transition = .fade, .exit_transition = .fade, .on_open_change = cx.on(MenuAction, action, MenuAction.changed) }).mount(scope, cx);
-        popup.chrome.setStyleInline(cx.allocator, S.popup());
+        const menu: Menu = @fromBackingInt(@intCast(index));
+        const action = try cx.bindState(MenuAction, .{ .view = state, .menu = menu });
+        const management = menu == .power or menu == .boot;
+        const popup = try ui.widgets.Popover(.{ .trigger = .manual, .open = state.open[index], .position = @as(ui.widgets.popover.PopoverPosition, if (management) .bottom_end else .bottom_start), .anchor = if (management) ui.widgets.popover.Anchor{ .virtual = .{ .ctx = action, .getRect = MenuAction.anchor } } else null, .width = if (menu == .boot) S.boot_width else S.popup_width, .max_width = if (menu == .boot) S.boot_width else S.popup_width, .constrain_width_to_viewport = true, .max_height = S.popup_max_height, .viewport_padding = S.popup_viewport_padding, .shift_main_axis = true, .offset = .{ .static = S.popup_offset }, .size_policy = .fit_content, .enter_transition = .fade, .exit_transition = .fade, .color_scheme = S.popup_scheme, .on_open_change = cx.on(MenuAction, action, MenuAction.changed) }).mount(scope, cx);
         popup.chrome.meta.ownership.meta.test_id = try scopedId(scope, id, ".popover");
-        // This vendor's fit_or_scroll fixes its height to max_height. Keep the
-        // Popover content-sized and own the one bounded scroll viewport here.
-        const menu_scroll = try ui.widgets.ScrollArea(.{ .height = @as(f32, 1), .direction = .vertical, .rubber_band_y = false }).mount(popup.scope, cx);
-        menu_scroll.container.setStyleInline(cx.allocator, .{ .width = .fill(), .flex_shrink = 0 });
-        try popup.content.appendChild(cx.allocator, menu_scroll.container);
-        const is_display = index == @backingInt(Menu.display);
+        // The panel's layout is this view's own boxes inside the Popover's content slot: a fixed
+        // header over one bounded scroll viewport (the tall key menu scrolls, Close stays put).
+        const panel = try ui.vstackStyled(cx, S.popupPanel, .{});
+        try popup.content.appendChild(cx.allocator, panel);
+        const is_display = menu == .display;
+        const head = if (is_display) try ui.hstackStyled(cx, S.displayHead, .{}) else try ui.hstackStyled(cx, S.popupHead, .{});
+        try panel.appendChild(cx.allocator, head);
+        const title = if (is_display) try ui.textStyled(cx, S.displayTitle, name) else try ui.textStyled(cx, S.title, name);
+        title.meta.ownership.meta.test_id = try scopedId(scope, id, ".title");
+        try head.appendChild(cx.allocator, title);
+        try head.appendChild(cx.allocator, try ui.spacer(cx));
+        // panel-heads：统一关闭按钮（原生 Popover 默认 Esc 关闭菜单）。
+        try head.appendChild(cx.allocator, try panel_header.mountClose(popup.scope, cx, .{ .label = "关闭菜单", .test_id = try scopedId(scope, id, ".close"), .on_close = cx.on(MenuAction, action, MenuAction.close) }));
+        // The viewport box carries the height (content-sized up to the popover's cap, see
+        // updatePopovers); the ScrollArea fills it.
+        const menu_viewport = try ui.box(cx, S.menuViewport(1), .{});
+        try panel.appendChild(cx.allocator, menu_viewport);
+        const menu_scroll = try ui.widgets.ScrollArea(.{ .direction = .vertical, .rubber_band_y = false }).mount(popup.scope, cx);
+        try menu_viewport.appendChild(cx.allocator, menu_scroll.container);
         const body = if (is_display) try ui.vstackStyled(cx, S.displayBody, .{}) else try ui.vstackStyled(cx, S.popupBody, .{});
         body.meta.ownership.meta.test_id = try scopedId(scope, id, ".body");
         try menu_scroll.content.appendChild(cx.allocator, body);
-        popup.content = body;
         state.menus[index] = popup;
+        state.menu_viewports[index] = menu_viewport;
+        state.menu_bodies[index] = body;
         state.menu_scrolls[index] = menu_scroll;
-        const button = try ui.widgets.Button(.{ .label = state.tool_labels[index], .a11y_label = name, .icon_only = state.tool_icon_only, .variant = .ghost, .icon_asset = icon, .icon_size = @as(f32, 16), .base_style = state.tool_styles[index], .hover_style = state.tool_hover, .pressed_style = state.tool_hover, .on_click = cx.on(MenuAction, action, MenuAction.toggle) }).mount(scope, cx);
+        // Native ghost Button with zenit's own dropdown chevron; no caller styling.
+        const button = try ui.widgets.Button(.{ .label = state.tool_labels[index], .a11y_label = name, .icon_only = state.tool_icon_only, .variant = .ghost, .size = .sm, .icon_asset = icon, .chevron = state.tool_chevron, .on_click = cx.on(MenuAction, action, MenuAction.toggle) }).mount(scope, cx);
         button.meta.ownership.meta.test_id = id;
         state.tool_nodes[index] = button;
-        const tooltip = try @import("../../ui/control_hint.zig").mount(cx, scope, button, name, .{ .id = try scopedId(scope, id, ".tooltip"), .enabled = state.tool_icon_only });
-        state.tool_hints[index] = tooltip.open;
+        const tooltip = try @import("../../shared/ui/components/control_hint/control_hint.zig").mount(cx, scope, button, name, .{ .id = try scopedId(scope, id, ".tooltip"), .enabled = state.hints_enabled });
         try popup.trigger.appendChild(cx.allocator, tooltip.wrapper);
-        try bar.appendChild(cx.allocator, popup.wrapper);
-        const head = if (is_display) try ui.hstackStyled(cx, S.displayHead, .{}) else try ui.hstackStyled(cx, S.popupHead, .{});
-        // Header is a fixed sibling of the scroller. Close remains visible
-        // while the tall key menu scrolls to its last actions.
-        cx.detachChild(popup.chrome, menu_scroll.container);
-        try popup.chrome.appendChild(cx.allocator, head);
-        try popup.chrome.appendChild(cx.allocator, menu_scroll.container);
-        try head.appendChild(cx.allocator, if (is_display) try ui.textStyled(cx, S.displayTitle, name) else try ui.textStyled(cx, S.title, name));
-        try head.appendChild(cx.allocator, try ui.spacer(cx));
-        const close = try ui.widgets.Button(.{ .variant = .ghost, .icon_asset = ui.icons.x, .icon_size = @as(f32, 14), .a11y_label = "关闭菜单", .base_style = S.close(), .on_click = cx.on(MenuAction, action, MenuAction.close) }).mount(popup.scope, cx);
-        if (is_display) close.setStyleInline(cx.allocator, .{ .width = .{ .px = 28 }, .height = .{ .px = 28 }, .border = .{ .width = 0, .radius = 14 } });
-        close.meta.ownership.meta.test_id = try scopedId(scope, id, ".close");
-        try head.appendChild(cx.allocator, close);
-        try mountMenu(state, @fromBackingInt(@intCast(index)), popup);
+        const slot = try ui.boxStyled(cx, S.toolSlot, .{});
+        try slot.appendChild(cx.allocator, popup.wrapper);
+        try bar.appendChild(cx.allocator, slot);
+        state.tool_slots[index] = slot;
+        try mountMenu(state, menu, popup.scope, body);
     }
-    const more = try ui.widgets.Popover(.{ .trigger = .manual, .open = state.more_open.?, .position = .bottom_end, .width = @as(f32, 152), .constrain_width_to_viewport = true, .viewport_padding = @as(f32, 12), .offset = .{ .static = 8 }, .size_policy = .fit_content, .enter_transition = .fade, .exit_transition = .fade, .on_open_change = cx.on(View, state, MoreAction.changed) }).mount(scope, cx);
-    state.more = more;
-    more.chrome.meta.ownership.meta.test_id = "bmc.more.popover";
-    var more_popup_style = S.popup();
-    more_popup_style.padding = ui.Padding.all(4);
-    more.chrome.setStyleInline(cx.allocator, more_popup_style);
-    const more_button = try ui.widgets.Button(.{ .variant = .ghost, .icon_only = true, .icon_asset = ui.icons.ellipsis, .icon_size = @as(f32, 16), .a11y_label = "更多 KVM 操作", .base_style = state.more_style.?, .hover_style = state.tool_hover, .pressed_style = state.tool_hover, .on_click = cx.on(View, state, MoreAction.toggle) }).mount(scope, cx);
+    const more = try app_menu.AppMenu.mountTrigger(cx, scope, .{ .panel_test_id = "bmc.more.popover", .position = .bottom_end, .trigger = .manual, .color_scheme = S.popup_scheme }, .{ .context = state, .select = MoreAction.selected, .closed = null });
+    state.more = more.menu;
+    state.more_open = more.menu.open;
+    const more_button = try ui.widgets.Button(.{ .variant = .ghost, .size = .sm, .icon_only = true, .icon_asset = ui.icons.ellipsis, .a11y_label = "更多 KVM 操作", .on_click = cx.on(View, state, MoreAction.toggle) }).mount(scope, cx);
     more_button.meta.ownership.meta.test_id = "bmc.more";
     state.more_node = more_button;
-    try more.trigger.appendChild(cx.allocator, more_button);
-    try bar.appendChild(cx.allocator, more.wrapper);
-    more.wrapper.setDisplay(.none);
-    for (3..5) |index| {
-        const action = try cx.bindState(MenuAction, .{ .view = state, .menu = @fromBackingInt(@intCast(index)) });
-        const row = try ui.widgets.Button(.{ .label = menu_names[index], .variant = .ghost, .icon_asset = menu_icons[index], .icon_size = @as(f32, 16), .base_style = state.more_row_style, .hover_style = state.tool_hover, .pressed_style = state.tool_hover, .on_click = cx.on(MenuAction, action, MenuAction.toggle) }).mount(more.scope, cx);
-        row.meta.ownership.meta.test_id = if (index == 3) "bmc.more.power" else "bmc.more.boot";
-        row.setStyleInline(cx.allocator, .{ .justify = .start });
-        state.more_rows[index - 3] = row;
-        const chevron = try ui.iconTintStyled(cx, ui.icons.chevron_right, S.theme.current().fg_2, .{ .position = .absolute, .width = .{ .px = 14 }, .height = .{ .px = 14 }, .inset = .{ .right = .{ .px = 8 }, .top = .{ .px = 13 } } });
-        state.more_chevrons[index - 3] = chevron;
-        try row.appendChild(cx.allocator, chevron);
-        try more.content.appendChild(cx.allocator, row);
-    }
+    try more.result.trigger.appendChild(cx.allocator, more_button);
+    const more_slot = try ui.boxStyled(cx, S.toolSlot, .{});
+    try more_slot.appendChild(cx.allocator, more.result.wrapper);
+    try bar.appendChild(cx.allocator, more_slot);
+    more_slot.setDisplay(.none);
+    state.more_slot = more_slot;
+    const no_keys = struct {
+        const map: @import("../../features/shell/mod.zig").shortcut_router.Map = .{};
+    };
+    more.menu.set(&.{
+        .{ .id = @tagName(Menu.power), .label = menu_names[@backingInt(Menu.power)], .icon = "power", .test_id = "bmc.more.power" },
+        .{ .id = @tagName(Menu.boot), .label = menu_names[@backingInt(Menu.boot)], .icon = "rocket", .test_id = "bmc.more.boot" },
+    }, .{ .keys = &no_keys.map });
     const workspace = try ui.boxStyled(cx, S.videoWorkspace, .{});
     workspace.meta.ownership.meta.test_id = "bmc.video_workspace";
     try root.appendChild(cx.allocator, workspace);
     const video_card = try ui.boxStyled(cx, S.videoCard, .{});
     video_card.meta.ownership.meta.test_id = "bmc.video_card";
-    @import("../../ui/layer_materials.zig").variableBackdrop(video_card);
     try workspace.appendChild(cx.allocator, video_card);
+    // The picture viewport is this view's own box: it takes focus and input and positions the
+    // connection card. The native ScrollArea inside it only scrolls the picture (100% mode).
+    const viewport = try ui.boxStyled(cx, S.video, .{});
+    viewport.meta.ownership.meta.test_id = "bmc.viewport";
+    viewport.behavior.interaction.focusable = true;
+    viewport.behavior.events.on_event_capture = View.handle;
+    viewport.behavior.events.capture_context = state;
+    try video_card.appendChild(cx.allocator, viewport);
     const scroll = try ui.widgets.ScrollArea(.{ .direction = .both, .rubber_band_x = false, .rubber_band_y = false, .background = ui.Color.BLACK }).mount(scope, cx);
-    scroll.container.setStyleInline(cx.allocator, S.video());
-    scroll.container.meta.ownership.meta.test_id = "bmc.viewport";
-    scroll.container.behavior.interaction.focusable = true;
-    scroll.container.behavior.events.on_event_capture = View.handle;
-    scroll.container.behavior.events.capture_context = state;
-    try video_card.appendChild(cx.allocator, scroll.container);
+    try viewport.appendChild(cx.allocator, scroll.container);
     state.scroll = scroll;
-    state.viewport = scroll.container;
-    if (scroll.container.children.items.len >= 3) {
-        scroll.container.children.items[1].meta.ownership.meta.test_id = "bmc.viewport.scroll_y";
-        scroll.container.children.items[2].meta.ownership.meta.test_id = "bmc.viewport.scroll_x";
-    }
-    const input_hint = try ui.textStyled(cx, S.inputHint, "");
-    input_hint.setStyleInline(cx.allocator, S.inputHintBox());
-    input_hint.setDisplay(.none);
-    input_hint.meta.ownership.meta.test_id = "bmc.input_hint";
-    try scroll.container.appendChild(cx.allocator, input_hint);
-    state.input_hint = input_hint;
+    state.viewport = viewport;
+    // The canvas is the scrolled extent (at least the viewport, the picture in 100% mode); the
+    // picture is placed inside it.
+    const canvas = try ui.box(cx, S.canvas(1, 1), .{});
+    try scroll.content.appendChild(cx.allocator, canvas);
+    state.canvas = canvas;
     const image_node = try ui.image(cx, 0, S.image());
     image_node.setImage(null);
     image_node.meta.ownership.meta.test_id = "bmc.frame";
-    try scroll.content.appendChild(cx.allocator, image_node);
+    try canvas.appendChild(cx.allocator, image_node);
     state.image_node = image_node;
-    const fps_hud = try ui.vstackStyled(cx, S.fpsHud, .{});
-    fps_hud.meta.ownership.meta.test_id = "bmc.fps";
-    state.fps_hud = fps_hud;
-    state.fps_display = try ui.textStyled(cx, S.fpsPrimary, "显示 — FPS");
-    state.fps_decode = try ui.textStyled(cx, S.fpsSecondary, "解码 — FPS");
-    state.fps_display.?.meta.ownership.meta.test_id = "bmc.fps.display";
-    state.fps_decode.?.meta.ownership.meta.test_id = "bmc.fps.decode";
-    try fps_hud.appendChild(cx.allocator, state.fps_display.?);
-    try fps_hud.appendChild(cx.allocator, state.fps_decode.?);
-    try video_card.appendChild(cx.allocator, fps_hud);
-    try mountProgress(state, scroll.container);
+    state.video_card = video_card;
+    for ([_]*ui.Node{ overlays.ai_frame, overlays.hud, overlays.hint, overlays.waiting }) |node| try video_card.appendChild(cx.allocator, node);
+    try mountProgress(state, viewport);
     try mountConnectionLog(state);
     try mountDisconnectConfirmation(state);
-    try scope.createEffect(.{ .view = state, .publication = try cx.themeSignal(scope) }, struct {
+    try state.theme_watch.bind(cx, scope);
+    try scope.createEffect(.{ .view = state, .publication = try cx.themeSignal() }, struct {
         fn paint(ctx: anytype) void {
             _ = ctx.publication.get();
             // Closed portal content is retained outside the window tree.
@@ -1931,42 +2322,67 @@ pub fn mount(_: ?*anyopaque, request: contract.ContentMount) !contract.RendererI
             if (view.disconnect_confirm_dialog) |dialog| if (!view.disconnect_confirm_open.peek()) view.mount_request.cx.replaySubtreeTheme(dialog);
         }
     }.paint);
+    // Events instead of per-frame checks: the disconnect button's hover / focus repaint its
+    // indicator; the picture's hover feeds the HUD state machine on the next frame.
+    try scope.createEffect(.{ .view = state, .hovered = state.connection_hovered.?, .focused = state.connection_focused.?, .disabled = state.disconnect_disabled }, struct {
+        fn sync(ctx: anytype) void {
+            _ = ctx.hovered.get();
+            _ = ctx.focused.get();
+            _ = ctx.disabled.get();
+            if (!ctx.view.closed) ctx.view.syncConnectionIndicator();
+        }
+    }.sync);
+    state.picture_hovered = try ui.hooks.useHover(scope, viewport);
+    try scope.createEffect(.{ .view = state, .hovered = state.picture_hovered.? }, struct {
+        fn moved(ctx: anytype) void {
+            _ = ctx.hovered.get();
+            if (!ctx.view.closed) ctx.view.mount_request.cx.requestRedraw();
+        }
+    }.moved);
+    // Toolbar tooltips exist only for the icon-only toolbar and never under an open menu.
+    try scope.createEffect(state, struct {
+        fn sync(view: *View) void {
+            var menu_open = view.more_open.?.get() or view.order_open.?.get() or view.log_open.?.get();
+            for (view.open) |signal| menu_open = signal.get() or menu_open;
+            view.hints_enabled.set(view.tool_icon_only.get() and !menu_open);
+        }
+    }.sync);
     try scope.onCleanup(View, state, View.release);
-    root.meta.per_frame.hooks.slots.anim_state = state;
-    root.addBeforeRender(View.beforeRender);
+    state.bindPresentation(true);
     try cx.addAfterLayoutHook(state, View.afterLayout);
     state.after_layout_registered = true;
-    try state.refresh(cx.frame_time_ms);
+    try state.refresh();
     cx.requestRedraw();
-    return .{ .context = state, .vtable = &.{ .update = View.update, .focus_changed = View.focus, .unmount = View.unmount, .connection_status = View.connectionStatus, .show_connection_details = View.showConnectionDetails } };
+    return .{ .context = state, .vtable = &.{ .update = View.update, .focus_changed = View.focus, .unmount = View.unmount, .connection_status = View.connectionStatus, .show_connection_details = View.showConnectionDetails, .launcher_context = View.launcherContext, .place_launcher = View.placeLauncher } };
 }
 
+/// Disconnect / stop-connecting confirmation: the shared native confirmation (`shared/ui/confirm`,
+/// zenit ConfirmDialog): 取消 takes focus; 取消 / × / Esc / scrim keep the session.
 fn mountDisconnectConfirmation(state: *View) !void {
     const cx = state.mount_request.cx;
     const scope = state.mount_request.scope;
-    const modal = try ui.widgets.Modal(.{ .title = state.disconnect_confirm_title, .open = state.disconnect_confirm_open, .width = @as(f32, 440), .max_height = @as(f32, 320), .background = S.theme.current().overlay, .close_icon_asset = ui.icons.x, .enter_transition = .fade, .exit_transition = .fade }).mount(scope, cx);
-    if (!modal.portaled) try state.root.?.appendChild(cx.allocator, modal.overlay);
-    modal.dialog.meta.ownership.meta.test_id = "bmc.disconnect.confirmation";
-    state.disconnect_confirm_dialog = modal.dialog;
-    modal.body.setStyleInline(cx.allocator, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 12, .padding = ui.Padding.all(18), .min_width = 0 });
+    const confirm_ui = @import("../../shared/ui/confirm/confirm.zig");
+    const dialog = try confirm_ui.confirm(scope, cx, .{
+        .open = state.disconnect_confirm_open,
+        .title = state.disconnect_confirm_title,
+        .message = state.disconnect_confirm_message,
+        .action = state.disconnect_confirm_action,
+        .width = @as(f32, 440),
+        .max_height = @as(f32, 320),
+        // confirmDisconnect closes the dialog itself (it checks that the dialog is still up).
+        .close_on_confirm = false,
+        .on_confirm = cx.on(View, state, View.confirmDisconnect),
+        .test_id = "bmc.disconnect.confirmation",
+        .test_ids = .{ .message = "bmc.disconnect.detail", .cancel = "bmc.disconnect.return", .confirm = "bmc.disconnect.confirm" },
+    });
+    if (!dialog.modal.portaled) try state.root.?.appendChild(cx.allocator, dialog.modal.overlay);
+    state.disconnect_confirm_dialog = dialog.modal.dialog;
     const target = try ui.textStyled(cx, S.title, "KVM 控制台");
     target.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0 });
-    try modal.body.appendChild(cx.allocator, target);
+    try dialog.content.insertChildBefore(cx.allocator, target, dialog.message);
     state.disconnect_confirm_target = target;
-    const detail = try ui.textStyled(cx, S.confirmationDetail, "");
-    detail.setStyleInline(cx.allocator, .{ .width = .fill() });
-    try modal.body.appendChild(cx.allocator, detail);
-    state.disconnect_confirm_detail = detail;
-    const actions = try ui.hstackStyled(cx, S.actions, .{});
-    actions.setStyleInline(cx.allocator, .{ .margin = .{ .top = 8 } });
-    try modal.body.appendChild(cx.allocator, actions);
-    const back = try ui.widgets.Button(.{ .label = "返回", .variant = .secondary, .base_style = S.action(), .on_click = cx.on(View, state, View.dismissDisconnect) }).mount(scope, cx);
-    back.meta.ownership.meta.test_id = "bmc.disconnect.return";
-    try actions.appendChild(cx.allocator, back);
-    state.disconnect_confirm_return = back;
-    const confirm = try ui.widgets.Button(.{ .label = state.disconnect_confirm_action, .variant = .danger, .base_style = S.action(), .on_click = cx.on(View, state, View.confirmDisconnect) }).mount(scope, cx);
-    confirm.meta.ownership.meta.test_id = "bmc.disconnect.confirm";
-    try actions.appendChild(cx.allocator, confirm);
+    state.disconnect_confirm_detail = dialog.message;
+    state.disconnect_confirm_return = dialog.cancel;
 }
 
 fn mountProgress(state: *View, parent: *ui.Node) !void {
@@ -2016,19 +2432,25 @@ fn mountProgress(state: *View, parent: *ui.Node) !void {
     state.progress_notice.?.setStyleInline(cx.allocator, .{ .width = .fill(), .height = .{ .px = 18 }, .flex_shrink = 0 });
     state.progress_notice.?.meta.ownership.meta.test_id = "bmc.progress.notice";
 
-    const body = try ui.widgets.ScrollArea(.{ .height = @as(f32, 1), .direction = .vertical, .rubber_band_y = false }).mount(scope, cx);
-    body.container.setStyleInline(cx.allocator, .{ .width = .fill(), .flex_shrink = 0, .min_width = 0 });
-    body.container.meta.ownership.meta.test_id = "bmc.progress.body";
-    body.container.behavior.interaction.focusable = true;
-    body.container.behavior.events.on_event_capture = View.progressKey;
-    body.container.behavior.events.capture_context = state;
-    body.content.setStyleInline(cx.allocator, .{ .width = .fill(), .height = .{ .fit = .{} }, .direction = .column, .gap = 12, .min_width = 0, .flex_shrink = 0 });
-    try surface.appendChild(cx.allocator, body.container);
+    // The viewport box carries the height (updateProgressBounds) and keyboard scrolling; the
+    // native ScrollArea fills it and follows the controlled offset.
+    const body_viewport = try ui.box(cx, S.scrollViewport(1), .{});
+    body_viewport.meta.ownership.meta.test_id = "bmc.progress.body";
+    body_viewport.behavior.interaction.focusable = true;
+    body_viewport.behavior.events.on_event_capture = View.progressKey;
+    body_viewport.behavior.events.capture_context = state;
+    try surface.appendChild(cx.allocator, body_viewport);
+    const body = try ui.widgets.ScrollArea(.{ .direction = .vertical, .rubber_band_y = false, .scroll_y = state.progress_scroll_y }).mount(scope, cx);
+    try body_viewport.appendChild(cx.allocator, body.container);
+    const list = try ui.vstackStyled(cx, S.progressList, .{});
+    try body.content.appendChild(cx.allocator, list);
     state.waiting_body = body;
-    try body.content.appendChild(cx.allocator, state.progress_notice.?);
+    state.waiting_viewport = body_viewport;
+    state.waiting_list = list;
+    try list.appendChild(cx.allocator, state.progress_notice.?);
     const steps = try ui.vstackStyled(cx, S.progressSteps, .{});
     steps.meta.ownership.meta.test_id = "bmc.progress.steps";
-    try body.content.appendChild(cx.allocator, steps);
+    try list.appendChild(cx.allocator, steps);
     state.progress_steps = steps;
     for (0..vm.progress_group_count) |index| {
         const group: vm.ProgressGroup = @fromBackingInt(@intCast(index));
@@ -2038,11 +2460,10 @@ fn mountProgress(state: *View, parent: *ui.Node) !void {
         const row = try ui.hstackStyled(cx, S.progressStepBackdrop, .{});
         state.progress_rows[index] = row;
         try block.appendChild(cx.allocator, row);
-        const button = try ui.widgets.Button(.{ .label = "", .a11y_label = vm.progressGroupLabel(group), .variant = .ghost, .base_style = S.progressStep(cx.tokens), .hover_style = ui.BoxStyle{ .background = ui.Color.TRANSPARENT }, .pressed_style = ui.BoxStyle{ .background = ui.Color.TRANSPARENT }, .focus_ring = .{ .width = 0, .offset = 0 }, .on_click = cx.on(ProgressStepAction, action, ProgressStepAction.toggle) }).mount(scope, cx);
-        // The standard button owns focus, keyboard and pressed semantics; its
-        // caller content supplies the status/name/disclosure columns.
-        for (button.children.items) |child| child.setDisplay(.none);
-        state.progress_buttons[index] = button;
+        // Native Pressable: focus, keyboard, pressed and the expanded semantics are zenit's; the
+        // status / name / duration / disclosure columns are its content.
+        state.progress_expanded[index] = try scope.createSignal(bool, false);
+        const button = try ui.view.render(scope, cx, ui.widgets.Pressable(.{ .expanded = state.progress_expanded[index], .a11y_label = vm.progressGroupLabel(group), .look = Rows.progress_step, .on_click = cx.on(ProgressStepAction, action, ProgressStepAction.toggle) }));
         button.meta.ownership.meta.test_id = try scopedId(scope, "bmc.progress.step.", @tagName(group));
         try row.appendChild(cx.allocator, button);
         const icon = try ui.textStyled(cx, S.progressText, "○");
@@ -2069,9 +2490,9 @@ fn mountProgress(state: *View, parent: *ui.Node) !void {
         try button.appendChild(cx.allocator, chevron);
         state.progress_chevrons[index] = chevron;
         const detail = try ui.textStyled(cx, S.progressDiagnostic, "该步骤尚无连接事件。");
-        detail.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0, .margin = .{ .left = 24, .top = 4 }, .padding = .{ .top = 8, .bottom = 8, .left = 10, .right = 10 }, .background = S.theme.current().well, .border = .{ .width = 0, .radius = 8 } });
+        detail.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0, .margin = .{ .left = 24, .top = 4 }, .padding = .{ .top = 8, .bottom = 8, .left = 10, .right = 10 }, .background = S.diagnosticFill(), .border = .{ .width = 0, .radius = 8 } });
         detail.meta.ownership.meta.test_id = try scopedId(scope, "bmc.progress.diagnostic.", @tagName(group));
-        @import("../../ui/layer_materials.zig").card(detail, .well);
+        try @import("../../shared/ui/styles/surface_material.zig").bindFill(cx, scope, detail, S.diagnosticFill);
         detail.setDisplay(.none);
         try block.appendChild(cx.allocator, detail);
         state.progress_details[index] = detail;
@@ -2079,15 +2500,14 @@ fn mountProgress(state: *View, parent: *ui.Node) !void {
     state.waiting_detail = try ui.textStyled(cx, S.progressDetail, "");
     state.waiting_detail.?.setStyleInline(cx.allocator, .{ .width = .fill(), .flex_shrink = 0 });
     state.waiting_detail.?.meta.ownership.meta.test_id = "bmc.progress.detail";
-    try body.content.appendChild(cx.allocator, state.waiting_detail.?);
+    try list.appendChild(cx.allocator, state.waiting_detail.?);
     const actions = try ui.hstackStyled(cx, S.progressActions, .{});
     try surface.appendChild(cx.allocator, actions);
     state.waiting_actions = actions;
     _ = try progressButton(state, actions, "连接日志", "bmc.connection_log", null, View.showLog);
-    const session_action = try ui.box(cx, .{ .width = .{ .px = 76 }, .height = .{ .px = 32 }, .flex_shrink = 0 }, .{});
-    try actions.appendChild(cx.allocator, session_action);
-    state.cancel_node = try progressButton(state, session_action, "取消连接", "bmc.cancel", state.cancel_disabled, View.cancel);
-    state.retry_node = try progressButton(state, session_action, "重试连接", "bmc.retry", state.retry_disabled, View.retry);
+    // 取消 / 重试 share one place: only one of them is shown.
+    state.cancel_node = try progressButton(state, actions, "取消连接", "bmc.cancel", state.cancel_disabled, View.cancel);
+    state.retry_node = try progressButton(state, actions, "重试连接", "bmc.retry", state.retry_disabled, View.retry);
 }
 
 fn logColumns() ui.BoxStyle {
@@ -2115,50 +2535,53 @@ fn logCell(cx: *ui.Cx, text: []const u8, width: ?f32, right: bool) !*ui.Node {
 fn mountConnectionLog(state: *View) !void {
     const cx = state.mount_request.cx;
     const scope = state.mount_request.scope;
-    const modal = try ui.widgets.Modal(.{ .title = "连接日志", .open = state.log_open.?, .width = S.log_width, .max_height = @as(f32, 600), .close_icon_asset = ui.icons.x, .enter_transition = .fade, .exit_transition = .fade }).mount(scope, cx);
+    // Native Modal: its title bar, close button and panel are zenit's (the close button is named
+    // through `close_label` and its `close_button` part); width and height cap follow the window through
+    // sources. The body is edge to edge so this view's own boxes lay out the content and footer.
+    const modal = try ui.widgets.Modal(.{ .title = "连接日志", .open = state.log_open.?, .width = state.log_width, .max_height = state.log_max_height, .close_icon_asset = ui.icons.x, .close_label = "关闭日志，连接继续", .body_padding = ui.Padding.all(0), .body_gap = @as(f32, 0), .enter_transition = .fade, .exit_transition = .fade }).mount(scope, cx);
+    // The title bar's close button is a public part of the native Modal: its test id goes on it.
+    if (modal.close_button) |close| close.meta.ownership.meta.test_id = "bmc.connection_log.close";
     if (!modal.portaled) try state.root.?.appendChild(cx.allocator, modal.overlay);
     modal.overlay.meta.ownership.meta.test_id = "bmc.connection_log.overlay";
     modal.dialog.meta.ownership.meta.test_id = "bmc.connection_log.modal";
-    if (modal.dialog.children.items.len != 0) {
-        const header = modal.dialog.children.items[0];
-        if (header.children.items.len != 0) {
-            header.children.items[0].setStyleInline(cx.allocator, .{ .font_size = 13, .font_weight = 700 });
-            setTextLayout(header.children.items[0], 20.0 / 13.0, .start);
-            const close = header.children.items[header.children.items.len - 1];
-            close.meta.ownership.meta.test_id = "bmc.connection_log.close";
-            cx.detachChild(header, close);
-            const close_hint = try @import("../../ui/control_hint.zig").mount(cx, scope, close, "关闭日志，连接继续", .{ .id = "bmc.connection_log.close.tooltip", .visible = state.log_open.? });
-            try header.appendChild(cx.allocator, close_hint.wrapper);
-        }
-    }
     state.log_modal = modal;
+    const content = try ui.box(cx, S.logContent(cx.viewport.height < 600), .{});
+    try modal.body.appendChild(cx.allocator, content);
+    state.log_content = content;
     const hint = try ui.textStyled(cx, S.hint, "最近 32 条脱敏事件 · 当前会话");
     hint.setStyleInline(cx.allocator, .{ .width = .fill(), .flex_shrink = 0 });
-    try modal.body.appendChild(cx.allocator, hint);
+    try content.appendChild(cx.allocator, hint);
     state.log_route_text = try ui.textStyled(cx, S.progressRoute, "");
-    state.log_route_text.?.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0, .padding = ui.Padding.all(10), .margin = .{ .bottom = 12 }, .background = S.theme.current().well, .border = .{ .width = 0, .radius = 8 } });
+    state.log_route_text.?.setStyleInline(cx.allocator, .{ .width = .fill(), .min_width = 0, .flex_shrink = 0, .padding = ui.Padding.all(10), .margin = .{ .bottom = 12 }, .background = S.logWellFill(), .border = .{ .width = 0, .radius = 8 } });
     state.log_route_text.?.meta.ownership.meta.test_id = "bmc.connection_log.route";
-    @import("../../ui/layer_materials.zig").card(state.log_route_text.?, .well);
-    try modal.body.appendChild(cx.allocator, state.log_route_text.?);
+    try @import("../../shared/ui/styles/surface_material.zig").bindFill(cx, scope, state.log_route_text.?, S.logWellFill);
+    try content.appendChild(cx.allocator, state.log_route_text.?);
     const columns = try ui.box(cx, logColumns(), .{});
     columns.meta.ownership.meta.test_id = "bmc.connection_log.columns";
-    try modal.body.appendChild(cx.allocator, columns);
+    try content.appendChild(cx.allocator, columns);
     try columns.appendChild(cx.allocator, try logCell(cx, "时间戳", 86, false));
     try columns.appendChild(cx.allocator, try logCell(cx, "消息", null, false));
     try columns.appendChild(cx.allocator, try logCell(cx, "耗时", 76, true));
-    const scroll = try ui.widgets.ScrollArea(.{ .height = @as(f32, 320), .direction = .vertical, .rubber_band_y = false }).mount(scope, cx);
-    scroll.container.setStyleInline(cx.allocator, .{ .width = .fill(), .background = LogS.theme.popupInset(), .border = .{ .width = 0, .radius = 9 }, .flex_shrink = 0 });
-    scroll.content.setStyleInline(cx.allocator, LogS.logContent());
-    scroll.container.meta.ownership.meta.test_id = "bmc.connection_log.list";
-    @import("../../ui/layer_materials.zig").card(scroll.container, .well);
-    scroll.container.behavior.interaction.focusable = true;
-    scroll.container.behavior.events.on_event_capture = View.logKey;
-    scroll.container.behavior.events.capture_context = state;
-    try modal.body.appendChild(cx.allocator, scroll.container);
+    // The list viewport is this view's own box (height, well surface, keyboard scrolling); the
+    // native ScrollArea fills it and follows the controlled offset.
+    const list_viewport = try ui.box(cx, S.logViewport(320), .{});
+    list_viewport.meta.ownership.meta.test_id = "bmc.connection_log.list";
+    try @import("../../shared/ui/styles/surface_material.zig").bindFill(cx, scope, list_viewport, S.logWellFill);
+    list_viewport.behavior.interaction.focusable = true;
+    list_viewport.behavior.events.on_event_capture = View.logKey;
+    list_viewport.behavior.events.capture_context = state;
+    try content.appendChild(cx.allocator, list_viewport);
+    state.log_viewport = list_viewport;
+    const scroll = try ui.widgets.ScrollArea(.{ .direction = .vertical, .rubber_band_y = false, .scroll_y = state.log_scroll_y }).mount(scope, cx);
+    try list_viewport.appendChild(cx.allocator, scroll.container);
     state.log_scroll = scroll;
+    // The scrolled extent (padded list) and, inside it, the event rows.
+    const log_list = try ui.box(cx, LogS.logContent(), .{});
+    try scroll.content.appendChild(cx.allocator, log_list);
+    state.log_list = log_list;
     state.log_detail = try ui.vstack(cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .gap = 0, .min_width = 0, .flex_shrink = 0 }, .{});
     state.log_detail.?.meta.ownership.meta.test_id = "bmc.connection_log.events";
-    try scroll.content.appendChild(cx.allocator, state.log_detail.?);
+    try log_list.appendChild(cx.allocator, state.log_detail.?);
     state.log_empty = try ui.textStyled(cx, logMessageStyle, "本会话尚未产生连接事件。");
     try state.log_detail.?.appendChild(cx.allocator, state.log_empty.?);
     for (0..state.log_rows.len) |index| {
@@ -2191,25 +2614,27 @@ fn mountConnectionLog(state: *View) !void {
     }
     const footer = try ui.box(cx, S.logFooter(cx.viewport.height < 600), .{});
     footer.meta.ownership.meta.test_id = "bmc.connection_log.footer";
-    @import("../../ui/layer_materials.zig").card(footer, .surface_2);
-    try modal.dialog.appendChild(cx.allocator, footer);
+    try @import("../../shared/ui/styles/surface_material.zig").bindFill(cx, scope, footer, S.logFooterFill);
+    try modal.body.appendChild(cx.allocator, footer);
     state.log_footer = footer;
-    const close = try ui.widgets.Button(.{ .label = "关闭", .variant = .secondary, .base_style = S.logClose(), .on_click = cx.on(View, state, View.closeLog) }).mount(scope, cx);
+    const close = try ui.widgets.Button(.{ .label = "关闭", .variant = .secondary, .on_click = cx.on(View, state, View.closeLog) }).mount(scope, cx);
     close.meta.ownership.meta.test_id = "bmc.connection_log.dismiss";
     try footer.appendChild(cx.allocator, close);
 }
 
-fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
+/// One menu's content, mounted into this view's own body box inside the Popover (`scope` is the
+/// Popover's).
+fn mountMenu(state: *View, menu: Menu, scope: *ui.Scope, parent: *ui.Node) !void {
     const cx = state.mount_request.cx;
-    const parent = popup.content;
-    const scope = popup.scope;
     switch (menu) {
         .control => {
             state.control_label = try ui.textStyled(cx, S.body, "仅观看 · 尚未获控制权");
             try parent.appendChild(cx.allocator, state.control_label.?);
             _ = try actionButton(state, scope, parent, "申请控制权", "bmc.control.request", state.request_disabled, View.requestControl);
-            _ = try actionButton(state, scope, parent, "捕获键盘鼠标", "bmc.control.capture", state.capture_disabled, View.capture);
-            _ = try actionButton(state, scope, parent, "释放键盘鼠标 · ⌃⌥Esc", "bmc.control.release", null, View.releaseCapture);
+            const capture_button = try menuButton(state, scope, "捕获键盘鼠标", "bmc.control.capture", state.capture_disabled, View.capture);
+            const capture_hint = try @import("../../shared/ui/components/control_hint/control_hint.zig").mount(cx, scope, capture_button, "点击画面后路由键鼠。Command 映射为远端 Super。", .{ .id = "bmc.control.capture.tooltip", .width = 300, .visible = state.open[@backingInt(Menu.control)] });
+            try parent.appendChild(cx.allocator, capture_hint.wrapper);
+            _ = try actionButton(state, scope, parent, "释放键盘鼠标 · " ++ mapping.release_hint, "bmc.control.release", null, View.releaseCapture);
             _ = try actionButton(state, scope, parent, "仅观看", "bmc.control.view_only", null, View.onlyView);
             state.control_request_row = try ui.vstackStyled(cx, S.root, .{});
             state.control_request_row.?.setStyleInline(cx.allocator, .{ .height = .{ .fit = .{} }, .gap = 6 });
@@ -2217,7 +2642,7 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
             try state.control_request_row.?.appendChild(cx.allocator, try ui.textStyled(cx, S.hint, "另一个客户端请求控制权"));
             for ([_]console.ControlReply{ .full_control, .video_only, .reject }, [_][]const u8{ "移交完整控制", "允许仅观看", "拒绝请求" }, [_][]const u8{ "bmc.control.grant", "bmc.control.video_only", "bmc.control.reject" }) |reply, label, id| {
                 const action = try cx.bindState(ReplyAction, .{ .view = state, .reply = reply });
-                const button = try ui.widgets.Button(.{ .label = label, .variant = .secondary, .base_style = S.action(), .on_click = cx.on(ReplyAction, action, ReplyAction.send) }).mount(scope, cx);
+                const button = try ui.widgets.Button(.{ .label = label, .variant = .secondary, .on_click = cx.on(ReplyAction, action, ReplyAction.send) }).mount(scope, cx);
                 button.meta.ownership.meta.test_id = id;
                 try state.control_request_row.?.appendChild(cx.allocator, button);
             }
@@ -2225,7 +2650,9 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
             try parent.appendChild(cx.allocator, state.message.?);
         },
         .keys => {
-            try parent.appendChild(cx.allocator, try ui.textStyled(cx, S.hint, "需要已获控制权；不会自动抢占。"));
+            const keys_hint = try ui.textStyled(cx, S.hint, "需要已获控制权；不会自动抢占。");
+            keys_hint.meta.ownership.meta.test_id = "bmc.keys.hint";
+            try parent.appendChild(cx.allocator, keys_hint);
             try chordButton(state, scope, parent, "Ctrl + Alt + Delete", "bmc.keys.ctrl_alt_delete", &.{ 0xffe3, 0xffe9, 0xffff });
             for (0..6) |row_index| {
                 const row = try ui.hstackStyled(cx, S.keyRow, .{});
@@ -2250,30 +2677,29 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
         .display => {
             const controls = try ui.vstackStyled(cx, S.displayControls, .{});
             try parent.appendChild(cx.allocator, controls);
-            const row = try ui.hstackStyled(cx, S.displayScale, .{});
-            row.meta.ownership.meta.test_id = "bmc.display.scale";
-            try controls.appendChild(cx.allocator, row);
-            const fit = try ui.widgets.Button(.{ .label = "适应窗口", .variant = .ghost, .base_style = state.fit_style, .on_click = cx.on(View, state, View.fit) }).mount(scope, cx);
-            fit.meta.ownership.meta.test_id = "bmc.display.fit";
-            try row.appendChild(cx.allocator, fit);
-            const original = try ui.widgets.Button(.{ .label = "100%", .variant = .ghost, .base_style = state.original_style, .on_click = cx.on(View, state, View.original) }).mount(scope, cx);
-            original.meta.ownership.meta.test_id = "bmc.display.original";
-            const original_hint = try @import("../../ui/control_hint.zig").mount(cx, scope, original, "按逻辑原尺寸显示。超出区域可在释放键鼠后滚动。", .{ .id = "bmc.display.original.tooltip", .layout = .{ .width = .fill(), .min_width = 0 }, .width = 300, .visible = state.open[@backingInt(Menu.display)] });
-            try row.appendChild(cx.allocator, original_hint.wrapper);
-            var full_style = S.displayAction();
-            full_style.width = .fill();
-            const fullscreen = try ui.widgets.Button(.{ .label = state.fullscreen_label, .icon_asset = ui.icons.maximize, .icon_size = @as(f32, 16), .variant = .secondary, .base_style = full_style, .on_click = cx.on(View, state, View.fullscreen) }).mount(scope, cx);
+            // 适应窗口 / 100%：zenit 原生分段选择（`W.Tabs` segmented），选中态与键盘行为都是它的。
+            const scale = try ui.box(cx, S.displayScale(), .{});
+            scale.meta.ownership.meta.test_id = "bmc.display.scale";
+            try controls.appendChild(cx.allocator, scale);
+            try scale.appendChild(cx.allocator, try ui.widgets.Tabs(.{ .items = &scale_items, .active = state.scale_value, .variant = .segmented, .size = .sm, .on_change = cx.on(View, state, View.scaleChanged) }).mount(scope, cx));
+            state.original_hint = try ui.textStyled(cx, S.hint, "按逻辑原尺寸显示。超出区域可在释放键鼠后滚动。");
+            state.original_hint.?.meta.ownership.meta.test_id = "bmc.display.original.hint";
+            state.original_hint.?.setDisplay(if (state.mode == .original) .flex else .none);
+            try controls.appendChild(cx.allocator, state.original_hint.?);
+            const fullscreen = try ui.widgets.Button(.{ .label = state.fullscreen_label, .icon_asset = ui.icons.maximize, .variant = .secondary, .block = true, .on_click = cx.on(View, state, View.fullscreen) }).mount(scope, cx);
             fullscreen.meta.ownership.meta.test_id = "bmc.display.fullscreen";
             try controls.appendChild(cx.allocator, fullscreen);
 
             const performance_section = try ui.vstackStyled(cx, S.displayPerformance, .{});
             try parent.appendChild(cx.allocator, performance_section);
-            try performance_section.appendChild(cx.allocator, try ui.boxStyled(cx, S.displayDivider, .{}));
+            try performance_section.appendChild(cx.allocator, try ui.widgets.Divider(.{ .spacing = .none }).mount(scope, cx));
+            // Native Switch in its default layout; the row around it is this view's box.
+            const fps_row = try ui.boxStyled(cx, S.displaySwitchRow, .{});
+            try performance_section.appendChild(cx.allocator, fps_row);
             const fps_toggle = try ui.widgets.Switch(.{ .label = "显示 FPS", .checked = state.show_fps, .on_change = cx.on(View, state, View.fpsChanged) }).mount(scope, cx);
-            fps_toggle.setStyleInline(cx.allocator, S.displaySwitch(cx.tokens));
             fps_toggle.meta.ownership.meta.test_id = "bmc.display.fps";
-            const fps_hint = try @import("../../ui/control_hint.zig").mount(cx, scope, fps_toggle, "显示：每秒提交到窗口的新视频帧数。\n解码：每秒发布的完整视频帧数。\n无新帧不一定表示卡顿。", .{ .id = "bmc.display.fps.tooltip", .layout = .{ .width = .fill(), .flex_shrink = 0 }, .width = 320, .visible = state.open[@backingInt(Menu.display)] });
-            try performance_section.appendChild(cx.allocator, fps_hint.wrapper);
+            const fps_hint = try @import("../../shared/ui/components/control_hint/control_hint.zig").mount(cx, scope, fps_toggle, "显示：每秒提交到窗口的新视频帧数。\n解码：每秒发布的完整视频帧数。\n无新帧不一定表示卡顿。", .{ .id = "bmc.display.fps.tooltip", .width = 320, .visible = state.open[@backingInt(Menu.display)] });
+            try fps_row.appendChild(cx.allocator, fps_hint.wrapper);
             const detail = try ui.vstackStyled(cx, S.displayStats, .{});
             state.fps_detail = detail;
             detail.meta.ownership.meta.test_id = "bmc.fps.detail";
@@ -2288,14 +2714,14 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
                 try stat_row.appendChild(cx.allocator, value);
                 if (index == 0) state.fps_gap_value = value else state.fps_age_value = value;
             }
-            try parent.appendChild(cx.allocator, try ui.boxStyled(cx, S.displayDivider, .{}));
+            try parent.appendChild(cx.allocator, try ui.widgets.Divider(.{ .spacing = .none }).mount(scope, cx));
             const actions = try ui.hstackStyled(cx, S.displayFooter, .{});
             actions.meta.ownership.meta.test_id = "bmc.display.actions";
             try parent.appendChild(cx.allocator, actions);
-            const refresh_button = try ui.widgets.Button(.{ .label = "请求完整视频帧", .icon_asset = ui.icons.refresh_cw, .icon_size = @as(f32, 16), .variant = .secondary, .base_style = full_style, .on_click = cx.on(View, state, View.refreshVideo) }).mount(scope, cx);
+            const refresh_button = try ui.widgets.Button(.{ .label = "请求完整视频帧", .icon_asset = ui.icons.refresh_cw, .variant = .secondary, .block = true, .on_click = cx.on(View, state, View.refreshVideo) }).mount(scope, cx);
             refresh_button.meta.ownership.meta.test_id = "bmc.display.refresh";
             try actions.appendChild(cx.allocator, refresh_button);
-            const log_button = try ui.widgets.Button(.{ .label = "连接日志", .icon_asset = ui.icons.file_text, .icon_size = @as(f32, 16), .variant = .ghost, .base_style = S.displayAction(), .on_click = cx.on(View, state, View.showLog) }).mount(scope, cx);
+            const log_button = try ui.widgets.Button(.{ .label = "连接日志", .icon_asset = ui.icons.file_text, .variant = .ghost, .on_click = cx.on(View, state, View.showLog) }).mount(scope, cx);
             log_button.meta.ownership.meta.test_id = "bmc.display.connection_log";
             try actions.appendChild(cx.allocator, log_button);
         },
@@ -2328,34 +2754,35 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
             details.setStyleInline(cx.allocator, .{ .height = .{ .fit = .{} }, .gap = 12, .overflow_hidden = false });
             try parent.appendChild(cx.allocator, details);
             state.boot_details = details;
-            const switch_node = try ui.widgets.Switch(.{ .label = "持续生效", .checked = state.boot_continuous, .disabled = state.switch_disabled, .on_change = cx.on(View, state, View.continuousChanged) }).mount(scope, cx);
+            const switch_node = try ui.widgets.Switch(.{ .label = "持续生效", .size = .sm, .checked = state.boot_continuous, .disabled = state.switch_disabled, .on_change = cx.on(View, state, View.continuousChanged) }).mount(scope, cx);
             switch_node.meta.ownership.meta.test_id = "bmc.boot.continuous";
             try details.appendChild(cx.allocator, switch_node);
-            state.boot_switch = switch_node;
             const mode_row = try ui.hstackStyled(cx, S.field, .{});
             try details.appendChild(cx.allocator, mode_row);
             state.mode_row = mode_row;
             try selectFieldContents(state, scope, mode_row, "下次启动模式", "bmc.boot.mode", state.mode_options, state.mode_value, state.mode_disabled, View.modeChanged);
             _ = try actionButton(state, scope, parent, "查看启动顺序（只读）", "bmc.boot.order", null, View.showOrder);
-            const modal = try ui.widgets.Modal(.{ .title = "启动顺序 · 只读", .open = state.order_open.?, .width = @as(f32, 420), .max_height = @as(f32, 360), .close_icon_asset = ui.icons.x, .enter_transition = .fade, .exit_transition = .fade }).mount(scope, cx);
+            const modal = try ui.widgets.Modal(.{ .title = "启动顺序 · 只读", .open = state.order_open.?, .width = @as(f32, 420), .max_height = @as(f32, 360), .close_icon_asset = ui.icons.x, .close_label = "关闭启动顺序", .enter_transition = .fade, .exit_transition = .fade }).mount(scope, cx);
+            // The title bar's close button is a public part of the native Modal: its test id goes on it.
+            if (modal.close_button) |close| close.meta.ownership.meta.test_id = "bmc.boot.order_close";
             if (!modal.portaled) try state.root.?.appendChild(cx.allocator, modal.overlay);
             modal.dialog.meta.ownership.meta.test_id = "bmc.boot.order_modal";
-            if (modal.dialog.children.items.len != 0) {
-                const header = modal.dialog.children.items[0];
-                if (header.children.items.len != 0) header.children.items[header.children.items.len - 1].meta.ownership.meta.test_id = "bmc.boot.order_close";
-            }
-            modal.dialog.setStyleInline(cx.allocator, .{ .background = S.theme.current().overlay, .glass = S.theme.overlayGlass() });
             state.order_modal = modal;
             state.order_mapping_warning = try mappingWarning(state, modal.body, "bmc.boot.order_mapping_warning");
             state.order_mapping_warning.?.setStyleInline(cx.allocator, .{ .margin = .{ .bottom = 12 } });
-            const order_scroll = try ui.widgets.ScrollArea(.{ .height = @as(f32, 240), .direction = .vertical, .rubber_band_y = false }).mount(scope, cx);
-            order_scroll.container.meta.ownership.meta.test_id = "bmc.boot.order_list";
-            order_scroll.container.behavior.interaction.focusable = true;
-            order_scroll.container.behavior.events.on_event_capture = View.orderKey;
-            order_scroll.container.behavior.events.capture_context = state;
-            try modal.body.appendChild(cx.allocator, order_scroll.container);
+            // The list viewport is this view's box (height, keyboard scrolling); the ScrollArea fills it.
+            const order_viewport = try ui.box(cx, S.scrollViewport(240), .{});
+            order_viewport.meta.ownership.meta.test_id = "bmc.boot.order_list";
+            order_viewport.behavior.interaction.focusable = true;
+            order_viewport.behavior.events.on_event_capture = View.orderKey;
+            order_viewport.behavior.events.capture_context = state;
+            try modal.body.appendChild(cx.allocator, order_viewport);
+            state.order_viewport = order_viewport;
+            const order_scroll = try ui.widgets.ScrollArea(.{ .direction = .vertical, .rubber_band_y = false }).mount(scope, cx);
+            try order_viewport.appendChild(cx.allocator, order_scroll.container);
             state.order_scroll = order_scroll;
-            state.order_rows = order_scroll.content;
+            state.order_rows = try ui.vstack(cx, .{ .width = .fill(), .height = .{ .fit = .{} }, .gap = 0, .min_width = 0, .flex_shrink = 0 }, .{});
+            try order_scroll.content.appendChild(cx.allocator, state.order_rows.?);
             try state.refreshOrder(null);
             state.boot_hint = try ui.textStyled(cx, S.hint, "仅查看启动覆盖；保存启动项不会自动重启。");
             try parent.appendChild(cx.allocator, state.boot_hint.?);
@@ -2370,21 +2797,19 @@ fn mountMenu(state: *View, menu: Menu, popup: Popover) !void {
     }
 }
 
-fn actionButton(state: *View, scope: *ui.Scope, parent: *ui.Node, label: []const u8, id: []const u8, disabled: ?*ui.Signal(bool), comptime action: fn (*View) void) !*ui.Node {
-    const button = try ui.widgets.Button(.{ .label = label, .variant = .secondary, .disabled = if (disabled) |signal| ui.Source(bool){ .signal = signal } else ui.Source(bool){ .value = false }, .base_style = S.action(), .focus_ring = ui.FocusRingConfig{ .width = 0 }, .on_click = state.mount_request.cx.on(View, state, action) }).mount(scope, state.mount_request.cx);
+/// A menu action: zenit's native secondary Button, default size and frame.
+fn menuButton(state: *View, scope: *ui.Scope, label: []const u8, id: []const u8, disabled: ?*ui.Signal(bool), comptime action: fn (*View) void) !*ui.Node {
+    const button = try ui.widgets.Button(.{ .label = label, .variant = .secondary, .disabled = if (disabled) |signal| ui.Source(bool){ .signal = signal } else ui.Source(bool){ .value = false }, .on_click = state.mount_request.cx.on(View, state, action) }).mount(scope, state.mount_request.cx);
     button.meta.ownership.meta.test_id = id;
-    if (std.mem.eql(u8, id, "bmc.control.capture")) {
-        const hint = try @import("../../ui/control_hint.zig").mount(state.mount_request.cx, scope, button, "点击画面后路由键鼠。Command 映射为远端 Super。", .{ .id = "bmc.control.capture.tooltip", .width = 300, .visible = state.open[@backingInt(Menu.control)] });
-        try parent.appendChild(state.mount_request.cx.allocator, hint.wrapper);
-    } else try parent.appendChild(state.mount_request.cx.allocator, button);
+    return button;
+}
+fn actionButton(state: *View, scope: *ui.Scope, parent: *ui.Node, label: []const u8, id: []const u8, disabled: ?*ui.Signal(bool), comptime action: fn (*View) void) !*ui.Node {
+    const button = try menuButton(state, scope, label, id, disabled, action);
+    try parent.appendChild(state.mount_request.cx.allocator, button);
     return button;
 }
 fn progressButton(state: *View, parent: *ui.Node, label: []const u8, id: []const u8, disabled: ?*ui.Signal(bool), comptime action: fn (*View) void) !*ui.Node {
-    const cx = state.mount_request.cx;
-    const button = try ui.widgets.Button(.{ .label = label, .variant = .secondary, .disabled = if (disabled) |signal| ui.Source(bool){ .signal = signal } else ui.Source(bool){ .value = false }, .base_style = S.progressAction(), .on_click = cx.on(View, state, action) }).mount(state.mount_request.scope, cx);
-    button.meta.ownership.meta.test_id = id;
-    try parent.appendChild(cx.allocator, button);
-    return button;
+    return actionButton(state, state.mount_request.scope, parent, label, id, disabled, action);
 }
 fn setHeight(cx: *ui.Cx, node: *ui.Node, height: f32) bool {
     const current = switch (node.style.height) {
@@ -2426,7 +2851,7 @@ fn chordButton(state: *View, scope: *ui.Scope, parent: *ui.Node, label: []const 
     const action = try cx.bindState(ChordAction, .{ .view = state, .chord = try input.Chord.init(keys) });
     const owned_label = try ownedText(scope, label);
     const owned_id = try ownedText(scope, id);
-    const button = try ui.widgets.Button(.{ .label = owned_label, .variant = .ghost, .disabled = state.keys_disabled, .base_style = state.key_style, .on_click = cx.on(ChordAction, action, ChordAction.send) }).mount(scope, cx);
+    const button = try ui.widgets.Button(.{ .label = owned_label, .variant = .secondary, .block = true, .disabled = state.keys_disabled, .on_click = cx.on(ChordAction, action, ChordAction.send) }).mount(scope, cx);
     button.meta.ownership.meta.test_id = owned_id;
     try parent.appendChild(cx.allocator, button);
 }
@@ -2435,7 +2860,6 @@ fn wellValue(state: *View, parent: *ui.Node, id: []const u8, label: []const u8, 
     const cx = state.mount_request.cx;
     const row = try ui.hstackStyled(cx, S.well, .{});
     row.meta.ownership.meta.test_id = id;
-    @import("../../ui/layer_materials.zig").card(row, .well);
     try parent.appendChild(cx.allocator, row);
     const label_node = try ui.textStyled(cx, S.hint, label);
     try row.appendChild(cx.allocator, label_node);
@@ -2459,12 +2883,13 @@ fn selectField(state: *View, scope: *ui.Scope, parent: *ui.Node, label: []const 
 fn selectFieldContents(state: *View, scope: *ui.Scope, row: *ui.Node, label: []const u8, id: []const u8, options: *ui.Signal([]const Option), value: *ui.Signal(?[]const u8), disabled: *ui.Signal(bool), comptime changed: fn (*View, ?[]const u8) void) !void {
     const cx = state.mount_request.cx;
     try row.appendChild(cx.allocator, try ui.textStyled(cx, S.body, label));
-    const select = try ui.widgets.Select(.{ .options = options, .value = value, .disabled = disabled, .width = S.select_width, .size = .md, .placeholder = "暂无可用选项", .on_change = cx.on(View, state, changed) }).mount(scope, cx);
+    const select = try ui.widgets.Select(.{ .panel_width = .trigger, .options = options, .value = value, .disabled = disabled, .width = S.select_width, .size = .md, .placeholder = "暂无可用选项", .virtualize = true, .on_change = cx.on(View, state, changed) }).mount(scope, cx);
     select.wrapper.meta.ownership.meta.test_id = id;
     select.trigger.meta.ownership.meta.test_id = try scopedId(scope, id, ".trigger");
-    select.trigger.setStyleInline(cx.allocator, .{ .height = .{ .px = 32 }, .min_height = 32, .border = .{ .width = 0, .radius = 8 }, .font_size = 12 });
-    select.chrome.meta.ownership.meta.test_id = try scopedId(scope, id, ".dropdown");
-    try @import("select_surface.zig").mount(cx, select);
+    select.panel.meta.ownership.meta.test_id = try scopedId(scope, id, ".dropdown");
+    // Selects only appear inside the fixed-scheme KVM popups; their portaled panel follows it.
+    // The panel, its rows and the trigger are zenit's own (native Select surface).
+    cx.setColorScheme(select.panel, S.popup_scheme);
     try row.appendChild(cx.allocator, select.wrapper);
 }
 fn setText(state: *View, node: ?*ui.Node, text: []const u8) !void {
@@ -2507,14 +2932,4 @@ fn buttonMask(button: ui.events.MouseButton) u8 {
         .middle => 2,
         .right => 4,
     };
-}
-fn patchSwitch(state: *View, root: *ui.Node) void {
-    const alloc = state.mount_request.cx.allocator;
-    root.setStyleInline(alloc, .{ .width = .fill(), .height = .{ .px = 24 }, .min_height = 24, .justify = .start, .gap = 8, .flex_shrink = 0 });
-    if (root.children.items.len == 0) return;
-    const track = root.children.items[0];
-    track.setStyleInline(alloc, .{ .width = .{ .px = 30 }, .height = .{ .px = 18 }, .border = .{ .radius = 9 }, .flex_shrink = 0 });
-    if (track.children.items.len == 0) return;
-    track.children.items[0].setStyleInline(alloc, .{ .width = .{ .px = 14 }, .height = .{ .px = 14 }, .translate_x = if (state.boot_continuous.peek()) 14 else 2, .translate_y = 2, .border = .{ .radius = 7 } });
-    if (root.children.items.len > 1) root.children.items[1].setStyleInline(alloc, .{ .font_size = 12 });
 }

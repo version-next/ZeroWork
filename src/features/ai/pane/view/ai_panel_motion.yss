@@ -1,0 +1,7 @@
+//! AI 面板过渡探针的布局：相对窗口根绝对定位、全透明、不参与命中，不画任何外观。
+const ui = @import("ui");
+
+/// 过渡本帧的快照矩形（窗口坐标），全透明且不参与命中。
+style frame($x: f32, $y: f32, $w: f32, $h: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = $x }, .top = .{ .px = $y } }}; width: {$w}; height: {$h}; opacity: 0; hit-behavior: pass-through; }
+/// 阶段名与锚点名：零尺寸、裁掉。
+style label { position: absolute; width: 0; height: 0; overflow: hidden; opacity: 0; hit-behavior: pass-through; }

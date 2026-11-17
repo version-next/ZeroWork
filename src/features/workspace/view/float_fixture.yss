@@ -1,0 +1,6 @@
+//! 测试卡片内容排版（float-split）：只写布局。
+const ui = @import("ui");
+
+style root { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; gap: 8; padding: 8 12 12 12; }
+style list { width: fill; height: grow; min-height: 0; }
+style status { font-size: 12; color: fg-secondary; wrap: none; selectable: false; }

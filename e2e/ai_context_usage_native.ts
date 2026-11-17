@@ -1,10 +1,15 @@
 /** Context uses a measured input baseline and invalidates it on mutations. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, writeFile, open, realpath, readFile, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {hoverUserRow} from './ai_user_actions.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? 'zig-out');
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
 const out = resolve(process.argv[2] ?? '/tmp/zw-context-usage-results');
@@ -19,9 +24,7 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({data: [{id: 'idle-fixture'}, {id: 'other-fixture'}]}));
         return;
     }
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (body.messages[0]?.content?.startsWith('将用户的问题概括')) {
         res.end(frame('中文回合闲置检查'));
@@ -71,12 +74,13 @@ const shown = (n: any) => n && n.hidden !== true && n.visible !== false && (n.ef
 const visible = (id: string) => h.waitFor(async () => (await h.query(id)).find(shown) ?? null, 15000);
 const click = async (id: string) => { await visible(id); assert((await h.clickTestId(id)).ok, id); };
 const text = (n: any): string => n.text ?? (n.children ?? []).map(text).join('');
+const containsId = (n: any, id: string): boolean => n.test_id === id || (n.children ?? []).some((child: any) => containsId(child, id));
 const report: any = {status: 'running', checks: []};
 try {
     await h.waitForServerReady(60000);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
     await h.resizeWindow(1440, 900);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
     const send = async (value: string) => { const turn = replies + 1; await click('ai.prompt'); await h.type_(value); await click('ai.send'); await h.waitFor(async () => (await h.query('ai.turn.complete')).filter(shown).length === turn || null, 15000); };
     const usageMenu = async () => { await click('ai.composer.usage'); return visible('ai.usage.menu'); };
     const summary = async () => text(await visible('ai.usage.summary'));
@@ -96,15 +100,23 @@ try {
     report.checks.push('24000 measured input retained; only answer and draft estimated, fixed costs not added twice');
     await h.key('escape'); await click('ai.prompt'); await h.key('a', {cmd: true}); await h.key('backspace');
     const viewport = await visible('ai.conversation.viewport'); await h.scrollAt(viewport.rect.x + viewport.rect.w / 2, viewport.rect.y + viewport.rect.h / 2, 0, 100000);
-    await click('ai.message.edit'); await click('ai.message.edit.input'); await h.key('a', {cmd: true}); await h.type_('第一轮已编辑'); await click('ai.message.edit.save');
+    await hoverUserRow(h, 0); await click('ai.message.edit'); await click('ai.message.edit.input'); await h.key('a', {cmd: true}); await h.type_('第一轮已编辑'); await click('ai.message.edit.save');
     await noBaseline(); report.checks.push('Editing user history invalidates the measured baseline');
     await send('第二轮：重新获取实测基准');
     menu = await usageMenu(); assert(text(menu).includes('基准输入（实测）'));
     values = (await h.query('ai.usage.part.value')).filter(shown).map(text); assert.equal(values[0], '48.0K'); await h.key('escape');
     const selectModel = async (name: string) => {
         await click('ai.composer.model');
-        const option = await h.waitFor(async () => (await h.query('ai.model.option')).filter(shown).find((n: any) => text(n).includes(name)) ?? null, 5000);
+        const findModelRow = async () => (await h.query('ai.model.option')).filter(shown).find((n: any) => text(n).includes(name));
+        const option = await h.waitFor(async () => await findModelRow() ?? null, 5000);
         assert((await h.clickAt(option.rect.x + option.rect.w / 2, option.rect.y + option.rect.h / 2)).ok);
+        await h.waitFor(async () => {
+            const row = await findModelRow();
+            return row && containsId(row, 'ai.model.selected') || null;
+        }, 5000);
+        // The picker stays open after selection so reasoning can be adjusted. Close it before using another trigger.
+        assert((await h.key('escape')).ok);
+        await h.waitFor(async () => !(await h.query('ai.model.menu')).some(shown) || null, 5000);
     };
     await selectModel('other-fixture'); await noBaseline();
     await selectModel('idle-fixture'); await noBaseline();
@@ -121,7 +133,7 @@ try {
     assert((await h.screenshot(join(out, 'estimated-context-compact.png'))).ok);
     report.status = 'passed';
 } catch (error) {
-    report.status = 'failed'; report.error = String(error); process.exitCode = 1;
+    report.status = 'failed'; report.error = error instanceof Error ? error.stack ?? error.message : String(error); process.exitCode = 1;
     await h.screenshot(join(out, 'failure.png')).catch(() => {});
 } finally {
     // Only terminate the isolated fixture created above; live SSH is untouched.

@@ -1,36 +1,82 @@
-/** Isolated native V3 shortcut recorder workflow and geometry evidence. */
+/**
+ * Settings › 快捷键: inline shortcut recording (human feedback round 1, item 7; F-set-panes-B).
+ * Same intent as the old recorder-dialog script, rewritten for the inline interaction:
+ *   - click a key area → it records in place ("按下新快捷键…"); the window's Escape / ⌘W do not fire while recording;
+ *   - Control combos are rejected with a reason; a conflict names the other action and offers 交换 / 取消;
+ *   - Escape and 取消 discard the candidate (draft untouched); Tab leaves recording; fixed rows never record;
+ *   - a recorded combo changes only the draft (config untouched) until Save; Save persists it, a reopened window shows it;
+ *   - per-row 恢复默认 and 交换 persist as well.
+ * Usage: node e2e/keybinding_v3_native.ts <zerowork binary> <output dir>
+ */
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
-import {mkdtemp,mkdir,writeFile,readFile,realpath,open} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
+import {readFile,writeFile} from 'node:fs/promises';
 import {resolve,join} from 'node:path';
-import {waitForServerReady,waitFor,query,clickAt,key,resizeWindow,screenshot,sleep,focused} from '../vendor/zenit/e2e/client.ts';
+import * as h from '../vendor/zenit/e2e/client.ts';
+import {launchIsolated,settingsNav,shown} from './settings_nav.ts';
+/** Visible text only (hidden keycap slots and prompts are skipped). */
+const textOf=(n:any):string=>n?.visible===false?'':[typeof n?.text==='string'?n.text:n?.text?.content??'',...(n?.children??[]).map(textOf)].join('');
+
 const [binaryArg,outputArg]=process.argv.slice(2);assert(binaryArg&&outputArg);
-const binary=resolve(binaryArg),output=resolve(outputArg);await mkdir(output,{recursive:true});
+const binary=resolve(binaryArg),output=resolve(outputArg);
 const report:any={runs:[],status:'running'};
-const shown=(n:any)=>n.visible!==false&&n.rect.w>0&&n.rect.h>0&&(n.effective_opacity??1)>0;
-const text=(n:any):string=>typeof n.text==='string'?n.text:n.text?.content??'';
 for(const theme of ['dark','light']){
- const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-keybinding-v3-'))),rpc=join(iso,'rpc'),data=join(iso,'data');await mkdir(rpc);await mkdir(data);
- await writeFile(join(data,'config.toml'),`[meta]\nconfig_revision=1\n[ui]\ntheme="${theme}"\n`,{mode:0o600});process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
- const log=await open(join(output,theme+'.log'),'w');const app=spawn(binary,[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',OPENAI_API_KEY:'',ANTHROPIC_API_KEY:''},stdio:['ignore',log.fd,log.fd]});const ended=new Promise<void>(done=>app.once('close',()=>done()));
+ const app=await launchIsolated({binary,out:output,prefix:'zw-keybinding-v3',theme,logName:theme+'.log'});
  const rec:any={theme,checks:[],captures:[]};report.runs.push(rec);
- const node=async(id:string):Promise<any>=>waitFor(async()=> (await query(id)).find(shown)??null,10000);
- const click=async(id:string)=>{const n=await node(id);assert((await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok);await sleep(180);};
- const capture=async(name:string)=>{await sleep(220);const path=join(output,theme+'-'+name+'.png');assert((await screenshot(path)).ok);rec.captures.push(path);};
+ const nav=settingsNav();
+ const config=()=>readFile(app.config,'utf8');
+ const text=async(id:string)=>textOf(await nav.node(id));
+ const visible=async(id:string)=>(await h.query(id)).some(shown);
+ const capture=async(name:string)=>{await h.sleep(220);const path=join(output,theme+'-'+name+'.png');assert((await h.screenshot(path)).ok);rec.captures.push(path);};
+ const persisted=async(line:string)=>h.waitFor(async()=>(await config()).includes(line)?true:null,10000);
  try{
-  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
-  await resizeWindow(1440,900);await click('toolbar.settings');await click('settings.nav.keys');await click('settings.key.new_tab');
-  const dialog=await node('settings.keybinding.dialog'),header=await node('settings.keybinding.header'),footer=await node('settings.keybinding.footer'),well=await node('settings.keybinding.capture');
-  assert(Math.abs(dialog.rect.w-390)<.6);assert(header.rect.h>=60);assert.equal(Math.round(well.rect.w),350);rec.geometry={dialog:dialog.rect,header:header.rect,footer:footer.rect,well:well.rect};await capture('initial');await click('settings.keybinding.unbind');await node('settings.keybinding.dialog');rec.checks.push('unbound unsupported by runtime and disabled with explanatory tooltip');await click('settings.keybinding.capture');
-  await key('x',{cmd:true,ctrl:true});assert(text(await node('settings.keybinding.error')).includes('Command'));await capture('reserved-error');
-  await key('c',{cmd:true});assert(text(await node('settings.keybinding.error')).includes('复制'));await capture('conflict-error');
-  await key('x',{cmd:true,shift:true});await key('escape');await node('settings.key.new_tab');assert.equal((await query('settings.keybinding.dialog')).filter(shown).length,0);rec.checks.push('Control reserved, duplicate conflict, Escape discards candidate');
-  await click('settings.key.new_tab');await click('settings.keybinding.reset');assert.equal(text(await node('settings.keybinding.recorded')),'⌘T');await capture('reset');await click('settings.keybinding.cancel');
-  await click('settings.key.new_tab');await key('x',{cmd:true,shift:true});assert.equal(text(await node('settings.keybinding.recorded')),'⌘⇧X');const before=await readFile(join(data,'config.toml'),'utf8');assert(!before.includes('new_tab = "cmd+shift+x"'));await capture('recorded');await click('settings.keybinding.confirm');await node('settings.key.new_tab');assert.equal((await readFile(join(data,'config.toml'),'utf8')),before);await click('settings.save');await waitFor(async()=> (await readFile(join(data,'config.toml'),'utf8')).includes('new_tab = "cmd+shift+x"')?true:null,10000);rec.checks.push('explicit confirmation changes outer draft; outer Save persists');
-  await click('settings.key.new_tab');await key('tab');rec.tabFocus=await focused();assert(rec.tabFocus.test_id?.startsWith('settings.keybinding.'));await capture('tab-focus');await key('escape');await click('settings.key.recent_tab');assert.equal((await query('settings.keybinding.dialog')).filter(shown).length,0);rec.checks.push('Tab focus stays inside modal; fixed mouse row does not open recorder');
-  await resizeWindow(860,480);await click('settings.key.new_tab');await key('x',{cmd:true,ctrl:true});await capture('compact-error');const compact=await node('settings.keybinding.dialog');assert(compact.rect.y>=23);assert(compact.rect.y+compact.rect.h<=457);rec.compact=compact.rect;await click('settings.keybinding.cancel');await click('settings.close');await click('toolbar.settings');await click('settings.nav.keys');rec.checks.push('compact header/footer and cancel releases focus; settings reopen');
-  rec.status='passed_pending_pixel_review';
- }catch(e){rec.status='failed';rec.error=String(e);await capture('failure').catch(()=>{});throw e;}finally{await writeFile(join(output,'report.json'),JSON.stringify(report,null,2));if(app.exitCode===null)app.kill('SIGTERM');await ended;await log.close();}
+  await h.resizeWindow(1440,900);
+  await nav.toCategory('keys');
+  assert.equal(await text('settings.key.new_tab'),'⌘T');
+  assert(!(await visible('settings.key.reset.new_tab')));
+  // Click → inline recording; the window's Escape / ⌘W stay quiet while recording.
+  await nav.click('settings.key.new_tab');
+  assert((await text('settings.key.row.new_tab')).includes('按下新快捷键'));await capture('recording');
+  rec.checks.push('clicking the key area records in place');
+  await h.key('x',{cmd:true,ctrl:true});
+  assert((await text('settings.key.error.new_tab')).includes('Control'));await capture('reserved-error');
+  await h.key('c',{cmd:true});
+  assert((await text('settings.key.error.new_tab')).includes('“复制”'));await nav.node('settings.key.swap.new_tab');await capture('conflict-error');
+  await nav.click('settings.key.cancel.new_tab');
+  assert.equal(await text('settings.key.new_tab'),'⌘T');assert(!(await visible('settings.key.error.new_tab')));
+  rec.checks.push('Control reserved with a reason, conflict names 复制 and offers 交换 / 取消, 取消 discards');
+  await nav.click('settings.key.new_tab');await h.key('w',{cmd:true});await h.sleep(200);
+  assert(await visible('settings.panel'),'⌘W must not close the window while recording');
+  assert((await text('settings.key.error.new_tab')).includes('“关闭页签”'));
+  await h.key('escape');await h.sleep(200);
+  assert(await visible('settings.panel'),'Escape must not close the window while recording');
+  assert.equal(await text('settings.key.new_tab'),'⌘T');assert(!(await visible('settings.key.error.new_tab')));
+  rec.checks.push('⌘W is recorded (conflict with 关闭页签), Escape cancels; neither closes the window');
+  // Tab leaves recording; fixed rows never record.
+  await nav.click('settings.key.new_tab');await h.key('tab');await h.sleep(150);
+  assert(!(await text('settings.key.row.new_tab')).includes('按下新快捷键'));rec.tabFocus=await h.focused();
+  await nav.click('settings.key.recent_tab');
+  assert(!(await text('settings.key.row.recent_tab')).includes('按下新快捷键'));await nav.node('settings.key.fixed.recent_tab');
+  rec.checks.push('Tab leaves recording; the fixed row does not record');
+  // Record ⇧⌘X (shortcut text follows the macOS menu order ⌃⌥⇧⌘): draft only until Save; Save persists.
+  const before=await config();
+  await nav.click('settings.key.new_tab');await h.key('x',{cmd:true,shift:true});await h.sleep(150);
+  assert.equal(await text('settings.key.new_tab'),'⇧⌘X');await nav.node('settings.key.unsaved.new_tab');await nav.node('settings.key.reset.new_tab');
+  assert.equal(await config(),before);await capture('recorded');
+  await nav.click('settings.save');await persisted('new_tab = "cmd+shift+x"');
+  await h.waitFor(async()=>(await visible('settings.key.unsaved.new_tab'))?null:true,5000);
+  rec.checks.push('recording changes the draft only; Save persists new_tab = cmd+shift+x');
+  // Per-row reset (back to ⌘T) and a swap (new_tab ⌘C ↔ copy ⌘T), then Save.
+  await nav.click('settings.key.reset.new_tab');assert.equal(await text('settings.key.new_tab'),'⌘T');await capture('reset');
+  await nav.click('settings.key.new_tab');await h.key('c',{cmd:true});await nav.click('settings.key.swap.new_tab');
+  assert.equal(await text('settings.key.new_tab'),'⌘C');assert.equal(await text('settings.key.copy'),'⌘T');await capture('swapped');
+  await nav.click('settings.save');await persisted('new_tab = "cmd+c"');assert((await config()).includes('copy = "cmd+t"'));
+  rec.checks.push('per-row reset and swap persist after Save');
+  // Reopen: the saved map is shown.
+  await nav.close();await nav.toCategory('keys');
+  assert.equal(await text('settings.key.new_tab'),'⌘C');assert.equal(await text('settings.key.copy'),'⌘T');
+  rec.checks.push('reopened settings show the saved shortcuts');
+  rec.status='passed';
+ }catch(e){rec.status='failed';rec.error=String(e);await capture('failure').catch(()=>{});throw e;}
+ finally{await writeFile(join(output,'report.json'),JSON.stringify(report,null,2));await app.stop();}
 }
-report.status='passed_pending_pixel_review';await writeFile(join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));
+report.status='passed';await writeFile(join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));

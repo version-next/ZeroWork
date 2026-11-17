@@ -246,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn checkFileFonts(allocator: std.mem.Allocator, fonts: *text.FontSystem, system_font: *text.Font, shaper: *text.TextShaper) !void {
-    const temp = try @import("zenit_environment").getOwned(allocator, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(allocator, "TEMP");
     defer allocator.free(temp);
     var random_bytes: [8]u8 = undefined;
     fonts.io.random(&random_bytes);

@@ -1,9 +1,13 @@
 /** Native production composer, isolated Local PTY and deterministic provider. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,writeFile,readFile,open} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-composer-native');
 const out=resolve(process.argv[2]??'/tmp/zw-composer-native-acceptance');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-composer-app-'),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');for(const d of [data,rpc,zdot])await mkdir(d);
@@ -15,7 +19,7 @@ const payload=(envelope:any)=>{for(const b of envelope.content??[])try{return JS
 const requests:any[]=[];let serverError:unknown=null;
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"composer-fixture"}]}');
- let raw='';for await(const b of req)raw+=b;const body=JSON.parse(raw);requests.push(body);
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);requests.push(body);
  res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length)return res.end(frame({content:'Composer interaction acceptance'})+'data: [DONE]\n\n');
  const scenario=body.messages.filter((m:any)=>m.role==='user').at(-1)?.content?.includes('拒绝')?'reject':body.messages.filter((m:any)=>m.role==='user').at(-1)?.content?.includes('停止')?'stop':'approve';
@@ -27,9 +31,9 @@ const server=createServer(async(req,res)=>{try{
  }
  if(scenario==='approve')assert(JSON.stringify(results.get('q-approve')).includes('reload'),'explicit selected answer reaches provider');
  const context:any=results.get('ctx-'+scenario);if(!context)return emit('ctx-'+scenario,'host.get_current_context',{});
- let ready=false;for(let i=0;i<10;i++){
+ let ready=false;for(let i=0;;i++){
   const facts:any=results.get(`ready-${scenario}-${i}`);
-  if(!facts){if(i)await new Promise(r=>setTimeout(r,200));return emit(`ready-${scenario}-${i}`,'host.get_session',{session_ref:context.binding_ref});}
+  if(!facts){if(!pollWithin('ready-'+scenario,15000))break;if(i)await new Promise(r=>setTimeout(r,200));return emit(`ready-${scenario}-${i}`,'host.get_session',{session_ref:context.binding_ref});}
   if(facts.session?.capabilities?.trusted_pty_execution){ready=true;break;}
  }
  assert(ready,'Local PTY not ready');
@@ -50,17 +54,18 @@ const report:any={checks:[],geometry:{},status:'running',scope:'Isolated native 
 const capture=async(name:string)=>{
  await h.mouseMove(20,42);await h.sleep(80);
  const nodes=await h.query('ai.panel');const root=nodes.find(shown);assert(root,'assistant panel is visible');
- const all=flat(nodes);const parent=all.find((n:any)=>(n.children??[]).some((c:any)=>c.test_id==='ai.interaction.panel'));
- assert(parent,'interaction is mounted directly in the original composer');
- const ids=['ai.interaction.panel','ai.interaction.actions','ai.interaction.pending','ai.interaction.title','ai.interaction.option.0','ai.interaction.option.1','ai.interaction.option.6','ai.interaction.answer','ai.stop','ai.prompt','ai.conversation.viewport'];
+ const all=flat(nodes);const parent=all.find((n:any)=>n.test_id==='ai.composer'&&shown(n));
+ // ai-redesign-a (Pencil Kaf7E A7 / A11): the decision panel takes the composer's place in the composer area.
+ assert(parent&&flat(parent).some((c:any)=>c.test_id==='ai.interaction.panel'),'interaction is mounted in the composer area');
+ const ids=['ai.interaction.panel','ai.interaction.card','ai.interaction.actions','ai.interaction.pending','ai.interaction.title','ai.interaction.option.0','ai.interaction.option.1','ai.interaction.option.6','ai.interaction.answer','ai.stop','ai.prompt','ai.conversation.viewport'];
  const relative=(r:any)=>({x:r.x-root.rect.x,y:r.y-root.rect.y,w:r.w,h:r.h});
  const geometry:any={panel:root.rect,composer:relative(parent.rect)};
  for(const id of ids){const n=(await h.query(id)).find(shown);if(n)geometry[id]=relative(n.rect);}
  report.geometry[name]=geometry;
  await writeFile(join(out,name+'.tree.json'),JSON.stringify(nodes,null,2));
- if(name.startsWith('question')||name.startsWith('approval')){const body=geometry['ai.interaction.panel'];assert(body.h>0&&body.h<=180,'interaction content is capped at 180px');assert(parent.rect.h<224,'short content does not reserve the full maximum');assert(Math.abs(parent.rect.h-body.h-44)<.6,'composer hugs its content and fixed action row');assert(parent.rect.y+parent.rect.h<=root.rect.y+root.rect.h+.6,'composer remains inside the assistant panel');}else assert.equal(parent.rect.h,90);
+ if(name.startsWith('question')||name.startsWith('approval')){const body=geometry['ai.interaction.panel'];assert(body.h>0&&body.h<=180,'interaction content is capped at 180px');const card=geometry['ai.interaction.card'],actions=geometry['ai.interaction.actions'];assert(card&&actions,'decision card and action row');assert(Math.abs(card.h-body.h-actions.h-32)<.6,'decision card hugs its content and fixed action row (padding 12 / 10, gap 10)');assert(Math.abs(parent.rect.h-card.h-6-(root.rect.w<=340?8:12))<.6,'composer area hugs the decision card (top 6, bottom margin 12; 8 on a 320 panel, Pencil ⑤)');assert(parent.rect.y+parent.rect.h<=root.rect.y+root.rect.h+.6,'composer remains inside the assistant panel');}else{const prompt=all.find((n:any)=>n.component==='Textarea'&&shown(n))??null;const field=(await h.query('ai.prompt')).find(shown);assert(field,'composer text field');assert(parent.rect.h>=field.rect.h+36+6+(root.rect.w<=340?8:12)-.6&&parent.rect.h<=field.rect.h+36+6+12+44+.6,'composer area = compound field (text + 36 tool row) + 12, plus an attachment row when shown');void prompt;}
  if(geometry['ai.interaction.pending']){
-  const badge=geometry['ai.interaction.pending'];assert.equal(badge.h,26);assert(Math.abs(geometry.composer.y-badge.y-badge.h-8)<.6,'floating capsule gap is 8px');
+  const badge=geometry['ai.interaction.pending'];assert(badge.h>0&&badge.h<=28,'native sm capsule');assert(Math.abs(geometry.composer.y-badge.y-badge.h-8)<.6,'floating capsule gap is 8px');
  }
  assert(!text(nodes).includes('存为复盘笔记'));
  if(geometry['ai.interaction.actions']){
@@ -69,16 +74,16 @@ const capture=async(name:string)=>{
    assert(button.rect.y>=parent.rect.y&&button.rect.y+button.rect.h<=parent.rect.y+parent.rect.h+.5,'action stays outside scrolling content');
   }
  }
- if(name.startsWith('question')||name.startsWith('approval')){assert(!geometry['ai.stop']);const later=await visible('ai.interaction.postpone');const primary=await visible(name.startsWith('question')?'ai.interaction.submit':'ai.interaction.approve');assert.equal(later.rect.h,primary.rect.h);assert(Math.abs(primary.rect.y-later.rect.y)<.5);const previous=name.startsWith('question')?later:await visible('ai.interaction.reject');assert(Math.abs(primary.rect.x-previous.rect.x-previous.rect.w-8)<.6);}
+ if(name.startsWith('question')||name.startsWith('approval')){assert(!geometry['ai.stop']);const later=await visible('ai.interaction.postpone');const primary=await visible(name.startsWith('question')?'ai.interaction.submit':'ai.interaction.approve');assert.equal(later.rect.h,primary.rect.h);assert(Math.abs(primary.rect.y-later.rect.y)<.5);const previous=name.startsWith('question')?later:await visible('ai.interaction.reject');assert(Math.abs(primary.rect.x-previous.rect.x-previous.rect.w-6)<.6);}
  await h.screenshot(join(out,name+'.png'));
 };
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.prompt');await h.type_('验证 composer 交互');await click('ai.send');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.prompt');await h.type_('验证 composer 交互');await click('ai.send');
  await visible('ai.interaction.option.0');assert((await visible('ai.interaction.title')).text.includes('如何处理'));
- assert(!(await h.query('ai.host_approval')).some(shown));assert(!(await h.query('ai.prompt')).some(shown));
+ assert(!(await h.query('ai.prompt')).some(shown));
  assert(!(await h.query('ai.stop')).some(shown));assert(!(await h.query('ai.send')).some(shown));const panel=await visible('ai.interaction.panel');assert(!flat(await h.query('ai.conversation')).some((n:any)=>n.test_id==='ai.interaction.panel'));
  await capture('question');await h.resizeWindow(860,480);await capture('question-compact');await h.resizeWindow(1200,900);await h.sleep(100);const beforeEmpty=requests.length;await click('ai.interaction.submit');await visible('ai.interaction.error');assert.equal(requests.length,beforeEmpty);report.checks.push('empty answer is rejected without leaving the question');report.checks.push('real question tool replaces composer input; transcript has no approval card');
- const questionRequests=requests.length;assert(!(await h.query('ai.interaction.answer')).some(shown));await visible('ai.interaction.other');await click('ai.interaction.option.1');await click('ai.interaction.option.6');await visible('ai.interaction.answer');assert(!(await h.query('ai.interaction.other')).some(shown));await h.type_('保留自定义答案');assert.equal((await h.inputState('ai.interaction.answer')).buffer,'保留自定义答案');await capture('question-custom');await click('ai.interaction.option.1');assert(!(await h.query('ai.interaction.answer')).some(shown));await click('ai.interaction.option.6');assert.equal((await h.inputState('ai.interaction.answer')).buffer,'保留自定义答案');await click('ai.interaction.postpone');await visible('ai.interaction.pending');await click('ai.prompt');await h.type_('保留这条草稿');const draft=(await h.inputState('ai.prompt')).buffer;assert.equal(draft,'保留这条草稿');
+ const questionRequests=requests.length;assert(!(await h.query('ai.interaction.answer')).some(shown));/* ai-redesign-a: “其他” is the native RadioGroup's own option row (ai.interaction.option.6), the answer field opens under the list. */await visible('ai.interaction.option.6');await click('ai.interaction.option.1');await click('ai.interaction.option.6');await visible('ai.interaction.answer');assert(text((await h.query('ai.interaction.option.6')).find(shown)).includes('其他'));await h.type_('保留自定义答案');assert.equal((await h.inputState('ai.interaction.answer')).buffer,'保留自定义答案');await capture('question-custom');await click('ai.interaction.option.1');assert(!(await h.query('ai.interaction.answer')).some(shown));await click('ai.interaction.option.6');assert.equal((await h.inputState('ai.interaction.answer')).buffer,'保留自定义答案');await click('ai.interaction.postpone');await visible('ai.interaction.pending');await click('ai.prompt');await h.type_('保留这条草稿');const draft=(await h.inputState('ai.prompt')).buffer;assert.equal(draft,'保留这条草稿');
  await h.sleep(200);assert.equal(requests.length,questionRequests,'postpone must not answer');
  await capture('pending-question');await click('ai.interaction.pending');await visible('ai.interaction.option.1');assert.equal((await h.inputState('ai.interaction.answer')).buffer,'保留自定义答案');
  report.checks.push('postpone leaves provider waiting and restores ordinary input');

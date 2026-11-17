@@ -1,12 +1,15 @@
 /** Production Local file tools + native transcript images, with an owned HTTP
  * model fixture. No external model, user configuration, credentials or SFTP.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,writeFile,readFile,copyFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 const out=resolve(process.argv[2]??'/tmp/zerowork-terminal-files-verification/native');
 const binary=resolve(process.argv[3]??'zig-out/bin/zerowork');
@@ -37,7 +40,7 @@ function findVersion(value:any):string|null {
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'terminal-file-fixture',context_window:200000}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests.push(body);
+  const raw=await readRequestText(req);const body=JSON.parse(raw);requests.push(body);
   assert(!raw.includes('data:image/'),'UI pixels must never enter model input');
   for(const message of body.messages) if(Array.isArray(message.content)) assert(message.content.every((block:any)=>!['image_url','input_image','image'].includes(block.type)));
   res.writeHead(200,{'content-type':'text/event-stream'});
@@ -76,7 +79,7 @@ const submit=async(text:string)=>{await click('ai.prompt');await h.type_(text);a
 const report:any={status:'running',binary,isolated,transport:ssh?'ssh-exec':'local',fault,vision:process.env.ZW_TEST_VISION==='1',checks:[],input:'synthetic public Harness; screenshots are actual native Metal pixels'};
 try{
  await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1200,1000);await click(ssh?'sidebar.host':'workspace.empty.local');if(ssh)await click('sidebar.host.connect');await visible('terminal.surface');await h.sleep(1500);await click('toolbar.ai');
+ await h.resizeWindow(1200,1000);await click(ssh?'sidebar.host':'workspace.empty.local');if(ssh)await click('sidebar.host.connect');await visible('terminal.surface');await h.sleep(1500);await click(await aiToggleId());
  await submit('执行文件与图片展示验收');
  await visible('ai.approval');await assert.rejects(readFile(target));await capture('01-create-approval');await click('ai.approval.accept');
  if(fault!=='none'){

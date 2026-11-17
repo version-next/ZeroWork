@@ -1,10 +1,12 @@
 /** Isolated native acceptance: opening refreshes only automatic model catalogs. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,realpath,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {aiToggleId} from './ai_entry.ts';
 
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);
 await mkdir(out,{recursive:true});
@@ -36,7 +38,7 @@ const row=async(id:string)=>(await h.query('ai.model.option')).find(n=>shown(n)&
 const report:any={status:'running',checks:[]};
 try{
  await h.waitForServerReady(60000);await h.resizeWindow(1440,900);
- await click('workspace.empty.local');await visible('terminal.surface');await click('ai.strip');
+ await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await h.waitFor(()=>requests.automatic>=1&&requests.configured===1||null,15000);
  await click('ai.composer.model');await visible('ai.model.menu');
  await h.waitFor(async()=>await row('old-model')||null,15000);
@@ -65,7 +67,7 @@ try{
  assert((await h.screenshot(join(out,'03-empty-automatic-list.png'))).ok);
  report.checks.push('A successful empty automatic catalog removes its models while preserving the configured model and the open popup.');
  report.status='passed';
-}catch(e){report.status='failed';report.error=String((e as Error).stack??e);throw e;}
+}catch(e){report.status='failed';report.error=String((e as Error).stack??e);await h.screenshot(join(out,'failure.png')).catch(()=>{});throw e;}
 finally{
  release?.();app.kill('SIGTERM');await ended;server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));await log.close();
  await writeFile(join(out,'report.json'),JSON.stringify({...report,requests},null,2));

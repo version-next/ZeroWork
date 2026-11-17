@@ -1,8 +1,10 @@
 /** Compare saved-source new_only with the ordinary sidebar connection.
  * Uses only disposable configuration, a deterministic provider and owned
  * loopback SSH peer. No external model, host, or production App is accessed.
- * ZW_AI_TEST_PREFIX=/path/to/test-build node e2e/ssh_owned_creation_native.mts /tmp/evidence
+ * ZW_AI_TEST_PREFIX=/path/to/test-build ZW_TEST_PYTHON=<audited python with paramiko> \
+ *   node e2e/ssh_owned_creation_native.mts /tmp/evidence [ordinary|reset-first|reject-auth|reject-host-key]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -10,9 +12,13 @@ import { createServer as httpServer } from 'node:http';
 import { createServer as tcpServer, createConnection } from 'node:net';
 import { mkdir, mkdtemp, open, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
 
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? '/private/tmp/zw-handoff-retention-build');
 const out = resolve(process.argv[2] ?? '/private/tmp/zw-ssh-owned-creation-native');
+assert(['ordinary', 'reset-first', 'reject-auth', 'reject-host-key', undefined].includes(process.argv[3]), 'unknown variant ' + process.argv[3]);
 const resetFirst = process.argv[3] === 'reset-first';
 const rejectAuth = process.argv[3] === 'reject-auth';
 const rejectHostKey = process.argv[3] === 'reject-host-key';
@@ -24,7 +30,8 @@ for (const directory of [data, rpc, zdot]) await mkdir(directory);
 await writeFile(join(zdot, '.zshrc'), "bindkey -e\nPS1='owned-loopback%# '\n");
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
 const peerLog = await open(join(out, 'peer.log'), 'w');
-const peer = spawn('python3', ['e2e/builtin_records_ssh_peer.py', '--out', join(out, 'peer'), ...(rejectAuth ? ['--reject-password'] : [])], { stdio: ['ignore', peerLog.fd, peerLog.fd] });
+assert(process.env.ZW_TEST_PYTHON, 'ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used');
+const peer = spawn(process.env.ZW_TEST_PYTHON, ['-I', 'e2e/builtin_records_ssh_peer.py', '--out', join(out, 'peer'), ...(rejectAuth ? ['--reject-password'] : [])], { stdio: ['ignore', peerLog.fd, peerLog.fd] });
 const peerEnded = new Promise(done => peer.once('close', done));
 const ready = await h.waitFor(async () => {
   try { return JSON.parse(await readFile(join(out, 'peer/ready.json'), 'utf8')); } catch { return null; }
@@ -68,17 +75,26 @@ await writeFile(join(data, 'hosts.toml'), `[registry]\nschema_version=2\nrevisio
 const frame = (delta: any) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta }] }) + '\n\n';
 const wire = (name: string) => name.replaceAll('_', '_u').replaceAll('.', '__');
 const payload = (envelope: any) => { for (const block of envelope.content ?? []) try { return JSON.parse(block.text); } catch {} return envelope; };
-const calls: any[] = [], results: any = {};
+const calls: any[] = [], results: any = {}, preemptedWaits: string[] = [];
 let providerFailure: string | null = null, ownedSettled = false;
 const provider = httpServer(async (request, response) => {
   try {
-    let raw = ''; for await (const chunk of request) raw += chunk;
+    const raw = await readRequestText(request);
     if (!raw) return response.end('{"data":[{"id":"owned-loopback"}]}');
     const body = JSON.parse(raw);
+    if (isTitleRequest(body)) return skipTitle(response);  // the conversation's tool-free title request (ai_title_fixture.ts) is not a round
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const map = new Map(body.messages.filter((message: any) => message.role === 'tool').map((message: any) => [message.tool_call_id, JSON.parse(message.content)]));
     const result = (id: string): any => {
       const envelope: any = map.get(id); if (!envelope) return null;
+      // A host-context notice admitted while a wait is in flight (the new member joining the group bumps the membership
+      // revision: ai/session_input.zig admits it as new input) preempts that wait undispatched (ai/tool_loop.zig
+      // planCurrent → not_dispatched_due_to_new_input). The model then sees the notice and waits again with a new call.
+      if (id.startsWith('owned-ready-') && envelope.status === 'rejected' && envelope.error_code === 'not_dispatched_due_to_new_input') {
+        const at = body.messages.findIndex((message: any) => message.role === 'tool' && message.tool_call_id === id);
+        assert(body.messages.slice(at + 1).some((message: any) => message.role === 'user' && String(message.content).includes('"host_context_notice":true')), id + ': a preempted wait is followed by the host-context notice that preempted it');
+        return results[id] = { preempted: true };
+      }
       if (!(expectRejected && id.startsWith('owned-ready-'))) assert.equal(envelope.status, 'succeeded', id + ': ' + JSON.stringify(envelope));
       return results[id] = payload(envelope);
     };
@@ -96,9 +112,10 @@ const provider = httpServer(async (request, response) => {
     assert(catalog.hosts[0].source_ref.startsWith('c1:'));
     const opened = result('owned-open'); if (!opened) return emit('owned-open', 'host.open_session', { group_ref: moved.binding_ref, source_ref: catalog.hosts[0].source_ref, connection_policy: 'new_only', retention: 'keep', request_key: 'owned-ssh-once' });
     let settled = opened;
-    for (let i = 0; !['ready', 'failed', 'cancelled'].includes(settled.state) && i < 12; ++i) {
+    for (let i = 0; !['ready', 'failed', 'cancelled'].includes(settled.state); ++i) {
       const id = 'owned-ready-' + i, next = result(id);
-      if (!next) return emit(id, 'host.wait_session_ready', { operation_ref: opened.operation_ref, after_revision: settled.source_revision, wait_ms: 5000 });
+      if (!next) { if (!pollWithin('owned-ready', 60000)) break; return emit(id, 'host.wait_session_ready', { operation_ref: opened.operation_ref, after_revision: settled.source_revision, wait_ms: 5000 }); }
+      if (next.preempted) { if (!preemptedWaits.includes(id)) preemptedWaits.push(id); continue; }
       settled = next;
     }
     assert.equal(settled.state, expectRejected ? 'failed' : 'ready'); assert.equal(settled.membership_committed, !expectRejected);
@@ -118,31 +135,65 @@ const ended = new Promise(done => app.once('close', done));
 const shown = (node: any) => node && node.hidden !== true && node.visible !== false && (node.effective_opacity ?? 1) > 0 && node.rect?.w > 0 && node.rect?.h > 0;
 const visible = (id: string) => h.waitFor(async () => (await h.query(id)).find(shown) ?? null, 15000);
 const click = async (id: string) => { await visible(id); assert((await h.clickTestId(id)).ok, id); };
+const text = (n: any): string => (n.text ?? '') + (n.children ?? []).map(text).join('');
+const approvals: Promise<string>[] = [];
 const report: any = { status: 'running', reset_first: resetFirst, reject_auth: rejectAuth, reject_host_key: rejectHostKey, binary_sha256: createHash('sha256').update(await readFile(join(prefix, 'bin/zerowork'))).digest('hex'), scope: 'Native product saved_source+new_only; optional first banner reset or host-key/auth rejection; successful cases compare ordinary sidebar creation. Deterministic provider and loopback SSH only.', limits: ['Does not reproduce an external network reset or prove the external network path.', 'No production App, user configuration, external host, external model, or remote helper is accessed.'] };
 try {
   await h.waitForServerReady(60000);
   assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
   await click('workspace.empty.local'); await visible('terminal.surface');
-  await click('toolbar.ai'); await click('ai.prompt'); await h.type_('Compare one saved-source new_only SSH creation.'); await click('ai.send');
+  await click(await aiToggleId()); await click('ai.prompt'); await h.type_('Compare one saved-source new_only SSH creation.'); await click('ai.send');
   await h.waitFor(async () => {
     assert.equal(providerFailure, null);
-    if ((await h.query('ai.host_approval.accept')).some(shown)) await click('ai.host_approval.accept');
+    // 主机工具的审批在输入区审批面板（ai_composer_interaction_view.zig：ai.interaction.panel / ai.interaction.approve）；
+    // 旧的 ai.host_approval.* 视图已删除（fed5d2f0）。
+    if ((await h.query('ai.interaction.approve')).some(shown)) { approvals.push(h.query('ai.interaction.panel').then((n: any[]) => text(n.find(shown) ?? {}))); await click('ai.interaction.approve'); }
     if (rejectHostKey && (await h.query('plugin.challenge.cancel')).some(shown)) await click('plugin.challenge.cancel');
     return ownedSettled && !(await h.query('ai.stop')).some(shown) || null;
   }, 45000);
   assert.equal(connections.length, resetFirst ? 2 : 1);
   await h.screenshot(join(out, expectRejected ? 'owned-rejected.png' : 'owned-ready.png'));
   if (expectRejected) {
-    await h.sleep(1700);
-    assert.equal(connections.length, 1, 'rejection must never schedule another TCP attempt');
+    // Observation window over the 500 ms retry delay (connect retry scheduled … delay_ms=500): the count must stay 1 throughout.
+    for (const until = Date.now() + 1700; Date.now() < until; await h.sleep(100)) assert.equal(connections.length, 1, 'rejection must never schedule another TCP attempt');
+    // The task result names only the generic failure (current contract, ai host_tools: error_code SessionCreateFailed); the
+    // SSH cause (AuthenticationFailed / host-key reject) stays in the app log, not in the result.
+    const failedReady = Object.entries(results).filter(([id]) => id.startsWith('owned-ready-')).map(([, value]) => value as any).find(value => value.state === 'failed');
+    assert.equal(failedReady?.error_code, 'SessionCreateFailed', 'failed creation result: ' + JSON.stringify(failedReady));
     const logs = await Promise.all((await readdir(join(data, 'logs'))).filter(name => /^app-.*\.log$/.test(name)).map(name => readFile(join(data, 'logs', name), 'utf8')));
     assert(!logs.join('\n').includes('connect retry scheduled'));
     if (rejectAuth) assert.equal(JSON.parse(await readFile(join(out, 'peer/auth-rejected.json'), 'utf8')).rejected, true);
+    if (rejectAuth) {
+      // 照现状断言（需用户判定的事项，见回报）：AI 自建会话失败时界面上没有失败卡片（成员未提交，组里只剩原会话）；
+      // 用户随后从侧栏普通连接同一主机，得到连接失败视图 connection.progress.failure（connections/progress/model/failure_view.zig）：
+      // 标题“<主机> 拒绝了认证”、本地化的原因 / 已尝试方式 / 不自动重试说明、逐阶段日志（最后一行“SSH 认证 · 服务器未接受认证信息”）。
+      // 视图里没有原始 SSH 诊断文本：日志行是阶段格式化文本，没有可悬停的失败行（connection.progress.logs.failure）与
+      // “原始 SSH 日志”弹层（connection.progress.logs.raw-popover，只挂在进度视图、且只对带 diagnostic 的失败记录出现）。
+      assert(!(await h.query('connection.progress.failure')).some(shown), 'the rejected task creation shows no failure card');
+      await click('ai.collapse'); await click('sidebar.host'); await click('sidebar.host.connect_button');
+      await visible('connection.progress.failure');
+      // 阶段日志默认收起；“查看日志 / 收起日志”开关是 connection.progress.failure.logs.toggle。
+      assert(!(await h.query('connection.progress.failure.logs')).some(shown), 'failure logs start collapsed');
+      await click('connection.progress.failure.logs.toggle');
+      await h.waitFor(async () => (await h.query('connection.progress.failure.logs')).some((n: any) => shown(n) && text(n).includes('服务器未接受认证信息')) || null, 10000);
+      const current = (await h.query('connection.progress.failure')).find(shown);
+      const at = (id: string) => { const f = (n: any): any => n.test_id === id && shown(n) ? n : (n.children ?? []).map(f).find(Boolean); return f(current); };
+      assert.equal(text(at('connection.progress.failure.title')), 'Owned loopback comparison 拒绝了认证');
+      const alert = text(at('connection.progress.failure.alert'));
+      assert(alert.includes(`服务器不接受 ${ready.user} 的认证信息`) && alert.includes('已尝试：密码（password）'), 'failure alert: ' + alert);
+      assert(text(at('connection.progress.failure.hold')).includes('不自动重试'));
+      const logLines = (at('connection.progress.failure.logs').children ?? []).filter(shown).map(text).filter(Boolean);
+      report.failure_view = { title: text(at('connection.progress.failure.title')), alert, logs: logLines };
+      assert(logLines.length > 0 && logLines.every((line: string) => /^\d\d:\d\d:\d\d\.\d{3} - .+ · 127\.0\.0\.1:\d+ · 第 1 跳 · 尝试 \d+ · #\d+ - /.test(line)), 'failure logs are stage records only: ' + JSON.stringify(logLines));
+      assert(logLines.at(-1).includes('SSH 认证 · 服务器未接受认证信息'));
+      for (const id of ['connection.progress.logs.failure', 'connection.progress.logs.raw-popover', 'connection.progress.logs.raw-text']) assert(!(await h.query(id)).some(shown), 'no raw SSH diagnostic surface: ' + id);
+      await h.screenshot(join(out, 'ordinary-auth-failure.png'));
+    }
     report.status = 'passed';
   } else {
   await click('ai.collapse');
-  const row = await visible('sidebar.host');
-  assert((await h.clickAt(row.rect.x + 60, row.rect.y + row.rect.h / 2)).ok);
+  // 侧栏契约（design-r3 A2，fe28ab5b）：单击主机行只选中；选中行行尾的原生“连接”按钮（sidebar.host.connect_button）发起普通连接。
+  await click('sidebar.host'); await click('sidebar.host.connect_button');
   await h.waitFor(async () => {
     const names = await readdir(join(data, 'logs')).catch(() => []);
     const logs = await Promise.all(names.filter(name => /^app-.*\.log$/.test(name)).map(name => readFile(join(data, 'logs', name), 'utf8')));
@@ -169,7 +220,7 @@ try {
   console.error(report.error);
   await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2));
   await h.screenshot(join(out, 'failure.png')).catch(() => {});
-  await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree(), null, 2)).catch(() => {});
+  await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }), null, 2)).catch(() => {});
 } finally {
   await h.request('POST', '/quit').catch(() => {});
   const deadline = performance.now() + 15000;
@@ -180,7 +231,12 @@ try {
     }
     await Promise.race([ended, h.sleep(100)]);
   }
-  if (app.exitCode === null && app.signalCode === null) { report.shutdown_error = 'Normal quit timed out'; app.kill('SIGTERM'); await ended; }
+  if (app.exitCode === null && app.signalCode === null) {
+    report.shutdown_error = 'Normal quit timed out';
+    await h.screenshot(join(out, 'quit-timeout.png')).catch(() => {});
+    try { await writeFile(join(out, 'quit-timeout-tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }), null, 1)); } catch (error) { report.quit_timeout_tree_error = String(error); }
+    app.kill('SIGTERM'); await ended;
+  }
   report.exit_code = app.exitCode; report.signal = app.signalCode;
   if (report.exit_code !== 0 || report.signal !== null) { report.status = 'failed'; process.exitCode = 1; }
   for (const name of await readdir(join(data, 'logs')).catch(() => [])) if (/^app-.*\.log$/.test(name)) await writeFile(join(out, name), await readFile(join(data, 'logs', name)));
@@ -190,6 +246,7 @@ try {
   peer.kill('SIGTERM'); await peerEnded;
   await log.close(); await peerLog.close();
   report.connections = connections; report.calls = calls; report.results = results;
+  report.approvals = await Promise.all(approvals); report.preempted_waits = preemptedWaits;
   await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2));
   await rm(iso, { recursive: true, force: true });
   console.log(JSON.stringify({ status: report.status, error: report.error, out }));

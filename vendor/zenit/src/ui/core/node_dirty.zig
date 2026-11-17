@@ -19,6 +19,7 @@ const world_mod = @import("world.zig");
 const node_mod = @import("node.zig");
 const redraw = @import("redraw.zig");
 const debug_trace = @import("debug_trace.zig");
+const types = @import("types.zig");
 
 const Node = node_mod.Node;
 
@@ -73,8 +74,33 @@ pub inline fn bumpLooseInteractionGen() void {
     g_loose_interaction_gen +%= 1;
 }
 
+var layout_dirty_debug: ?bool = null;
+var layout_dirty_reports: u32 = 0;
+/// ZENIT_DEBUG_LAYOUT_DIRTY=1: print who marks a clean node layout-dirty (first 400 marks, with a
+/// stack trace). Finds layout work on frames that should only move content (scroll).
+fn layoutDirtyDebugEnabled() bool {
+    return layout_dirty_debug orelse blk: {
+        const v = @import("zenit_environment").flag("ZENIT_DEBUG_LAYOUT_DIRTY");
+        layout_dirty_debug = v;
+        break :blk v;
+    };
+}
+
+fn reportLayoutDirty(self: *Node) void {
+    if (layout_dirty_reports >= 400) return;
+    layout_dirty_reports += 1;
+    std.debug.print("[layout-dirty] node={d} component={s} test_id={s}\n", .{
+        self.id,
+        self.meta.ownership.meta.component_name orelse "(nil)",
+        self.meta.ownership.meta.test_id orelse "(nil)",
+    });
+    std.debug.dumpCurrentStackTrace(.{});
+}
+
 pub fn markLayoutDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     if (self.frame_state.state_bits.dirty.core.layout) return;
+    if (layoutDirtyDebugEnabled()) reportLayoutDirty(self);
     if (!self.frame_state.state_bits.dirty.hit.geometry) bumpLooseInteractionGen();
     self.invalidateCustomClipGeometryCache();
     self.meta.per_frame.caches.versions.content +%= 1;
@@ -103,6 +129,7 @@ pub fn markLayoutDirty(self: *Node) void {
 /// Mark self and parent layout dirty. Used when child sizing properties (width/height) dynamically
 /// change, requiring parent container to re-run layoutChildren to recalculate child sizes.
 pub fn markSizingDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     if (!self.frame_state.state_bits.dirty.hit.geometry) bumpLooseInteractionGen();
     self.invalidateCustomClipGeometryCache();
     self.meta.per_frame.caches.versions.content +%= 1;
@@ -146,6 +173,7 @@ pub fn markSizingDirty(self: *Node) void {
 /// Separate from normal layout dirty to avoid full-tree runtime index rebuild on mere position/size
 /// changes.
 pub fn markRuntimeIndexDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     if (!self.frame_state.state_bits.dirty.runtime.dirty) {
         self.frame_state.state_bits.dirty.runtime.dirty = true;
     }
@@ -153,6 +181,7 @@ pub fn markRuntimeIndexDirty(self: *Node) void {
 }
 
 pub fn markRuntimeIndexFullRebuild(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     markRuntimeIndexDirty(self);
     if (!self.frame_state.state_bits.dirty.runtime.full_rebuild) {
         self.frame_state.state_bits.dirty.runtime.full_rebuild = true;
@@ -161,6 +190,7 @@ pub fn markRuntimeIndexFullRebuild(self: *Node) void {
 }
 
 pub fn markOrderDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     if (!self.frame_state.state_bits.dirty.pipeline.order) {
         self.frame_state.state_bits.dirty.pipeline.order = true;
     }
@@ -178,6 +208,7 @@ pub fn markOrderDirty(self: *Node) void {
 }
 
 pub fn markInteractionDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     const loose = self.frame_state.state_bits.dirty;
     if (!loose.pipeline.interaction or !loose.hit.geometry or !loose.hit.semantics) bumpLooseInteractionGen();
     self.invalidateCustomClipGeometryCache();
@@ -201,10 +232,12 @@ pub fn markInteractionDirty(self: *Node) void {
 }
 
 pub fn markHitSemanticsDirty(self: *Node) void {
+    // markInteractionDirty sets hit.semantics and bumps only on a real change.
     markInteractionDirty(self);
 }
 
 pub fn markHitStructureDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     self.frame_state.state_bits.dirty.hit.structure = true;
     markRuntimeIndexDirty(self);
 }
@@ -233,6 +266,7 @@ pub fn bubbleChildRuntimeIndexDirty(self: *Node, full_rebuild: bool) void {
 /// absolute-positioned children; after rebind, only recursively relayout dirty children without
 /// re-running content_node's own layoutChildren.
 pub fn markSubtreeDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     if (self.frame_state.state_bits.dirty.core.subtree_layout and self.frame_state.state_bits.dirty.core.subtree_render) return;
     self.invalidateCustomClipGeometryCache();
     self.meta.per_frame.caches.versions.content +%= 1;
@@ -254,6 +288,12 @@ pub fn markSubtreeDirty(self: *Node) void {
 }
 
 pub fn markCompositeDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
+    markCompositeDirtyBits(self);
+}
+
+/// markCompositeDirty without the scene mutation bump.
+fn markCompositeDirtyBits(self: *Node) void {
     const self_out_of_band = isOutOfBandRenderUnit(self);
     const self_needs_render_dirty = self.meta.per_frame.caches.commands.promoted == null and !self_out_of_band;
     var bubble_render_dirty = true;
@@ -301,9 +341,170 @@ pub fn markCompositeDirty(self: *Node) void {
 /// must converge here; separate per-path dirty marking misses composite or cache invalidation and
 /// causes visual bugs during animation.
 pub fn markCompositePropDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     markInteractionDirty(self);
     markCompositeDirty(self);
     @import("node_render_cache.zig").invalidateRenderCache(self);
+}
+
+/// markCompositePropDirty for a write that changed **only** the node's translate (translate_x /
+/// translate_y; no scale, rotate, origin, z_index or hit semantics): the render part is
+/// identical, the hit part is markTranslationDirty. Single entry point for translate-only
+/// writers (StyleHost markStyleChanges / restyleBox, Node.setTranslateX).
+///
+/// Render part, translate-only fast path (translationRenderFastPathEligible): the node's recorded
+/// content is node-local and lowering reads this frame's property tree, so the node keeps its own
+/// payload / subtree payload / retained memo (each re-keys on the new placement, see
+/// render_engine). The node gets `pipeline.transform` instead of render + composite and no
+/// version bump; ancestors get exactly the bits markCompositeDirty gives them, so every cache
+/// above the node is invalidated as before. The legacy overflow cache of the node itself is still
+/// dropped (it stores no culling stamp). Nodes the fast path cannot prove take the full
+/// markCompositeDirty + invalidateRenderCache path unchanged. ZENIT_DISABLE_TRANSLATE_FAST_PATH=1
+/// (or `translate_render_fast_path_enabled = false`) restores the full path for every node.
+pub fn markOwnTranslationDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
+    markTranslationDirty(self);
+    if (translateRenderFastPathEnabled() and translationRenderFastPathEligible(self)) {
+        markOwnTranslationRenderDirty(self);
+        @import("node_render_cache.zig").invalidateRenderCache(self);
+        return;
+    }
+    markCompositeDirty(self);
+    @import("node_render_cache.zig").invalidateRenderCache(self);
+}
+
+/// Bench / test switch for the translate-only render fast path (null: read
+/// ZENIT_DISABLE_TRANSLATE_FAST_PATH once).
+pub var translate_render_fast_path_override: ?bool = null;
+var translate_render_fast_path_env: ?bool = null;
+pub fn translateRenderFastPathEnabled() bool {
+    if (translate_render_fast_path_override) |v| return v;
+    return translate_render_fast_path_env orelse blk: {
+        const v = !@import("zenit_environment").flag("ZENIT_DISABLE_TRANSLATE_FAST_PATH");
+        translate_render_fast_path_env = v;
+        break :blk v;
+    };
+}
+
+/// Mark-time screen of the translate-only render fast path. Conservative: anything whose output
+/// depends on its own world placement beyond "node-local items under this frame's transform"
+/// takes the full path:
+/// - a promoted surface cache on the node, or an out-of-band render unit (z > 0 child): their
+///   invalidation runs through composite dirty / version stamps;
+/// - anything that opens a capture surface or samples the backdrop: opacity layer (opacity < 1,
+///   composited group, content warp, blend, scale / rotate, pre-promoted z > 0 + will_change),
+///   a clip of its own (rounded clip bridge, custom clip geometry), backdrop blur / glass;
+/// - sticky positioning (its offset is folded into the same local transform);
+/// - custom draw on the node (the callback may read its placement);
+/// - active transform / opacity animation, transition or linger (they read state outside the
+///   dirty bits, see retained_memo.nodeVolatile).
+pub fn translationRenderFastPathEligible(self: *const Node) bool {
+    if (self.meta.per_frame.caches.commands.promoted != null) return false;
+    if (isOutOfBandRenderUnit(self)) return false;
+    if (self.meta.per_frame.custom_hooks.draw != null) return false;
+    const st = &self.style;
+    if (st.position == .sticky) return false;
+    if (st.overflow_hidden) return false;
+    if (st.composited_group() or st.contentWarp() != null or st.blendMode() != .normal) return false;
+    if (std.math.clamp(self.getOpacity(), 0.0, 1.0) < 0.999) return false;
+    if (@abs(st.rotate()) > 0.0001 or @abs(st.scale_x() - 1.0) > 0.0001 or @abs(st.scale_y() - 1.0) > 0.0001) return false;
+    if (st.z_index() > 0 and (st.will_change_transform() or st.will_change_opacity())) return false;
+    if (st.glass_params() != null or st.backdrop_blur() > 0) return false;
+    const flags = self.frame_state.state_bits.flags;
+    if (flags.manual_transform_animation_active or flags.manual_opacity_animation_active) return false;
+    const rt = self.frame_state.frame_local.runtime;
+    if (rt.linger.composite > 0 or rt.linger.opacity > 0 or rt.linger.transform > 0) return false;
+    if (rt.transitions) |slots| if (slots.any_active) return false;
+    if (rt.commands) |anims| if (anims.count > 0) return false;
+    return true;
+}
+
+/// Render half of the fast path: `pipeline.transform` on the node, and on its ancestors exactly
+/// the subtree bits markCompositeDirty bubbles (subtree_composite always; subtree_render per hop,
+/// skipping out-of-band hops and stopping at layout_isolation).
+fn markOwnTranslationRenderDirty(self: *Node) void {
+    self.invalidateCustomClipGeometryCache();
+    self.frame_state.state_bits.dirty.pipeline.transform = true;
+    redraw.requested = true;
+    var bubble_render_dirty = true;
+    var child: *Node = self;
+    var p = self.parent;
+    while (p) |parent| {
+        const had_composite_dirty = parent.frame_state.state_bits.dirty.pipeline.subtree_composite;
+        const had_render_dirty = parent.frame_state.state_bits.dirty.core.subtree_render;
+        parent.frame_state.state_bits.dirty.pipeline.subtree_composite = true;
+        if (bubble_render_dirty) {
+            if (!isOutOfBandRenderUnit(child)) {
+                parent.frame_state.state_bits.dirty.core.subtree_render = true;
+            }
+            if (parent.style.layout_isolation) {
+                bubble_render_dirty = false;
+            }
+        }
+        if (had_composite_dirty and (!bubble_render_dirty or had_render_dirty)) break;
+        child = parent;
+        p = parent.parent;
+    }
+}
+
+/// Hit part of a translate-only change. The node's hit geometry is indexed, its shape, roles,
+/// paint order and clip membership did not change: the next index commit
+/// (cx_runtime_index.commitPendingTranslations) moves its proxies and those of its subtree in
+/// place, or falls back to markInteractionDirty for nodes it cannot move exactly. Nodes whose hit
+/// geometry is produced by callbacks, and hit-layer nodes, take markInteractionDirty right away.
+/// Unlike markInteractionDirty this sets no loose bit (no loose-gen bump) and no
+/// subtree_interaction: a frame that only moves nodes makes no partial root.
+pub fn markTranslationDirty(self: *Node) void {
+    if (!translation_hit_path_enabled or !translationDirtyEligible(self)) return markInteractionDirty(self);
+    @import("node_tree.zig").hostDirty(self);
+    self.invalidateCustomClipGeometryCache();
+    self.frame_state.state_bits.dirty.hit.translation = true;
+    bubbleSubtreeTranslation(self);
+    redraw.requested = true;
+}
+
+/// Layout output placed `self` at a different rect (node_lifecycle.setLayoutRect saw the change).
+///
+/// The hit index stores geometry derived from rects (world matrices, proxy and clip rects), so
+/// every rect a layout pass changes is one the index must follow, whether the frame marked that
+/// node or layout only moved it: an in-flow size change resizes fit ancestors, and their parents
+/// re-center them, align them to the end or push their siblings. Invalidation therefore comes from
+/// the rects that actually changed, never from a prediction of how far a change propagates.
+///
+/// Reconciled at the next index commit (cx_runtime_index.commitPendingTranslations, after the
+/// layout pass): a node whose final placement equals what the index holds costs one comparison;
+/// a pure move is moved in place (HitRuntime.translateSubtree), a hit layer only advances the scene
+/// epoch (its space follows its live transform); anything else (a resize, callback-produced
+/// geometry) falls back to that node's partial rebuild. Sets only the pending-placement bits: the
+/// layout pass that writes the rect already owns the frame's redraw.
+pub fn markLayoutPlacementDirty(self: *Node) void {
+    if (self.frame_state.state_bits.dirty.hit.translation) return;
+    self.frame_state.state_bits.dirty.hit.translation = true;
+    bubbleSubtreeTranslation(self);
+}
+
+/// Bench / test switch (Cx.setHitTranslationPathForTest): false sends every translate-only write
+/// down markInteractionDirty, the path that existed before markTranslationDirty.
+pub var translation_hit_path_enabled: bool = true;
+
+/// Set subtree_translation on `self` and its ancestors. Stops at an ancestor that already has
+/// it (the bit is only cleared top-down by the commit walk, so its ancestors have it too; a
+/// subtree attached with the bit set re-bubbles it, node_tree.appendChild).
+pub fn bubbleSubtreeTranslation(self: *Node) void {
+    self.frame_state.state_bits.dirty.hit.subtree_translation = true;
+    var p = self.parent;
+    while (p) |parent| {
+        if (parent.frame_state.state_bits.dirty.hit.subtree_translation) break;
+        parent.frame_state.state_bits.dirty.hit.subtree_translation = true;
+        p = parent.parent;
+    }
+}
+
+/// Mark-time screen of markTranslationDirty (the commit re-checks everything it relies on).
+pub fn translationDirtyEligible(self: *const Node) bool {
+    const hooks = &self.meta.per_frame.custom_hooks;
+    return !self.behavior.interaction.hit_layer and hooks.hit_proxy == null and
+        hooks.hit_test == null and hooks.clip_meta.provider == null;
 }
 
 /// Combo for **per-frame animation driving** of composite props: interaction + composite,
@@ -313,8 +514,42 @@ pub fn markCompositePropDirty(self: *Node) void {
 /// (positioning, setters, state switches); use this for per-frame interpolation. No manual dirty
 /// combos outside these two named ones.
 pub fn markCompositeAnimFrameDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
     markInteractionDirty(self);
     markCompositeDirty(self);
+}
+
+/// Advances whenever a hit layer moves (markHitLayerMotion*). Hit-index consumers that cache a
+/// query result against the scene (stationary-pointer hover) compare
+/// `HitRuntime.sceneEpoch()`, which folds this in: a layer move changes what a fixed world point
+/// resolves to without any rebuild.
+pub var g_hit_layer_motion_gen: u64 = 0;
+
+/// Own-transform change (scroll offset) of a node, interaction part only: the hit-layer
+/// counterpart of markInteractionDirty. A hit layer's subtree is stored in its own local space and
+/// queried through its live transform (hit_runtime.HitLayer), so the move needs no rebuild; only
+/// the scene epoch advances. Any other node falls back to markInteractionDirty.
+pub fn markHitLayerMotion(self: *Node) void {
+    if (!self.behavior.interaction.hit_layer) return markInteractionDirty(self);
+    @import("node_tree.zig").hostDirty(self);
+    self.invalidateCustomClipGeometryCache();
+    g_hit_layer_motion_gen +%= 1;
+    redraw.requested = true;
+}
+
+/// markCompositeAnimFrameDirty for an own-transform change: hit part via markHitLayerMotion.
+pub fn markHitLayerMotionAnimFrameDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
+    markHitLayerMotion(self);
+    markCompositeDirty(self);
+}
+
+/// markCompositePropDirty for an own-transform change: hit part via markHitLayerMotion.
+pub fn markHitLayerMotionPropDirty(self: *Node) void {
+    @import("node_tree.zig").hostDirty(self);
+    markHitLayerMotion(self);
+    markCompositeDirty(self);
+    @import("node_render_cache.zig").invalidateRenderCache(self);
 }
 
 /// Out-of-band render unit: whether `self` is **excluded from replay and freshly redrawn** when its
@@ -370,15 +605,21 @@ fn bubbleSubtreeRenderAcrossOutOfBandHops(self: *Node) void {
 }
 
 pub fn markRenderDirty(self: *Node) void {
-    self.invalidateCustomClipGeometryCache();
-    self.meta.per_frame.caches.versions.content +%= 1;
-    self.frame_state.state_bits.dirty.core.render = true;
-    self.frame_state.state_bits.dirty.core.subtree_render = true;
-    redraw.requested = true;
-
+    @import("node_tree.zig").hostDirty(self);
     // P0-3 phase 3: push dirty directly to owner World, no longer through process-level
     // g_dirty_notify.
     markWorldDirty(self, .style);
+    markRenderDirtyBits(self, true);
+}
+
+/// markRenderDirty's own effect on the node and its ancestors (version, bits, bubbling), without
+/// the scene mutation / World notification.
+fn markRenderDirtyBits(self: *Node, bump_content: bool) void {
+    self.invalidateCustomClipGeometryCache();
+    if (bump_content) self.meta.per_frame.caches.versions.content +%= 1;
+    self.frame_state.state_bits.dirty.core.render = true;
+    self.frame_state.state_bits.dirty.core.subtree_render = true;
+    redraw.requested = true;
 
     // Out-of-band render unit (isOutOfBandRenderUnit): parent's cache replay excludes it and
     // freshly
@@ -409,8 +650,88 @@ pub fn markRenderDirty(self: *Node) void {
     }
 }
 
+/// render_engine/raw_shadow.zig found an unmarked change to the node's render input (a raw write
+/// since its last paint): the bits and versions markRenderDirty + markCompositeDirty give, which
+/// is what today's full re-record of a hook-owned subtree shows. Never layout. No scene mutation
+/// bump / World notification: the write itself made none, and the tick of this frame is over.
+///
+/// The content version is not bumped: layout's intrinsic-size cache is keyed on it, and today a
+/// raw write leaves it alone, so a later (marked) layout must measure exactly what it measures
+/// today. What the version guards on the paint side is covered otherwise: the render bit keeps the
+/// own payload / subtree payload from being reused this frame and drops them when re-recorded,
+/// invalidateRenderCache (caller) drops the legacy overflow copy, and the text hash cache (keyed
+/// on the version, e.g. for an in-place text edit) is reset here.
+pub fn markUnmarkedRenderChange(self: *Node) void {
+    markRenderDirtyBits(self, false);
+    markCompositeDirtyBits(self);
+    @import("node_render_cache.zig").invalidateTextHashCache(self);
+}
+
+/// The same for an unmarked translate-only change: what the full markOwnTranslationDirty path gives
+/// the render side (composite + render cache), without the hit-index part a raw write never had.
+pub fn markUnmarkedTranslation(self: *Node) void {
+    markCompositeDirtyBits(self);
+    @import("node_render_cache.zig").invalidateRenderCache(self);
+}
+
+/// Which inheritable text properties of a node changed (see markInheritedTextDirty).
+pub const InheritedTextChange = struct {
+    /// text_color: read at paint (text, currentColor icons / images, custom draws).
+    color: bool = false,
+    /// text_font_size / text_font_weight: read by layout **and** paint (Node.resolveTextProps).
+    metrics: bool = false,
+
+    pub fn any(self: InheritedTextChange) bool {
+        return self.color or self.metrics;
+    }
+
+    /// The inheritable text fields a box style carries.
+    pub fn of(s: types.BoxStyle) InheritedTextChange {
+        return .{ .color = s.text_color != null, .metrics = s.font_size != null or s.font_weight != null };
+    }
+};
+
+/// The node's inheritable text properties (text_color / text_font_size / text_font_weight) changed.
+/// Every text that resolves them (the node itself included, its own StyleExt value applies to it)
+/// and every descendant reading them is otherwise clean, so a parent repaint would replay cached
+/// commands and layout would reuse cached measurements with the old values:
+/// - size / weight: text re-measures (markSizingDirty: new content version drops its intrinsic
+///   cache entry, the ancestors re-lay out) — unless the text declares both itself;
+/// - color: text, currentColor icons / images and custom draws (DrawContext.current_color)
+///   repaint.
+pub fn markInheritedTextDirty(self: *Node, change: InheritedTextChange) void {
+    @import("node_tree.zig").hostDirty(self);
+    if (!change.any()) return;
+    markInheritedTextReader(self, change);
+    markInheritedTextDescendants(self, change);
+}
+
+fn markInheritedTextDescendants(self: *Node, change: InheritedTextChange) void {
+    for (self.children.items) |child| {
+        markInheritedTextReader(child, change);
+        markInheritedTextDescendants(child, change);
+    }
+}
+
+fn markInheritedTextReader(node: *Node, change: InheritedTextChange) void {
+    if (change.metrics) if (node.getText()) |t| if (!(t.font_size_set and t.font_weight_set)) {
+        markSizingDirty(node);
+        return;
+    };
+    if (change.color and readsInheritedColor(node)) markRenderDirty(node);
+}
+
+fn readsInheritedColor(node: *const Node) bool {
+    if (node.meta.per_frame.custom_hooks.draw != null) return true;
+    if (node.getText() != null) return true;
+    if (node.getIcon()) |ic| return ic.tint_current_color;
+    if (node.getImage()) |im| return im.tint_current_color;
+    return false;
+}
+
 /// markRenderDirty + track render reason (DevTools trace).
 pub fn markRenderDirtyTracked(self: *Node, reason: debug_trace.RenderReason, comptime source: []const u8) void {
+    @import("node_tree.zig").hostDirty(self);
     markRenderDirty(self);
     debug_trace.maybeRecordRender(self.id, reason, source);
 }

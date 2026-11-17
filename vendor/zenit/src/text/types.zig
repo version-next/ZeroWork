@@ -62,7 +62,10 @@ pub const FontDescriptor = struct {
     family: []const u8,
     size: f32,
     weight: FontWeight = .regular,
-    /// Exact numeric weight for variable fonts; null preserves named tiers.
+    /// Opt-in exact CSS numeric weight (e.g. 450) for variable fonts. null (default) keeps the
+    /// named-tier lookup from `weight`. When set, backends that support it pin the variable
+    /// 'wght' coordinate; non-variable faces resolve to the nearest tier (CoreText only today,
+    /// other backends ignore it).
     numeric_weight: ?u16 = null,
     style: FontStyle = .normal,
 };

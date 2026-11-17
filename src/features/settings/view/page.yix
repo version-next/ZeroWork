@@ -1,0 +1,48 @@
+//! 内容页（`settings.content`）：滚动视口（概览或正文，正文最后是“恢复默认…”行）、浮在上面的页头、Save Bar。
+//! 宿主每次“重挂正文”加一纪元，窗口按纪元给本组件换 key（见 `ViewModel.contentEpochs`）；
+//! 同一纪元里页头、概览摘要与 Save Bar 由选择器驱动，正文形态固定（`ViewModel.contentMode`）。
+//! 视口的滚动偏移是 view-model 的信号（S-5，`ViewModel.pageScroll`）：挂载时绑当前位置的槽，
+//! 切回该位置、重挂时由 `W.ScrollArea` 自己恢复，宿主不拿 `ScrollState`。
+//! 视口是一个 `W.ScrollArea`（G24 已由上游修复，概览与正文不再各写一份分支）：内容的样式按形态取 `S.PageBody`，
+//! 子元素按形态二选一；回弹（RubberBand）用原生默认（人工验收反馈 5）。
+//! 页头（第 2 轮验收：照 znote 画板详情页 chrome 的 header）：视口占满整列、从窗口顶边开始，正文静止时从页头下方（内边距 64）
+//! 开始，往上滚时从浮在上面的页头（`Header.PageIntro`）底下穿过。视口自带原生 scroll edge（`W.ScrollArea scrollEdge`，
+//! UIScrollEdgeEffect：绑定视口自己的 `ScrollState` 的 `.blur_only` 玻璃带，不拦截命中，没有洗白渐变）——数值照 znote 的
+//! `progressiveBlurEdge`：带高 76、模糊半径 180、顶部 30%（22.8）满糊后渐出到清晰（`hold` + `fade_width` = 76，上游补的
+//! `hold`）、满强度 1；静止在顶端时强度 0、看不见（第一行正文清晰，反馈 3 回归），内容滚到页头下面才渐进磨砂。
+//! 页头底下虽然有滚动区，但页头自己是窗口拖动区（window chrome 的 `windowRegion={.drag}`）并拦截命中（见 `header.yix`，
+//! S-10）。znote 那条带是全宽、垫在左右两岛之下；这里只有内容列会滚动，带子铺满内容列（左侧导航浮层
+//! 背后是不动的窗面，磨砂与否看不出差别）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const F = @import("window_frame.zig");
+const S = @import("styles.yss");
+const Panes = @import("panes/registry.yix");
+const Header = @import("header.yix");
+const Overview = @import("overview.yix");
+const SaveBar = @import("save_bar.yix");
+
+fn overview(vm: *m.ViewModel) bool {
+    return vm.contentMode() == .overview;
+}
+fn pageScroll(vm: *m.ViewModel) f32 {
+    return vm.pageScroll();
+}
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+
+/// `root`：窗口模板的 live Ref，本页挂着的时候指向页根 `settings.content`（宿主经 `F.Page.of` 读）。
+pub fn ContentPage(vm: *m.ViewModel, frame: *F.Frame, root: *ui.view.Ref(*ui.Node)) View {
+    return (
+        <box ref={root} testId="settings.content" style={S.page_frame}>
+            <W.ScrollArea direction={.vertical} testId={m.ids.viewport} style={S.viewport} scrollEdge={.{ .edge = .top, .style = .soft, .height = 76, .hold = 22.8, .fade_width = 53.2, .max_strength = 1, .blur_radius = 180 }} scrollY={pageScroll(vm)} onScrollYChange={|y| send(vm, m.Intent.scrolledTo(y))} parts={.{ .content = .{ .style = S.PageBody.of(.{ .overview = overview(vm) }) } }}>
+                {if (overview(vm)) <Overview.Overview vm={vm} /> else <Panes.Body vm={vm} frame={frame} />}
+                <SaveBar.ResetRow vm={vm} />
+            </W.ScrollArea>
+            <Header.PageIntro vm={vm} />
+            <SaveBar.SaveBar vm={vm} />
+        </box>
+    );
+}

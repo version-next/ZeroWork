@@ -498,10 +498,10 @@ test "tool result store budgets full resolution observations separately from lat
             const blocks = try a.alloc(api.ContentBlock, 1);
             blocks[0] = .{ .image_ref = reference.retain() };
             results[0] = .{ .status = .succeeded, .blocks = blocks, .receipt = .{ .owner = owner, .operation_id = index + 1 } };
-            try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .session = 171 }, .turn_id = 1, .call_id = try std.fmt.allocPrint(run.arena.allocator(), "image-{d}", .{index}) }, .name = "bmc_ikvm.screenshot", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = true, .generic_results = results });
+            try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .tab = 171 }, .turn_id = 1, .call_id = try std.fmt.allocPrint(run.arena.allocator(), "image-{d}", .{index}) }, .name = "bmc_ikvm.screenshot", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = true, .generic_results = results });
         }
     };
-    var run = loop.Loop.init(a, .{ .owner = .{ .session = 171 }, .members = .{} }, 1, .{});
+    var run = loop.Loop.init(a, .{ .owner = .{ .tab = 171 }, .content = .{ .session = 171 }, .members = .{} }, 1, .{});
     defer run.deinit();
     var store = Store.init(a);
     defer store.deinit();
@@ -512,7 +512,7 @@ test "tool result store budgets full resolution observations separately from lat
     try std.testing.expect(store.retained_bytes < 4096);
     try std.testing.expect(!try store.capture(&run, &.{}));
     // The next pure-text exchange remains admissible after both observations.
-    try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .session = 171 }, .turn_id = 2, .call_id = "later-text" }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = true, .outcome = try loop.Outcome.copy(a, &.{.{ .session_id = 171, .status = .succeeded, .transport = .local, .stdout = "follow-up text" }}) });
+    try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .tab = 171 }, .turn_id = 2, .call_id = "later-text" }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = true, .outcome = try loop.Outcome.copy(a, &.{.{ .session_id = 171, .status = .succeeded, .transport = .local, .stdout = "follow-up text" }}) });
     try std.testing.expect(try store.capture(&run, &.{}));
     const two_images = store.retained_image_bytes;
     store.recount();
@@ -537,7 +537,7 @@ test "tool result store budgets full resolution observations separately from lat
     try std.testing.expectEqual(@as(usize, 0), store.retained_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.retained_image_bytes);
 
-    var text_run = loop.Loop.init(a, .{ .owner = .{ .session = 171 }, .members = .{} }, 3, .{});
+    var text_run = loop.Loop.init(a, .{ .owner = .{ .tab = 171 }, .content = .{ .session = 171 }, .members = .{} }, 3, .{});
     defer text_run.deinit();
     const oversized = try a.alloc(u8, 64 * 1024);
     defer a.free(oversized);
@@ -546,7 +546,7 @@ test "tool result store budgets full resolution observations separately from lat
     for (&targets, 1..) |*target, id| target.* = .{ .session_id = id, .status = .succeeded, .transport = .local, .stdout = oversized };
     // Each group member stays within its valid 64 KiB output limit; the
     // aggregate retained text can grow beyond the former 16 MiB ceiling.
-    for (0..17) |index| try text_run.records.append(text_run.arena.allocator(), .{ .key = .{ .owner = .{ .session = 171 }, .turn_id = 3, .call_id = try std.fmt.allocPrint(text_run.arena.allocator(), "text-{d}", .{index}) }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .outcome = try loop.Outcome.copy(a, &targets) });
+    for (0..17) |index| try text_run.records.append(text_run.arena.allocator(), .{ .key = .{ .owner = .{ .tab = 171 }, .turn_id = 3, .call_id = try std.fmt.allocPrint(text_run.arena.allocator(), "text-{d}", .{index}) }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .outcome = try loop.Outcome.copy(a, &targets) });
     try std.testing.expect(try store.capture(&text_run, &.{}));
     try std.testing.expectEqual(@as(usize, 17), store.records.items.len);
 }
@@ -555,7 +555,7 @@ test "host result snapshot retains exact content and receipt without a fake sess
     const a = std.testing.allocator;
     var store = Store.init(a);
     defer store.deinit();
-    const context: @import("host_tools.zig").Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
+    const context: @import("host_tools.zig").Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
     var run = loop.Loop.init(a, .{ .owner = context.binding, .members = .{} }, 4, .{});
     const aa = run.arena.allocator();
     const blocks = try a.alloc(@import("host_tools.zig").Block, 1);
@@ -579,10 +579,10 @@ test "tool result snapshot owns all mixed facts after loop is destroyed and isol
     const a = std.testing.allocator;
     var store = Store.init(a);
     defer store.deinit();
-    var run = loop.Loop.init(a, .{ .owner = .{ .group = 7 }, .members = .{} }, 4, .{});
+    var run = loop.Loop.init(a, .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{} }, 4, .{});
     const aa = run.arena.allocator();
     const outcome = try loop.Outcome.copy(a, &.{ .{ .session_id = 101, .status = .succeeded, .transport = .local, .stdout = "LOCAL_REAL", .exit = 0 }, .{ .session_id = 102, .status = .cancelled, .transport = .ssh, .stdout = "PARTIAL_REAL", .stderr = "kept stderr", .local_released = true } });
-    try run.records.append(aa, .{ .key = .{ .owner = .{ .group = 7 }, .turn_id = 4, .call_id = try aa.dupe(u8, "original-call") }, .name = "run_command", .arguments = "{\"session_ids\":[101,102],\"command\":\"sleep 10\"}", .arguments_hash = @splat(7), .dispatched = true, .outcome = outcome });
+    try run.records.append(aa, .{ .key = .{ .owner = .{ .tab = 7 }, .turn_id = 4, .call_id = try aa.dupe(u8, "original-call") }, .name = "run_command", .arguments = "{\"session_ids\":[101,102],\"command\":\"sleep 10\"}", .arguments_hash = @splat(7), .dispatched = true, .outcome = outcome });
     try std.testing.expect(try store.capture(&run, &.{.{ .owner = .{ .session_id = @fromBackingInt(102), .generation = 9 }, .label = "SSH original@remote:22" }}));
     try std.testing.expect(!try store.capture(&run, &.{}));
     run.deinit();
@@ -592,8 +592,8 @@ test "tool result snapshot owns all mixed facts after loop is destroyed and isol
     try std.testing.expectEqualStrings("kept stderr", record.targets[1].result.stderr);
     try std.testing.expectEqual(@as(u64, 9), record.targets[1].source.?.generation);
     try std.testing.expect(record.targets[1].result.local_released);
-    try std.testing.expectEqual(@as(usize, 0), store.countForOwner(.{ .session = 101 }));
-    try std.testing.expectEqual(@as(usize, 1), store.countForOwner(.{ .group = 7 }));
+    try std.testing.expectEqual(@as(usize, 0), store.countForOwner(.{ .tab = 101 }));
+    try std.testing.expectEqual(@as(usize, 1), store.countForOwner(.{ .tab = 7 }));
     var summary: [128]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, record.summary(&summary), "部分成功") != null);
 }
@@ -610,7 +610,7 @@ test "execution result projection preserves exact host identities output and lat
     const terminal = @import("../host/terminal_execution.zig");
     var store = Store.init(a);
     defer store.deinit();
-    const context: @import("host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
+    const context: @import("host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
     const exec: identity.ExecutionId = .generate();
     const recording: identity.RecordingId = .generate();
     const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(101), .generation = 9 };
@@ -672,7 +672,7 @@ test "execution result projection missing invalid or cross-task identities never
     defer a.free(body);
     const conflict = (try execution_projection.parse(aa, "host.run_in_terminal", "{}", .succeeded, receipt, body)).?;
     try std.testing.expect(conflict.execution_id == null and conflict.actionTarget() == null);
-    var original: Record = .{ .arena = .init(a), .owner = .{ .group = 7 }, .turn_id = 1, .call_id = "original", .name = "host.get_execution", .arguments = "{}", .command = "{}", .arguments_hash = @splat(0), .targets = &.{}, .dispatched = true, .execution = missing };
+    var original: Record = .{ .arena = .init(a), .owner = .{ .tab = 7 }, .turn_id = 1, .call_id = "original", .name = "host.get_execution", .arguments = "{}", .command = "{}", .arguments_hash = @splat(0), .targets = &.{}, .dispatched = true, .execution = missing };
     defer original.arena.deinit();
     original.execution.?.execution_id = id;
     var alien = original;
@@ -689,14 +689,14 @@ test "execution result without host receipt keeps actual rejection cancellation 
     const a = std.testing.allocator;
     var store = Store.init(a);
     defer store.deinit();
-    var run = loop.Loop.init(a, .{ .owner = .{ .group = 7 }, .members = .{} }, 42, .{});
+    var run = loop.Loop.init(a, .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{} }, 42, .{});
     defer run.deinit();
     const cid: identity.ConversationId = .generate();
     const task: identity.TaskId = .generate();
     inline for (.{ .{ "rejected", "ToolApprovalRejected" }, .{ "rejected", "CancelledBeforeDispatch" }, .{ "outcome_unknown", "WorkerUnavailable" } }, 0..) |source, index| {
         const body = try std.json.Stringify.valueAlloc(run.arena.allocator(), .{ .conversation_id = cid, .task_id = task, .status = source[0], .error_code = source[1] }, .{});
         const call = try std.fmt.allocPrint(run.arena.allocator(), "preflight-{d}", .{index});
-        try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .group = 7 }, .turn_id = 42, .call_id = call }, .name = "host.run_in_terminal", .arguments = "{\"command\":\"not-dispatched\",\"session_ref\":\"model-supplied-value\"}", .arguments_hash = @splat(0), .result_body = body });
+        try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .tab = 7 }, .turn_id = 42, .call_id = call }, .name = "host.run_in_terminal", .arguments = "{\"command\":\"not-dispatched\",\"session_ref\":\"model-supplied-value\"}", .arguments_hash = @splat(0), .result_body = body });
     }
     try std.testing.expect(try store.capture(&run, &.{}));
     for (store.records.items, 0..) |record, index| {
@@ -717,9 +717,9 @@ test "execution result invalid host receipt never becomes authority for an execu
     const a = std.testing.allocator;
     var store = Store.init(a);
     defer store.deinit();
-    var run = loop.Loop.init(a, .{ .owner = .{ .group = 7 }, .members = .{} }, 42, .{});
+    var run = loop.Loop.init(a, .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{} }, 42, .{});
     defer run.deinit();
-    const context: @import("host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
+    const context: @import("host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
     const id: identity.ExecutionId = .generate();
     const body = try std.json.Stringify.valueAlloc(a, .{ .execution_ref = try std.fmt.allocPrint(run.arena.allocator(), "x1:{s}", .{std.fmt.bytesToHex(id.bytes, .lower)}), .snapshot = .{ .owner = identity.SessionHandle{ .session_id = @fromBackingInt(101), .generation = 9 }, .execution_id = id, .state = "running" } }, .{});
     defer a.free(body);
@@ -738,9 +738,9 @@ test "tool result cloned scroll positions are independent and survive original s
     var store = Store.init(a);
     var store_alive = true;
     defer if (store_alive) store.deinit();
-    var run = loop.Loop.init(a, .{ .owner = .{ .group = 7 }, .members = .{} }, 4, .{});
+    var run = loop.Loop.init(a, .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{} }, 4, .{});
     defer run.deinit();
-    try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .group = 7 }, .turn_id = 4, .call_id = "position" }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = false });
+    try run.records.append(run.arena.allocator(), .{ .key = .{ .owner = .{ .tab = 7 }, .turn_id = 4, .call_id = "position" }, .name = "read_terminal", .arguments = "{}", .arguments_hash = @splat(0), .dispatched = false });
     _ = try store.capture(&run, &.{});
     const original = store.records.items[0];
     original.selected = 1;

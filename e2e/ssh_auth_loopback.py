@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real SSH authentication packets over loopback; no shell/channel/remote IO.
 
-Run after building src/ssh_auth_loopback_runner.zig against the vendored SSH
+Run after building src/proto/ssh/acceptance/ssh_auth_loopback_runner.zig against the vendored SSH
 library: python3 e2e/ssh_auth_loopback.py --runner /tmp/zerowork-auth-loopback-runner
 Only test method names/counts and outcomes are written to the report.
 """
@@ -25,6 +25,11 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import paramiko
 from paramiko.common import cMSG_USERAUTH_FAILURE
 from paramiko.message import Message
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
@@ -210,6 +215,7 @@ def main():
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("dist/ssh-acceptance/20261018/auth-loopback/report.json"))
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     host_key = paramiko.RSAKey.generate(2048)
     fixture_key = paramiko.RSAKey.generate(2048)
     records = []

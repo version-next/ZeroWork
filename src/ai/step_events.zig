@@ -22,6 +22,8 @@ pub const Mailbox = struct {
     allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     pending: std.ArrayList(Event) = .empty,
+    /// The UI that drains this box (its owner binds it); every push publishes to it.
+    wake: ?*const @import("publication.zig").Wake = null,
     pub fn init(a: std.mem.Allocator) Mailbox {
         return .{ .allocator = a };
     }
@@ -29,6 +31,10 @@ pub const Mailbox = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn push(self: *Mailbox, event: Event) !void {
+        try self.pushLocked(event);
+        @import("publication.zig").publish(self.wake);
+    }
+    fn pushLocked(self: *Mailbox, event: Event) !void {
         self.lock();
         defer self.mutex.unlock();
         const a = self.allocator;
@@ -121,7 +127,8 @@ pub fn apply(a: std.mem.Allocator, steps: *std.ArrayList(Step), e: Event) !void 
             step.activity_approval_baseline_ms = step.approval_elapsed_ms;
         }
         if (e.phase == .succeeded and step.activity_started_ms == null) step.activity_started_ms = step.started_ms;
-        step.phase = e.phase;
+        // 用户拒绝之后到达的工具结果（ToolApprovalRejected）仍是“被拒绝”，不是“失败”。
+        step.phase = if (e.phase == .failed and (step.decision == false or step.phase == .rejected)) .rejected else e.phase;
         if (e.phase == .approved or e.phase == .rejected) step.decision = e.phase == .approved;
         if (terminal(e.phase)) step.ended_ms = e.at_ms;
         return;
@@ -164,6 +171,23 @@ test "step events preserve approval and tool identity until the actual result" {
     try std.testing.expectEqualStrings("actual stdout", steps.items[0].detail);
     try std.testing.expect(steps.items[0].decision.?);
     try std.testing.expectEqual(@as(u64, 40), steps.items[0].ended_ms.? - steps.items[0].started_ms);
+}
+
+test "a rejected step stays rejected when the tool result arrives as a failure" {
+    const a = std.testing.allocator;
+    var steps: std.ArrayList(Step) = .empty;
+    defer {
+        for (steps.items) |*step| step.deinit(a);
+        steps.deinit(a);
+    }
+    try apply(a, &steps, .{ .call_id = "one", .name = "run_command", .command = "rm -rf /tmp/x", .phase = .approval, .at_ms = 1 });
+    try apply(a, &steps, .{ .call_id = "one", .phase = .rejected, .at_ms = 2 });
+    try apply(a, &steps, .{ .call_id = "one", .phase = .failed, .detail = "{\"error_code\":\"ToolApprovalRejected\"}", .at_ms = 3 });
+    try std.testing.expectEqual(Phase.rejected, steps.items[0].phase);
+    try std.testing.expect(steps.items[0].decision == false);
+    try apply(a, &steps, .{ .call_id = "two", .name = "run_command", .phase = .running, .at_ms = 4 });
+    try apply(a, &steps, .{ .call_id = "two", .phase = .failed, .at_ms = 5 });
+    try std.testing.expectEqual(Phase.failed, steps.items[1].phase);
 }
 
 test "step approval pauses activity time across duplicate updates and clone" {

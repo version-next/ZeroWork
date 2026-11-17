@@ -1,0 +1,14 @@
+//! 全窗口材质预览操作条的样式（旧 `appearance_styles.previewBar`：48 高、内边距 [0, 12]、间距 8、圆角 14、浮层底色）。
+//! 位置由宿主按主窗口内容区算好（`Place`），经 `placed` 写成绝对定位；颜色只用 token。
+const ui = @import("ui");
+
+pub const Place = struct { left: f32 = 0, bottom: f32 = 58, width: f32 = 660 };
+
+style bar { height: 48; direction: row; align-items: center; gap: 8; padding: 0 12; corner-radius: 14; background: zw-window-surface; border-overlay: true; border: 1 border; flex-shrink: 0; }
+pub fn placed(place: Place, _: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .position = .absolute, .width = .{ .px = place.width }, .inset = .{ .left = .{ .px = place.left }, .bottom = .{ .px = place.bottom } }, .z_index = 11000 };
+}
+style bar_icon { width: 16; height: 16; flex-shrink: 0; icon-color: zw-fg-supporting; }
+style bar_cell { width: 120; flex-shrink: 0; }
+style bar_label { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; color: fg-primary; }
+style bar_value { font-size: 12; font-weight: 400; line-height: {18.0 / 12.0}; color: zw-fg-supporting; }

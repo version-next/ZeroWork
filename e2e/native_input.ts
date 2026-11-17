@@ -1,6 +1,8 @@
 /** Native close driver; CUA must click the correct app window twice. Actual Local PTY/Metal integration. Requires a fresh -Dtest-mode=true build.
  * Cleanup termination is reported separately and is never normal-close proof.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -64,7 +66,7 @@ async function visible(id: string): Promise<Node> {
   return await waitFor(async () => (await query(id)).find((node) => node.hidden !== true && (node.effective_opacity ?? 1) > 0 && node.rect.w > 0 && node.rect.h > 0) ?? null);
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -80,7 +82,7 @@ async function capture(name: string): Promise<void> {
   // Let the actual widget enter transition settle before recording its pixels.
   await sleep(250);
   assert((await screenshot(join(output, `${name}.png`))).ok);
-  await writeFile(join(output, `${name}.tree.json`), JSON.stringify(await tree(), null, 2));
+  await writeFile(join(output, `${name}.tree.json`), JSON.stringify(await tree({ visibleOnly: true }), null, 2));
 }
 let failure: unknown;
 try {

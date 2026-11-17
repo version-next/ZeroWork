@@ -1,0 +1,10 @@
+old_path	new_path	layer	mixed	note
+src/ui/app_update_styles.zig	src/features/update/view/app_update_styles.zig	view	no	import ui；跟随 app_update_view
+src/ui/app_update_view.zig	src/features/update/view/app_update_view.zig	view	no	import ui、control_hint、shell_styles（shell）；被 core 目录 src/update/app_host.zig import，但 app_host 本包一并搬入 feature/host，故不下沉
+src/update/app_host.zig	src/features/update/host/app_host.zig	host	no	§5.2 点名；import ui、ui/app_theme、ui/app_update_view、host/session_host、platform/realtime、update/{admission,client,close_coordinator}（core，搬后需改为跨目录相对路径）；被 src/main.zig:17,17443 引用
+src/update_tests.zig	src/tests_update.zig	root	no	按 §5.1 改名并留在 src 根；是 zig build test-update 的构建根（build.zig:234 硬编码 src/update_tests.zig，需同步改）；自身 5 个 test 块（1 个匿名聚合 test{} 引用 update/crypto、close_coordinator、config、settings_values 等 + 4 个命名用例），filters 为 "update " 与 "settings page map"；import config/*、update/*
+# E2E build.zig 引用了 src/update_tests.zig（build.zig:234，step test-update）
+# E2E docs/DESIGN/V0.3_APP_UPDATE.md 引用了 src/ui/app_update_*（通配描述）
+# E2E docs/ui-revamp/baselines/tests.md 引用了 src/update_tests.zig
+# E2E e2e/ 下 app_update_* 脚本为文件名匹配，未引用 src 路径
+# TESTID update

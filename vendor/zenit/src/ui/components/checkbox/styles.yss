@@ -1,92 +1,130 @@
 //! Checkbox / Radio / Switch styling. Views in checkbox.yix / radio.yix / switch.yix,
 //! logic in mod.zig.
 const ui = @import("../../ui.zig");
+// TODO(token): line_height.body = 1.4 (LKxqO control labels).
 
-/// Optional control dimensions preserve the existing 18 / 14 defaults.
-pub fn checkboxSize(size: f32, _: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .{ .px = size }, .height = .{ .px = size } };
-}
-pub fn checkboxCheckSize(size: f32, t: *const ui.ThemeTokens) ui.BoxStyle {
-    return checkboxSize(@max(0, size - 4), t);
-}
-pub fn checkboxLabelSize(size: f32, _: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = size };
-}
-
-/// root: control + label row; track: 40x22 capsule; thumb: 18x18 slider (translate-x
-/// positioned, motion and color same transition). Off/on: track switch-track-off <-> accent,
-/// thumb and disabled colors use explicit theme pairs; label secondary <-> primary.
+/// root: control + label row; track: capsule (md 40x22, sm 32x18); thumb: slider (md 18,
+/// sm 14; translate-x positioned, motion and color same transition), 2px inset at both
+/// ends. Colors are the switch-* role tokens (on/off track and thumb, disabled on/off);
+/// defaults alias accent / fg-inverse / border / bg-secondary.
 recipe SwitchParts slots(root, track, thumb, label) {
   base {
-    root { width: fit; height: fit; gap: 8; align-items: center; cursor: pointer; }
-    track { position: relative; width: 40; height: 22; corner-radius: 11; transition: background 200ms ease-out-cubic; }
+    root { width: fit; height: fit; no-cross-stretch: true; gap: 8; align-items: center; cursor: pointer; }
+    track { position: relative; transition: background 200ms ease-out-cubic; }
     thumb {
       position: absolute;
-      width: 18;
-      height: 18;
-      corner-radius: 9;
       translate-y: 2;
-      shadow: 0 1 2 #00000020;
+      shadow: xs;
       transition: translate-x 200ms ease-out-cubic, background 200ms ease-out-cubic;
     }
-    label { font-size: 14; transition: color 200ms ease-out-cubic; }
+    label { font-size: md; line-height: 1.4; transition: color 200ms ease-out-cubic; }
   }
   flag checked {
     track { background: switch-track-on; }
-    thumb { background: switch-thumb-on; translate-x: 20; }
+    thumb { background: switch-thumb-on; translate-x: switch-travel; }
     label { color: fg-primary; }
   } else {
     track { background: switch-track-off; }
     thumb { background: switch-thumb; translate-x: 2; }
-    label { color: fg-secondary; }
+    label { color: fg-primary; }
   }
+  variant size = md {
+    sm {
+      track { width: switch-width-sm; height: switch-height-sm; corner-radius: 9; }
+      thumb { width: switch-thumb-sm; height: switch-thumb-sm; corner-radius: 7; }
+    }
+    md {
+      track { width: switch-width; height: switch-height; corner-radius: 11; }
+      thumb { width: switch-thumb; height: switch-thumb; corner-radius: 9; }
+    }
+  }
+  // On: travel = track width - thumb - 2px inset: the switch-travel(-sm) size tokens (md 20,
+  // sm 16), so a theme that resizes the switch sets its travel with it.
+  when checked & size = sm { thumb { translate-x: switch-travel-sm; } }
   flag disabled { root { cursor: not-allowed; } }
-  when disabled { label { color: fg-secondary; } }
-  when disabled & checked { track { background: checkbox-disabled-checked-bg; } thumb { background: checkbox-disabled-fg; } }
-  when disabled & !checked { track { background: checkbox-disabled-bg; } thumb { background: switch-disabled-thumb-off; } }
+  when disabled { label { color: fg-disabled; } }
+  when disabled & checked { track { background: switch-disabled-track-on; } thumb { background: switch-disabled-thumb-on; } }
+  when disabled & !checked { track { background: switch-disabled-track-off; } thumb { background: switch-disabled-thumb-off; } }
 }
 
-/// root: control + label row; box: 18x18 frame (bg/border 150ms transition); check:
+/// Optional checkbox geometry (CheckboxProps.size / label_font_size). null resolves to the same
+/// value the recipe uses (`checkbox` box, 12 px glyph, `md` label), so the default is unchanged;
+/// the check / mixed glyph keeps its 12:16 ratio to the box. The label size is a partial text
+/// struct for `ui.view.styleBy` (parameterized styles apply to boxes only).
+style box_size($size: ?f32) { width: $size ?? checkbox; height: $size ?? checkbox; }
+style check_size($size: ?f32) { width: {checkGlyph($size)}; height: {checkGlyph($size)}; }
+
+pub const LabelSize = struct { font_size: f32 };
+pub fn labelSize(size: ?f32, t: *const ui.ThemeTokens) LabelSize {
+    return .{ .font_size = size orelse t.tokens.font_size.md };
+}
+
+pub fn checkGlyph(size: ?f32) f32 {
+    return if (size) |s| s * 0.75 else 12;
+}
+
+/// root: control + label row; box: 16x16 frame (bg/border 150ms transition); check:
 /// checkmark icon; indet: half-check overlay; label: label. Box bg/border = checked
-/// (incl half) * disabled; disabled+checked uses special checkbox-disabled-checked-bg.
+/// (incl half) × disabled, resolved by recipe compounds.
 recipe CheckboxParts slots(root, box, check, indet, label) {
   base {
-    root { width: fit; height: fit; gap: 8; align-items: center; }
-    box { width: 18; height: 18; border-width: 1.5; corner-radius: 4; justify: center; align-items: center; transition: background 150ms ease-out, border-color 150ms ease-out; }
-    check { width: 14; height: 14; icon-color: checkbox-fg; }
-    indet { position: absolute; width: 18; height: 18; justify: center; align-items: center; }
-    label { font-size: 14; }
+    root { width: fit; height: fit; no-cross-stretch: true; gap: 8; align-items: center; }
+    box { width: checkbox; height: checkbox; border-overlay: true; border-width: thin; corner-radius: md; justify: center; align-items: center; transition: background 150ms ease-out, border-color 150ms ease-out; }
+    check { width: 12; height: 12; icon-color: checkbox-fg; }
+    indet { position: absolute; width: checkbox; height: checkbox; justify: center; align-items: center; }
+    label { font-size: md; line-height: 1.4; }
   }
   flag on;
-  flag disabled { root { cursor: not-allowed; } label { color: fg-secondary; } } else { root { cursor: pointer; } label { color: fg-primary; } }
+  flag disabled { root { cursor: not-allowed; } label { color: fg-disabled; } } else { root { cursor: pointer; } label { color: fg-primary; } }
   when !on & !disabled { box { background: checkbox-bg; border-color: checkbox-border; } }
-  when on & !disabled { box { background: accent; border-color: accent; } }
+  when on & !disabled { box { background: checkbox-checked-bg; border-color: checkbox-checked-bg; } }
   when !on & disabled { box { background: checkbox-disabled-bg; border-color: checkbox-disabled-border; } }
   when on & disabled { box { background: checkbox-disabled-checked-bg; border-color: checkbox-disabled-checked-bg; } }
   when disabled { check { icon-color: checkbox-disabled-fg; } }
   flag shown { check { opacity: 1; } indet { opacity: 1; } } else { check { opacity: 0; } indet { opacity: 0; } }
 }
 
-/// root: circle + label row (disabled = all translucent, selected color kept); circle:
-/// 18x18 circle (bg/border 150ms transition); dot: checked inner dot (opacity 150ms
+/// root: circle + label row; colors share the checkbox-* role tokens; circle:
+/// 16x16 circle (bg/border 150ms transition); dot: checked inner dot (opacity 150ms
 /// transition); label: label. RadioGroup option: unhovered shows circle border as accent on
 /// hover (selected already accent).
 recipe RadioParts slots(root, circle, dot, label) {
   base {
-    root { width: fit; height: fit; gap: 8; align-items: center; }
-    circle { width: 18; height: 18; border-width: 1.5; corner-radius: full; justify: center; align-items: center; transition: background 150ms ease-out, border-color 150ms ease-out; }
-    dot { width: 9; height: 9; background: checkbox-fg; corner-radius: 4.5; transition: opacity 150ms ease-out; }
-    label { font-size: 14; color: fg-primary; }
+    root { width: fit; height: fit; no-cross-stretch: true; gap: 8; align-items: center; }
+    circle { width: checkbox; height: checkbox; border-overlay: true; border-width: thin; corner-radius: full; justify: center; align-items: center; transition: background 150ms ease-out, border-color 150ms ease-out; }
+    dot { width: dot; height: dot; background: checkbox-fg; corner-radius: full; transition: opacity 150ms ease-out; }
+    label { font-size: md; line-height: 1.4; color: fg-primary; }
   }
-  flag checked { circle { background: accent; border-color: accent; } dot { opacity: 1; } } else { circle { background: checkbox-bg; border-color: checkbox-border; } dot { opacity: 0; } }
-  flag disabled { root { cursor: not-allowed; } label { color: fg-secondary; } } else { root { cursor: pointer; } }
-  when disabled & checked { circle { background: checkbox-disabled-checked-bg; border-color: checkbox-disabled-checked-bg; } dot { background: checkbox-disabled-fg; } }
-  when disabled & !checked { circle { background: checkbox-disabled-bg; border-color: checkbox-disabled-border; } }
+  /// A description line under the label (RadioOption.description): the row aligns to the top
+  /// (the circle's drop onto the label's first line: style described_circle).
+  flag described { root { align-items: start; } circle { flex-shrink: 0; } }
+  flag checked { circle { background: checkbox-checked-bg; border-color: checkbox-checked-bg; } dot { opacity: 1; } } else { circle { background: checkbox-bg; border-color: checkbox-border; } dot { opacity: 0; } }
+  flag disabled { root { cursor: not-allowed; } label { color: fg-disabled; } dot { background: checkbox-disabled-fg; } } else { root { cursor: pointer; } }
+  when disabled & checked { circle { background: checkbox-disabled-checked-bg; } }
+  when disabled & !checked { circle { background: checkbox-disabled-bg; } }
   flag hovered;
-  when !checked & hovered & !disabled { circle { border-color: accent; } }
+  when !checked & !disabled & hovered { circle { border-color: accent; } }
 }
 
+/// The circle's top offset on a described row: half the difference between the label's line box
+/// (font-size md x 1.4) and the circle (size.checkbox).
+pub fn describedCircleTop(t: *const ui.ThemeTokens) f32 {
+    return @max(0, (t.tokens.font_size.md * 1.4 - t.tokens.size.checkbox) / 2);
+}
+
+/// On a described row the circle sits on the centre of the label's first line.
+style described_circle($on: bool) { when $on { margin: {describedCircleTop(t)} 0 0 0; } }
+
+/// Label over its description (RadioOption.description), same spec as MenuItem.description; the
+/// description inherits the column's colour (fg-secondary, fg-disabled on a disabled option).
+style radio_text($disabled: bool) {
+  width: fit; min-width: 0; height: fit; direction: column; gap: space50; color: fg-secondary;
+  when $disabled { color: fg-disabled; }
+}
+/// RadioOption.description: xs, wraps.
+style radio_description { font-size: xs; line-height: 1.5; wrap: word; }
+
 recipe RadioGroupLayout {
-  base { height: fit; }
+  base { height: fit; no-cross-stretch: true; }
   flag horizontal { direction: row; gap: 16; } else { direction: column; gap: 8; }
 }

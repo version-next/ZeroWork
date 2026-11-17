@@ -1,0 +1,7 @@
+host.list_hosts: reserved_parameter_shape
+host.read_command_output: reserved_parameter_shape
+run_command: name_format
+read_terminal: name_format
+file.read_text: reserved_parameter_shape
+list_remote_files: name_format
+read_remote_file: name_format reserved_parameter_shape

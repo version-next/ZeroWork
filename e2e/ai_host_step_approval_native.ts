@@ -1,9 +1,13 @@
 /** Host approval stage on the real native UI and Local PTY; fixture provider. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,writeFile,readFile,open,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/private/tmp/zw-settlement-build');
 const out=resolve(process.argv[2]??'/private/tmp/zw-host-step-approval');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-host-step-approval-'),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');for(const d of[data,rpc,zdot])await mkdir(d);
@@ -14,23 +18,23 @@ const payload=(envelope:any)=>{for(const b of envelope.content??[])try{return JS
 let failed:string|null=null;let requests=0;const marker=join(iso,"approved-command");
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"approval-fixture"}]}');
- requests++;let raw='';for await(const b of req)raw+=b;const body=JSON.parse(raw);
+ requests++;const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
  const results=new Map(body.messages.filter((m:any)=>m.role==='tool').map((m:any)=>[m.tool_call_id,payload(JSON.parse(m.content))]));
  const emit=(id:string,name:string,args:any)=>res.end((id==='approval-run'?frame({content:'APPROVAL_PREFACE：我会先请求确认，再执行这条命令。'}):'')+frame({tool_calls:[{index:0,id,type:'function',function:{name:wire(name),arguments:JSON.stringify(args)}}]})+'data: [DONE]\n\n');
  res.writeHead(200,{'content-type':'text/event-stream'});
  const context:any=results.get('approval-context');if(!context)return emit('approval-context','host.get_current_context',{});
  let ready=false;
- for(let i=0;i<8;i++){
+ for(let i=0;;i++){
   const facts:any=results.get('approval-ready-'+i);
-  if(!facts){if(i)await new Promise(r=>setTimeout(r,350));return emit('approval-ready-'+i,'host.get_session',{session_ref:context.binding_ref});}
+  if(!facts){if(!pollWithin('approval-ready',15000))break;if(i)await new Promise(r=>setTimeout(r,350));return emit('approval-ready-'+i,'host.get_session',{session_ref:context.binding_ref});}
   if(facts.session?.capabilities?.trusted_pty_execution){ready=true;break}
  }
  assert(ready,'Local PTY did not report ready');
  const run:any=results.get('approval-run');if(!run)return emit('approval-run','host.run_in_terminal',{session_ref:context.binding_ref,command:`printf APPROVAL_NATIVE_OK; printf once >> '${marker}'`,request_key:'approval-native-once'});
  let observed:any=run;
- for(let i=0;observed.state!=='interval_recorded'&&i<8;i++){
+ for(let i=0;observed.state!=='interval_recorded';i++){
   const next:any=results.get('approval-wait-'+i);
-  if(!next)return emit('approval-wait-'+i,'host.wait_execution',{execution_ref:run.execution_ref,after_revision:observed.source_revision,wait_ms:30000,max_bytes:4096});
+  if(!next){if(!pollWithin('approval-wait',120000))break;return emit('approval-wait-'+i,'host.wait_execution',{execution_ref:run.execution_ref,after_revision:observed.source_revision,wait_ms:30000,max_bytes:4096})}
   observed=next;
  }
  assert.equal(observed.state,'interval_recorded');assert.equal(observed.snapshot.process.exit_code,0);
@@ -46,7 +50,7 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok)};
 const report:any={status:'running',scope:'Isolated native App, real Local zsh and deterministic provider; no production App or remote host accessed.'};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.prompt');await h.type_('在当前终端执行审批阶段验证');await click('ai.send');await visible('ai.host_approval');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.prompt');await h.type_('在当前终端执行审批阶段验证');await click('ai.send');await visible('ai.interaction.panel');
  const requestCount=requests;
  const panel=flat(await h.query('ai.panel'));
  assert(!panel.some((n:any)=>n.test_id==='ai.step.projection'&&n.text?.includes('printf APPROVAL_NATIVE_OK')),'unapproved request must not have an execution step');
@@ -54,13 +58,22 @@ try{
  const nodes=flat(await h.query('ai.conversation'));
  const prose=nodes.find((n:any)=>n.test_id==='ai.message.assistant');
  assert(prose&&text(prose).includes('APPROVAL_PREFACE'),'model explanation remains before the approval');
- const approval=nodes.find((n:any)=>n.test_id==='ai.host_approval');assert(approval,'approval belongs inside the transcript');
- assert(Math.abs(prose.rect.x-approval.rect.x)<.5&&Math.abs(prose.rect.w-approval.rect.w)<.5,'model prose and approval share both outer edges');
+ // 审批已移入输入区交互卡（ai_composer_interaction_view.zig，挂在 composer 行，见 ai_host.zig mountAssistantConversation）：不在对话流里，位于对话视口下方。
+ assert(!nodes.some((n:any)=>n.test_id==='ai.interaction.panel'),'approval lives in the composer, not inside the transcript');
+ // ai-redesign-d: the approval's edges are its card's (ai.interaction.card); ai.interaction.panel is the content viewport inside the card's 12 padding.
+ const approval=(await h.query('ai.interaction.card')).find(shown);assert(approval,'composer approval visible');report.geometry={prose:prose.rect,approval:approval.rect};
+ // 外缘：正文与审批共用左缘（消息区与输入区左内边距都是 14）；右缘按各自设计内边距——消息 [6,14,12,14]、输入区 [10,8,8,14]
+ // （ai_assistant_styles.zig messages()/composer()，Pencil kuRaJ），面板自身 1px 内边距。
+ // Kaf7E ③ (ai-redesign-b): the conversation column is inset 16 on both sides; the composer's approval
+ // sits in the composer's own margin (12 by design, ai-redesign-a), so the two left edges are within 4 of
+ // each other and the approval is symmetric inside the panel.
+ const edges=async(p:any,a:any)=>{const panel=(await h.query('ai.panel')).find(shown).rect,inner=panel.x+panel.w-1;const column=(await h.query('ai.conversation')).find(shown).rect;assert(Math.abs(p.x-(column.x+16))<.6,'prose starts at the 16 inset');/* ai-redesign-a ⑤: the composer margin is 12, 8 at the 320 tier (panel ≤ 340); the prose keeps 16, so the left edges differ by 16 − margin. */const margin=panel.w<=340?8:12;assert(Math.abs(a.x-(panel.x+margin))<.6,'approval sits in the composer margin');assert(Math.abs(p.x-a.x-(16-margin))<.6,'model prose and approval share the left edge (within the 16 / 12 / 8 insets)');assert(Math.abs(p.x+p.w-(column.x+column.w-16))<.6,'prose right edge');assert(Math.abs((a.x-panel.x)-(panel.x+panel.w-(a.x+a.w)))<.5,'composer approval right edge (symmetric inside the panel: the composer margin on both sides)');void inner};
+ await edges(prose.rect,approval.rect);
  assert(prose.rect.y+prose.rect.h<=approval.rect.y,'approval follows the model explanation');
  assert(!(await h.query('ai.task_finish')).some(shown),'an idle task terminal must not claim that execution is running');
  await h.resizeWindow(860,480);await h.sleep(150);
- const compactProse=(await h.query('ai.message.assistant')).find(shown),compactApproval=(await h.query('ai.host_approval')).find(shown);
- assert(compactProse&&compactApproval);assert(Math.abs(compactProse.rect.x-compactApproval.rect.x)<.5&&Math.abs(compactProse.rect.w-compactApproval.rect.w)<.5);
+ const compactProse=(await h.query('ai.message.assistant')).find(shown),compactApproval=(await h.query('ai.interaction.card')).find(shown);report.compact_geometry={prose:compactProse?.rect,approval:compactApproval?.rect};
+ assert(compactProse&&compactApproval);await edges(compactProse.rect,compactApproval.rect);
  await h.screenshot(join(out,'compact-approval.png'));await h.resizeWindow(1200,900);
 
  const footerTime=()=>h.query('ai.turn.elapsed').then((n:any)=>text(n));
@@ -70,9 +83,10 @@ try{
  assert.equal(await footerTime(),beforeTime,'processing clock pauses during approval');
  assert.equal(requests,requestCount,'provider must not continue while waiting');
  await h.screenshot(join(out,'waiting-approval.png'));await writeFile(join(out,'waiting-approval.tree.json'),JSON.stringify(await h.query('ai.panel'),null,2));
- assert(text(await h.query('ai.host_approval.state')).includes('待确认'));
- assert(!text(await h.query('ai.host_approval')).includes('重新确认'));
- await click('ai.host_approval.accept');await h.waitFor(async()=>text(await h.query('ai.panel')).includes('APPROVAL_NATIVE_FINISHED')||null,30000);assert.equal(failed,null);assert.equal(await readFile(marker,'utf8'),'once');await h.screenshot(join(out,'approved-result.png'));
- report.status='passed';report.waited_ms=dwellMs;report.checks=['model prose precedes inline approval','no execution step or PTY write before approval','processing clock excludes approval wait','provider remains paused while waiting','no expiry or renewal state','approval executes the Local command exactly once and resumes the provider'];
-}catch(err){report.status='failed';report.error=String(err);await h.screenshot(join(out,'failure.png')).catch(()=>{});await writeFile(join(out,'failure.tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{});process.exitCode=1}
+ // 交互卡没有单独的状态标签：待确认由标题「确认执行命令」与可用的「允许执行」表达（ai_host.zig updateComposerInteraction）。
+ assert.equal(text(await h.query('ai.interaction.title')).trim(),'确认执行命令');assert(!(await visible('ai.interaction.approve')).disabled);
+ assert(!text(await h.query('ai.interaction.panel')).includes('重新确认'));
+ await click('ai.interaction.approve');await h.waitFor(async()=>text(await h.query('ai.panel')).includes('APPROVAL_NATIVE_FINISHED')||null,30000);assert.equal(failed,null);assert.equal(await readFile(marker,'utf8'),'once');await h.screenshot(join(out,'approved-result.png'));
+ report.status='passed';report.waited_ms=dwellMs;report.checks=['model prose precedes the composer approval card and shares its left edge','no execution step or PTY write before approval','processing clock excludes approval wait','provider remains paused while waiting','no expiry or renewal state','approval executes the Local command exactly once and resumes the provider'];
+}catch(err){report.status='failed';report.error=String(err);await h.screenshot(join(out,'failure.png')).catch(()=>{});await writeFile(join(out,'failure.tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{});process.exitCode=1}
 finally{app.kill('SIGTERM');await new Promise<void>(r=>{if(app.exitCode!==null||app.signalCode!==null)return r();app.once('close',()=>r());setTimeout(()=>{app.kill('SIGKILL');r()},3000)});server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));await log.close();await rm(iso,{recursive:true,force:true});await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report))}

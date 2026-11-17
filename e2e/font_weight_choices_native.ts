@@ -2,12 +2,15 @@
  * node e2e/font_weight_choices_native.ts /absolute/evidence [binary]
  * Uses isolated data and public synthetic Harness input.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,rm,open,readFile,writeFile,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {settingsNav} from './settings_nav.ts';
+const nav=settingsNav();
 
 const out=resolve(process.argv[2]??'/tmp/zerowork-font-weight-choices');
 await mkdir(out,{recursive:true});
@@ -32,15 +35,22 @@ async function reveal(id:string){
 }
 async function click(id:string){if(id.startsWith('settings.field.'))await reveal(id);await node(id);assert((await h.clickTestId(id)).ok,id);}
 async function capture(name:string){await h.mouseMove(5,5);await h.sleep(150);await h.screenshot(join(out,name+'.png'));report.captures.push(name+'.png');}
-async function settings(){await click('toolbar.settings');await click('settings.nav.appearance');if(!(await h.query('settings.field.font_family')).some(shown))await click('settings.appearance.font.header');}
-async function choose(family:string){await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_(family);await click('settings.option.font_family.'+family);await h.waitFor(async()=>(await h.inputState('settings.font.search')).buffer===family?true:null);}
+// Two-level settings (settings_nav.ts): 外观与主题 › 字体与排版. The family is a native searchable W.Select whose trigger
+// (settings.field.font_family) shows the selected family; the separate settings.font.search input was removed with the legacy view.
+async function settings(){await nav.toSub('appearance','font');await node('settings.field.font_family');}
+async function choose(family:string){await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_(family);await click('settings.option.font_family.'+family);await h.waitFor(async()=>text(await node('settings.field.font_family')).includes(family)?true:null);}
 async function choices(expected:string[],shot?:string){
  await click('settings.field.font_weight');
+ await node('settings.chooser.font_weight');
+ // The popup can be mounted but still transparent in the frame after the
+ // click. Wait for the expected options to be visible before checking absences.
+ for(const weight of expected) await node('settings.option.font_weight.'+weight);
  for(const weight of ['light','regular','medium','bold'])assert.equal((await h.query('settings.option.font_weight.'+weight)).some(shown),expected.includes(weight),weight);
  if(shot)await capture(shot);
  await h.key('escape');
+ await h.waitFor(async()=>!(await h.query('settings.chooser.font_weight')).some(shown)||null);
 }
-async function save(family:string,weight:string){await click('settings.save');await h.waitFor(async()=>{const s=await readFile(config,'utf8');return s.includes('font_family = "'+family+'"')&&s.includes('font_weight = "'+weight+'"')&&(await node('settings.footer.state')).text==='已保存'?true:null;});}
+async function save(family:string,weight:string){await click('settings.save');await h.waitFor(async()=>{const s=await readFile(config,'utf8');return s.includes('font_family = "'+family+'"')&&s.includes('font_weight = "'+weight+'"')&&!(await nav.dirty())?true:null;});}
 async function launch(round:number){
  const rpc=join(base,'rpc-'+round);await mkdir(rpc);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
  log=await open(join(out,'app-'+round+'.log'),'w');
@@ -68,7 +78,7 @@ try{
  await click('settings.field.font_family');await h.key('a',{cmd:true});await h.type_('ZeroWorkMissingFontWeightNative');await h.key('enter');
  assert.match(text(await node('settings.field.font_weight')),/Regular/);await choices(['regular','bold']);await save('ZeroWorkMissingFontWeightNative','regular');
  report.checks.push('A custom missing family uses Menlo fallback weights and reconciles its previous Light.');
- await click('settings.close');await stop();
+ await nav.close();await stop();
  await launch(2);await choices(['regular','bold']);assert.match(text(await node('settings.field.font_weight')),/Regular/);await capture('fallback-restarted');
  report.checks.push('Saved family, reconciled weight and fallback choices survive restart.');report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});console.error(e);}

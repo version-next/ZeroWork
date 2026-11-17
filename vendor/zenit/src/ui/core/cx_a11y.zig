@@ -16,18 +16,57 @@ const a11y_router_mod = @import("../a11y/nsaccessibility_router.zig");
 const a11y_tree_mod = @import("../a11y/tree.zig");
 const core_types = @import("types.zig");
 
+/// Frame-end projection policy. `a11y_on_demand` hosts skip the projection
+/// while no assistive client can read the tree; every reader projects first.
+pub const ProjectionPolicy = enum {
+    /// Project now (bare Cx, platforms whose bridges read the tree each frame,
+    /// or a macOS process that has already seen a client).
+    eager,
+    /// macOS: defer until the first NSAccessibility query (ProjectionDemand).
+    defer_until_query,
+    /// Windows: defer; the UIA publisher (zenit_app/windows_accessibility.zig)
+    /// projects before it publishes a snapshot (client activity, event
+    /// subscriptions, first-client demand) and before it runs an action.
+    defer_until_publish,
+};
+
+pub fn projectionPolicy(os: @import("std").Target.Os.Tag, on_demand: bool, macos_clients_seen: bool) ProjectionPolicy {
+    if (!on_demand) return .eager;
+    return switch (os) {
+        .macos => if (macos_clients_seen) .eager else .defer_until_query,
+        .windows => .defer_until_publish,
+        else => .eager,
+    };
+}
+
 pub fn syncOrDeferA11yProjection(self: *Cx, root: *Node) void {
-    if (!self.a11y_on_demand or builtin.os.tag != .macos or a11y_macos_bridge_mod.clientsSeen()) {
-        syncA11yTreeFromInteractions(self, root);
-        return;
+    const clients_seen = builtin.os.tag == .macos and a11y_macos_bridge_mod.clientsSeen();
+    switch (projectionPolicy(builtin.os.tag, self.a11y_on_demand, clients_seen)) {
+        .eager => syncA11yTreeFromInteractions(self, root),
+        .defer_until_query => {
+            self.a11y_projection_stale = true;
+            // Stay registered so the first query reaches this window and projects it.
+            registerA11yContext(self);
+            a11y_macos_bridge_mod.setProjectionDemand(cx_platform.a11yWindowKey(self), .{
+                .ctx = self,
+                .project = &cxA11yProjectOnDemand,
+            });
+        },
+        .defer_until_publish => {
+            self.a11y_projection_stale = true;
+            // Keep the window's context registered so the zenit_a11y_* action
+            // entry points route to this Cx (they project before acting).
+            registerA11yContext(self);
+        },
     }
-    self.a11y_projection_stale = true;
-    // Stay registered so the first query reaches this window and projects it.
-    registerA11yContext(self);
-    a11y_macos_bridge_mod.setProjectionDemand(cx_platform.a11yWindowKey(self), .{
-        .ctx = self,
-        .project = &cxA11yProjectOnDemand,
-    });
+}
+
+/// Project now if a frame deferred projection. Readers of
+/// `accessibility_tree` outside the frame-end step call this first.
+pub fn projectA11yIfStale(self: *Cx) void {
+    if (!self.a11y_projection_stale) return;
+    const root = self.root orelse return;
+    syncA11yTreeFromInteractions(self, root);
 }
 
 fn cxA11yProjectOnDemand(ctx: *anyopaque) void {
@@ -40,6 +79,7 @@ fn cxA11yProjectOnDemand(ctx: *anyopaque) void {
 pub fn syncA11yTreeFromInteractions(self: *Cx, root: *Node) void {
     // Cleared first: the push flush below can call back into the bridge.
     self.a11y_projection_stale = false;
+    self.a11y_projection_count +%= 1;
     self.a11y_label_buf.clearRetainingCapacity(self.allocator);
     self.accessibility_tree.beginProjection();
     var sibling_counter: u32 = 0;
@@ -119,6 +159,12 @@ fn cxA11yPerformAction(ctx: *anyopaque, id: AXId, action: a11y_macos_bridge_mod.
     if (props.disabled or props.hidden or !self.overlay_stack.allowsSemanticAction(node)) return false;
 
     if (node.behavior.interaction.focusable) self.setFocus(node);
+    if (action == .increment or action == .decrement) if (props.value_range) |range| if (range.step) |step| if (range.context) |context| {
+        const stepped = step(context, if (action == .increment) 1 else -1);
+        self.needs_redraw = true;
+        cx_input.rebuildRuntimeIndexesIfCurrentRootDirty(self);
+        return stepped;
+    };
     const rect = node.globalRect();
     const result = switch (action) {
         .press, .toggle => self.dispatcher.dispatch(.{ .click = .{
@@ -341,7 +387,7 @@ fn buildTextClip(self: *Cx, node: *Node, viewport: ?core.ComputedRect) !TextClip
         var node_quad: ?[4]polygon_geometry.Point = null;
         if (current.style.overflow_hidden) {
             const shape = @import("interaction_semantics.zig").nodeClipShape(current);
-            if (shape == .rect or (shape == .rounded_rect and shape.rounded_rect <= 0)) {
+            if (shape == .rect or (shape == .rounded_rect and shape.rounded_rect <= 0) or (shape == .rounded_corners and @max(@max(shape.rounded_corners[0], shape.rounded_corners[1]), @max(shape.rounded_corners[2], shape.rounded_corners[3])) <= 0)) {
                 const local = current.rectFromWorldOrFallback();
                 const padding_clip = @import("render_engine/clip.zig").paddingBoxClipRect(current, .{ .x = 0, .y = 0, .w = local.w, .h = local.h });
                 const transform = retained.buildAncestorWorldTransform(current, .{ .include_rotation = true });

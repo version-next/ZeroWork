@@ -71,7 +71,7 @@ style title { color: fg-primary; font-size: 14; font-weight: 600; }
 
 | 写法 | 生成 |
 |---|---|
-| `style name { … }` | `pub const name = ui.css(.{ … });` |
+| `style name { … }` | `pub const name = ui.css(.{ … });`；`{zig}` 值里引用了主题 `t` 时见下方「读主题的普通样式」 |
 | `style name($p: T = 默认, …) { … }` | `pub const name = ui.paramStyle(struct { p: T = 默认, …, resolve });`，见「参数化样式」 |
 | `recipe Name { … }` | `pub const Name = ui.cva(.{ … });` |
 | `recipe Name slots(a, b) { … }` | `pub const Name = ui.sva(.{ .slots = .{ .a, .b }, … });`，各块里按插槽分 `a { … }` |
@@ -108,9 +108,32 @@ base ← selected ← expanded ← hover ← active ← focus ← focus-visible 
 - 名字 = token 或枚举：token 按字段的类别取引用（`bg-primary` → `ui.tokenRef(.color, "bg-primary")`），名字不存在是编译错误，报在 `.yss` 的属性行。
   `column` / `center` / `fit` / `fill` 等枚举同理；宽高的 `grow` = 撑满剩余空间。
 - 颜色：`transparent`、`#rrggbb` / `#rrggbbaa`、`rgb()` / `rgba()`（alpha 0..1）、`mix(a, b, 权重)`；`{zig 表达式}` 原样嵌入（逃生口）。
+- **读主题的普通样式**：`{zig}` 里出现裸标识符 `t`（不是字段访问 `.t`）时，它是当前主题 `*const ui.theme.Values`：
+
+  ```
+  style themed_ring { outline: {ui.Outline{ .color = t.tokens.color.accent, .width = 2, .offset = 1 }}; }
+  ```
+
+  这样的样式生成无参的主题解析器 `ui.paramStyle(struct { … }).of(.{})`（与参数化样式同一运行时，换主题重算），视图里照常写 `S.themed_ring`。
+  它经 `ui.boxFrom` 解析，只承载盒属性：**不能写 `:hover` 等条件块和 `transition`**，`.yss` 编译器在条件 / 过渡所在行报错
+  （不会静默丢弃）；交互态与过渡写进同一节点上的另一个普通 style，用元组叠加。主题色优先写 token（包括渐变端点，见下条），
+  用不到 `{t}`。
 - 简写：`padding` / `margin` 收 1 / 2（竖 横）/ 4（上 右 下 左）个值；`border: 宽 [颜色]`；`shadow: md` 或 `shadow: x y blur [spread] 颜色`，
   多层用逗号分隔（`shadow: lg, 0 32 80 #00000019;`，CSS 顺序，最多 4 层，写入 `shadows`）；
   `transition: …` 整段原文是过渡描述（可以跨行），时长可以是 duration token（`background fast ease-out`）。
+- `gradient: 起色 止色 [方向]`：线性渐变，两端是颜色（token、`#hex`、`rgb()` / `rgba()`、`mix()`、参数化样式里的 `$p`），方向是
+  `horizontal` / `vertical` / `diagonal` / `radial` / `conic`，省略时 `vertical`（同 `ui.Gradient`）。可以写在 `:hover` / `:active` / `:disabled`
+  等条件块里（各状态整份替换渐变），换主题时端点跟随：
+
+  ```
+  style primary_fill {
+    gradient: button-primary-bg accent diagonal;
+    :hover { gradient: bg-hover accent diagonal; }
+    :disabled { gradient: disabled-bg disabled-bg diagonal; }
+  }
+  ```
+
+  单个 `{zig}` 值（整份 `ui.Gradient`）照旧可用。Zig 里同样可以写 `ui.css(.{ .gradient = .{ .from = .accent, .to = .bg_primary, .direction = .diagonal } })`。
 - `icon-color`：图标着色，随变体 / 条件走。
 - 用在 `<text>` 上的 `style` 可以同时写文字属性与盒属性，自动拆分（详见 YIX_REFERENCE §3.5）；文字唯一的条件是 `:hover`。
 
@@ -145,3 +168,26 @@ style bone($variant: Variant, $width: f32) {
 
 选哪种写法：闭合的离散状态集（尤其要 `:hover`、插槽）用 `recipe`；连续 / 开放的值、直接取组件参数的值用参数化样式；
 只有 Zig 才算得出来的（例如按状态色派生的多段渐变）写 Zig 函数配 `ui.view.styleBy`，函数照搬在 `.yss` 里。
+
+## 开发构建的值重载
+
+`-Ddev-preview=true` 下，生成的普通 style / 单节点 recipe 使用保留原 API 的
+类型外壳；运行时由同一个 YSS parser 产生固定形状的 StyleIR。值更新经完整批量
+校验后发布。改变条件集合、transition、存储/box-text 能力、variant/default、依赖
+或已编译 Zig 代码会明确降级到 L3。参数化和 slot recipe 本阶段保持编译实现，
+编辑它们也会降级。未启用 dev-preview 时仍走编译期样式解析，无运行时解析器。
+协议、诊断与验收入口见 [DEV_CONTROL.md](dev/DEV_CONTROL.md#lp2-style-transactions-preview-builds-only)。
+
+### Flex basis and line alignment (LC3B)
+
+`flex-basis: auto` uses the specified main size (otherwise content);
+`flex-basis: content` measures content even when the main size is specified.
+Nonnegative pixel numbers, including `flex-basis: 0`, remain distinct. Keywords
+compile to `ui.FlexBasis.auto/content`; the reflected schema is generated with
+`zig build gen-yss-schema`, and twins with `zig build gen-yix`.
+
+`align-content: normal | stretch | start | end | center | space-between |
+space-around | space-evenly` packs wrap lines. Normal stretches lines; nowrap
+ignores this property. `align-items` / `align-self` accept `baseline` and
+`first-baseline` (CSS `first baseline`). Stretch only affects auto cross sizes,
+respects min/max, and yields to cross-axis auto margins.

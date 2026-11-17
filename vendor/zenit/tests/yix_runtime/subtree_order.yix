@@ -1,0 +1,107 @@
+//! Runtime fixture: a {for} row or an {if} / {switch} branch whose own derived values read the
+//! same signal as the list / condition (ZeroWork G21). Removing the row or unloading the branch
+//! must come first: the row's `name(vm, row.i)` with the new page and an old index is out of range.
+//! Lives outside tests/yix so it is not an LP3 equivalence input (those need reviewed goldens).
+const ui = @import("ui");
+
+pub const Vm = struct {
+    page: *ui.Signal(u8),
+    /// Selected entry of page 0, null when nothing is picked.
+    pick: *ui.Signal(?u8),
+    tab: *ui.Signal(Tab),
+};
+pub const Tab = enum { list, empty };
+pub const Item = struct { i: u8 };
+
+const page_items = [_][]const Item{
+    &.{ .{ .i = 0 }, .{ .i = 1 }, .{ .i = 2 } },
+    &.{.{ .i = 0 }},
+};
+const page_names = [_][]const []const u8{
+    &.{ "a0", "a1", "a2" },
+    &.{"b0"},
+};
+
+/// Counts reads that would have indexed past the end (the downstream code panics there).
+pub var stale_reads: u32 = 0;
+
+fn items(vm: *Vm) []const Item {
+    return page_items[vm.page.get()];
+}
+fn name(vm: *Vm, i: u8) []const u8 {
+    const names = page_names[vm.page.get()];
+    if (i >= names.len) {
+        stale_reads += 1;
+        return "stale";
+    }
+    return names[i];
+}
+fn picked(vm: *Vm) bool {
+    return vm.pick.get() != null;
+}
+fn pickedName(vm: *Vm) []const u8 {
+    const i = vm.pick.get() orelse {
+        stale_reads += 1;
+        return "stale";
+    };
+    return page_names[0][i];
+}
+fn tab(vm: *Vm) Tab {
+    return vm.tab.get();
+}
+fn firstName(vm: *Vm) []const u8 {
+    if (vm.tab.get() != .list) {
+        stale_reads += 1;
+        return "stale";
+    }
+    return page_names[0][0];
+}
+
+/// The row written inline in {for}: its text reads the page signal and the row variable.
+pub fn InlineRows(vm: *Vm) View {
+    return (
+        <col>
+            {for (items(vm)) |row| <text key={row.i}>{name(vm, row.i)}</text>}
+        </col>
+    );
+}
+
+fn Row(vm: *Vm, i: u8) View {
+    return (<text>{name(vm, i)}</text>);
+}
+
+/// The same row as a row component.
+pub fn ComponentRows(vm: *Vm) View {
+    return (
+        <col>
+            {for (items(vm)) |row| <Row key={row.i} vm={vm} i={row.i} />}
+        </col>
+    );
+}
+
+/// A row inside a row: the inner list and the inner text both read the page signal.
+pub fn NestedRows(vm: *Vm) View {
+    return (
+        <col>
+            {for (items(vm)) |row| <col key={row.i}>{for (items(vm)) |cell| <text key={cell.i}>{name(vm, cell.i)}</text>}</col>}
+        </col>
+    );
+}
+
+/// An {if} branch whose text reads the condition's signal.
+pub fn Picked(vm: *Vm) View {
+    return (
+        <col>
+            {if (picked(vm)) <text>{pickedName(vm)}</text> else <text>none</text>}
+        </col>
+    );
+}
+
+/// A {switch} branch whose text reads the switched signal.
+pub fn Tabs(vm: *Vm) View {
+    return (
+        <col>
+            {switch (tab(vm)) { .list => <text>{firstName(vm)}</text>, .empty => <text>empty</text> }}
+        </col>
+    );
+}

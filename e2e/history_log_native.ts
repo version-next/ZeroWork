@@ -1,4 +1,5 @@
 /** Focused @log replay acceptance across viewport-only and structured history frames. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,rm} from 'node:fs/promises';
@@ -36,6 +37,13 @@ async function donationVisible() {
   await visible('terminal.dots.qr');
   await waitFor(async()=> (await query('terminal.command.output')).filter(shown).map(text).join('\n').includes('支付宝扫码 · 捐献支持开发') || null);
 }
+async function waitForShellPrompt() {
+  await waitFor(async()=> {
+    const surfaces=(await query('terminal.surface')).filter(shown);
+    return surfaces.some((surface:any)=>surface.children?.some((viewport:any)=>viewport.test_id==='terminal.surface.viewport' &&
+      viewport.children?.some((row:any)=>row.test_id?.startsWith('terminal.surface.row.') && text(row).trim()==='replay%'))) || null;
+  });
+}
 try {
   await Promise.all([mkdir(rpc),mkdir(data),mkdir(shell)]);
   await writeFile(join(shell,'.zshrc'),"bindkey -e\nPS1='replay%# '\n");
@@ -51,6 +59,7 @@ try {
   const ready=join(iso,'ready');
   await type(`printf ready > ${JSON.stringify(ready)}`); await press('return');
   await waitFor(async()=> {try{return await readFile(ready,'utf8')==='ready'||null}catch{return null}});
+  await waitForShellPrompt();
   await command('log'); await visible('terminal.history.position');
   await waitFor(async()=> (await query('terminal.command.output')).filter(shown).map(text).join('\n').includes('已打开会话历史') || null);
   await waitFor(async()=> (await query('terminal.row')).filter(shown).map(text).join('\n').includes('printf ready') || null);
@@ -79,7 +88,7 @@ try {
   report.checks.push('Escape returns to the live Local PTY and shell input continues');
   report.status='passed';
 } catch (error) {
-  report.status='failed'; report.error=String(error); process.exitCode=1;
+  report.status='failed'; report.error=error instanceof Error ? error.stack ?? error.message : String(error); process.exitCode=1;
   await capture('failure').catch(()=>{});
 } finally {
   if(app && app.exitCode===null && app.signalCode===null) {

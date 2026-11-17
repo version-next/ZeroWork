@@ -143,6 +143,9 @@ pub const ShapingCache = struct {
     }
 
     pub fn deinit(self: *ShapingCache) void {
+        // Managed authoritative-width memo keys use this owner's identity.
+        // Invalidate before callbacks can reuse its address or source storage.
+        @import("text_layout.zig").invalidateMeasureCache();
         var entries = self.map.valueIterator();
         while (entries.next()) |entry| self.freeEntry(entry.*);
         var visuals = self.visual_map.valueIterator();

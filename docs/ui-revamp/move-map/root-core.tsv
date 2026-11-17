@@ -1,0 +1,377 @@
+old_path	new_path	layer	mixed	note
+src/ai_child_agent_tests.zig	src/ai/tests/ai_child_agent_tests.zig	core	no	依据 import 分布 ai:15 host:1 config:4; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_values.zig
+src/ai_conversation_commands_tests.zig	src/ai/tests/ai_conversation_commands_tests.zig	core	no	依据 import 分布 ai:3 host:1 config:2; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_values.zig
+src/ai_extensions_tests.zig	src/ai/tests/ai_extensions_tests.zig	core	no	依据 import 分布 ai:13 host:1 config:5; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_schema.zig
+src/ai_gateway_runner.zig	src/ai/acceptance/ai_gateway_runner.zig	core	no	依据 import 分布 ai:1 config:1; 构建根(build.zig:945)，搬进子目录后须经根目录多路复用根引入
+src/ai_host_catalog_tests.zig	src/ai/tests/ai_host_catalog_tests.zig	core	no	依据 import 分布 ai:10 config:2
+src/ai_image_attachment_tests.zig	src/ai/tests/ai_image_attachment_tests.zig	core	no	依据 import 分布 ai:7 host:1
+src/ai_inventory_grant_tests.zig	src/ai/tests/ai_inventory_grant_tests.zig	core	no	依据 import 分布 ai:2
+src/ai_lifecycle_backend_tests.zig	src/ai/tests/ai_lifecycle_backend_tests.zig	core	no	依据 import 分布 ai:2
+src/ai_limits_tests.zig	src/ai/tests/ai_limits_tests.zig	core	no	依据 import 分布 ai:11 host:2
+src/ai_local_text_attachment_tests.zig	src/ai/tests/ai_local_text_attachment_tests.zig	core	no	依据 import 分布 ai:3 host:1 platform:1; platform:4 为出现次数(同一 platform/realtime 重复)，唯一模块 ai 多，归 ai
+src/ai_request_budget_tests.zig	src/ai/tests/ai_request_budget_tests.zig	core	no	依据 import 分布 ai:10
+src/ai_session_patch_tests.zig	src/ai/tests/ai_session_patch_tests.zig	core	no	依据 import 分布 ai:13 host:1 platform:1 config:1
+src/ai_task_gateway_tests.zig	src/ai/tests/ai_task_gateway_tests.zig	core	no	依据 import 分布 ai:11 host:1
+src/ai_terminal_selection_tests.zig	src/host/tests/ai_terminal_selection_tests.zig	core	no	依据 import 分布 host:4 vt:4; host/vt 各 4 个 import 并列，被测对象 host/ai_terminal_selection → 归 host
+src/ai_terminal_text_attachment_tests.zig	src/ai/tests/ai_terminal_text_attachment_tests.zig	core	no	依据 import 分布 ai:5 host:1; 兄弟根文件 import: ai_local_text_attachment_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/ai_wire_history_tests.zig	src/ai/tests/ai_wire_history_tests.zig	core	no	依据 import 分布 ai:3
+src/appearance_apply_tests.zig	src/config/tests/appearance_apply_tests.zig	core	no	依据 import 分布 config:7; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig; 同时 import config/settings_controller(将进 settings)，被测对象为 config 其他文件，仍归 config
+src/appearance_font_tests.zig	src/platform/tests/appearance_font_tests.zig	core	no	依据 import 分布 platform:1 config:1 zenit_app(模块); 构建根(build.zig:668)，搬进子目录后须经根目录多路复用根引入
+src/application_environment_contract.zig	src/platform/acceptance/application_environment_contract.zig	core	no	建议：作为 platform 验收 runner 迁到 src/platform/acceptance/；它是 build.zig:961 的 exe 根，step test-app-environment，仅检查正式默认值忽略进程环境变量，与 UI 无关；也可留根改名 acceptance.zig 多路复用，但需 T1 决定；依据 import platform:2 config:2 ai:1 formal_environment(模块); 构建根(build.zig:961)，搬进子目录后须经根目录多路复用根引入
+src/application_task_domain_tests.zig	src/host/tests/application_task_domain_tests.zig	core	no	依据 import 分布 host:5 transfer:1 config:1
+src/applog_tests.zig	src/platform/tests/applog_tests.zig	core	no	依据 import 分布 platform:1
+src/asset_registry_tests.zig	src/config/tests/asset_registry_tests.zig	core	no	依据 import 分布 config:2
+src/background_asset_tests.zig	src/config/tests/background_asset_tests.zig	core	no	依据 import 分布 config:4
+src/bmc_ai_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_input_tests.zig	plugin	no	依据 import 分布 host:3 platform:1 plugins:4
+src/bmc_ai_observation_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_observation_tests.zig	plugin	no	依据 import 分布 ai:1 host:3 platform:1 plugins:4
+src/bmc_ai_tool_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_tool_tests.zig	plugin	no	依据 import 分布 ai:6 host:5 platform:1 plugins:6
+src/bmc_bootstrap_tests.zig	src/plugins/bmc_ikvm/tests/bmc_bootstrap_tests.zig	plugin	no	依据 import 分布 proto:1 host:5 plugins:9
+src/bmc_composition_tests.zig	src/plugins/bmc_ikvm/tests/bmc_composition_tests.zig	plugin	no	依据 import 分布 host:6 ui:1 plugins:6 ui(模块); 另 import ui/: plugin_content_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_connection_progress_tests.zig	src/plugins/bmc_ikvm/tests/bmc_connection_progress_tests.zig	plugin	no	依据 import 分布 host:1 plugins:3
+src/bmc_controller_tests.zig	src/plugins/bmc_ikvm/tests/bmc_controller_tests.zig	plugin	no	依据 import 分布 host:2 plugins:8
+src/bmc_credential_gc_tests.zig	src/plugins/bmc_ikvm/tests/bmc_credential_gc_tests.zig	plugin	no	依据 import 分布 config:4
+src/bmc_editor_capability_tests.zig	src/plugins/bmc_ikvm/tests/bmc_editor_capability_tests.zig	plugin	no	依据 import 分布 host:9 config:5 ui:1 ui(模块); 另 import ui/: wizard.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_editor_tests.zig	src/plugins/bmc_ikvm/tests/bmc_editor_tests.zig	plugin	no	依据 import 分布 host:7 config:5 ui:2 plugins:5 ui(模块); 另 import ui/: app_theme.zig shell_styles.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_explicit_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_explicit_input_tests.zig	plugin	no	依据 import 分布 host:2 plugins:3
+src/bmc_frame_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_frame_input_tests.zig	plugin	no	依据 import 分布 host:3 plugins:2
+src/bmc_journal_concurrency_tests.zig	src/plugins/bmc_ikvm/tests/bmc_journal_concurrency_tests.zig	plugin	no	依据 import 分布 plugins:2
+src/bmc_kvm_preview_runner.zig	src/plugins/bmc_ikvm/preview/bmc_kvm_preview_runner.zig	plugin	no	依据 import 分布 host:5 platform:2 config:2 ui:7 plugins:5 ui(模块) zenit_app(模块); 另 import ui/: app_theme.zig connection_details_view.zig layer_materials.zig local_session_styles.zig shell_styles.zig ssh_status_host.zig workspace_chrome.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:619)，搬进子目录后须经根目录多路复用根引入
+src/bmc_live_backend_tests.zig	src/plugins/bmc_ikvm/tests/bmc_live_backend_tests.zig	plugin	no	依据 import 分布 proto:1 host:3 platform:1 plugins:3; 兄弟根文件 import: bmc_native_driver_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/bmc_live_readonly_runner.zig	src/plugins/bmc_ikvm/acceptance/bmc_live_readonly_runner.zig	plugin	no	依据 import 分布 proto:2 ai:3 host:15 platform:1 config:2 ui:1 plugins:12 ui(模块) zenit_app(模块); 另 import ui/: app_theme.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:632)，搬进子目录后须经根目录多路复用根引入
+src/bmc_management_tests.zig	src/plugins/bmc_ikvm/tests/bmc_management_tests.zig	plugin	no	依据 import 分布 plugins:9
+src/bmc_native_driver_tests.zig	src/plugins/bmc_ikvm/tests/bmc_native_driver_tests.zig	plugin	no	依据 import 分布 proto:1 host:5 config:1 plugins:13
+src/bmc_plugin_probe_tests.zig	src/plugins/bmc_ikvm/tests/bmc_plugin_probe_tests.zig	plugin	no	依据 import 分布 proto:1 host:4 config:1 plugins:7
+src/bmc_plugin_runtime_tests.zig	src/plugins/bmc_ikvm/tests/bmc_plugin_runtime_tests.zig	plugin	no	依据 import 分布 ai:1 host:5 config:1 plugins:8
+src/bmc_probe_access_tests.zig	src/plugins/bmc_ikvm/tests/bmc_probe_access_tests.zig	plugin	no	依据 import 分布 host:9 config:1
+src/bmc_production_management_tests.zig	src/plugins/bmc_ikvm/tests/bmc_production_management_tests.zig	plugin	no	依据 import 分布 proto:1 host:6 plugins:6; 兄弟根文件 import: bmc_native_driver_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/bmc_redfish_compatibility_tests.zig	src/plugins/bmc_ikvm/tests/bmc_redfish_compatibility_tests.zig	plugin	no	依据 import 分布 plugins:4
+src/bmc_rfb_tests.zig	src/plugins/bmc_ikvm/tests/bmc_rfb_tests.zig	plugin	no	依据 import 分布 plugins:1
+src/bmc_security_tests.zig	src/plugins/bmc_ikvm/tests/bmc_security_tests.zig	plugin	no	依据 import 分布 host:4 config:1
+src/bmc_snapshot_copy_tests.zig	src/plugins/bmc_ikvm/tests/bmc_snapshot_copy_tests.zig	plugin	no	依据 import 分布 plugins:4
+src/bmc_tests.zig	src/tests_bmc.zig	root	no	按 §5.1 改名为 tests_bmc.zig 留根；是 test-bmc 构建根(build.zig:454)；自身含 0 个 test 块，仅 comptime 聚合 ~30 个 import；唯一 ui 依赖 ui/plugin_window_host.zig；聚合 bmc_*_tests 搬走后要改成 plugins/bmc_ikvm/tests/ 路径; 另 import ui/: plugin_window_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 兄弟根文件 import: bmc_ai_input_tests.zig bmc_ai_observation_tests.zig bmc_ai_tool_tests.zig bmc_bootstrap_tests.zig bmc_composition_tests.zig bmc_connection_progress_tests.zig bmc_controller_tests.zig bmc_credential_gc_tests.zig bmc_editor_capability_tests.zig bmc_editor_tests.zig bmc_explicit_input_tests.zig bmc_frame_input_tests.zig bmc_journal_concurrency_tests.zig bmc_live_backend_tests.zig bmc_management_tests.zig bmc_native_driver_tests.zig bmc_plugin_probe_tests.zig bmc_plugin_runtime_tests.zig bmc_probe_access_tests.zig bmc_production_management_tests.zig bmc_redfish_compatibility_tests.zig bmc_rfb_tests.zig bmc_security_tests.zig bmc_snapshot_copy_tests.zig bmc_view_tests.zig bmc_wire_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 构建根(build.zig:454)，搬进子目录后须经根目录多路复用根引入
+src/bmc_view_tests.zig	src/plugins/bmc_ikvm/tests/bmc_view_tests.zig	plugin	no	依据 import 分布 host:5 config:2 ui:4 plugins:8 ui(模块); 另 import ui/: app_theme.zig layer_materials.zig shell_styles.zig theme_states.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_wire_tests.zig	src/plugins/bmc_ikvm/tests/bmc_wire_tests.zig	plugin	no	依据 import 分布 plugins:4
+src/command_metadata_tests.zig	src/vt/tests/command_metadata_tests.zig	core	no	依据 import 分布 host:1 vt:2; 被 terminal_controller_tests 兄弟 import
+src/compaction_e2e_tests.zig	src/ai/tests/compaction_e2e_tests.zig	core	no	依据 import 分布 ai:9 config:1
+src/connection_transport_runner.zig	src/host/acceptance/connection_transport_runner.zig	core	no	依据 import 分布 proto:1 host:2 platform:1 config:1 plugins:1; 构建根(build.zig:814)，搬进子目录后须经根目录多路复用根引入; 被测 host/connection_config_resolver+transport_factory 归 host（runner 与 tests 成对）
+src/connection_transport_tests.zig	src/host/tests/connection_transport_tests.zig	core	no	依据 import 分布 host:2 config:1; 兄弟根文件 import: connection_transport_runner.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 被测 host/connection_config_resolver+transport_factory 归 host（runner 与 tests 成对）
+src/credential_store_tests.zig	src/config/tests/credential_store_tests.zig	core	no	依据 import 分布 config:5; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig; 同时 import config/settings_controller(将进 settings)，被测对象为 config 其他文件，仍归 config
+src/data_lifecycle_tests.zig	src/config/tests/data_lifecycle_tests.zig	core	no	依据 import 分布 platform:1 config:2
+src/diagnostic_export_tests.zig	src/host/tests/diagnostic_export_tests.zig	core	no	依据 import 分布 host:1
+src/engine_dispatch_tests.zig	src/transfer/tests/engine_dispatch_tests.zig	core	no	依据 import 分布 host:2 transfer:3
+src/fetch_url_tests.zig	src/ai/tests/fetch_url_tests.zig	core	no	依据 import 分布 ai:3
+src/file_binding_host_runner.zig	src/host/acceptance/file_binding_host_runner.zig	core	no	依据 import 分布 proto:1 host:4 platform:1
+src/file_binding_host_tests.zig	src/host/tests/file_binding_host_tests.zig	core	no	依据 import 分布 proto:1 host:5 platform:1 config:1
+src/file_binding_startup_tests.zig	src/host/tests/file_binding_startup_tests.zig	core	no	依据 import 分布 proto:1 host:5 platform:1; 兄弟根文件 import: file_binding_host_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/file_route_factory_runner.zig	src/host/acceptance/file_route_factory_runner.zig	core	no	依据 import 分布 proto:3 host:5 platform:1
+src/file_route_factory_tests.zig	src/host/tests/file_route_factory_tests.zig	core	no	依据 import 分布 host:1
+src/file_transfer_active_fin_native_tests.zig	src/host/tests/file_transfer_active_fin_native_tests.zig	core	no	依据 import 分布 proto:1 host:5 transfer:2 platform:1
+src/file_transfer_fault_native_tests.zig	src/host/tests/file_transfer_fault_native_tests.zig	core	no	依据 import 分布 proto:1 host:8 transfer:3 platform:1
+src/file_transfer_fault_tests.zig	src/transfer/tests/file_transfer_fault_tests.zig	core	no	依据 import 分布 proto:1 transfer:2 platform:1
+src/file_transfer_host_tests.zig	src/host/tests/file_transfer_host_tests.zig	core	no	依据 import 分布 proto:1 host:7 transfer:1 platform:1
+src/file_transfer_runtime_tests.zig	src/host/tests/file_transfer_runtime_tests.zig	core	no	依据 import 分布 proto:1 host:6 transfer:2 platform:1
+src/file_workspace_controller_tests.zig	src/host/tests/file_workspace_controller_tests.zig	core	no	依据 import 分布 proto:1 host:7 transfer:1 platform:1 ui(模块)
+src/fixed_forward_runner.zig	src/proto/ssh/acceptance/fixed_forward_runner.zig	core	no	依据 import 分布 proto:4 host:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:875)，搬进子目录后须经根目录多路复用根引入
+src/forward_load_runner.zig	src/proto/ssh/acceptance/forward_load_runner.zig	core	no	依据 import 分布 proto:4 host:2 platform:1 vt:3; 构建根(build.zig:877)，搬进子目录后须经根目录多路复用根引入; 混合 host/proto/vt
+src/host_context_tests.zig	src/host/tests/host_context_tests.zig	core	no	依据 import 分布 host:6 config:1
+src/local_adapter_tests.zig	src/local/tests/local_adapter_tests.zig	core	no	依据 import 分布 host:4 platform:2 config:3 local:3 vt:6 generated_ghostty_vt(模块); 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/local_fs_service_tests.zig	src/local/tests/local_fs_service_tests.zig	core	no	依据 import 分布 host:2 platform:1 local:1
+src/local_process_tests.zig	src/local/tests/local_process_tests.zig	core	no	依据 import 分布 host:2 local:4; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/local_trusted_edit_tests.zig	src/local/tests/local_trusted_edit_tests.zig	core	no	依据 import 分布 host:3 local:4 vt:1; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/main.zig	src/main.zig	root	no	固定留根(AGENTS/§5.1)；导入大量 ui/ 文件，路径随各 feature 搬迁在 P1 后续任务中改写；见 BUILDROOT; 另 import ui/: ai_assistant_header.zig ai_assistant_styles.zig ai_attachments_styles.zig ai_attachments_view.zig ai_card_scroll.zig ai_children_styles.zig ai_children_view.zig ai_close_confirmation_view.zig ai_composer_controls_view.zig ai_composer_interaction_view.zig ai_composer_keys.zig ai_composer_sizing.zig ai_empty_view.zig ai_execution_backend.zig ai_execution_result_view.zig ai_feedback_view.zig ai_float_gestures.zig ai_history_view.zig ai_host_approval_view.zig ai_host_catalog_controller.zig ai_host_notice_view.zig ai_host_queries.zig ai_host_secret_controller.zig ai_host_secret_view.zig ai_host_terminal_queries.zig ai_image_attachments_view.zig ai_inventory_grant_view.zig ai_lifecycle_controller.zig ai_message_view.zig ai_pane_layout.zig ai_pending_styles.zig ai_pending_view.zig ai_recording_query_access.zig ai_recovery_view.zig ai_remote_picker.zig ai_return_focus.zig ai_sessions_view.zig ai_step_group_view.zig ai_step_view.zig ai_strip_styles.zig ai_strip_view.zig ai_tail_follow.zig ai_task_finish.zig ai_text_selection.zig ai_timeline_view.zig ai_tool_approval_view.zig ai_tool_header_projection.zig ai_tool_results_styles.zig ai_tool_results_view.zig ai_tool_titles.zig ai_tools.zig ai_transcript_images.zig ai_turn_status_view.zig ai_verification_view.zig app_theme.zig application_data_cleanup_view.zig application_host.zig asset_action_view.zig asset_group_host.zig aux_window.zig background_layers.zig background_texture.zig broadcast_controller.zig broadcast_event.zig broadcast_view.zig builtin_commands.zig builtin_dispatch.zig command_help_view.zig command_history_view.zig connection_details_host.zig connection_details_view.zig connection_host.zig connection_progress_view.zig context_menu_state.zig context_menus.zig control_hint.zig copy_button.zig design.zig donation_qr.zig feedback_message.zig file_application_host.zig file_copy_view.zig file_workspace_presentation.zig file_workspace_view.zig floating_input.zig group_close_controller.zig group_model.zig history_host.zig history_styles.zig host_os_assets.zig layer_materials.zig local_close_view.zig local_status_view.zig multiwindow_test_routes.zig notification_history.zig notification_presenter.zig plugin_editor_host.zig plugin_window_host.zig probe_connection_host.zig quick_connect.zig quick_connect_icon.zig quick_connect_view.zig record_cleanup_view.zig retained_panel.zig session_export.zig session_export_jobs.zig session_icon.zig session_menu.zig session_os_cache.zig shell_styles.zig sidebar_collapsed_view.zig sidebar_model.zig sidebar_view.zig socks_application_host.zig socks_background_host.zig socks_config_view.zig socks_exposure_confirm.zig socks_info_view.zig ssh_status_host.zig startup_view.zig status_connection_extras.zig status_connection_view.zig status_controller.zig status_detail_view.zig status_hover_preview.zig status_theme_view.zig status_transfer_view.zig terminal_view.zig transfer_conflict_view.zig transfer_manager_view.zig transfer_panel.zig transfer_toolbar_view.zig wizard.zig wizard_probe.zig workspace.zig workspace_chrome.zig workspace_tab_styles.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 依赖将被 §5.2 搬进 feature 的 core 文件: ai_extensions_settings.zig ai_provider_settings.zig appearance_ui_context.zig appearance_ui_picker.zig appearance_ui_worker.zig keybinding_picker.zig settings_ai_draft.zig settings_content_view.zig settings_controller.zig settings_history.zig settings_pages.zig settings_picker.zig settings_schema.zig settings_shell.zig settings_subpages.zig settings_values.zig update/app_host.zig; 构建根(build.zig:167)，搬进子目录后须经根目录多路复用根引入
+src/model_catalog_tests.zig	src/ai/tests/model_catalog_tests.zig	core	no	依据 import 分布 ai:1
+src/network_socks_runner.zig	src/proto/ssh/acceptance/network_socks_runner.zig	core	no	依据 import 分布 proto:3 platform:1
+src/notification_coordinator_tests.zig	src/host/tests/notification_coordinator_tests.zig	core	no	依据 import 分布 host:1 config:1
+src/notification_platform_tests.zig	src/host/tests/notification_platform_tests.zig	core	no	依据 import 分布 host:4 platform:1
+src/plugin_fixture_tests.zig	src/tests_plugin_fixture.zig	root	no	按 §5.1 改名为 tests_plugin_fixture.zig 留根；是 test-plugin-fixture 构建根(build.zig:782)；自身含 7 个具名 test 加 1 个匿名 test{}（共 8 个测试体）；import 仅 plugins/fixture_probe、host、ai、config 与 ui(zenit) 模块，无 ui/ 视图; 另 import ui/: plugin_window_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:782)，搬进子目录后须经根目录多路复用根引入
+src/provider_protocol_tools_tests.zig	src/ai/tests/provider_protocol_tools_tests.zig	core	no	依据 import 分布 ai:5
+src/real_jump_validation_runner.zig	src/proto/ssh/acceptance/real_jump_validation_runner.zig	core	no	依据 import 分布 proto:3 host:1 platform:1 generated_ssh_session(模块) generated_ssh_channel(模块)
+src/record_cleanup_tests.zig	src/host/tests/record_cleanup_tests.zig	core	no	依据 import 分布 host:1 vt:1
+src/retained_transfer_store_tests.zig	src/host/tests/retained_transfer_store_tests.zig	core	no	依据 import 分布 host:6 transfer:3 platform:1
+src/root.zig	src/root.zig	root	no	固定留根(AGENTS/§5.1)；导入大量 ui/ 文件，路径随各 feature 搬迁在 P1 后续任务中改写；见 BUILDROOT; 另 import ui/: ai_execution_backend.zig ai_host_queries.zig ai_lifecycle_controller.zig ai_recording_query_access.zig ai_tools.zig application_host.zig broadcast_controller.zig builtin_commands.zig builtin_dispatch.zig command_bar.zig completion.zig completion_controller.zig completion_state.zig context_menu_effects.zig context_menu_state.zig context_menu_view.zig context_menus.zig copy_button.zig glyph_atlas.zig group_context.zig group_dispatch.zig group_model.zig history_cast.zig history_list.zig history_replay.zig host_key_confirmation.zig local_command_state.zig overlay_anchor.zig overlay_model.zig pane_manager.zig pane_worker_registry.zig paste_policy.zig quick_connect.zig reconnect_bridge.zig session_reconnect_policy.zig session_tombstone.zig session_tombstone_view.zig shortcut_dispatch.zig shortcut_router.zig sidebar_model.zig status_controller.zig tab_strip_layout.zig terminal_export.zig terminal_selection.zig theme.zig timestamp_gutter.zig workspace_model.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 兄弟根文件 import: ai_attached_service_tests.zig ai_child_agent_tests.zig ai_conversation_commands_tests.zig ai_extensions_tests.zig ai_host_catalog_tests.zig ai_inventory_grant_tests.zig ai_limits_tests.zig ai_local_text_attachment_tests.zig ai_request_budget_tests.zig ai_session_patch_tests.zig ai_task_gateway_tests.zig asset_actions_tests.zig bmc_ai_tool_tests.zig bmc_tests.zig connection_transport_tests.zig credential_store_tests.zig data_lifecycle_tests.zig diagnostic_export_tests.zig file_transfer_active_fin_native_tests.zig file_transfer_fault_native_tests.zig file_transfer_fault_tests.zig host_context_tests.zig host_recording_queries_tests.zig host_secret_store_tests.zig host_terminal_queries_tests.zig notification_coordinator_tests.zig notification_platform_tests.zig retained_transfer_store_tests.zig session_export_tests.zig session_host_auxiliary_tests.zig session_host_background_tests.zig session_host_retained_tests.zig settings_quiet_hours_tests.zig sftp_directory_recovery_tests.zig socks_route_host_tests.zig ssh_totp_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_model.zig settings_pages.zig settings_schema.zig settings_values.zig settings_view.zig; 构建根(build.zig:41)，搬进子目录后须经根目录多路复用根引入
+src/service_model_catalog_tests.zig	src/ai/tests/service_model_catalog_tests.zig	core	no	依据 import 分布 ai:1
+src/session_host_auxiliary_tests.zig	src/host/tests/session_host_auxiliary_tests.zig	core	no	依据 import 分布 host:3
+src/session_host_background_tests.zig	src/host/tests/session_host_background_tests.zig	core	no	依据 import 分布 host:4
+src/session_host_retained_tests.zig	src/host/tests/session_host_retained_tests.zig	core	no	依据 import 分布 host:2
+src/sftp_directory_recovery_tests.zig	src/host/tests/sftp_directory_recovery_tests.zig	core	no	依据 import 分布 proto:1 host:6 platform:1
+src/sftp_engine_worker_tests.zig	src/transfer/tests/sftp_engine_worker_tests.zig	core	no	依据 import 分布 transfer:1
+src/sftp_readonly_runner.zig	src/proto/ssh/acceptance/sftp_readonly_runner.zig	core	no	依据 import 分布 proto:2 host:1 platform:1 generated_ssh_session(模块)
+src/sftp_readonly_tests.zig	src/proto/ssh/tests/sftp_readonly_tests.zig	core	no	依据 import 分布 proto:1
+src/sftp_resume_native_tests.zig	src/transfer/tests/sftp_resume_native_tests.zig	core	no	依据 import 分布 proto:1 transfer:2 platform:1
+src/shared_forward_runner.zig	src/proto/ssh/acceptance/shared_forward_runner.zig	core	no	依据 import 分布 proto:3 host:2 platform:1 generated_ssh_session(模块)
+src/shared_readonly_native_tests.zig	src/proto/ssh/tests/shared_readonly_native_tests.zig	core	no	依据 import 分布 proto:4 host:1 transfer:1 platform:1 vt:3
+src/shared_transfer_native_tests.zig	src/proto/ssh/tests/shared_transfer_native_tests.zig	core	no	依据 import 分布 proto:2 host:1 transfer:1 platform:1 vt:3
+src/socks_background_runtime_runner.zig	src/host/acceptance/socks_background_runtime_runner.zig	core	no	依据 import 分布 proto:1 host:4 platform:1
+src/socks_route_host_runner.zig	src/host/acceptance/socks_route_host_runner.zig	core	no	依据 import 分布 proto:1 host:3 platform:1
+src/socks_route_host_tests.zig	src/host/tests/socks_route_host_tests.zig	core	no	依据 import 分布 proto:2 host:3 config:1
+src/socks_worker_host_runner.zig	src/host/acceptance/socks_worker_host_runner.zig	core	no	依据 import 分布 proto:3 host:3 transfer:1 platform:1 vt:3; 构建根(build.zig:876)，搬进子目录后须经根目录多路复用根引入; 混合 host/proto/vt
+src/ssh_auth_challenge_tests.zig	src/proto/ssh/tests/ssh_auth_challenge_tests.zig	core	no	依据 import 分布 proto:2 platform:1
+src/ssh_auth_flow_tests.zig	src/proto/ssh/tests/ssh_auth_flow_tests.zig	core	no	依据 import 分布 proto:3
+src/ssh_auth_loopback_runner.zig	src/proto/ssh/acceptance/ssh_auth_loopback_runner.zig	core	no	依据 import 分布 proto:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:838)，搬进子目录后须经根目录多路复用根引入
+src/ssh_auth_native_tests.zig	src/proto/ssh/tests/ssh_auth_native_tests.zig	core	no	依据 import 分布 proto:1
+src/ssh_bootstrap_protocol_tests.zig	src/host/tests/ssh_bootstrap_protocol_tests.zig	core	no	依据 import 分布 host:2 local:1; 被测 host/trusted_edit + local/execution，归 host
+src/ssh_bootstrap_runner.zig	src/host/acceptance/ssh_bootstrap_runner.zig	core	no	依据 import 分布 proto:2 host:3 platform:1 vt:2; 构建根(build.zig:873)，搬进子目录后须经根目录多路复用根引入
+src/ssh_connection_wait_runner.zig	src/proto/ssh/acceptance/ssh_connection_wait_runner.zig	core	no	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块); 构建根(build.zig:836)，搬进子目录后须经根目录多路复用根引入
+src/ssh_connection_wait_tests.zig	src/proto/ssh/tests/ssh_connection_wait_tests.zig	core	no	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块)
+src/ssh_exec_service_runner.zig	src/proto/ssh/acceptance/ssh_exec_service_runner.zig	core	no	依据 import 分布 proto:2 ai:1 host:3 platform:2 generated_ssh_session(模块); 构建根(build.zig:839)，搬进子目录后须经根目录多路复用根引入; 被测核心 proto/ssh/exec_bridge，故归 proto/ssh
+src/ssh_exec_service_tests.zig	src/proto/ssh/tests/ssh_exec_service_tests.zig	core	no	依据 import 分布 proto:2 ai:1 host:3 transfer:1; 被测核心 proto/ssh/exec_bridge，故归 proto/ssh
+src/ssh_execution_recording_tests.zig	src/vt/tests/ssh_execution_recording_tests.zig	core	no	依据 import 分布 host:1 vt:5
+src/ssh_hardening_runner.zig	src/proto/ssh/acceptance/ssh_hardening_runner.zig	core	no	依据 import 分布 proto:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:837)，搬进子目录后须经根目录多路复用根引入
+src/ssh_known_hosts_tests.zig	src/proto/ssh/tests/ssh_known_hosts_tests.zig	core	no	依据 import 分布 proto:1
+src/ssh_release_receipt_runner.zig	src/proto/ssh/acceptance/ssh_release_receipt_runner.zig	core	no	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块)
+src/ssh_release_receipt_tests.zig	src/proto/ssh/tests/ssh_release_receipt_tests.zig	core	no	依据 import 分布 proto:1 generated_ssh_session(模块)
+src/ssh_session_smoke.zig	src/proto/ssh/acceptance/ssh_session_smoke.zig	core	no	依据 import 分布 proto:1
+src/ssh_shell_end_runner.zig	src/vt/acceptance/ssh_shell_end_runner.zig	core	no	依据 import 分布 proto:1 host:1 platform:1 vt:4
+src/ssh_shell_end_tests.zig	src/vt/tests/ssh_shell_end_tests.zig	core	no	依据 import 分布 vt:2
+src/ssh_totp_tests.zig	src/proto/ssh/tests/ssh_totp_tests.zig	core	no	依据 import 分布 proto:1
+src/ssh_vm_smoke_runner.zig	src/proto/ssh/acceptance/ssh_vm_smoke_runner.zig	core	no	依据 import 分布 proto:3 host:1 platform:1 generated_ssh_session(模块)
+src/terminal_controller_tests.zig	src/vt/tests/terminal_controller_tests.zig	core	no	依据 import 分布 proto:1 host:2 vt:10 generated_ghostty_vt(模块); 兄弟根文件 import: command_metadata_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/terminal_search_service_tests.zig	src/vt/tests/terminal_search_service_tests.zig	core	no	依据 import 分布 host:1 vt:5
+src/theme_installation_tests.zig	src/config/tests/theme_installation_tests.zig	core	no	依据 import 分布 config:3
+src/transfer_conflict_tests.zig	src/transfer/tests/transfer_conflict_tests.zig	core	no	依据 import 分布 host:1 transfer:1
+src/transfer_engine_mux_tests.zig	src/transfer/tests/transfer_engine_mux_tests.zig	core	no	依据 import 分布 proto:1 host:2 transfer:4 platform:1
+src/update_tests.zig	src/update/tests/update_tests.zig	core	no	依据 import 分布 config:4 update:4; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_pages.zig settings_schema.zig settings_values.zig; 构建根(build.zig:234)，搬进子目录后须经根目录多路复用根引入; 含 config/settings_* 依赖(将进 settings)，被测对象 update/*
+src/vt_conformance_runner.zig	src/vt/acceptance/vt_conformance_runner.zig	core	no	依据 import 分布 vt:1; 构建根(build.zig:106)，搬进子目录后须经根目录多路复用根引入
+# CONTESTED 说明：下列 4 个不 import ui/ 的文件拿不准，未认领（已计入全量划分，不在上表）
+# CONTESTED src/appearance_ui_worker_tests.zig settings 被测 config/appearance_ui_worker 属 §5.2 appearance_ui_*→settings；本身不 import ui/；若 settings 包认领其被测文件，则测试应随去 settings/tests，建议由主 agent 裁决(备选 core:src/config/tests/)
+# CONTESTED src/config_transaction_tests.zig settings import 的 config/settings_controller|settings_schema|settings_view|plugin_page 均属 settings 范畴(§5.2)；无 ui/ import；备选 core:src/config/tests/
+# CONTESTED src/settings_field_lifecycle_tests.zig settings 只 import config/settings_controller|settings_schema|settings_values 等；无 ui/ import；备选 core:src/config/tests/
+# CONTESTED src/settings_quiet_hours_tests.zig settings 只 import config/settings_controller|settings_schema|runtime_config；无 ui/ import；备选 core:src/config/tests/
+# UI-NOTE 说明：下列文件已有 # UI 行，仅对 feature 判断或最终归属另作提示（不是 CONTESTED）
+# UI-NOTE src/appearance_tests.zig settings 是 test-appearance 构建根(build.zig:679)，聚合本包的 appearance_apply_tests/background_asset_tests/theme_installation_tests 与 appearance_ui_worker_tests；还 import ui/startup_transition(shell)；按 §5.1 应变为 src/tests_appearance.zig 留根
+# UI-NOTE src/notification_read_view_tests.zig terminal 名字像 notifications，但只 import ui/terminal_surface 与 terminal_view(+vt/ghostty_adapter)；归 terminal 或 notifications 待定
+# UI-NOTE src/session_export_tests.zig terminal import ui/session_export 与 ui/terminal_export(+vt/session_archive)；§5.2 session_*→workspace 与 terminal_export 冲突
+# UI-NOTE src/sftp_adapter_tests.zig host 仅 ui 依赖为 ui/session_lifecycle(§5.2 将下沉 host/)；被测对象 host/sftp_adapter；下沉后应为 core:src/host/tests/
+# UI-NOTE src/asset_actions_tests.zig connections 仅 ui 依赖为 ui/session_lifecycle(将下沉 host/)；名字属 asset_*→connections，若 session_lifecycle 下沉后则可能属 host/tests
+# UI-NOTE src/transfer_panel_tests.zig shared-ui 是 test-ui 构建根(build.zig:735)，import 约 30 个跨 feature ui 文件，按 §5.1 接替为 src/tests_ui.zig 聚合根；建议主 agent 直接指定为 root
+# UI-NOTE src/ssh_request_counter_tests.zig connections 只 import ui/host_key_confirmation(connections) 与 proto/ssh/auth_challenge、兄弟 ssh_auth_challenge_tests.zig(归本包 proto/ssh/tests)
+# UI src/ai_attached_service_tests.zig ai
+# UI src/ai_attachments_view_tests.zig ai
+# UI src/ai_children_view_tests.zig ai
+# UI src/ai_close_confirmation_preview_runner.zig ai
+# UI src/ai_close_confirmation_view_tests.zig ai
+# UI src/ai_composer_controls_view_tests.zig ai
+# UI src/ai_composer_input_tests.zig ai
+# UI src/ai_composer_interaction_view_tests.zig ai
+# UI src/ai_conversation_input_view_tests.zig ai
+# UI src/ai_conversation_tests.zig ai
+# UI src/ai_empty_recent_preview_runner.zig ai
+# UI src/ai_empty_recent_view_tests.zig ai
+# UI src/ai_feedback_view_tests.zig ai
+# UI src/ai_file_tool_result_tests.zig ai
+# UI src/ai_float_gestures_tests.zig ai
+# UI src/ai_image_attachment_view_tests.zig ai
+# UI src/ai_inventory_grant_view_tests.zig ai
+# UI src/ai_local_tools_tests.zig ai
+# UI src/ai_message_alignment_tests.zig ai
+# UI src/ai_panel_visibility_tests.zig ai
+# UI src/ai_provider_settings_tests.zig settings
+# UI src/ai_recovery_preview_runner.zig ai
+# UI src/ai_recovery_view_tests.zig ai
+# UI src/ai_remote_file_snapshot_runner.zig ai
+# UI src/ai_remote_file_snapshot_tests.zig ai
+# UI src/ai_remote_picker_view_tests.zig ai
+# UI src/ai_ssh_tools_tests.zig ai
+# UI src/ai_tail_follow_tests.zig ai
+# UI src/ai_tool_approval_view_tests.zig ai
+# UI src/ai_tool_results_view_tests.zig ai
+# UI src/ai_vt_attachment_view_tests.zig ai
+# UI src/appearance_tests.zig settings
+# UI src/application_data_cleanup_ui_tests.zig settings
+# UI src/asset_action_view_tests.zig connections
+# UI src/asset_actions_tests.zig connections
+# UI src/asset_group_host_tests.zig connections
+# UI src/auth_challenge_native_fixture.zig connections
+# UI src/auth_challenge_view_tests.zig connections
+# UI src/auxiliary_appearance_tests.zig shared-ui
+# UI src/background_surface_tests.zig shell
+# UI src/broadcast_view_tests.zig workspace
+# UI src/builtin_records_tests.zig history
+# UI src/button_policy_preview_runner.zig shared-ui
+# UI src/button_policy_tests.zig shared-ui
+# UI src/chrome_policy_tests.zig shared-ui
+# UI src/command_error_hint_tests.zig terminal
+# UI src/composer_interaction_preview_runner.zig ai
+# UI src/connection_details_view_tests.zig connections
+# UI src/connection_host_tests.zig connections
+# UI src/connection_logs_view_tests.zig connections
+# UI src/connection_progress_preview_runner.zig connections
+# UI src/connection_progress_view_tests.zig connections
+# UI src/execution_result_preview_runner.zig ai
+# UI src/file_application_host_tests.zig files
+# UI src/file_authentication_tests.zig files
+# UI src/file_mkdir_view_tests.zig files
+# UI src/file_workspace_native_fixture.zig files
+# UI src/file_workspace_presentation_tests.zig files
+# UI src/file_workspace_view_tests.zig files
+# UI src/floating_input_tests.zig files
+# UI src/forward_config_preview_runner.zig connections
+# UI src/fullscreen_titlebar_tests.zig shell
+# UI src/group_close_controller_tests.zig workspace
+# UI src/host_approval_preview_runner.zig ai
+# UI src/host_recording_queries_tests.zig ai
+# UI src/host_secret_store_tests.zig ai
+# UI src/host_terminal_queries_tests.zig ai
+# UI src/incremental_ui_tests.zig ai
+# UI src/inventory_grant_preview_runner.zig ai
+# UI src/keybinding_recorder_tests.zig settings
+# UI src/keybinding_tests.zig settings
+# UI src/material_performance_tests.zig shared-ui
+# UI src/material_popup_tests.zig shared-ui
+# UI src/notification_presenter_controls_tests.zig notifications
+# UI src/notification_preview_runner.zig notifications
+# UI src/notification_read_view_tests.zig terminal
+# UI src/plugin_settings_v3_tests.zig settings
+# UI src/quick_connect_view_tests.zig connections
+# UI src/record_cleanup_ui_tests.zig history
+# UI src/recording_access_tests.zig ai
+# UI src/remaining_ui_tests.zig ai
+# UI src/session_export_tests.zig terminal
+# UI src/session_menu_tests.zig workspace
+# UI src/settings_content_tests.zig settings
+# UI src/settings_notification_permission_view_tests.zig settings
+# UI src/settings_picker_tests.zig settings
+# UI src/settings_preview_runner.zig settings
+# UI src/settings_runtime_consumer_tests.zig settings
+# UI src/settings_search_alias_tests.zig settings
+# UI src/settings_transfer_budget_tests.zig settings
+# UI src/settings_transfer_defaults_tests.zig settings
+# UI src/sftp_adapter_tests.zig files
+# UI src/sidebar_view_tests.zig shell
+# UI src/socks_background_ui_tests.zig connections
+# UI src/socks_config_view_tests.zig connections
+# UI src/socks_info_preview_runner.zig connections
+# UI src/socks_info_theme_tests.zig connections
+# UI src/socks_info_view_tests.zig connections
+# UI src/ssh_connection_details_runner.zig connections
+# UI src/ssh_connection_details_tests.zig connections
+# UI src/ssh_disconnect_runner.zig workspace
+# UI src/ssh_probe_loopback_runner.zig connections
+# UI src/ssh_reconnect_loopback_runner.zig workspace
+# UI src/ssh_reconnect_tests.zig workspace
+# UI src/ssh_request_counter_tests.zig connections
+# UI src/ssh_resource_ledger_tests.zig connections
+# UI src/ssh_shared_connection_runner.zig workspace
+# UI src/ssh_shell_execution_runner.zig terminal
+# UI src/ssh_status_host_tests.zig shell
+# UI src/ssh_terminal_service_tests.zig terminal
+# UI src/ssh_terminal_status_tests.zig terminal
+# UI src/status_connection_view_tests.zig shell
+# UI src/status_controller_tests.zig shell
+# UI src/status_detail_tests.zig shell
+# UI src/task_finish_preview_runner.zig ai
+# UI src/terminal_execution_tests.zig terminal
+# UI src/terminal_focus_local_tests.zig terminal
+# UI src/terminal_overlay_theme_tests.zig terminal
+# UI src/terminal_search_tests.zig terminal
+# UI src/terminal_search_theme_tests.zig terminal
+# UI src/terminal_surface_tests.zig terminal
+# UI src/theme_layer_tests.zig shared-ui
+# UI src/totp_autofill_tests.zig connections
+# UI src/transfer_confirmation_view_tests.zig transfer
+# UI src/transfer_conflict_native_fixture.zig transfer
+# UI src/transfer_conflict_view_tests.zig transfer
+# UI src/transfer_controls_preview_runner.zig transfer
+# UI src/transfer_events_native_fixture.zig transfer
+# UI src/transfer_manager_view_tests.zig transfer
+# UI src/transfer_panel_tests.zig shared-ui
+# UI src/trusted_completion_ui_tests.zig terminal
+# UI src/ui_constraint_tests.zig shared-ui
+# UI src/ui_theme_test_support.zig shared-ui
+# UI src/wizard_probe_tests.zig connections
+# UI src/wizard_test_progress_tests.zig connections
+# UI src/wizard_tests.zig connections
+# E2E README.md 引用了 src/applog_tests.zig
+# E2E README.md 引用了 src/ssh_session_smoke.zig
+# E2E README.zh-CN.md 引用了 src/ssh_session_smoke.zig
+# E2E build.zig 引用了 src/ai_gateway_runner.zig
+# E2E build.zig 引用了 src/appearance_font_tests.zig
+# E2E build.zig 引用了 src/application_environment_contract.zig
+# E2E build.zig 引用了 src/bmc_kvm_preview_runner.zig
+# E2E build.zig 引用了 src/bmc_live_readonly_runner.zig
+# E2E build.zig 引用了 src/bmc_tests.zig
+# E2E build.zig 引用了 src/connection_transport_runner.zig
+# E2E build.zig 引用了 src/fixed_forward_runner.zig
+# E2E build.zig 引用了 src/forward_load_runner.zig
+# E2E build.zig 引用了 src/local_adapter_tests.zig
+# E2E build.zig 引用了 src/local_process_tests.zig
+# E2E build.zig 引用了 src/local_trusted_edit_tests.zig
+# E2E build.zig 引用了 src/main.zig
+# E2E build.zig 引用了 src/plugin_fixture_tests.zig
+# E2E build.zig 引用了 src/root.zig
+# E2E build.zig 引用了 src/socks_worker_host_runner.zig
+# E2E build.zig 引用了 src/ssh_auth_loopback_runner.zig
+# E2E build.zig 引用了 src/ssh_bootstrap_runner.zig
+# E2E build.zig 引用了 src/ssh_connection_wait_runner.zig
+# E2E build.zig 引用了 src/ssh_exec_service_runner.zig
+# E2E build.zig 引用了 src/ssh_hardening_runner.zig
+# E2E build.zig 引用了 src/terminal_controller_tests.zig
+# E2E build.zig 引用了 src/update_tests.zig
+# E2E build.zig 引用了 src/vt_conformance_runner.zig
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/main.zig
+# E2E docs/DESIGN/V0.1.4_SFTP_TRANSFERS.md 引用了 src/main.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/main.zig
+# E2E docs/DESIGN/V0.3_MENU_BAR_ACTIVITY.md 引用了 src/main.zig
+# E2E docs/DESIGN/V0.4_AI_AGENT_CLUSTER.md 引用了 src/main.zig
+# E2E docs/SPEC/OVERALL_ARCHITECTURE.md 引用了 src/main.zig
+# E2E e2e/ai_context_compaction.py 引用了 src/compaction_e2e_tests.zig
+# E2E e2e/ssh_auth_loopback.py 引用了 src/ssh_auth_loopback_runner.zig
+# E2E e2e/ssh_raw_diagnostic_production_native.ts 引用了 src/main.zig
+# E2E e2e/tab_shortcuts.ts 引用了 src/main.zig
+# E2E e2e/v02_grok_gateway.py 引用了 src/ai_gateway_runner.zig
+# E2E e2e/workspace.ts 引用了 src/main.zig
+# E2E scripts/build_ui_check.sh 引用了 src/main.zig
+# E2E scripts/ui_acceptance.py 引用了 src/main.zig
+# TESTID fixture.*（plugin_fixture 夹具：fixture.window / fixture.shell.* / fixture.shared_pane / fixture.content_slot，在 bmc_*_tests 与 plugin_fixture_tests 中）
+# TESTID bmc.*（bmc_view_tests / bmc_editor_tests，属 plugin:bmc_ikvm，不归任何 UI feature）
+# TESTID live.*（bmc_live_readonly_runner 的 live.window / live.content_slot）
+# BUILDROOT src/root.zig 41 core模块根(zerowork)；417 另作 test-root(zig build test，单元聚合根) [归属:root-core]
+# BUILDROOT src/vt_conformance_runner.zig 106 vt-perf [归属:root-core]
+# BUILDROOT src/main.zig 167 zerowork(exe 根) [归属:root-core]
+# BUILDROOT src/update_tests.zig 234 test-update [归属:root-core]
+# BUILDROOT src/settings_preview_runner.zig 345 settings-preview [归属:UI包]
+# BUILDROOT src/file_workspace_native_fixture.zig 357 file-workspace-preview [归属:UI包]
+# BUILDROOT src/auth_challenge_native_fixture.zig 367 auth-challenge-preview [归属:UI包]
+# BUILDROOT src/connection_progress_preview_runner.zig 375 connection-progress-preview [归属:UI包]
+# BUILDROOT src/transfer_events_native_fixture.zig 384 transfer-events-preview [归属:UI包]
+# BUILDROOT src/transfer_conflict_native_fixture.zig 392 transfer-conflict-preview [归属:UI包]
+# BUILDROOT src/transfer_controls_preview_runner.zig 400 transfer-controls-preview [归属:UI包]
+# BUILDROOT src/bmc_tests.zig 454 test-bmc [归属:root-core]
+# BUILDROOT src/local_process_tests.zig 546 test-local(数组项) [归属:root-core]
+# BUILDROOT src/terminal_controller_tests.zig 546 test-local(数组项) [归属:root-core]
+# BUILDROOT src/local_adapter_tests.zig 546 test-local+test-local-adapter(数组项) [归属:root-core]
+# BUILDROOT src/local_trusted_edit_tests.zig 546 test-local+test-trusted-edit(数组项) [归属:root-core]
+# BUILDROOT src/terminal_execution_tests.zig 546 test-local+test-terminal-execution(数组项) [归属:UI包]
+# BUILDROOT src/notification_preview_runner.zig 610 test-notification-preview [归属:UI包]
+# BUILDROOT src/bmc_kvm_preview_runner.zig 619 bmc-kvm-preview [归属:root-core]
+# BUILDROOT src/bmc_live_readonly_runner.zig 632 bmc-live-readonly [归属:root-core]
+# BUILDROOT src/host_approval_preview_runner.zig 651 host-approval-preview(数组项) [归属:UI包]
+# BUILDROOT src/task_finish_preview_runner.zig 651 task-finish-preview(数组项) [归属:UI包]
+# BUILDROOT src/execution_result_preview_runner.zig 651 execution-result-preview(数组项) [归属:UI包]
+# BUILDROOT src/inventory_grant_preview_runner.zig 651 inventory-grant-preview(数组项) [归属:UI包]
+# BUILDROOT src/ai_close_confirmation_preview_runner.zig 651 close-confirmation-preview(数组项) [归属:UI包]
+# BUILDROOT src/ai_empty_recent_preview_runner.zig 651 ai-empty-recent-preview(数组项) [归属:UI包]
+# BUILDROOT src/ai_recovery_preview_runner.zig 651 ai-recovery-preview(数组项) [归属:UI包]
+# BUILDROOT src/composer_interaction_preview_runner.zig 651 composer-interaction-preview(数组项) [归属:UI包]
+# BUILDROOT src/button_policy_preview_runner.zig 651 button-policy-preview(数组项) [归属:UI包]
+# BUILDROOT src/appearance_font_tests.zig 668 test-font [归属:root-core]
+# BUILDROOT src/appearance_tests.zig 679 test-appearance [归属:UI包]
+# BUILDROOT src/transfer_panel_tests.zig 735 test-ui [归属:UI包]
+# BUILDROOT src/plugin_fixture_tests.zig 782 test-plugin-fixture [归属:root-core]
+# BUILDROOT src/connection_transport_runner.zig 814 transport-acceptance [归属:root-core]
+# BUILDROOT src/ssh_connection_wait_runner.zig 836 ssh-hardening-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_hardening_runner.zig 837 ssh-hardening-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_auth_loopback_runner.zig 838 ssh-hardening-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_exec_service_runner.zig 839 ssh-hardening-acceptance+ssh-exec-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_disconnect_runner.zig 872 forward-acceptance+ssh-disconnect-acceptance(数组项) [归属:UI包]
+# BUILDROOT src/ssh_bootstrap_runner.zig 873 forward-acceptance+ssh-bootstrap-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_shell_execution_runner.zig 874 forward-acceptance+ssh-shell-execution-acceptance(数组项) [归属:UI包]
+# BUILDROOT src/fixed_forward_runner.zig 875 forward-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/socks_worker_host_runner.zig 876 forward-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/forward_load_runner.zig 877 forward-acceptance(数组项) [归属:root-core]
+# BUILDROOT src/ssh_connection_details_runner.zig 878 forward-acceptance(数组项) [归属:UI包]
+# BUILDROOT src/ssh_reconnect_loopback_runner.zig 879 forward-acceptance+reconnect-acceptance(数组项) [归属:UI包]
+# BUILDROOT src/ssh_shared_connection_runner.zig 880 forward-acceptance+shared-connection-acceptance(数组项) [归属:UI包]
+# BUILDROOT src/forward_config_preview_runner.zig 924 forward-config-preview [归属:UI包]
+# BUILDROOT src/ai_gateway_runner.zig 945 test-ai-gateway [归属:root-core]
+# BUILDROOT src/application_environment_contract.zig 961 test-app-environment [归属:root-core]

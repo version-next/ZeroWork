@@ -442,7 +442,7 @@ fn freeze(challenge: AuthChallenge, identity: RequestIdentity, now: i128) !Snaps
         .session => |owner| @backingInt(owner.session_id) != 0 and owner.generation != 0,
         .asset => |owner| @backingInt(owner.id) != 0 and owner.revision != 0,
         .group => |owner| @backingInt(owner.id) != 0 and owner.revision != 0,
-        .history => |owner| @backingInt(owner) != 0,
+        .card => |owner| owner.valid(),
         .transfer_owner => |owner| @backingInt(owner.id) != 0 and @backingInt(owner.original_handle.session_id) != 0 and owner.original_handle.generation != 0,
     };
     if (!valid_owner) return error.InvalidChallengeIdentity;

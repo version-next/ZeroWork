@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "../automation_environment.h"
 #include <d3d11.h>
 #include <d2d1_1.h>
 #include <initguid.h>
@@ -399,7 +400,7 @@ extern "C" void *zenit_d2d_retained_begin(void *device, ID2D1RenderTarget **targ
     D2D1_RECT_F dirty={INFINITY,INFINITY,-INFINITY,-INFINITY};
     if (matches && entry->hash==info->hash) s->retained_mode=1;
     else if (matches && entry->count && info->safe && info->count &&
-        !GetEnvironmentVariableW(L"ZENIT_DISABLE_PARTIAL_REPAINT",nullptr,0)) {
+        !zenitAutomationEnvironmentW(L"ZENIT_DISABLE_PARTIAL_REPAINT",nullptr,0)) {
         unsigned n=entry->count>info->count ? entry->count : info->count;
         for (unsigned i=0;i<n;++i) {
             if (i<entry->count && i<info->count && entry->damage[i].digest==info->damage[i].digest &&

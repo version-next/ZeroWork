@@ -1,0 +1,16 @@
+//! V-1：子目录里的 Yix 组件，用 `../` 引用上层目录的 Zig 与 Yss（同一模块内，模块根是
+//! tools/mockups/yix_spike.zig 所在目录 tools/mockups/）。
+const ui = @import("ui");
+const S = @import("../styles.yss");
+const m = @import("../vm.zig");
+
+fn countOf(vm: *m.ViewModel) i32 { return vm.count.get(); }
+
+pub fn CountRow(vm: *m.ViewModel, label: []const u8 = "") View {
+    return (
+        <row testId="spike.v1.row" style={S.section_row}>
+            <text style={S.body_text}>{label}</text>
+            <text testId="spike.v1.count" style={S.body_text}>{countOf(vm)}</text>
+        </row>
+    );
+}

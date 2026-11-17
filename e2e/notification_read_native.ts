@@ -12,6 +12,8 @@
  * The runner never changes production metadata, calls domain backdoors, or
  * requests OS authorization. All system-event preferences and Bell are false.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -243,7 +245,7 @@ async function assertNoSystemEffects(): Promise<void> {
 }
 async function reads(session: Session): Promise<any[]> { return (await trace()).filter(value => value.prefix === "NOTIFICATION_READ" && value.owner_id_text === session.session_id); }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap(line => { const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return m ? [{ pid: Number(m[1]), parent: Number(m[2]), command: m[3] }] : []; });
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap(line => { const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return m ? [{ pid: Number(m[1]), parent: Number(m[2]), command: m[3] }] : []; });
   const owned = new Set([app.pid!]);
   for (let i = 0; i < all.length; i++) { let changed = false; for (const value of all) if (owned.has(value.parent) && !owned.has(value.pid)) { owned.add(value.pid); changed = true; } if (!changed) break; }
   return all.filter(value => value.pid !== app.pid && owned.has(value.pid));
@@ -323,7 +325,8 @@ async function createSession(label: string, previous: string[]): Promise<Session
   const owned = descendants();
   for (const pid of [Number(shellPid), Number(producerPid)]) assert(owned.some(value => value.pid === pid && value.command.endsWith("/zsh")), "Only app-owned real ZSH PIDs are used");
   await waitFor(async () => (await currentSurfaceText()).includes(seed) || null, 15000);
-  await click("local.status.identity");
+  // title-click: the session card opens from the tab menu's “会话连接” (no hover card on the tab).
+  { const identity = await visible("local.status.identity"); assert((await clickAt(identity.rect.x + identity.rect.w / 2, identity.rect.y + identity.rect.h / 2, 1, "right")).ok); await click("context.menu.session_identity"); }
   const id = await waitFor(async () => text(await visible("status.detail")).match(/会话 #(\d+)/)?.[1] ?? null, 10000);
   await click("status.detail.close");
   const session = { label, tab, session_id: id, focus_id: input.id, input_rect: input.rect, surface_id: surface.id, shell_pid: Number(shellPid), producer_pid: Number(producerPid), spool, stop, seed };

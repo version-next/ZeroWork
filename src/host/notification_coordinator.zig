@@ -312,6 +312,17 @@ pub const Coordinator = struct {
         self.dequeue(removed.fact_id);
         removed.arena.deinit();
     }
+    /// 清除这些已结束的记录（“清除已结束”的撤销窗口结束时）：之后又变成待处理的、已不在的照常跳过。
+    pub fn clearHistoryFacts(self: *Coordinator, fact_ids: []const u64) void {
+        var index = self.notification_records.items.len;
+        while (index > 0) {
+            index -= 1;
+            const record = self.notification_records.items[index];
+            if (std.mem.indexOfScalar(u64, fact_ids, record.fact_id) == null) continue;
+            if (!self.incidentPending(record)) self.removeHistoryAt(index);
+        }
+        self.history_revision +|= 1;
+    }
     pub fn clearHistory(self: *Coordinator) void {
         var index = self.notification_records.items.len;
         while (index > 0) {
@@ -411,6 +422,15 @@ pub const Coordinator = struct {
     pub fn dismissNotification(self: *Coordinator, fact_id: u64) void {
         for (self.notification_records.items) |*record| if (record.fact_id == fact_id) {
             record.presentation = .hidden;
+            break;
+        };
+        self.dequeue(fact_id);
+    }
+    /// The banner's own timer ran out (the window's native notification stack owns the countdown
+    /// while it shows the fact): same as the coordinator's expiry — the fact stays in history.
+    pub fn expireNotification(self: *Coordinator, fact_id: u64) void {
+        for (self.notification_records.items) |*record| if (record.fact_id == fact_id) {
+            record.presentation = .expired;
             break;
         };
         self.dequeue(fact_id);
@@ -673,7 +693,7 @@ fn validOwner(owner: Owner) !void {
     const valid = switch (owner) {
         .session => |value| @backingInt(value.session_id) != 0 and value.generation != 0,
         .group => |value| @backingInt(value.id) != 0 and value.revision != 0,
-        .history => |value| @backingInt(value) != 0,
+        .card => |value| value.valid(),
     };
     if (!valid) return error.InvalidOwner;
 }

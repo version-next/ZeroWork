@@ -1,4 +1,5 @@
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const raw_stream_tap = @import("raw_stream_tap.zig");
 
 /// Bounded, allocator-owned stream timeline used by @log/export surfaces.
@@ -344,17 +345,12 @@ pub const Timeline = struct {
 
     pub fn saveCast(self: *Timeline, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, cols: u16, rows: u16) !void {
         var atomic_buffer: [16 * 1024]u8 = undefined;
-        var atomic = try dir.createFileAtomic(io, sub_path, .{
-            .permissions = @as(std.Io.File.Permissions, @fromBackingInt(@intCast(0o600))),
-            .make_path = true,
-            .replace = true,
-        });
-        defer atomic.deinit(io);
-        var writer = atomic.file.writer(io, &atomic_buffer);
+        var atomic = try persist.AtomicWriter.begin(io, dir, sub_path, .{ .make_path = true });
+        defer atomic.deinit();
+        var writer = atomic.writer(&atomic_buffer);
         try self.exportCast(&writer.interface, cols, rows);
         try writer.flush();
-        try atomic.file.sync(io);
-        try atomic.replace(io);
+        try atomic.commit();
     }
 
     /// Atomically persists the current transcript with owner-only permissions.
@@ -362,17 +358,12 @@ pub const Timeline = struct {
         var frozen = try self.snapshot();
         defer frozen.deinit();
         var atomic_buffer: [16 * 1024]u8 = undefined;
-        var atomic = try dir.createFileAtomic(io, sub_path, .{
-            .permissions = @as(std.Io.File.Permissions, @fromBackingInt(@intCast(0o600))),
-            .make_path = true,
-            .replace = true,
-        });
-        defer atomic.deinit(io);
-        var writer = atomic.file.writer(io, &atomic_buffer);
+        var atomic = try persist.AtomicWriter.begin(io, dir, sub_path, .{ .make_path = true });
+        defer atomic.deinit();
+        var writer = atomic.writer(&atomic_buffer);
         try frozen.exportTextUnlocked(&writer.interface);
         try writer.flush();
-        try atomic.file.sync(io);
-        try atomic.replace(io);
+        try atomic.commit();
     }
 
     fn lock(self: *Timeline) void {

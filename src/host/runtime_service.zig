@@ -47,7 +47,7 @@ pub const Runtime = struct {
         attachCurrentShell: ?*const fn (*anyopaque) anyerror!void = null,
         attachShell: ?*const fn (*anyopaque, terminal.execution.ShellAttachment) anyerror!void = null,
         requestCurrentDirectory: ?*const fn (*anyopaque) anyerror!void = null,
-        completeRemotePath: ?*const fn (*anyopaque, []const u8) anyerror!@import("../ui/builtin_completion.zig").Call = null,
+        completeRemotePath: ?*const fn (*anyopaque, []const u8) anyerror!@import("builtin_completion.zig").Call = null,
         copyCwd: *const fn (*anyopaque, std.mem.Allocator) anyerror!?[]u8,
         searchText: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
         readLines: *const fn (*anyopaque, terminal.LineLimits, std.mem.Allocator) anyerror!terminal.Lines,
@@ -126,7 +126,7 @@ pub const Runtime = struct {
         if (self.torn_down) return error.SessionClosed;
         return (self.vtable.encodeKey orelse return error.UnsupportedService)(self.context, event, allocator);
     }
-    pub fn mountTerminal(self: *Runtime, view: *@import("../ui/terminal_view.zig").TerminalViewNode, status: *@import("ui").Node) !void {
+    pub fn mountTerminal(self: *Runtime, view: *@import("../features/terminal/view/terminal_view.zig").TerminalViewNode, status: *@import("ui").Node) !void {
         if (self.torn_down) return error.SessionClosed;
         view.bindWorker(self);
         if (self.vtable.terminalService) |call| {
@@ -197,7 +197,7 @@ pub const Runtime = struct {
         if (self.vtable.requestCurrentDirectory) |call| return call(self.context);
         return error.UnsupportedOperation;
     }
-    pub fn completeRemotePath(self: *Runtime, path: []const u8) !@import("../ui/builtin_completion.zig").Call {
+    pub fn completeRemotePath(self: *Runtime, path: []const u8) !@import("builtin_completion.zig").Call {
         if (self.torn_down) return error.SessionClosed;
         return (self.vtable.completeRemotePath orelse return error.UnsupportedService)(self.context, path);
     }
@@ -344,7 +344,7 @@ test "released runtime rejects retained consumers before dereferencing provider 
 
 test "bootstrap product terminal mounts release owned frame buffers and preserve borrowed buffers" {
     const ui = @import("ui");
-    const View = @import("../ui/terminal_view.zig").TerminalViewNode;
+    const View = @import("../features/terminal/view/terminal_view.zig").TerminalViewNode;
     const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 400);

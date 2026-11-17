@@ -27,7 +27,15 @@ pub const GpuDraw = gpu_draw_mod.GpuDraw;
 /// shadow path and cx.syncPaintToTable writes to PaintTable are **field-wise identical**,
 /// basis for content validation when encoder switches to paint_table.DisplayItem.
 pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
-    const kind: PaintItemKind = switch (item) {
+    var out: PaintItem = undefined;
+    lowerDisplayItemInto(&item, &out);
+    return out;
+}
+
+/// lowerDisplayItem writing straight into `out` (e.g. a list slot): PaintItem is 512 B and
+/// variant payloads are read through pointers, so the per-item lowering copies neither.
+pub fn lowerDisplayItemInto(item: *const DisplayItem, out: *PaintItem) void {
+    const kind: PaintItemKind = switch (item.*) {
         .fill_rect, .stroke_rect, .border_side, .border_per_side, .outline_rect, .noise_rect => .rect,
         .text_run => .text,
         .image_quad, .icon_rep => .image,
@@ -37,23 +45,23 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .push_clip, .pop_clip, .begin_opacity_layer, .end_opacity_layer, .begin_blur_layer, .end_blur_layer, .begin_rounded_clip, .end_rounded_clip => .control,
     };
     // resource_handle only meaningful for text/image/icon; rest 0
-    const resource: u64 = switch (item) {
-        .text_run => |t| t.blob_id,
-        .image_quad => |i| i.texture_id,
-        .icon_rep => |i| i.icon_id,
+    const resource: u64 = switch (item.*) {
+        .text_run => |*t| t.blob_id,
+        .image_quad => |*i| i.texture_id,
+        .icon_rep => |*i| i.icon_id,
         else => 0,
     };
     // geom + color + radii + local_bounds: rect-family kind extracts full geometry/color
-    var out: PaintItem = .{ .kind = kind, .resource_handle = resource };
-    switch (item) {
-        .fill_rect => |r| {
+    out.* = .{ .kind = kind, .resource_handle = resource };
+    switch (item.*) {
+        .fill_rect => |*r| {
             out.local_bounds = .{ .min_x = r.x, .min_y = r.y, .max_x = r.x + r.w, .max_y = r.y + r.h };
             out.geom = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
             out.color = .{ .r = r.color.r, .g = r.color.g, .b = r.color.b, .a = r.color.a };
             out.radii = .{ .tl = r.radius[0], .tr = r.radius[1], .br = r.radius[2], .bl = r.radius[3] };
             out.shape_kind = r.shape;
         },
-        .stroke_rect => |r| {
+        .stroke_rect => |*r| {
             out.local_bounds = .{ .min_x = r.x, .min_y = r.y, .max_x = r.x + r.w, .max_y = r.y + r.h };
             out.geom = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
             out.color = .{ .r = r.color.r, .g = r.color.g, .b = r.color.b, .a = r.color.a };
@@ -61,28 +69,28 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.stroke_width = r.width;
             out.shape_kind = r.shape;
         },
-        .border_side => |b| {
+        .border_side => |*b| {
             out.local_bounds = .{ .min_x = b.x, .min_y = b.y, .max_x = b.x + b.w, .max_y = b.y + b.h };
             out.geom = .{ .x = b.x, .y = b.y, .w = b.w, .h = b.h };
             out.color = .{ .r = b.color.r, .g = b.color.g, .b = b.color.b, .a = b.color.a };
             out.radii = .{ .tl = b.radius[0], .tr = b.radius[1], .br = b.radius[2], .bl = b.radius[3] };
             out.stroke_width = b.width;
         },
-        .border_per_side => |b| {
+        .border_per_side => |*b| {
             out.local_bounds = .{ .min_x = b.x, .min_y = b.y, .max_x = b.x + b.w, .max_y = b.y + b.h };
             out.geom = .{ .x = b.x, .y = b.y, .w = b.w, .h = b.h };
             out.color = .{ .r = b.color.r, .g = b.color.g, .b = b.color.b, .a = b.color.a };
             out.radii = .{ .tl = b.radius[0], .tr = b.radius[1], .br = b.radius[2], .bl = b.radius[3] };
             out.border_widths = b.widths;
         },
-        .outline_rect => |o| {
+        .outline_rect => |*o| {
             out.local_bounds = .{ .min_x = o.x, .min_y = o.y, .max_x = o.x + o.w, .max_y = o.y + o.h };
             out.geom = .{ .x = o.x, .y = o.y, .w = o.w, .h = o.h };
             out.color = .{ .r = o.color.r, .g = o.color.g, .b = o.color.b, .a = o.color.a };
             out.radii = .{ .tl = o.radius[0], .tr = o.radius[1], .br = o.radius[2], .bl = o.radius[3] };
             out.stroke_width = o.width;
         },
-        .shadow_rect => |s| {
+        .shadow_rect => |*s| {
             out.local_bounds = .{ .min_x = s.x, .min_y = s.y, .max_x = s.x + s.w, .max_y = s.y + s.h };
             out.geom = .{ .x = s.x, .y = s.y, .w = s.w, .h = s.h };
             out.color = .{ .r = s.color.r, .g = s.color.g, .b = s.color.b, .a = s.color.a };
@@ -95,7 +103,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.shadow_offset_y = s.offset_y;
             out.shadow_spread = s.spread;
         },
-        .text_run => |t| {
+        .text_run => |*t| {
             out.local_bounds = .{ .min_x = t.x, .min_y = t.y, .max_x = t.x + 1, .max_y = t.y + 1 };
             out.geom = .{ .x = t.x, .y = t.y, .w = 0, .h = 0 };
             out.color = .{ .r = t.color.r, .g = t.color.g, .b = t.color.b, .a = t.color.a };
@@ -124,7 +132,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.text_fade_dx0 = t.fade_dx0;
             out.text_fade_dx1 = t.fade_dx1;
         },
-        .image_quad => |i| {
+        .image_quad => |*i| {
             out.local_bounds = .{ .min_x = i.x, .min_y = i.y, .max_x = i.x + i.w, .max_y = i.y + i.h };
             out.geom = .{ .x = i.x, .y = i.y, .w = i.w, .h = i.h };
             out.image_opacity = i.opacity;
@@ -132,7 +140,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.image_corner_radius = i.corner_radius;
             out.rotate = i.rotate;
         },
-        .icon_rep => |ic| {
+        .icon_rep => |*ic| {
             out.local_bounds = .{ .min_x = ic.x, .min_y = ic.y, .max_x = ic.x + ic.w, .max_y = ic.y + ic.h };
             out.geom = .{ .x = ic.x, .y = ic.y, .w = ic.w, .h = ic.h };
             out.image_opacity = ic.opacity;
@@ -145,7 +153,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             // (captured ic is
             // stack temporary, &ic.rep becomes invalid)
         },
-        .multi_gradient_rect => |mg| {
+        .multi_gradient_rect => |*mg| {
             out.local_bounds = .{ .min_x = mg.x, .min_y = mg.y, .max_x = mg.x + mg.w, .max_y = mg.y + mg.h };
             out.geom = .{ .x = mg.x, .y = mg.y, .w = mg.w, .h = mg.h };
             out.radii = .{ .tl = mg.radius[0], .tr = mg.radius[1], .br = mg.radius[2], .bl = mg.radius[3] };
@@ -168,7 +176,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
                 out.mg_stop_positions[i] = mg.stop_positions[i];
             }
         },
-        .fill_path => |fp| {
+        .fill_path => |*fp| {
             out.color = .{ .r = fp.color.r, .g = fp.color.g, .b = fp.color.b, .a = fp.color.a };
             out.geom = .{ .x = fp.offset_x, .y = fp.offset_y, .w = 0, .h = 0 };
             out.image_opacity = fp.opacity;
@@ -193,7 +201,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.gradient_radial_center_y = fp.gradient_center_y;
             out.gradient_conic_start_angle = fp.gradient_start_angle;
         },
-        .stroke_path => |sp| {
+        .stroke_path => |*sp| {
             out.color = .{ .r = sp.color.r, .g = sp.color.g, .b = sp.color.b, .a = sp.color.a };
             out.geom = .{ .x = sp.offset_x, .y = sp.offset_y, .w = 0, .h = 0 };
             out.image_opacity = sp.opacity;
@@ -201,7 +209,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.path_line_join = @backingInt(sp.line_join);
             out.path_geometry_ptr = sp.geometry;
         },
-        .gradient_rect => |g| {
+        .gradient_rect => |*g| {
             out.local_bounds = .{ .min_x = g.x, .min_y = g.y, .max_x = g.x + g.w, .max_y = g.y + g.h };
             out.geom = .{ .x = g.x, .y = g.y, .w = g.w, .h = g.h };
             out.color = .{ .r = g.from.r, .g = g.from.g, .b = g.from.b, .a = g.from.a };
@@ -214,7 +222,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.gradient_conic_start_angle = g.conic_start_angle;
             out.shape_kind = g.shape;
         },
-        .noise_rect => |nr| {
+        .noise_rect => |*nr| {
             out.local_bounds = .{ .min_x = nr.x, .min_y = nr.y, .max_x = nr.x + nr.w, .max_y = nr.y + nr.h };
             out.geom = .{ .x = nr.x, .y = nr.y, .w = nr.w, .h = nr.h };
             out.color = .{ .r = nr.fill.r, .g = nr.fill.g, .b = nr.fill.b, .a = nr.fill.a };
@@ -224,7 +232,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.noise_intensity = nr.intensity;
             out.noise_seed = nr.seed;
         },
-        .inset_shadow_rect => |is| {
+        .inset_shadow_rect => |*is| {
             out.local_bounds = .{ .min_x = is.x, .min_y = is.y, .max_x = is.x + is.w, .max_y = is.y + is.h };
             out.geom = .{ .x = is.x, .y = is.y, .w = is.w, .h = is.h };
             out.color = .{ .r = is.fill.r, .g = is.fill.g, .b = is.fill.b, .a = is.fill.a };
@@ -234,7 +242,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.shadow_offset_x = is.offset_x;
             out.shadow_offset_y = is.offset_y;
         },
-        .shadow_dual_rect => |sd| {
+        .shadow_dual_rect => |*sd| {
             out.local_bounds = .{ .min_x = sd.x, .min_y = sd.y, .max_x = sd.x + sd.w, .max_y = sd.y + sd.h };
             out.geom = .{ .x = sd.x, .y = sd.y, .w = sd.w, .h = sd.h };
             out.color = .{ .r = sd.fill.r, .g = sd.fill.g, .b = sd.fill.b, .a = sd.fill.a };
@@ -248,7 +256,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.shadow2_offset_x = sd.shadow2_offset_x;
             out.shadow2_offset_y = sd.shadow2_offset_y;
         },
-        .arc => |ar| {
+        .arc => |*ar| {
             // arc geometry has no rect bounds, use (cx-r, cy-r, 2r, 2r) as conservative AABB
             const r = ar.outer_radius;
             out.local_bounds = .{ .min_x = ar.cx - r, .min_y = ar.cy - r, .max_x = ar.cx + r, .max_y = ar.cy + r };
@@ -260,9 +268,9 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.arc_end_angle = ar.end_angle;
         },
         // B-7-C: 8 control kinds, kind = .control + control_kind distinguishes token
-        .push_clip => |pc| {
+        .push_clip => |*pc| {
             out.geom = .{ .x = pc.x, .y = pc.y, .w = pc.w, .h = pc.h };
-            out.radii = .{ .tl = pc.radius, .tr = pc.radius, .br = pc.radius, .bl = pc.radius };
+            out.radii = .{ .tl = pc.radii[0], .tr = pc.radii[1], .br = pc.radii[2], .bl = pc.radii[3] };
             out.control_kind = .push_clip;
             out.clip_shape_kind = @backingInt(pc.shape_kind);
             // polygon shape field via cx.lowerForEncoderPaintTable allocs
@@ -274,9 +282,9 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .pop_clip => {
             out.control_kind = .pop_clip;
         },
-        .begin_opacity_layer => |bo| {
+        .begin_opacity_layer => |*bo| {
             out.geom = .{ .x = bo.x, .y = bo.y, .w = bo.w, .h = bo.h };
-            out.radii = .{ .tl = bo.corner_radius, .tr = bo.corner_radius, .br = bo.corner_radius, .bl = bo.corner_radius };
+            out.radii = .{ .tl = bo.corner_radii[0], .tr = bo.corner_radii[1], .br = bo.corner_radii[2], .bl = bo.corner_radii[3] };
             out.opacity = bo.opacity;
             out.rotate = bo.rotate;
             out.draw_x = bo.draw_x;
@@ -284,6 +292,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.draw_w = bo.draw_w;
             out.draw_h = bo.draw_h;
             out.use_draw_transform = bo.use_draw_transform;
+            out.surface_rest_origin = bo.surface_rest_origin;
             out.draw_transform = .{
                 bo.draw_transform.a,  bo.draw_transform.b,
                 bo.draw_transform.c,  bo.draw_transform.d,
@@ -291,6 +300,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             };
             out.blend_mode = @backingInt(bo.blend_mode);
             out.warp = bo.warp;
+            out.genie = bo.genie;
             out.surface_stable_id = bo.surface_stable_id;
             out.surface_content_version = bo.surface_content_version;
             out.control_kind = .begin_opacity_layer;
@@ -298,19 +308,17 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .end_opacity_layer => {
             out.control_kind = .end_opacity_layer;
         },
-        .begin_blur_layer => |bb| {
+        .begin_blur_layer => |*bb| {
             out.glass_owner_id = bb.owner_node;
             out.geom = .{ .x = bb.x, .y = bb.y, .w = bb.w, .h = bb.h };
-            out.radii = if (bb.corner_radii[0] >= 0)
-                .{ .tl = bb.corner_radii[0], .tr = bb.corner_radii[1], .br = bb.corner_radii[2], .bl = bb.corner_radii[3] }
-            else
-                .{ .tl = bb.corner_radius, .tr = bb.corner_radius, .br = bb.corner_radius, .bl = bb.corner_radius };
+            out.radii = .{ .tl = bb.corner_radii[0], .tr = bb.corner_radii[1], .br = bb.corner_radii[2], .bl = bb.corner_radii[3] };
             out.rotate = bb.rotate;
             out.draw_x = bb.draw_x;
             out.draw_y = bb.draw_y;
             out.draw_w = bb.draw_w;
             out.draw_h = bb.draw_h;
             out.use_draw_transform = bb.use_draw_transform;
+            out.surface_rest_origin = bb.surface_rest_origin;
             out.draw_transform = .{
                 bb.draw_transform.a,  bb.draw_transform.b,
                 bb.draw_transform.c,  bb.draw_transform.d,
@@ -325,15 +333,16 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .end_blur_layer => {
             out.control_kind = .end_blur_layer;
         },
-        .begin_rounded_clip => |br| {
+        .begin_rounded_clip => |*br| {
             out.geom = .{ .x = br.x, .y = br.y, .w = br.w, .h = br.h };
-            out.radii = .{ .tl = br.radius, .tr = br.radius, .br = br.radius, .bl = br.radius };
+            out.radii = .{ .tl = br.radii[0], .tr = br.radii[1], .br = br.radii[2], .bl = br.radii[3] };
             out.rotate = br.rotate;
             out.draw_x = br.draw_x;
             out.draw_y = br.draw_y;
             out.draw_w = br.draw_w;
             out.draw_h = br.draw_h;
             out.use_draw_transform = br.use_draw_transform;
+            out.surface_rest_origin = br.surface_rest_origin;
             out.draw_transform = .{
                 br.draw_transform.a,  br.draw_transform.b,
                 br.draw_transform.c,  br.draw_transform.d,
@@ -345,7 +354,6 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.control_kind = .end_rounded_clip;
         },
     }
-    return out;
 }
 
 pub const ShadowResult = struct {
@@ -742,7 +750,7 @@ test "lowerDisplayItem: push_clip rect → control kind + clip_shape_kind=0" {
         .y = 20,
         .w = 100,
         .h = 50,
-        .radius = 8,
+        .radii = .{ 8, 8, 8, 8 },
         .shape_kind = .rect,
     } };
     const lowered = lowerDisplayItem(item);
@@ -756,6 +764,24 @@ test "lowerDisplayItem: push_clip rect → control kind + clip_shape_kind=0" {
     try testing.expect(lowered.clip_polygon_ptr == null);
 }
 
+test "lowerDisplayItem: push_clip rounded_rect keeps each corner radius (TL, TR, BR, BL)" {
+    const item: DisplayItem = .{ .push_clip = .{
+        .header = dummyHeader(),
+        .x = 0,
+        .y = 0,
+        .w = 120,
+        .h = 32,
+        .radii = .{ 8, 0, 3, 5 },
+        .shape_kind = .rounded_rect,
+    } };
+    const lowered = lowerDisplayItem(item);
+    try testing.expectEqual(@as(u8, 1), lowered.clip_shape_kind);
+    try testing.expectEqual(@as(f32, 8), lowered.radii.tl);
+    try testing.expectEqual(@as(f32, 0), lowered.radii.tr);
+    try testing.expectEqual(@as(f32, 3), lowered.radii.br);
+    try testing.expectEqual(@as(f32, 5), lowered.radii.bl);
+}
+
 test "lowerDisplayItem: push_clip polygon → control_kind/clip_shape_kind 标识" {
     var item: DisplayItem = .{ .push_clip = .{
         .header = dummyHeader(),
@@ -765,10 +791,12 @@ test "lowerDisplayItem: push_clip polygon → control_kind/clip_shape_kind 标�
         .h = 50,
         .shape_kind = .polygon,
     } };
-    item.push_clip.polygon.point_count = 3;
-    item.push_clip.polygon.points[0] = .{ 0, 0 };
-    item.push_clip.polygon.points[1] = .{ 50, 0 };
-    item.push_clip.polygon.points[2] = .{ 25, 50 };
+    var polygon: display_list_mod.ClipPolygon = .{};
+    polygon.point_count = 3;
+    polygon.points[0] = .{ 0, 0 };
+    polygon.points[1] = .{ 50, 0 };
+    polygon.points[2] = .{ 25, 50 };
+    item.push_clip.polygon = &polygon;
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.push_clip, lowered.control_kind);
     try testing.expectEqual(@as(u8, 3), lowered.clip_shape_kind);
@@ -806,9 +834,15 @@ test "lowerDisplayItem: begin_opacity_layer 字段无损 (geom + opacity + draw_
         .draw_transform = types_mod.Transform2D{ .a = 1.5, .b = 0, .c = 0, .d = 1.5, .tx = 5, .ty = 6 },
         .blend_mode = .multiply,
         .warp = .{ 6, 2, 4, 14 },
+        .corner_radii = .{ 0, 12, 12, 0 },
     } };
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.begin_opacity_layer, lowered.control_kind);
+    // Folded rounded clip mask keeps per-corner radii (attached group item: square left side).
+    try testing.expectEqual(@as(f32, 0), lowered.radii.tl);
+    try testing.expectEqual(@as(f32, 12), lowered.radii.tr);
+    try testing.expectEqual(@as(f32, 12), lowered.radii.br);
+    try testing.expectEqual(@as(f32, 0), lowered.radii.bl);
     try testing.expectEqual([4]f32{ 6, 2, 4, 14 }, lowered.warp);
     try testing.expectApproxEqAbs(@as(f32, 0.5), lowered.opacity, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 1.5), lowered.draw_transform[0], 0.001);
@@ -825,7 +859,7 @@ test "lowerDisplayItem: begin_blur_layer extra_ptr 透传 source variant" {
         .y = 0,
         .w = 200,
         .h = 100,
-        .corner_radius = 12,
+        .corner_radii = .{ 12, 12, 12, 12 },
     } };
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.begin_blur_layer, lowered.control_kind);
@@ -840,12 +874,30 @@ test "lowerDisplayItem: begin_blur_layer 四角半径逐角透传（同心圆角
         .y = 0,
         .w = 60,
         .h = 60,
-        .corner_radius = 12,
         .corner_radii = .{ 12, 0, 0, 0 },
     } };
     const lowered = lowerDisplayItem(item);
     try testing.expectApproxEqAbs(@as(f32, 12), lowered.radii.tl, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0), lowered.radii.bl, 0.001);
+}
+
+test "lowerDisplayItem: begin_blur_layer never substitutes a uniform radius for odd corners" {
+    // A negative / NaN first corner used to read as the old "uniform" sentinel and turn the glass
+    // into an all-round shape while the owner's clip and hit shape kept the four corners. The
+    // lowering passes the corners through untouched; the encoder normalises them.
+    const item: DisplayItem = .{ .begin_blur_layer = .{
+        .header = dummyHeader(),
+        .x = 0,
+        .y = 0,
+        .w = 100,
+        .h = 40,
+        .corner_radii = .{ -4, 20, 0, 0 },
+    } };
+    const lowered = lowerDisplayItem(item);
+    try testing.expectEqual(@as(f32, -4), lowered.radii.tl);
+    try testing.expectEqual(@as(f32, 20), lowered.radii.tr);
+    try testing.expectEqual(@as(f32, 0), lowered.radii.br);
+    try testing.expectEqual(@as(f32, 0), lowered.radii.bl);
 }
 
 test "lowerDisplayItem: begin_rounded_clip 字段无损 (geom + radius + draw fields)" {
@@ -856,7 +908,7 @@ test "lowerDisplayItem: begin_rounded_clip 字段无损 (geom + radius + draw fi
         .y = 6,
         .w = 80,
         .h = 60,
-        .radius = 10,
+        .radii = .{ 10, 0, 0, 10 },
         .rotate = 0,
         .draw_x = 1,
         .draw_y = 2,
@@ -868,6 +920,9 @@ test "lowerDisplayItem: begin_rounded_clip 字段无损 (geom + radius + draw fi
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.begin_rounded_clip, lowered.control_kind);
     try testing.expectApproxEqAbs(@as(f32, 10), lowered.radii.tl, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), lowered.radii.tr, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), lowered.radii.br, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10), lowered.radii.bl, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 1), lowered.draw_x, 0.001);
     try testing.expectEqual(false, lowered.use_draw_transform);
 }

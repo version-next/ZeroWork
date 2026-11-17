@@ -1,9 +1,11 @@
 /** Focus ownership through production AI, tabs and group UI, with real Local PTYs. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, writeFile, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
+import {aiToggleId} from './ai_entry.ts';
 
 const binary = resolve(process.argv[2] ?? '/tmp/zw-focus-fix/bin/zerowork');
 const out = resolve(process.argv[3] ?? '/tmp/zw-focus-handoff');
@@ -63,17 +65,20 @@ try {
     const firstPid = await receipt('first-ready');
     const firstTab = (await h.query('tabs.strip')).flatMap(flat).find((n: any) => /^tabs\.tab\.\d+$/.test(n.test_id ?? '') && shown(n)).test_id;
     for (let i = 0; i < 3; i++) {
-        await click('toolbar.ai');
+        await click(await aiToggleId());
         // Do not click ai.prompt or add a readiness sleep before the first text.
         await h.type_('a');
         assert.equal((await h.inputState('ai.prompt')).buffer, 'a');
         await focus('assistant first letter ' + i, 'ai.prompt');
         await h.key('a', {cmd: true}); await h.key('backspace');
-        await click(i % 2 === 0 ? 'ai.collapse' : 'toolbar.ai');
+        // Z12: the panel takes no pointer input while it unfolds; click its controls once it rests.
+        await h.waitFor(async () => (await h.query('ai.panel.motion.phase'))[0]?.text === 'expanded' || null, 5000);
+        // PL4c: the launcher hides while the panel is open; the second close route is toggle_ai (⌘J).
+        if (i % 2 === 0) await click('ai.collapse'); else await h.key('j', {cmd: true});
         await focus('assistant collapse ' + i, firstFocus);
         assert.equal(await receipt('after-ai-' + i), firstPid);
     }
-    report.checks.push('Repeated AI opening accepts its first letter without a prompt click; collapse and toolbar toggle restore the same live PTY.');
+    report.checks.push('Repeated AI opening accepts its first letter without a prompt click; collapse button and toggle_ai (⌘J) restore the same live PTY.');
     await click('toolbar.new_session'); await click('session.menu.local');
     await visible('terminal.surface');
     const secondFocus = await focus('second local', 'terminal.input');

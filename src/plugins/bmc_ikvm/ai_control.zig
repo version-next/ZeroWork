@@ -89,6 +89,7 @@ pub const Service = struct {
         reservation: @import("../../host/frame_budget.zig").Reservation,
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = .init(false),
+        wake: ?*const @import("presentation_wake.zig").Wake = null,
         result: images.ContentRef = .{},
         candidate: images.ContentRef = .{},
         reused: bool = false,
@@ -103,6 +104,8 @@ pub const Service = struct {
             // frame metadata and the independent encoded image survive.
             self.lease.release();
             self.done.store(true, .release);
+            // The owner's poll collects the finished image on the frame this wakes.
+            @import("presentation_wake.zig").notify(self.wake);
         }
         fn destroy(self: *EncodeJob) void {
             self.thread.?.join(); // Called only after the acquire done barrier.
@@ -138,6 +141,8 @@ pub const Service = struct {
     reused_images: usize = 0,
     /// Enabled by the production Runtime, which drains jobs before destruction.
     asynchronous_encoding: bool = false,
+    /// The owning session's wake, handed to each encode job.
+    wake: ?*const @import("presentation_wake.zig").Wake = null,
     encoding: ?*EncodeJob = null,
     encoding_revision: u64 = 1,
 
@@ -336,6 +341,23 @@ pub const Service = struct {
         };
         return false;
     }
+    /// An observation of this screen is being encoded or is still valid (the screen is "being
+    /// looked at" by AI). Metadata only; never touches pixels.
+    pub fn observing(self: *const Service) bool {
+        if (self.closed) return false;
+        if (self.encoding != null) return true;
+        const now = self.clock.milliseconds(self.clock.context);
+        for (self.observations) |maybe| if (maybe) |observation| {
+            if (now < observation.valid_until_monotonic_ms) return true;
+        };
+        return false;
+    }
+    /// Work `poll` finishes by the clock rather than by a worker publication: an image being
+    /// encoded (collected or expired by age) and an observation still inside its validity window.
+    pub fn busy(self: *const Service) bool {
+        if (self.closed) return false;
+        return self.observing();
+    }
     pub fn stop(self: *Service, binding_value: typed.Binding) !void {
         try self.validate(binding_value);
         if (self.on_stop) |callback| callback.revoke_lease(callback.context);
@@ -377,6 +399,7 @@ pub const Service = struct {
             job.candidate = self.cached_image.retain();
         };
         errdefer job.candidate.release();
+        job.wake = self.wake;
         job.thread = try std.Thread.spawn(.{}, EncodeJob.run, .{job});
         lease.token = 0;
         self.encoding = job;

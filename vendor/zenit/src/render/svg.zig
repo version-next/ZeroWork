@@ -534,20 +534,40 @@ fn parseRectElement(
     var y: f32 = 0;
     var w: f32 = 0;
     var h: f32 = 0;
+    var rx_in: ?f32 = null;
+    var ry_in: ?f32 = null;
     var style = inherited_style;
 
     var it = AttrIterator{ .raw = attrs };
     while (it.next()) |attr| {
-        if (asciiEqIgnoreCase(attr.name, "x")) x = parseDimension(attr.value) orelse x else if (asciiEqIgnoreCase(attr.name, "y")) y = parseDimension(attr.value) orelse y else if (asciiEqIgnoreCase(attr.name, "width")) w = parseDimension(attr.value) orelse w else if (asciiEqIgnoreCase(attr.name, "height")) h = parseDimension(attr.value) orelse h else applyStyleAttr(&style, attr.name, attr.value);
+        if (asciiEqIgnoreCase(attr.name, "x")) x = parseDimension(attr.value) orelse x else if (asciiEqIgnoreCase(attr.name, "y")) y = parseDimension(attr.value) orelse y else if (asciiEqIgnoreCase(attr.name, "width")) w = parseDimension(attr.value) orelse w else if (asciiEqIgnoreCase(attr.name, "height")) h = parseDimension(attr.value) orelse h else if (asciiEqIgnoreCase(attr.name, "rx")) rx_in = parseDimension(attr.value) else if (asciiEqIgnoreCase(attr.name, "ry")) ry_in = parseDimension(attr.value) else applyStyleAttr(&style, attr.name, attr.value);
     }
 
     if (w <= 0 or h <= 0) return;
 
-    const pts = try allocator.alloc(Point, 4);
-    pts[0] = .{ .x = x, .y = y };
-    pts[1] = .{ .x = x + w, .y = y };
-    pts[2] = .{ .x = x + w, .y = y + h };
-    pts[3] = .{ .x = x, .y = y + h };
+    // SVG 1.1 §9.2: a missing rx / ry takes the other's value; both clamp to half the side.
+    const rx = @min(@max(0, rx_in orelse ry_in orelse 0), w / 2);
+    const ry = @min(@max(0, ry_in orelse rx_in orelse 0), h / 2);
+    const corner_steps = 6;
+    const pts = try allocator.alloc(Point, if (rx > 0 and ry > 0) 4 * (corner_steps + 1) else 4);
+    if (rx > 0 and ry > 0) {
+        // Corners clockwise from the top-right; each a quarter ellipse sampled at corner_steps.
+        const centres = [4]Point{ .{ .x = x + w - rx, .y = y + ry }, .{ .x = x + w - rx, .y = y + h - ry }, .{ .x = x + rx, .y = y + h - ry }, .{ .x = x + rx, .y = y + ry } };
+        var k: usize = 0;
+        for (centres, 0..) |c, corner| {
+            const start = -std.math.pi / 2.0 + @as(f32, @floatFromInt(corner)) * (std.math.pi / 2.0);
+            for (0..corner_steps + 1) |i| {
+                const t = start + @as(f32, @floatFromInt(i)) * (std.math.pi / 2.0) / @as(f32, @floatFromInt(corner_steps));
+                pts[k] = .{ .x = c.x + rx * @cos(t), .y = c.y + ry * @sin(t) };
+                k += 1;
+            }
+        }
+    } else {
+        pts[0] = .{ .x = x, .y = y };
+        pts[1] = .{ .x = x + w, .y = y };
+        pts[2] = .{ .x = x + w, .y = y + h };
+        pts[3] = .{ .x = x, .y = y + h };
+    }
 
     // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
@@ -975,8 +995,10 @@ fn parsePathContours(allocator: std.mem.Allocator, d: []const u8) ![]Contour {
                     const rx = try parseNumber(d, &i);
                     const ry = try parseNumber(d, &i);
                     const x_axis_rotation = try parseNumber(d, &i);
-                    const large_arc = (try parseNumber(d, &i)) != 0;
-                    const sweep = (try parseNumber(d, &i)) != 0;
+                    // Flags are single 0/1 characters and may be written without separators
+                    // ("a2 2 0 00-2-2", lucide): a number parse would read "00" as one value.
+                    const large_arc = try parseFlag(d, &i);
+                    const sweep = try parseFlag(d, &i);
                     var p = Point{ .x = try parseNumber(d, &i), .y = try parseNumber(d, &i) };
                     if (cmd == 'a') {
                         p.x += current.x;
@@ -1972,6 +1994,26 @@ fn parseNumber(s: []const u8, index: *usize) !f32 {
     return svg_safety.parseFiniteNumber(s, index) orelse error.InvalidSvg;
 }
 
+/// SVG arc flag: one '0' / '1' character after optional separators (SVG 2 path grammar).
+fn parseFlag(s: []const u8, index: *usize) !bool {
+    skipNumberSeparators(s, index);
+    if (index.* >= s.len) return error.InvalidSvg;
+    const c = s[index.*];
+    if (c != '0' and c != '1') return error.InvalidSvg;
+    index.* += 1;
+    return c == '1';
+}
+
+test "svg path: compact arc flags (lucide calendar-clock)" {
+    var i: usize = 0;
+    const d = "0 00-2-2";
+    _ = try parseNumber(d, &i);
+    try std.testing.expect(!(try parseFlag(d, &i)));
+    try std.testing.expect(!(try parseFlag(d, &i)));
+    try std.testing.expectEqual(@as(f32, -2), try parseNumber(d, &i));
+    try std.testing.expectEqual(@as(f32, -2), try parseNumber(d, &i));
+}
+
 fn nextIsNumber(s: []const u8, index: usize) bool {
     return svg_safety.nextIsNumber(s, index);
 }
@@ -2088,6 +2130,42 @@ test "svg rasterize simple rect" {
     const center = ((32 * image.width) + 32) * 4;
     try std.testing.expect(image.pixels[center + 0] > 200);
     try std.testing.expect(image.pixels[center + 3] > 200);
+}
+
+test "svg rasterize rounded rect corners (rx / ry)" {
+    const allocator = std.testing.allocator;
+    const rounded =
+        \\<svg viewBox="0 0 100 100">
+        \\  <rect width="100" height="100" rx="30" fill="#ff0000"/>
+        \\</svg>
+    ;
+    var image = try rasterize(allocator, rounded, .{ .target_width = 64, .target_height = 64, .supersample = 2 });
+    defer image.deinit(allocator);
+    const alphaAt = struct {
+        fn f(img: anytype, px: u32, py: u32) u8 {
+            return img.pixels[((py * img.width) + px) * 4 + 3];
+        }
+    }.f;
+    // The corner is cut away by the quarter ellipse; the edge midpoints and the centre are filled.
+    try std.testing.expect(alphaAt(image, 1, 1) < 20);
+    try std.testing.expect(alphaAt(image, 62, 62) < 20);
+    try std.testing.expect(alphaAt(image, 32, 1) > 200);
+    try std.testing.expect(alphaAt(image, 1, 32) > 200);
+    try std.testing.expect(alphaAt(image, 32, 32) > 200);
+
+    // ry alone rounds both axes (a missing rx takes ry); rx = 0 keeps square corners.
+    const ry_only =
+        \\<svg viewBox="0 0 100 100"><rect width="100" height="100" ry="30" fill="#ff0000"/></svg>
+    ;
+    var image_ry = try rasterize(allocator, ry_only, .{ .target_width = 64, .target_height = 64, .supersample = 2 });
+    defer image_ry.deinit(allocator);
+    try std.testing.expect(alphaAt(image_ry, 1, 1) < 20);
+    const square =
+        \\<svg viewBox="0 0 100 100"><rect width="100" height="100" rx="0" ry="30" fill="#ff0000"/></svg>
+    ;
+    var image_sq = try rasterize(allocator, square, .{ .target_width = 64, .target_height = 64, .supersample = 2 });
+    defer image_sq.deinit(allocator);
+    try std.testing.expect(alphaAt(image_sq, 1, 1) > 200);
 }
 
 test "svg rasterize path" {

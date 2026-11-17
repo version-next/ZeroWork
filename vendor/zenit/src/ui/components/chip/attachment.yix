@@ -1,0 +1,78 @@
+//! AttachmentChip: the attachment spec of the Chip family (composer attachment bar, message
+//! attachments). Built on ControlShell like Chip; styles in attachment.yss, tests in mod.zig.
+const ui = @import("../../ui.zig");
+const core = @import("../../core.zig");
+const S = @import("attachment.yss");
+const ControlShell = @import("../control_shell/mod.zig").ControlShell;
+const B = @import("../button/mod.zig");
+const icons = @import("zenit_icons");
+
+/// Leading slot: the whole 44 tile; on the row the slot fits its icon / thumbnail.
+fn leadSlot(tile: bool) core.BoxStyle {
+    return if (tile) .{ .width = .{ .px = 44 }, .height = .{ .px = 44 }, .min_height = 44 } else .{};
+}
+
+/// Remove button: after the text on the row; over the top-right corner of the tile.
+fn removeSlot(tile: bool) core.BoxStyle {
+    return if (tile) .{ .position = .absolute, .inset = .{ .top = .{ .px = 2 }, .right = .{ .px = 2 } }, .min_height = 0 } else .{};
+}
+
+/// AttachmentChip: one attachment. Row form (default, 28 high): type icon (13, fg-secondary) or a
+/// 20 × 20 thumbnail, the name (sm, ellipsis), its size / origin (xs, fg-tertiary) and a remove
+/// button (W.Button ghost xs, x). Tile form (`tile`, 44 × 44 on bg-tertiary): the thumbnail
+/// filling the tile (or the type icon, 16, fg-tertiary, centered), a compact 18 remove button
+/// (round, on bg-primary so it reads over a picture) over its top-right corner, clear of the
+/// tile's center (a click there opens the attachment). `onClick` opens / previews it (the chip then hovers, focuses and clicks);
+/// `removable = false` hides the remove button.
+/// `<W.AttachmentChip label="syslog.1" detail="48 KB" iconAsset={ui.icons.file_text} onRemove={…} />`
+/// `removeTestId` names the remove button (a `testId` on the element names only the root).
+pub fn AttachmentChip(
+    label: Text = "",
+    detail: []const u8 = "",
+    iconAsset: ?ui.SvgAsset = null,
+    thumbnail: ?u32 = null,
+    tile: bool = false,
+    removable: bool = true,
+    disabled: bool = false,
+    removeLabel: []const u8 = "Remove attachment",
+    removeTestId: ?[]const u8 = null,
+    onClick: ?Handler(void) = null,
+    onRemove: ?Handler(void) = null,
+) View {
+    const interactive = computed(onClick != null and !disabled);
+    const has_lead = computed(thumbnail != null or iconAsset != null);
+    const show_icon = computed(thumbnail == null and iconAsset != null);
+    const lead_slot = computed(leadSlot(tile));
+    const remove_slot = computed(removeSlot(tile));
+    const role = computed(if (onClick != null) core.A11yRole.button else core.A11yRole.listitem);
+    const remove_icon = computed(@as(?f32, if (tile) 10 else 12));
+    return (
+        <ControlShell
+            variant={.ghost}
+            size={.sm}
+            iconOnly={tile}
+            leadingIcon={has_lead}
+            disabled={disabled}
+            focusable={interactive}
+            focusRing={@as(?ui.FocusRingConfig, if (onClick != null) .{} else null)}
+            cursor={if (onClick != null) core.CursorShape.pointer else core.CursorShape.default}
+            onClick={onClick}
+            iconStyle={lead_slot}
+            appendStyle={remove_slot}
+            style={.{ S.Attachment.of(.{ .tile = tile, .interactive = interactive }) }}
+            a11y={.{ .role = role, .label = label, .disabled = disabled }}
+            icon={if (has_lead)
+                <box style={S.Lead.of(.{ .tile = tile })}>
+                    {if (thumbnail) |tex| <image style={S.Thumb.of(.{ .tile = tile })} src={tex} />}
+                    {if (show_icon) <icon style={S.Glyph.of(.{ .tile = tile })} src={iconAsset} />}
+                </box>}
+            content={if (!tile)
+                <row style={S.text_row}>
+                    <text style={S.name} box={S.name_box}>{label}</text>
+                    {if (detail.len != 0) <text style={S.detail} box={S.detail_box}>{detail}</text>}
+                </row>}
+            append={if (removable)
+                <B.Button testId={removeTestId} variant={.ghost} size={.xs} iconOnly={true} iconAsset={icons.x} iconSize={remove_icon} look={S.TileRemove.of(.{ .tile = tile })} a11yLabel={removeLabel} disabled={disabled} onClick={onRemove} />}
+        />
+    );
+}

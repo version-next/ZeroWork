@@ -2,6 +2,7 @@
  * Synthetic background Harness events; no Runtime, network, credentials or
  * physical keyboard/pointer. node e2e/bmc_kvm_native.ts --binary PATH --out DIR
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -39,6 +40,19 @@ function shown(n: any): boolean { return !!n?.rect && n.hidden !== true && n.vis
 function flatten(n: any): any[] { return !n || n.hidden === true ? [] : [n, ...(n.children ?? []).flatMap(flatten)]; }
 async function visible(id: string): Promise<any> { return waitFor(async () => (await query(id)).find(shown) ?? null, 10000); }
 async function click(id: string) { assert((await clickTestId(id)).ok, `click ${id}`); await sleep(180); }
+/** A control inside an open KVM menu: the menu body is a native ScrollArea, so a short window scrolls it with the
+ * wheel (over the panel) until the control is inside the panel, as a user would, then clicks it. */
+async function clickInMenu(menu: string, id: string) {
+  const panel = (await visible(`bmc.${menu}.popover`)).rect;
+  for (let i = 0; i < 20; i++) {
+    const r = (await visible(id)).rect;
+    if (r.y >= panel.y && r.y + r.h <= panel.y + panel.h - 4) break;
+    await scrollAt(panel.x + panel.w / 2, panel.y + panel.h / 2, 0, r.y + r.h > panel.y + panel.h ? -60 : 60); await sleep(120);
+  }
+  const r = (await visible(id)).rect, now = (await visible(`bmc.${menu}.popover`)).rect;
+  assert(r.y >= now.y && r.y + r.h <= now.y + now.h, `${id} scrolled into the ${menu} panel: ${JSON.stringify(r)} in ${JSON.stringify(now)}`);
+  await click(id);
+}
 async function attemptReadOnly(id: string) {
   await waitFor(async () => (await query(id)).find(n => n.hidden !== true && (n.effective_opacity ?? 1) > 0 && n.rect.w > 0 && n.rect.h > 0) ?? null, 5000);
   const outcome = await clickTestId(id);
@@ -75,16 +89,31 @@ async function capture(name: string, width: number, height: number) {
   return geometry;
 }
 async function geometry(width: number, height: number) {
-  const root = await visible("fixture.window"), content = await visible("bmc.content"), viewport = await visible("bmc.viewport"), frame = await visible("bmc.frame");
+  // The fixture embeds the KVM card in the app shell (sidebar, title row, shared pane); the card fills
+  // fixture.content_slot. Card layout (j8WXoF / uy2Fa, src/plugins/bmc_ikvm/styles.zig): 40 point toolbar
+  // flush on the island, video under it inside an 8 point black inset; the tools are native Buttons.
+  const root = await visible("fixture.window"), slot = (await visible("fixture.content_slot")).rect;
+  const content = await visible("bmc.content"), viewport = await visible("bmc.viewport"), frame = await visible("bmc.frame");
   near(root.rect.w, width, "window width"); near(root.rect.h, height, "window height");
-  near(content.rect.x, 8, "content x"); near(content.rect.y, 50, "content y");
-  near(content.rect.w, width - 16, "content width"); near(content.rect.h, height - 90, "content height");
-  near(viewport.rect.x, 8, "video x"); near(viewport.rect.y, 94, "video y");
-  near(viewport.rect.w, width - 16, "video width"); near(viewport.rect.h, height - 134, "video height");
-  near(frame.rect.h, height - 134, "fit image height"); near(frame.rect.w, (height - 134) * 1.6, "fit image width");
-  near(frame.rect.x, (width - frame.rect.w) / 2, "fit centered x"); near(frame.rect.y, 94, "fit centered y");
-  for (const menu of menus) { const tool = await visible(`bmc.${menu}`); near(tool.rect.w, width < 1000 ? 74 : 82, `${menu} tool width`); near(tool.rect.h, 24, `${menu} tool height`); }
-  report.checks.push(`${width}×${height}: actual content bounds, 44 point toolbar, all five tools, 1920×1200 fit ratio and centered real texture`);
+  assert(slot.x + slot.w <= width + 0.5 && slot.y + slot.h <= height + 0.5, "content slot inside the window");
+  near(content.rect.x, slot.x, "content x"); near(content.rect.y, slot.y, "content y");
+  near(content.rect.w, slot.w, "content width"); near(content.rect.h, slot.h, "content height");
+  const toolbar = 40, inset = 8;
+  near(viewport.rect.x, slot.x + inset, "video x"); near(viewport.rect.y, slot.y + toolbar + inset, "video y");
+  near(viewport.rect.w, slot.w - 2 * inset, "video width"); near(viewport.rect.h, slot.h - toolbar - 2 * inset, "video height");
+  const vp = viewport.rect, fitH = Math.min(vp.h, vp.w / 1.6), fitW = fitH * 1.6;
+  near(frame.rect.h, fitH, "fit image height"); near(frame.rect.w, fitW, "fit image width");
+  near(frame.rect.x, vp.x + (vp.w - fitW) / 2, "fit centered x"); near(frame.rect.y, vp.y + (vp.h - fitH) / 2, "fit centered y");
+  // The tools are zenit's native Buttons at their own size: all five sit inside the 40 point toolbar, in order,
+  // without overlapping (the view folds labels to icons when they would not fit).
+  let right = slot.x;
+  for (const menu of menus) {
+    const tool = await visible(`bmc.${menu}`);
+    assert(tool.rect.w > 0 && tool.rect.x >= right - 0.5 && tool.rect.x + tool.rect.w <= slot.x + slot.w + 0.5, `${menu} tool inside the toolbar, after the previous one`);
+    assert(tool.rect.y >= slot.y - 0.5 && tool.rect.y + tool.rect.h <= slot.y + toolbar + 0.5, `${menu} tool inside the toolbar height`);
+    right = tool.rect.x + tool.rect.w;
+  }
+  report.checks.push(`${width}×${height}: actual content bounds in the shell slot, 40 point toolbar, all five native tools in order, 1920×1200 fit ratio and centered real texture`);
 }
 async function inspectMenus(theme: string, width: number, height: number) {
   for (const menu of menus) {
@@ -186,8 +215,8 @@ try {
     assert.equal(released.keys, imeBefore, "reserved Ctrl+Alt+Escape never reaches remote");
     await click("bmc.keys"); const chordBefore = await stats(); await click("bmc.keys.ctrl_alt_delete"); const chordAfter = await stats();
     assert.equal(chordAfter.chords, chordBefore.chords + 1); assert.deepEqual(chordAfter.last_chord.keys.slice(0, 3), [0xffe3, 0xffe9, 0xffff]); assert.equal(chordAfter.captured, false);
-    await click("bmc.keys.f12"); const f12 = await stats(); assert.equal(f12.chords, chordAfter.chords + 1); assert.equal(f12.last_chord.count, 1); assert.equal(f12.last_chord.keys[0], 0xffc9);
-    await click("bmc.keys.ctrl_alt_f12"); const ctrlF12 = await stats(); assert.equal(ctrlF12.chords, f12.chords + 1); assert.deepEqual(ctrlF12.last_chord.keys.slice(0, 3), [0xffe3, 0xffe9, 0xffc9]);
+    await clickInMenu("keys", "bmc.keys.f12"); const f12 = await stats(); assert.equal(f12.chords, chordAfter.chords + 1); assert.equal(f12.last_chord.count, 1); assert.equal(f12.last_chord.keys[0], 0xffc9);
+    await clickInMenu("keys", "bmc.keys.ctrl_alt_f12"); const ctrlF12 = await stats(); assert.equal(ctrlF12.chords, f12.chords + 1); assert.deepEqual(ctrlF12.last_chord.keys.slice(0, 3), [0xffe3, 0xffe9, 0xffc9]);
     await capture("dark-860x480-keys-lower-actions", 860, 480);
     const keysPopup = (await visible("bmc.keys.popover")).rect, keysClose = (await visible("bmc.keys.close")).rect;
     assert(keysClose.y >= keysPopup.y && keysClose.y + keysClose.h <= keysPopup.y + 60, "sticky Keys header close stays inside popup after scrolling to lower actions");
@@ -247,7 +276,8 @@ try {
       }
       if (fixture === "unknown") assert.equal(current.draft.target, "VendorOriginalText", "unknown raw boot value retained");
       await capture(`dark-860x480-${fixture}-boot`, 860, 480); await closeMenu("boot");
-      if (fixture === "no_signal") assert(!(await query("bmc.frame")).some(shown), "no-signal status hides synthetic frame");
+      // j8WXoF O4: no signal keeps the old picture under the "waiting for picture" alert.
+      if (fixture === "no_signal") { assert((await query("bmc.frame")).some(shown), "no-signal keeps the last synthetic frame"); assert((await query("bmc.waiting")).some(shown), "no-signal shows the waiting alert"); }
     }
     await state("controlled");
     await click("bmc.power"); const powerBefore = await stats(); await attemptReadOnly("bmc.power.execute"); assert.equal((await stats()).power_writes, powerBefore.power_writes); await closeMenu("power");

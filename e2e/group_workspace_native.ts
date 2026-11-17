@@ -2,6 +2,7 @@
  * node e2e/group_workspace_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  * --prepare-only 1 writes a plan without starting an app.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -9,10 +10,11 @@ import { copyFile, mkdir, mkdtemp, open, readFile, readdir, writeFile } from "no
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { waitForServerReady, waitFor, query, clickAt, key, type_, screenshot, sleep, resizeWindow } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, clickAt, key, type_, screenshot, sleep, resizeWindow, focused } from "../zig-out/share/zenit/harness/client.ts";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args: Record<string,string> = {};
-for(let i=2;i<process.argv.length;i+=2) { assert(["--binary","--expected-sha","--out","--prepare-only"].includes(process.argv[i]) && process.argv[i+1]); args[process.argv[i]]=process.argv[i+1]; }
+for(let i=2;i<process.argv.length;i+=2) { assert(["--binary","--expected-sha","--out","--prepare-only","--theme"].includes(process.argv[i]) && process.argv[i+1]); args[process.argv[i]]=process.argv[i+1]; }
+const theme=args["--theme"]??"dark"; assert(["light","dark"].includes(theme));
 assert(args["--out"]);
 const output=resolve(args["--out"]); await mkdir(output,{recursive:true}); assert.equal((await readdir(output)).length,0);
 const report:any={status:"prepared_not_run",checks:[],screenshots:[],input:"Synthetic public Harness only",visual_status:"not_reviewed",limits:["Physical pointer, IME, window blur, VoiceOver require separate native acceptance","Runner cleanup SIGTERM is not normal application shutdown proof","Local mixed-group paths only; SSH reconnect/offline and AI impacts require their own fixtures"]};
@@ -21,7 +23,7 @@ if(args["--prepare-only"]==="1") { report.plan=["Create two real zsh services vi
 assert(args["--binary"] && /^[a-f0-9]{64}$/.test(args["--expected-sha"]??""));
 const sourceBinary=resolve(args["--binary"]), binary=join(output,"zerowork-frozen"); await copyFile(sourceBinary,binary); await copyFile(join(dirname(sourceBinary),"zw_ipc.so"),join(output,"zw_ipc.so")); assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"),args["--expected-sha"]);
 const isolated=await mkdtemp(join(tmpdir(),"zw-group-workspace-")), rpc=join(isolated,"rpc"),data=join(isolated,"data"); await Promise.all([mkdir(rpc),mkdir(data)]);
-await writeFile(join(data,"config.toml"),'[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\nfont_size = 14\n');
+await writeFile(join(data,"config.toml"),`[meta]\nconfig_revision = 1\n[ui]\ntheme = "${theme}"\nfont_family = "Menlo"\nfont_size = 14\n[updates]\nauto_check = false\n`);
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const log=await open(join(output,"app.log"),"w");
 const child=spawn(binary,[],{cwd:root,env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:"0",ZENIT_E2E_BACKGROUND:"1",ZENIT_E2E_ISOLATE_POINTER:"1",OPENAI_API_KEY:"",ANTHROPIC_API_KEY:""},stdio:["ignore",log.fd,log.fd]});
@@ -38,7 +40,7 @@ const type=async(text:string)=>{report.last_action={kind:"type",text,at:new Date
 const menuItem=async(label:string)=>{
  const menu=await visible("groups.member_menu");const n=flat(menu).find(n=>n.text===label);assert(n,`Missing member menu item ${label}`);await clickNode(n);
 };
-const tabs=async()=>{const strip=(await query("tabs.strip")).find(shown);return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??"")&&!flat(n).some(c=>c.test_id==="groups.close")):[]};
+const tabs=async()=>{const strip=(await query("tabs.strip")).find(shown);return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??"")&&!flat(n).some(c=>c.test_id==="groups.close"||c.test_id==="groups.tab.count")):[]};
 const panes=async()=>flat(await visible("groups.workspace")).filter(n=>/^groups\.pane\.\d+$/.test(n.test_id??""));
 const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);const observed:any={};for(const id of ["tabs.strip","groups.workspace","groups.close.confirm","groups.close.partial","local.close.confirmation"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
 const check=(name:string,detail:any)=>report.checks.push({name,status:"passed",detail});
@@ -71,7 +73,7 @@ try {
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,"owner.json"),"utf8")).pid),child.pid);
  await resizeWindow(1440,900);await click("workspace.empty.local");await visible("terminal.surface");
  const firstTab=(await tabs())[0].test_id;
- await joinTrustedGroup("first");await visible("groups.workspace");await visible("groups.waiting");
+ await joinTrustedGroup("first");await visible("groups.workspace"); /* 88529dc0: a one-member group shows its pane (no "waiting" placeholder) */
  const firstPane=(await panes())[0].test_id; assert.equal((await panes()).length,1);await capture("01-single-member-real-pane");
  await click("toolbar.new_session");await click("session.menu.local");await visible("terminal.surface");
  const secondTab=(await tabs()).find(n=>n.test_id!==firstTab).test_id;
@@ -86,7 +88,16 @@ try {
  }
  check("each focused pane writes through its own real zsh service",{first:firstId,second:secondId});
  await click(firstTab);await hidden("groups.workspace");await click("groups.tab");await visible("groups.workspace");check("standalone and group remain independent presentation owners",{});
- await click("groups.close");await visible("groups.close.confirm");await capture("04-group-close-confirm");await click("groups.close.cancel");await hidden("groups.close.confirm");assert.equal((await tabs()).length,2);assert.equal((await panes()).length,2);check("group-close cancel preserves both sessions",{});
+ await click("groups.close");await visible("groups.close.confirm");
+ // The shared native confirmation (CONSISTENCY_AUDIT #2): 取消 focused, danger 动词 + 对象, Esc = 取消.
+ {const textOf=(n:any):string=>(n.text??"")+(n.children??[]).map(textOf).join("");
+  assert.equal(textOf(await visible("groups.close.accept")),"关闭 2 个会话");assert.equal(textOf(await visible("groups.close.cancel")),"取消");
+  assert(textOf(await visible("groups.close.heading")).includes("关闭组内全部会话？"));
+  await waitFor(async()=>(await focused() as any)?.test_id==="groups.close.cancel"||null,5000);
+  await sleep(250);await capture(`04-group-close-confirm-${theme}`);
+  await press("escape");await hidden("groups.close.confirm");assert.equal((await tabs()).length,2);check("group-close Escape cancels",{});
+  await click("groups.close");await visible("groups.close.confirm");}
+ await click("groups.close.cancel");await hidden("groups.close.confirm");assert.equal((await tabs()).length,2);assert.equal((await panes()).length,2);check("group-close cancel preserves both sessions",{});
  await click("groups.close");await visible("groups.close.confirm");await click("groups.close.accept");
  let memberConfirmations=0;
  await waitFor(async()=>{

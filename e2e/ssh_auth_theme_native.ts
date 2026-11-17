@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Actual authentication dialog paints for every theme at T0/T100.
  * node e2e/ssh_auth_theme_native.ts <evidence-dir> <owned-peer.json> <binary>

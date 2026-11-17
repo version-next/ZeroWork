@@ -14,6 +14,10 @@
 //!   247). Unfocused ratio unchanged.
 //! - Divider between segments 1x20 pt (5% black), only between two unselected adjacent segments.
 //! - State changes snap per frame, no transition; segment select jumps on release.
+//! - Disabled item (not measured): icon at the family ink's tertiary-label alpha (~26%), no plate.
+//!
+//! Template form: `<W.GlassToolbar>` takes `<W.GlassToolbarGroup>` children, each a capsule of
+//! `<W.GlassToolbarButton>` elements whose icon / label / disabled follow their sources.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
@@ -25,6 +29,7 @@ const Handler = core.Handler;
 const reactive = @import("../../reactive.zig");
 const Scope = reactive.Scope;
 const Model = reactive.Model;
+const Source = reactive.Source;
 const events = @import("../../events.zig");
 const Event = events.Event;
 const EventResult = events.EventResult;
@@ -60,16 +65,20 @@ pub const Palette = struct {
     separator: u8,
     icon_active: u8,
     icon_inactive: u8,
+    /// Disabled item icon (window focused or not), no backplate. Not measured on native yet:
+    /// AppKit draws a disabled toolbar item with the tertiary label color (alpha ~0.26 light /
+    /// 0.25 dark), so the same alpha of the family ink.
+    icon_disabled: u8,
 };
 
 /// Light family (glass 247): hover 234, press/selected 222, selected+hover 209, selected+press 197;
 /// icon 74 (unfocused 176).
-pub const light_palette = Palette{ .ink = Color.rgba(0, 0, 0, 255), .plate_hover = 13, .plate_press = 26, .plate_selected = 26, .separator = 13, .icon_active = 179, .icon_inactive = 73 };
+pub const light_palette = Palette{ .ink = Color.rgba(0, 0, 0, 255), .plate_hover = 13, .plate_press = 26, .plate_selected = 26, .separator = 13, .icon_active = 179, .icon_inactive = 73, .icon_disabled = 66 };
 /// Dark family (dark appearance, glass 26 on titlebar 31): hover 46, press/selected 61,
 /// selected+hover 81,
 /// selected+press 96 (stack white 8.7% / 15.3%, additive); icon 90% white (232, unfocused ~34%);
 /// divider 46. Unfocused backplate ratio unchanged.
-pub const dark_palette = Palette{ .ink = Color.rgba(255, 255, 255, 255), .plate_hover = 22, .plate_press = 39, .plate_selected = 39, .separator = 22, .icon_active = 230, .icon_inactive = 87 };
+pub const dark_palette = Palette{ .ink = Color.rgba(255, 255, 255, 255), .plate_hover = 22, .plate_press = 39, .plate_selected = 39, .separator = 22, .icon_active = 230, .icon_inactive = 87, .icon_disabled = 64 };
 
 pub const ToolbarButton = struct {
     icon: svg_assets.Asset,
@@ -78,6 +87,9 @@ pub const ToolbarButton = struct {
     /// Accessibility name
     label: []const u8 = "",
     test_id: ?[]const u8 = null,
+    /// Disabled: dimmed icon, no hover / press plate, clicks ignored, a11y disabled
+    /// (`.{ .signal = sig }` / `.{ .derived = … }` follows a source).
+    disabled: Source(bool) = .{ .value = false },
 };
 
 pub const ToolbarSegmented = struct {
@@ -116,9 +128,11 @@ pub const GlassToolbarProps = struct {
 
 /// Single clickable item (button or segment)
 const Item = struct {
-    toolbar: *GlassToolbarRuntime,
-    /// Glass state of capsule it's in: family (light/dark) adapts to background, coloring follows
-    glass: *glass_box.AdaptiveGlassBoxState,
+    cx: *Cx,
+    /// Glass state of capsule it's in: family (light/dark) adapts to background, coloring follows.
+    /// A `GlassToolbarButton` element finds its capsule on its first frame (null before: the
+    /// appearance's family).
+    glass: ?*glass_box.AdaptiveGlassBoxState,
     node: *Node,
     plate: *Node,
     icon: *Node,
@@ -128,6 +142,9 @@ const Item = struct {
     /// Pointer still in item after press (drag out cancels highlight, drag back restores--AppKit
     /// std tracking)
     inside: bool = false,
+    disabled: Source(bool) = .{ .value = false },
+    /// svg data of the icon on screen (element buttons rebuild the icon when it changes)
+    icon_svg: ?[*]const u8 = null,
     kind: union(enum) {
         button: ?Handler(void),
         segment: struct { group: *Segmented, index: usize },
@@ -140,15 +157,24 @@ const Item = struct {
         };
     }
 
+    fn familyDark(self: *const Item) bool {
+        return if (self.glass) |g| g.family_dark else self.cx.tokens.scheme == .dark;
+    }
+
+    fn isDisabled(self: *const Item) bool {
+        return self.disabled.peek();
+    }
+
     fn palette(self: *const Item) *const Palette {
-        return if (self.glass.family_dark) &dark_palette else &light_palette;
+        return if (self.familyDark()) &dark_palette else &light_palette;
     }
 
     /// Color under one family, interpolate between families by capsule's family transition (ink
     /// color
     /// transitions with glass on family flip)
     fn ink(self: *const Item, comptime f: fn (*const Item, *const Palette) Color) Color {
-        return glass_box.familyInk(self.glass, f(self, &light_palette), f(self, &dark_palette));
+        const g = self.glass orelse return f(self, self.palette());
+        return glass_box.familyInk(g, f(self, &light_palette), f(self, &dark_palette));
     }
 
     fn plateColor(self: *const Item, p: *const Palette) Color {
@@ -156,7 +182,8 @@ const Item = struct {
     }
 
     fn iconColor(self: *const Item, p: *const Palette) Color {
-        return p.ink.withAlpha(if (self.toolbar.cx.window_active) p.icon_active else p.icon_inactive);
+        if (self.isDisabled()) return p.ink.withAlpha(p.icon_disabled);
+        return p.ink.withAlpha(if (self.cx.window_active) p.icon_active else p.icon_inactive);
     }
 
     fn separatorColor(self: *const Item, p: *const Palette) Color {
@@ -170,6 +197,7 @@ const Item = struct {
 
     fn plateAlphaIn(self: *const Item, p: *const Palette) u8 {
         const base: u8 = if (self.selected()) p.plate_selected else 0;
+        if (self.isDisabled()) return base;
         const state: u8 = if (self.pressed and self.inside) p.plate_press else if (self.hovered and !self.pressed) p.plate_hover else 0;
         return base + state;
     }
@@ -206,10 +234,7 @@ pub const GlassToolbarRuntime = struct {
     /// self-deduplicate,
     /// silent when at rest (not mark dirty).
     fn refresh(self: *GlassToolbarRuntime) void {
-        for (self.items.items) |it| {
-            it.plate.setBackground(it.ink(Item.plateColor));
-            if (it.icon.setTint(it.ink(Item.iconColor))) it.icon.markRenderDirty();
-        }
+        for (self.items.items) |it| refreshItem(it);
         for (self.segmented.items) |seg| {
             const sel = seg.selected.readAs(false);
             for (seg.separators, 0..) |sep, i| {
@@ -249,10 +274,9 @@ pub const TitlebarEdgeProps = struct {
 };
 
 /// Build titlebar edge strip: absolutely positioned stick to parent top, don't intercept hit
-/// (content below scrolls normally), place above content, below toolbar.
+/// (content below scrolls normally), place above content, below toolbar. With `dark` null the
+/// strip re-picks light / dark on every `Cx.setTheme`.
 pub fn titlebarEdge(cx: *Cx, props: TitlebarEdgeProps) !*Node {
-    const dark = props.dark orelse (cx.tokens.scheme == .dark);
-    const base = if (dark) titlebar_edge_dark else titlebar_edge_light;
     const n = try box(cx, .{
         .width = if (props.width) |w| .{ .px = w } else .{ .grow = .{} },
         .height = .{ .px = titlebar_edge_height },
@@ -262,14 +286,42 @@ pub fn titlebarEdge(cx: *Cx, props: TitlebarEdgeProps) !*Node {
     const e = try n.style.ensureExtFallible(cx.allocator);
     e.inset = .{ .left = .{ .px = 0 }, .top = .{ .px = 0 } };
     e.hit_behavior = .pass_through;
+    setTitlebarEdgeGradient(n, props.dark orelse (cx.tokens.scheme == .dark));
+    if (props.dark == null) n.meta.per_frame.hooks.on_theme = struct {
+        fn hook(node: *Node, t: *const core.ThemeTokens, _: Allocator) void {
+            setTitlebarEdgeGradient(node, t.scheme == .dark);
+            node.markRenderDirty();
+        }
+    }.hook;
+    n.meta.ownership.meta.component_name = "TitlebarEdge";
+    return n;
+}
+
+/// The measured wash profile toward the window background of one appearance (ext allocated).
+fn setTitlebarEdgeGradient(n: *Node, dark: bool) void {
+    const base = if (dark) titlebar_edge_dark else titlebar_edge_light;
     var stops: [titlebar_edge_profile.len]core.GradientStop = undefined;
     for (titlebar_edge_profile, 0..) |pt, i| {
         stops[i] = .{ .color = base.withAlpha(@intFromFloat(@round(pt[1] * 255))), .position = pt[0] / titlebar_edge_height };
     }
-    e.multi_gradient = core.MultiGradient.fromSlice(&stops, .vertical);
-    n.meta.ownership.meta.component_name = "TitlebarEdge";
-    return n;
+    n.style.ext.?.multi_gradient = core.MultiGradient.fromSlice(&stops, .vertical);
 }
+
+/// `W.TitlebarEdge` (Yix `<W.TitlebarEdge />`): `titlebarEdge` as a component. Put it in the
+/// positioned container that holds the scrolling content, after the content and before the
+/// toolbar / header, so it paints between them.
+pub fn TitlebarEdge(props: anytype) TitlebarEdgeBuilder {
+    return .{ .props = reactive.props.coerce(TitlebarEdgeProps, props) };
+}
+
+pub const TitlebarEdgeBuilder = struct {
+    props: TitlebarEdgeProps,
+
+    pub fn mount(self: TitlebarEdgeBuilder, scope: *Scope, cx: *Cx) !*Node {
+        _ = scope;
+        return titlebarEdge(cx, self.props);
+    }
+};
 
 test "titlebarEdge: measured wash profile as a vertical gradient of the window background" {
     var ctx = try Cx.init(testing.allocator, std.testing.io);
@@ -287,6 +339,35 @@ test "titlebarEdge: measured wash profile as a vertical gradient of the window b
     try testing.expectEqual(@as(u8, 34), d.style.ext.?.multi_gradient.?.stops[0].color.r);
 }
 
+test "TitlebarEdge: follows theme switches unless `dark` is given; mounts from ui.view" {
+    var ctx = try Cx.init(testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setTheme(&core.theme.light);
+    const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 400 }, .position = .relative }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const view = @import("../../view.zig");
+    var themed: *Node = undefined;
+    var pinned: *Node = undefined;
+    try view.mount(scope, ctx, root, view.capture(&themed, TitlebarEdge(.{})));
+    try view.mount(scope, ctx, root, view.capture(&pinned, TitlebarEdge(.{ .dark = false })));
+    try testing.expectEqualStrings("TitlebarEdge", themed.meta.ownership.meta.component_name.?);
+    try testing.expectEqual(@as(u8, 249), themed.style.ext.?.multi_gradient.?.stops[0].color.r);
+    ctx.setTheme(&core.theme.dark);
+    try testing.expectEqual(@as(u8, 34), themed.style.ext.?.multi_gradient.?.stops[0].color.r);
+    try testing.expectEqual(@as(u8, 217), themed.style.ext.?.multi_gradient.?.stops[0].color.a);
+    try testing.expectEqual(@as(u8, 249), pinned.style.ext.?.multi_gradient.?.stops[0].color.r);
+    ctx.setTheme(&core.theme.light);
+    try testing.expectEqual(@as(u8, 249), themed.style.ext.?.multi_gradient.?.stops[0].color.r);
+}
+
+/// Plate / icon as appearance (setBackground / setTint self-deduplicate).
+fn refreshItem(it: *Item) void {
+    it.plate.setBackground(it.ink(Item.plateColor));
+    if (it.icon.setTint(it.ink(Item.iconColor))) it.icon.markRenderDirty();
+}
+
 pub fn GlassToolbar(props: anytype) GlassToolbarBuilder {
     return .{ .props = reactive.props.coerce(GlassToolbarProps, props) };
 }
@@ -294,6 +375,12 @@ pub fn GlassToolbar(props: anytype) GlassToolbarBuilder {
 pub const GlassToolbarResult = struct {
     root: *Node,
     runtime: *GlassToolbarRuntime,
+
+    /// `ui.view` / Yix `<W.GlassToolbar>`: children (`<W.GlassToolbarGroup>` elements, a
+    /// `<spacer />`) go into the toolbar row after the `groups` built from props.
+    pub fn viewParts(self: GlassToolbarResult) core.ViewParts {
+        return .{ .root = self.root, .slot = self.root };
+    }
 };
 
 pub const GlassToolbarBuilder = struct {
@@ -349,6 +436,7 @@ pub const GlassToolbarBuilder = struct {
                     const it = try mountItem(my_scope, cx, rt, cap, b.icon, b.width, .{ .button = b.on_click });
                     it.node.behavior.interaction.a11y = .{ .role = .button, .label = b.label };
                     if (b.test_id) |tid| it.node.meta.ownership.meta.test_id = tid;
+                    try bindDisabled(my_scope, it, b.disabled);
                 }
             },
             .segmented => |sp| {
@@ -403,13 +491,16 @@ pub const GlassToolbarBuilder = struct {
                             if (it.node.behavior.interaction.a11y) |*a11y| a11y.checked = v == i;
                             it.node.markRenderDirty();
                         }
-                        if (s.items.len > 0) s.items[0].toolbar.cx.needs_redraw = true;
+                        if (s.items.len > 0) s.items[0].cx.needs_redraw = true;
                     }
                 }.run);
             },
         };
 
         root.meta.per_frame.hooks.before_render.main = toolbarBeforeRender;
+        // refresh() writes plates / icons / separators through setBackground / setTint +
+        // markRenderDirty only: descendants stay cacheable (audited in Debug).
+        root.frame_state.state_bits.flags.before_render_hook_descendants_cache_safe = true;
         root.behavior.events.event_context = @ptrCast(rt);
         rt.refresh();
         return .{ .root = root, .runtime = rt };
@@ -434,15 +525,61 @@ fn mountCapsule(scope: *Scope, cx: *Cx, parent: *Node, content_width: f32, end_p
 }
 
 fn mountItem(scope: *Scope, cx: *Cx, rt: *GlassToolbarRuntime, cap: glass_box.GlassBoxMount, icon: svg_assets.Asset, width: f32, kind: @FieldType(Item, "kind")) !*Item {
+    const node = try core.adoptChild(cx, cx.allocator, cap.body, try itemNode(cx, icon, width));
+    // All possible fail steps before creating Item; once in rt.items belongs to rt cleanup
+    // (can't errdefer after, else later fail cleanup twice--OOM sweep measured)
+    const it = try scope.allocator.create(Item);
+    it.* = .{ .cx = cx, .glass = cap.state, .node = node, .plate = node.children.items[0], .icon = node.children.items[1], .width = width, .kind = kind };
+    rt.items.append(scope.allocator, it) catch |err| {
+        scope.allocator.destroy(it);
+        return err;
+    };
+    attachItemEvents(it);
+    return it;
+}
+
+fn attachItemEvents(it: *Item) void {
+    const node = it.node;
+    node.behavior.events.event_context = @ptrCast(it);
+    node.behavior.events.on_event = itemEvent;
+    node.on_capture_lost = itemCaptureLost;
+}
+
+/// Disabled source of a button: a11y and cursor now, and again whenever a dynamic source changes
+/// (the per-frame refresh repaints icon and plate).
+fn bindDisabled(scope: *Scope, it: *Item, disabled: Source(bool)) !void {
+    it.disabled = disabled;
+    applyDisabled(it, disabled.peek());
+    if (disabled.isStatic()) return;
+    try scope.createEffect(it, struct {
+        fn run(item: *Item) void {
+            applyDisabled(item, item.disabled.get());
+            item.cx.needs_redraw = true;
+        }
+    }.run);
+}
+
+fn applyDisabled(it: *Item, disabled: bool) void {
+    if (it.node.behavior.interaction.a11y) |*a| a.disabled = disabled;
+    if (disabled) {
+        it.hovered = false;
+        it.pressed = false;
+        it.inside = false;
+    }
+    it.node.markRenderDirty();
+}
+
+/// Item node: fixed-width cell with the centered backplate (child 0) and icon (child 1).
+fn itemNode(cx: *Cx, icon: svg_assets.Asset, width: f32) !*Node {
     const a = cx.allocator;
-    const parent = cap.body;
-    const node = try core.adoptChild(cx, a, parent, try box(cx, .{
+    const node = try box(cx, .{
         .width = .{ .px = width },
         .height = .{ .px = bar_height },
         .position = .relative,
         .justify = .center,
         .align_items = .center,
-    }, .{}));
+    }, .{});
+    errdefer cx.freeNode(node);
     const plate = try core.adoptChild(cx, a, node, try box(cx, .{
         .width = .{ .px = plate_width },
         .height = .{ .px = plate_height },
@@ -452,27 +589,18 @@ fn mountItem(scope: *Scope, cx: *Cx, rt: *GlassToolbarRuntime, cap: glass_box.Gl
     const ext = try plate.style.ensureExtFallible(a);
     ext.inset = .{ .left = .{ .px = (width - plate_width) / 2 }, .top = .{ .px = (bar_height - plate_height) / 2 } };
     ext.corner_radius = core.CornerRadius.uniform(plate_height / 2);
-    plate.style.border = .{ .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = plate_height / 2 };
-    const icon_node = try core.adoptChild(cx, a, node, try core.iconTint(cx, icon, light_palette.ink.withAlpha(light_palette.icon_active), .{
-        .width = .{ .px = icon_size },
-        .height = .{ .px = icon_size },
-    }));
-
+    plate.style.border = .{ .overlay = true, .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = plate_height / 2 };
+    _ = try core.adoptChild(cx, a, node, try iconNode(cx, icon));
     node.style.cursor = .default;
     (try node.style.ensureExtFallible(a)).hit_roles = .{ .pointer = true };
+    return node;
+}
 
-    // All possible fail steps before creating Item; once in rt.items belongs to rt cleanup
-    // (can't errdefer after, else later fail cleanup twice--OOM sweep measured)
-    const it = try scope.allocator.create(Item);
-    it.* = .{ .toolbar = rt, .glass = cap.state, .node = node, .plate = plate, .icon = icon_node, .width = width, .kind = kind };
-    rt.items.append(scope.allocator, it) catch |err| {
-        scope.allocator.destroy(it);
-        return err;
-    };
-    node.behavior.events.event_context = @ptrCast(it);
-    node.behavior.events.on_event = itemEvent;
-    node.on_capture_lost = itemCaptureLost;
-    return it;
+fn iconNode(cx: *Cx, icon: svg_assets.Asset) !*Node {
+    return core.iconTint(cx, icon, light_palette.ink.withAlpha(light_palette.icon_active), .{
+        .width = .{ .px = icon_size },
+        .height = .{ .px = icon_size },
+    });
 }
 
 fn toolbarBeforeRender(node: *Node) void {
@@ -498,12 +626,12 @@ fn itemCaptureLost(node: *Node) void {
     // not guaranteed to re-send--prefer one fewer hover highlight, never leave backplate always lit
     // (next true enter resets)
     it.hovered = false;
-    it.toolbar.cx.needs_redraw = true;
+    it.cx.needs_redraw = true;
 }
 
 fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
     const it: *Item = @ptrCast(@alignCast(context orelse return .ignored));
-    const cx = it.toolbar.cx;
+    const cx = it.cx;
     switch (event) {
         .mouse_enter => {
             it.hovered = true;
@@ -517,6 +645,8 @@ fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
         },
         .mouse_down => |e| {
             if (e.button != .left) return .ignored;
+            // A disabled item takes the press (nothing behind it reacts) and does nothing.
+            if (it.isDisabled()) return .stop;
             const identity = cx.node_registry.handleFor(it.node);
             cx.setPointerCapture(it.node);
             const live = cx.node_registry.resolve(identity, null) orelse return .stop;
@@ -547,7 +677,7 @@ fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
             it.hovered = inside;
             if (ownsCapture(cx, it.node)) cx.releasePointerCapture();
             cx.needs_redraw = true;
-            if (!inside) return .stop;
+            if (!inside or it.isDisabled()) return .stop;
             // Last step: callback may destroy this control, don't visit it after
             switch (it.kind) {
                 .button => |h| if (h) |handler| handler.invoke(),
@@ -557,6 +687,165 @@ fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
         },
         else => return .ignored,
     }
+}
+
+// ============================================================================
+// Template form: <W.GlassToolbarGroup> with <W.GlassToolbarButton> children
+// ============================================================================
+
+/// One toolbar capsule as an element (Yix):
+///   <W.GlassToolbarGroup testId="nav.history">
+///       <W.GlassToolbarButton icon={ui.icons.chevron_left} label="Back" disabled={!canBack(vm)} onClick={back(vm)} />
+///       <W.GlassToolbarButton icon={ui.icons.chevron_right} label="Forward" disabled={!canForward(vm)} onClick={forward(vm)} />
+///   </W.GlassToolbarGroup>
+/// Same capsule as a `.buttons` group (36 pt regular glass, 1 pt end padding), its width fits the
+/// buttons. Works inside `<W.GlassToolbar>` or on its own (a header row).
+pub const GlassToolbarGroupProps = struct {
+    /// Accessibility name of the group (null = none).
+    label: ?[]const u8 = null,
+};
+
+pub fn GlassToolbarGroup(props: anytype) GlassToolbarGroupBuilder {
+    return .{ .props = reactive.props.coerce(GlassToolbarGroupProps, props) };
+}
+
+pub const GlassToolbarGroupBuilder = struct {
+    props: GlassToolbarGroupProps,
+
+    pub fn mount(self: GlassToolbarGroupBuilder, scope: *Scope, cx: *Cx) !GlassToolbarGroupResult {
+        const g = try glass_box.GlassBox(.{
+            .height = bar_height,
+            .shape = .capsule,
+            .corner_radius = bar_height / 2,
+            .padding = .{ .left = buttons_end_pad, .right = buttons_end_pad },
+            .body_gap = 0,
+        }).mountWithState(scope, cx);
+        g.box.meta.ownership.meta.component_name = "GlassToolbarGroup";
+        // The capsule keeps its fitted width in a stretching parent.
+        (try g.box.style.ensureExtFallible(cx.allocator)).no_cross_stretch = true;
+        g.body.style.direction = .row;
+        g.body.style.height = .{ .grow = .{} };
+        g.body.behavior.interaction.a11y = .{ .role = .group, .label = self.props.label };
+        return .{ .glass = g };
+    }
+};
+
+pub const GlassToolbarGroupResult = struct {
+    glass: glass_box.GlassBoxMount,
+
+    pub fn viewParts(self: GlassToolbarGroupResult) core.ViewParts {
+        return .{ .root = self.glass.box, .slot = self.glass.body };
+    }
+};
+
+/// One toolbar button as an element; every visual prop but `width` follows its source.
+pub const GlassToolbarButtonProps = struct {
+    icon: Source(svg_assets.Asset),
+    /// Accessibility name
+    label: Source([]const u8) = .{ .value = "" },
+    /// Dimmed icon, no hover / press plate, clicks ignored, a11y disabled.
+    disabled: Source(bool) = .{ .value = false },
+    on_click: ?Handler(void) = null,
+    width: f32 = button_width,
+};
+
+pub fn GlassToolbarButton(props: anytype) GlassToolbarButtonBuilder {
+    return .{ .props = reactive.props.coerce(GlassToolbarButtonProps, props) };
+}
+
+pub const GlassToolbarButtonBuilder = struct {
+    props: GlassToolbarButtonProps,
+
+    pub fn mount(self: GlassToolbarButtonBuilder, scope: *Scope, cx: *Cx) !*Node {
+        const p = self.props;
+        const my_scope = try scope.childScope();
+        var bound = false;
+        errdefer if (!bound) my_scope.dispose();
+        const node = try itemNode(cx, p.icon.peek(), p.width);
+        errdefer cx.freeNode(node);
+        node.meta.ownership.meta.component_name = "GlassToolbarButton";
+        node.behavior.interaction.a11y = .{ .role = .button, .label = p.label.peek() };
+        try core.bindScopeToNode(my_scope, node);
+        bound = true;
+
+        const it = try my_scope.allocator.create(Item);
+        it.* = .{ .cx = cx, .glass = null, .node = node, .plate = node.children.items[0], .icon = node.children.items[1], .icon_svg = p.icon.peek().svg_data.ptr, .width = p.width, .kind = .{ .button = p.on_click } };
+        try my_scope.adoptResource(@ptrCast(it), struct {
+            fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+                alloc.destroy(@as(*Item, @ptrCast(@alignCast(ptr))));
+            }
+        }.destroy);
+        attachItemEvents(it);
+        try bindDisabled(my_scope, it, p.disabled);
+        if (!p.label.isStatic()) try my_scope.createEffect(LabelBinding{ .item = it, .label = p.label }, LabelBinding.run);
+        if (!p.icon.isStatic()) try my_scope.createEffect(IconBinding{ .item = it, .icon = p.icon }, IconBinding.run);
+
+        node.meta.per_frame.hooks.before_render.main = buttonBeforeRender;
+        // Like the toolbar hook: plate / icon writes are dirty-marking setters only.
+        node.frame_state.state_bits.flags.before_render_hook_descendants_cache_safe = true;
+        refreshItem(it);
+        return node;
+    }
+};
+
+const LabelBinding = struct {
+    item: *Item,
+    label: Source([]const u8),
+
+    fn run(self: LabelBinding) void {
+        const text = self.label.get();
+        if (self.item.node.behavior.interaction.a11y) |*a| a.label = text;
+        self.item.node.markRenderDirty();
+    }
+};
+
+/// A changed icon source rebuilds the icon node in place (child 1).
+const IconBinding = struct {
+    item: *Item,
+    icon: Source(svg_assets.Asset),
+
+    fn run(self: IconBinding) void {
+        const asset = self.icon.get();
+        const it = self.item;
+        if (it.icon_svg == asset.svg_data.ptr) return;
+        const cx = it.cx;
+        const fresh = iconNode(cx, asset) catch {
+            std.log.warn("GlassToolbarButton: icon change dropped (out of memory)", .{});
+            return;
+        };
+        it.node.insertChildBefore(cx.allocator, fresh, it.icon) catch {
+            cx.freeNode(fresh);
+            std.log.warn("GlassToolbarButton: icon change dropped (out of memory)", .{});
+            return;
+        };
+        const old = it.icon;
+        cx.detachChild(it.node, old);
+        cx.freeNode(old);
+        it.icon = fresh;
+        it.icon_svg = asset.svg_data.ptr;
+        refreshItem(it);
+        it.node.markLayoutDirty();
+        cx.needs_redraw = true;
+    }
+};
+
+/// Per frame: find the capsule the button sits in (first frame on the tree), then paint.
+fn buttonBeforeRender(node: *Node) void {
+    const it: *Item = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
+    if (it.glass == null) it.glass = enclosingGlass(node);
+    refreshItem(it);
+}
+
+fn enclosingGlass(node: *Node) ?*glass_box.AdaptiveGlassBoxState {
+    var cur = node.parent;
+    while (cur) |n| : (cur = n.parent) {
+        const name = n.meta.ownership.meta.component_name orelse continue;
+        if (std.mem.eql(u8, name, "GlassToolbarGroup") or std.mem.eql(u8, name, "GlassBox")) {
+            const raw = n.meta.per_frame.hooks.slots.anim_state orelse return null;
+            return @ptrCast(@alignCast(raw));
+        }
+    }
+    return null;
 }
 
 // ============================================================================
@@ -619,7 +908,7 @@ test "GlassToolbar: plate alphas add up (selected + hover / press) and switch wi
     rt.refresh();
     try testing.expectEqual(light_palette.icon_inactive, btn.icon.getIcon().?.tint.a);
     // Dark family: stack white, selected+hover = 39 + 22
-    glass_box.glassSetFamilyImmediate(seg1.glass, true);
+    glass_box.glassSetFamilyImmediate(seg1.glass.?, true);
     try testing.expectEqual(dark_palette.plate_selected + dark_palette.plate_hover, seg1.plateAlpha());
     rt.refresh();
     try testing.expectEqual(@as(u8, 255), seg1.plate.getBackground().r);
@@ -637,6 +926,109 @@ test "GlassToolbar: mount OOM sweep (every allocation failure path frees exactly
                 .flexible_space,
             };
             return (try GlassToolbar(.{ .groups = &groups }).mount(scope, cx)).root;
+        }
+    }.mount);
+}
+
+test "GlassToolbar: disabled button dims its icon, shows no plate, ignores clicks and follows its source" {
+    var ctx = try Cx.init(testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.tokens = &core.theme.light;
+    const root = try box(ctx, .{ .width = .{ .px = 600 }, .height = .{ .px = 80 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const Counter = struct {
+        n: usize = 0,
+        fn hit(self: *@This()) void {
+            self.n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    const off = try scope.createSignal(bool, true);
+    const groups = [_]ToolbarGroup{
+        .{ .buttons = &[_]ToolbarButton{
+            .{ .icon = icons.home, .label = "Back", .disabled = .{ .signal = off }, .on_click = Cx.handlerFrom(Counter, &counter, Counter.hit) },
+            .{ .icon = icons.upload, .label = "Share" },
+        } },
+    };
+    const tb = try GlassToolbar(.{ .groups = &groups }).mount(scope, ctx);
+    try root.appendChild(testing.allocator, tb.root);
+    ctx.layout();
+    const back = tb.runtime.items.items[0];
+    const share = tb.runtime.items.items[1];
+    tb.runtime.refresh();
+    try testing.expect(back.node.behavior.interaction.a11y.?.disabled);
+    try testing.expect(!share.node.behavior.interaction.a11y.?.disabled);
+    try testing.expectEqual(light_palette.icon_disabled, back.icon.getIcon().?.tint.a);
+    try testing.expectEqual(light_palette.icon_active, share.icon.getIcon().?.tint.a);
+    const g = back.node.globalRect();
+    _ = itemEvent(.mouse_enter, back);
+    try testing.expectEqual(@as(u8, 0), back.plateAlpha());
+    try testing.expectEqual(EventResult.stop, itemEvent(.{ .mouse_down = .{ .x = g.x + 4, .y = g.y + 4 } }, back));
+    _ = itemEvent(.{ .mouse_up = .{ .x = g.x + 4, .y = g.y + 4 } }, back);
+    try testing.expectEqual(@as(usize, 0), counter.n);
+    // Enabled again: full ink, hover plate, click lands.
+    off.set(false);
+    tb.runtime.refresh();
+    try testing.expect(!back.node.behavior.interaction.a11y.?.disabled);
+    try testing.expectEqual(light_palette.icon_active, back.icon.getIcon().?.tint.a);
+    _ = itemEvent(.mouse_enter, back);
+    try testing.expectEqual(light_palette.plate_hover, back.plateAlpha());
+    _ = itemEvent(.{ .mouse_down = .{ .x = g.x + 4, .y = g.y + 4 } }, back);
+    _ = itemEvent(.{ .mouse_up = .{ .x = g.x + 4, .y = g.y + 4 } }, back);
+    try testing.expectEqual(@as(usize, 1), counter.n);
+}
+
+test "GlassToolbarGroup / GlassToolbarButton: element form mounts a fitted capsule; label, icon and disabled follow sources" {
+    var ctx = try Cx.init(testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.tokens = &core.theme.light;
+    const root = try box(ctx, .{ .width = .{ .px = 600 }, .height = .{ .px = 80 }, .direction = .row, .align_items = .center }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const view = @import("../../view.zig");
+    const off = try scope.createSignal(bool, true);
+    const name = try scope.createSignal([]const u8, "Back");
+    const glyph = try scope.createSignal(svg_assets.Asset, icons.home);
+    var group: GlassToolbarGroupResult = undefined;
+    var back_node: *Node = undefined;
+    try view.mount(scope, ctx, root, view.capture(&group, view.with(GlassToolbarGroup(.{ .label = "History" }), .{
+        view.capture(&back_node, GlassToolbarButton(.{ .icon = glyph, .label = name, .disabled = off })),
+        GlassToolbarButton(.{ .icon = icons.upload, .label = "Forward" }),
+    })));
+    ctx.layout();
+    try testing.expectEqualStrings("GlassToolbarGroup", group.glass.box.meta.ownership.meta.component_name.?);
+    // Two 38 pt items + 1 pt at each end, 36 tall (the `.buttons` group capsule).
+    try testing.expectApproxEqAbs(@as(f32, 2 * button_width + 2 * buttons_end_pad), group.glass.box.rectFromWorldOrFallback().w, 0.5);
+    try testing.expectApproxEqAbs(bar_height, group.glass.box.rectFromWorldOrFallback().h, 0.5);
+    const it: *Item = @ptrCast(@alignCast(back_node.behavior.events.event_context.?));
+    buttonBeforeRender(back_node);
+    try testing.expect(it.glass == group.glass.state);
+    try testing.expect(back_node.behavior.interaction.a11y.?.disabled);
+    try testing.expectEqual(light_palette.icon_disabled, it.icon.getIcon().?.tint.a);
+    off.set(false);
+    buttonBeforeRender(back_node);
+    try testing.expect(!back_node.behavior.interaction.a11y.?.disabled);
+    try testing.expectEqual(light_palette.icon_active, it.icon.getIcon().?.tint.a);
+    name.set("Previous page");
+    try testing.expectEqualStrings("Previous page", back_node.behavior.interaction.a11y.?.label.?);
+    const before = it.icon;
+    glyph.set(icons.settings);
+    try testing.expect(it.icon != before);
+    try testing.expectEqual(@as(usize, 2), back_node.children.items.len);
+    try testing.expect(back_node.children.items[1] == it.icon);
+    glyph.set(icons.settings);
+    try testing.expect(back_node.children.items[1] == it.icon);
+}
+
+test "GlassToolbarButton: mount OOM sweep" {
+    try @import("../oom_sweep.zig").sweepMount("glass_toolbar_button", struct {
+        fn mount(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const off = try scope.createSignal(bool, false);
+            const name = try scope.createSignal([]const u8, "Back");
+            return try GlassToolbarButton(.{ .icon = icons.home, .label = name, .disabled = off }).mount(scope, cx);
         }
     }.mount);
 }

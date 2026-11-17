@@ -1,0 +1,20 @@
+//! 命令帮助卡（`@help`，NATIVE_AUDIT B4）的正文样式。面板、遮罩、标题栏、关闭按钮都是原生 `W.Modal` 默认外观，
+//! 这里只排正文：指令列表（原生 `W.ScrollArea`，窗口矮时在面板内滚动）与两行脚注。颜色只用 token。
+const ui = @import("ui");
+
+/// 原生 Modal 的挂载点：Modal 自己挂到窗口浮层根（portal），模板根不能为空，留一个不占位的 box。
+style anchor { position: absolute; width: 0; height: 0; }
+/// 正文：列表在上、脚注在下；列表吃掉面板剩余高度，脚注不收缩。
+style body { width: fill; height: grow; min-height: 0; direction: column; gap: 8; }
+style list_scroll { width: fill; flex: 1; flex-shrink: 1; min-height: 0; }
+style list { width: fill; direction: column; }
+/// 一行：图标列 20、用法列 150（等宽、强调色）、说明。
+style row { width: fill; height: 28; direction: row; align-items: center; gap: 11; flex-shrink: 0; }
+style icon_cell { width: 20; align-items: center; flex-shrink: 0; }
+style usage_cell { width: 150; flex-shrink: 0; }
+style icon { font-size: 12; color: fg-primary; }
+style usage { font-size: 11; font-weight: 600; color: accent; use-monospace-font: true; }
+style description { font-size: 11.5; color: fg-secondary; }
+style footer { width: fill; direction: row; align-items: end; gap: 12; flex-shrink: 0; }
+style notes { flex: 1; direction: column; }
+style note { font-size: 10; line-height: 1.6; color: zw-fg-supporting; }

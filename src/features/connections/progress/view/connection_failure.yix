@@ -1,0 +1,171 @@
+//! 连接失败 / 重试视图（design-r3 稿 1，Pencil RDiob › Hwswl）：会话 tab 内容区里居中的一列（宽 560），
+//! 替代连接进度卡片的失败态与等待自动重试态。只用 zenit 原生组件，外观全是默认：
+//!
+//! - 头部：失败类别图标、主机名、`user@host:port`（等宽）、右侧原生 `W.StatusBadge`（“N 秒后重试 / 已停止重试 / 需要确认”）。
+//! - 一句话标题；失败原因是原生 `W.Alert`（error / warning），写明具体地址、端口、用户名。
+//! - 只有确实在等一次自动重试时才有重试行：说明文字 + 原生 `W.Progress` 倒计时条；不重试时一行说明为什么。
+//! - 主机密钥变更：“已保存的密钥”与“服务器当前提供的密钥”两块指纹（后者用危险色）。
+//! - 逐跳连接路径：本机 → 各跳 → 目标，状态用用户能看懂的说法。
+//! - 操作行：左“编辑连接”（secondary）“查看日志 / 收起日志”（ghost）；右继续类操作，主按钮在最右
+//!   （立即重试 / 重新输入凭据 / “替换主机密钥”用 danger；替换前先弹原生确认框 `W.ConfirmDialog`，规则取
+//!   `shared/ui/confirm`：焦点在“取消”，Esc / × / 点遮罩 = 取消）。
+//! 文案与状态全部来自 `model/failure_view.zig` 的投影；这里不做判断，只把点击交给 `FailureView.act`。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/failure_view.zig");
+const C = @import("failure_controller.zig");
+const S = @import("connection_failure.yss");
+const Confirm = @import("../../../../shared/ui/confirm/confirm.zig");
+
+pub const ids = struct {
+    pub const root = "connection.progress.failure";
+    pub const badge = "connection.progress.failure.badge";
+    pub const title = "connection.progress.failure.title";
+    pub const alert = "connection.progress.failure.alert";
+    pub const retry = "connection.progress.failure.retry";
+    pub const retry_bar = "connection.progress.failure.retry.bar";
+    pub const hold = "connection.progress.failure.hold";
+    pub const saved_key = "connection.progress.failure.key.saved";
+    pub const offered_key = "connection.progress.failure.key.offered";
+    pub const route = "connection.progress.failure.route";
+    pub const hop = "connection.progress.failure.hop";
+    pub const logs = "connection.progress.failure.logs";
+    pub const edit = "connection.progress.failure.edit";
+    pub const logs_toggle = "connection.progress.failure.logs.toggle";
+    pub const stop_retry = "connection.progress.failure.stop";
+    pub const retry_now = "connection.progress.failure.retry_now";
+    pub const credentials = "connection.progress.failure.credentials";
+    pub const disconnect = "connection.progress.failure.disconnect";
+    pub const trust_key = "connection.progress.failure.trust";
+    pub const trust_confirm = "connection.progress.failure.trust.confirm";
+    pub const trust_confirm_cancel = "connection.progress.failure.trust.cancel";
+    pub const trust_confirm_accept = "connection.progress.failure.trust.accept";
+};
+
+const replace_key = Confirm.label(.replace, "主机密钥");
+fn trustOpen(vm: *C.FailureView) bool {
+    return vm.trust_confirm.get();
+}
+fn trustConfirmed(vm: *C.FailureView) void {
+    vm.trustConfirmed();
+}
+fn trustCancelled(vm: *C.FailureView) void {
+    vm.trust_confirm.set(false);
+}
+
+fn send(vm: *C.FailureView, action: C.Action) void {
+    vm.act(action);
+}
+fn headIcon(icon: m.Icon) ui.SvgAsset {
+    return switch (icon) {
+        .refused, .failed => ui.icons.circle_x,
+        .timeout => ui.icons.clock_alert,
+        .shield => ui.icons.shield_alert,
+    };
+}
+fn headTone(icon: m.Icon) S.Tone {
+    return if (icon == .timeout) .warning else .danger;
+}
+/// The four tone recipes share variant names; each has its own dimension type.
+fn toneOf(comptime T: type, tone: m.Tone) T {
+    return switch (tone) {
+        .ok => .ok,
+        .danger => .danger,
+        .warning => .warning,
+        .muted => .muted,
+    };
+}
+fn badgeStatus(badge: m.Badge) W.badge.BadgeStatus {
+    return switch (badge) {
+        .info => .info,
+        .success => .success,
+        .warning => .warning,
+        .@"error" => .@"error",
+    };
+}
+fn alertVariant(warning: bool) W.AlertVariant {
+    return if (warning) .warning else .@"error";
+}
+fn hopIcon(tone: m.Tone) ui.SvgAsset {
+    return switch (tone) {
+        .ok => ui.icons.check,
+        .danger => ui.icons.x,
+        .warning => ui.icons.triangle_alert,
+        .muted => ui.icons.circle_dashed,
+    };
+}
+fn retryVariant(p: m.Projection) W.ButtonVariant {
+    return if (p.primary == .retry_now) .primary else .secondary;
+}
+
+fn HopRow(hop: m.HopRow, index: usize) View {
+    return (
+        <row testId={ids.hop} style={S.hop_row} a11y={.{ .role = .listitem, .label = hop.name, .value_text = hop.status }}>
+            <box style={S.Marker.of(.{ .tone = toneOf(S.MarkerTone, hop.tone) })}>
+                <icon style={S.MarkerIcon.of(.{ .tone = toneOf(S.MarkerIconTone, hop.tone) })} src={hopIcon(hop.tone)} />
+            </box>
+            <col style={S.hop_text}>
+                <text style={S.hop_name}>{hop.name}</text>
+                <text style={S.hop_address}>{hop.address}</text>
+            </col>
+            <text style={S.HopStatus.of(.{ .tone = toneOf(S.HopStatusTone, hop.tone) })} box={S.fixed_box}>{hop.status}</text>
+        </row>
+    );
+}
+
+pub fn ConnectionFailure(vm: *C.FailureView) View {
+    return (
+        <box testId={ids.root} style={S.surface} visible={vm.shown()}>
+            <col style={S.column}>
+                <row style={S.header}>
+                    <icon style={S.HeadIcon.of(.{ .tone = headTone(vm.p().icon) })} src={headIcon(vm.p().icon)} />
+                    <text style={S.name} box={S.name_box}>{vm.p().name}</text>
+                    <text style={S.endpoint} box={S.endpoint_box}>{vm.p().endpoint}</text>
+                    <spacer />
+                    <W.StatusBadge testId={ids.badge} status={badgeStatus(vm.p().badge)} label={vm.p().badge_text} />
+                </row>
+                <text testId={ids.title} style={S.title} box={S.fill_box} a11y={.{ .role = .heading }}>{vm.p().title}</text>
+                <W.Alert testId={ids.alert} variant={alertVariant(vm.p().alert_warning)} title={vm.p().alert_title} message={vm.p().alert_detail} />
+                <col testId={ids.retry} style={S.retry} visible={vm.p().retry_shown}>
+                    <row style={S.note_row}>
+                        <icon style={S.note_icon} src={ui.icons.refresh_cw} />
+                        <text style={S.note} box={S.grow_box}>{vm.p().retry_text}</text>
+                    </row>
+                    <box testId={ids.retry_bar} style={S.bar}><W.Progress value={vm.p().retry_percent} height={4} sweep={.flat} /></box>
+                </col>
+                <row testId={ids.hold} style={S.note_row} visible={vm.holdShown()}>
+                    <icon style={S.note_icon} src={ui.icons.pause} />
+                    <text style={S.note} box={S.grow_box}>{vm.p().hold_text}</text>
+                </row>
+                <col style={S.keys} visible={vm.p().host_key_shown}>
+                    <col testId={ids.saved_key} style={S.key_block}>
+                        <text style={S.key_title}>{vm.p().saved_key_title}</text>
+                        <text style={S.key_value} box={S.fill_box}>{vm.p().saved_key}</text>
+                    </col>
+                    <col testId={ids.offered_key} style={S.key_block}>
+                        <text style={S.key_title}>{vm.p().offered_key_title}</text>
+                        <text style={S.key_value_changed} box={S.fill_box}>{vm.p().offered_key}</text>
+                    </col>
+                </col>
+                <col testId={ids.route} style={S.route} a11y={.{ .role = .list, .label = vm.p().route }}>
+                    <text style={S.route_label}>{vm.p().route}</text>
+                    {for (vm.p().hops) |hop, i| <HopRow key={hop.key} hop={hop} index={i} />}
+                </col>
+                <col testId={ids.logs} style={S.logs} visible={vm.p().logs_open}>
+                    {for (vm.logLines()) |line| <text style={S.log_line} box={S.fill_box}>{line.text}</text>}
+                </col>
+                <row style={S.actions}>
+                    <W.Button testId={ids.edit} label="编辑主机" variant={.secondary} visible={vm.p().can_edit} onClick={send(vm, .edit)} />
+                    <W.Button testId={ids.logs_toggle} label={vm.p().logs_label} variant={.ghost} disabled={vm.logsDisabled()} onClick={send(vm, .toggle_logs)} />
+                    <spacer />
+                    <W.Button testId={ids.stop_retry} label="停止重试" variant={.ghost} visible={vm.p().stop_retry} onClick={send(vm, .stop_retry)} />
+                    <W.Button testId={ids.disconnect} label="断开" variant={.ghost} visible={vm.p().disconnect} onClick={send(vm, .disconnect)} />
+                    <W.Button testId={ids.retry_now} label="立即重试" variant={retryVariant(vm.p())} visible={vm.p().retry_now} disabled={vm.p().retry_disabled} onClick={send(vm, .retry_now)} />
+                    <W.Button testId={ids.credentials} label="重新输入凭据" variant={.primary} visible={vm.p().credentials} onClick={send(vm, .credentials)} />
+                    <W.Button testId={ids.trust_key} label={replace_key} variant={.danger} visible={vm.p().trust_key} onClick={send(vm, .trust_key)} />
+                </row>
+            </col>
+            <W.ConfirmDialog testId={ids.trust_confirm} open={trustOpen(vm)} title="替换主机密钥？" message="服务器当前提供的密钥与已保存的不同。替换会覆盖已保存的密钥并用新密钥继续连接；请先核对新指纹，确认服务器确实更换过密钥。" confirmLabel={replace_key} cancelLabel={Confirm.cancel_label} closeOnOverlay={Confirm.close_on_overlay} onConfirm={trustConfirmed(vm)} onCancel={trustCancelled(vm)} testIds={.{ .cancel = ids.trust_confirm_cancel, .confirm = ids.trust_confirm_accept }} />
+        </box>
+    );
+}

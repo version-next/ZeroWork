@@ -1,13 +1,13 @@
 //! Stable global theme identities, owned import drafts and independent metadata.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const importer = @import("imported_theme.zig");
 const presets = @import("theme_presets.zig");
 
 pub const max_import_bytes = 2 * 1024 * 1024;
 pub const default_id = "dark";
-pub const reset_id = "sauber";
+pub const reset_id = "light";
 pub const Source = enum { builtin, imported };
-pub const Filter = enum { all, favorites, imported };
 pub const UiTokens = struct {
     // Filled-action roles are independent of link/icon accents. Zero derives
     // compatible colours for imported and legacy palettes.
@@ -46,7 +46,6 @@ pub const Record = struct {
     managed_source: ?[]u8 = null,
     source_bytes: ?[]u8 = null,
     staged_for: ?u64 = null,
-    favorite: bool = false,
     revision: u64 = 1,
 
     fn deinit(self: *Record, allocator: std.mem.Allocator) void {
@@ -67,7 +66,7 @@ pub const ImportResult = struct {
     }
 };
 pub const References = struct { saved: []const u8, draft: []const u8 };
-pub const Counts = struct { all: usize = 0, favorites: usize = 0, imported: usize = 0 };
+pub const Counts = struct { all: usize = 0, imported: usize = 0 };
 
 /// A worker prepares managed copies before the shared configuration transaction.
 /// On Save failure keep this receipt for retry, or abort it before deinit.
@@ -125,11 +124,7 @@ pub const Installation = struct {
                 error.FileNotFound => {
                     const bytes = try std.json.Stringify.valueAlloc(self.allocator, importer.Managed{ .name = record.theme.name, .source = record.source_bytes.? }, .{});
                     defer self.allocator.free(bytes);
-                    var atomic = try dir.createFileAtomic(io, entry.path.?, .{ .make_path = true, .replace = false });
-                    defer atomic.deinit(io);
-                    try atomic.file.writePositionalAll(io, bytes, 0);
-                    try atomic.file.sync(io);
-                    try atomic.replace(io);
+                    try persist.writeAtomic(io, dir, entry.path.?, bytes, .{ .make_path = true, .permissions = null });
                     entry.created = true;
                     continue;
                 },
@@ -231,18 +226,9 @@ pub const Registry = struct {
     pub fn counts(self: Registry) Counts {
         var result: Counts = .{ .all = self.records.items.len };
         for (self.records.items) |record| {
-            if (record.favorite) result.favorites += 1;
             if (record.source_kind == .imported) result.imported += 1;
         }
         return result;
-    }
-    pub fn matches(record: Record, filter: Filter, query: []const u8) bool {
-        if (filter == .favorites and !record.favorite) return false;
-        if (filter == .imported and record.source_kind != .imported) return false;
-        if (query.len > record.theme.name.len) return false;
-        for (0..record.theme.name.len - query.len + 1) |i|
-            if (std.ascii.eqlIgnoreCase(record.theme.name[i..][0..query.len], query)) return true;
-        return false;
     }
     /// Parsing belongs on a bounded worker. The result owns every byte and may
     /// be released without touching the registry if its request became stale.
@@ -313,42 +299,6 @@ pub const Registry = struct {
             return;
         };
     }
-    /// This transaction only writes favorite metadata. Failure changes neither
-    /// the favorite marker nor settings dirty/current theme state.
-    pub fn favorite(self: *Registry, io: std.Io, dir: std.Io.Dir, metadata_path: []const u8, id: []const u8, expected_revision: u64, enabled: bool) !void {
-        if (expected_revision != self.revision) return error.StaleRegistryRevision;
-        const record = self.getMut(id) orelse return error.UnknownTheme;
-        if (record.favorite == enabled) return;
-        if (self.revision == std.math.maxInt(u64)) return error.RegistryRevisionExhausted;
-        var buffer: [64 * 1024]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        try writer.writeByte('[');
-        for (self.records.items, 0..) |entry, i| {
-            if (i != 0) try writer.writeByte(',');
-            try std.json.Stringify.value(.{ .id = entry.id, .favorite = if (std.mem.eql(u8, entry.id, id)) enabled else entry.favorite }, .{}, &writer);
-        }
-        try writer.writeByte(']');
-        var atomic = try dir.createFileAtomic(io, metadata_path, .{ .make_path = true, .replace = true });
-        defer atomic.deinit(io);
-        try atomic.file.writePositionalAll(io, writer.buffered(), 0);
-        try atomic.file.sync(io);
-        try atomic.replace(io);
-        record.favorite = enabled;
-        self.revision += 1;
-        record.revision = self.revision;
-    }
-    pub fn loadFavorites(self: *Registry, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
-        const bytes = dir.readFileAlloc(io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        defer self.allocator.free(bytes);
-        const parsed = try std.json.parseFromSlice([]const struct { id: []const u8, favorite: bool }, self.allocator, bytes, .{});
-        defer parsed.deinit();
-        for (parsed.value) |entry| if (self.getMut(entry.id)) |record| {
-            record.favorite = entry.favorite;
-        };
-    }
     pub fn loadInstalled(self: *Registry, io: std.Io, dir: std.Io.Dir) !void {
         var directory = dir.openDir(io, "themes", .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -390,25 +340,14 @@ pub const LibraryState = struct {
     draft_id: u64,
     saved_theme_id: []const u8,
     draft_theme_id: []const u8,
-    query: []const u8 = "",
-    filter: Filter = .all,
-    scroll: f32 = 0,
     selected_id: []const u8,
     registry_revision: u64,
     import_operation: ?ImportRequest = null,
     problem: ?anyerror = null,
-    open: bool = false,
-    query_storage: ?[]u8 = null,
 
     pub fn deinit(self: *LibraryState, allocator: std.mem.Allocator) void {
-        if (self.query_storage) |query| allocator.free(query);
+        _ = allocator;
         self.* = undefined;
-    }
-    pub fn setQuery(self: *LibraryState, allocator: std.mem.Allocator, query: []const u8) !void {
-        const owned = try allocator.dupe(u8, query);
-        if (self.query_storage) |previous| allocator.free(previous);
-        self.query_storage = owned;
-        self.query = owned;
     }
 
     pub fn select(self: *LibraryState, registry: *const Registry, id: []const u8) !void {
@@ -579,8 +518,6 @@ test "imports reject bad colors reuse identical content and retain same-name rec
     const other_id = (try registry.completeImport(request, &other)).?;
     try std.testing.expect(!std.mem.eql(u8, first_id, other_id));
     try std.testing.expectEqual(@as(usize, 2), registry.counts().imported);
-    try std.testing.expect(Registry.matches(registry.get(first_id).?.*, .imported, "ARED N"));
-    try std.testing.expect(!Registry.matches(registry.get(first_id).?.*, .all, "missing"));
     try std.testing.expectError(error.CurrentThemeProtected, registry.checkRemove(first_id, registry.revision, .{ .saved = first_id, .draft = "dark" }));
     try std.testing.expectError(error.DraftThemeProtected, registry.checkRemove(first_id, registry.revision, .{ .saved = "dark", .draft = first_id }));
     const invalid = try testSource(allocator, "nan");
@@ -608,22 +545,6 @@ test "import completions always consume including stale revision and allocation 
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, empty.completeImport(request, &result));
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-}
-
-test "favorites persist independently and failed replacement leaves marker unchanged" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var registry = try Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "blocked", .data = "file" });
-    try std.testing.expectError(error.NotDir, registry.favorite(std.testing.io, tmp.dir, "blocked/favorites.json", "dark", registry.revision, true));
-    try std.testing.expect(!registry.get("dark").?.favorite);
-    try registry.favorite(std.testing.io, tmp.dir, "themes/favorites.json", "dark", registry.revision, true);
-    var reloaded = try Registry.init(std.testing.allocator);
-    defer reloaded.deinit();
-    try reloaded.loadFavorites(std.testing.io, tmp.dir, "themes/favorites.json");
-    try std.testing.expect(reloaded.get("dark").?.favorite);
-    try std.testing.expectEqual(@as(usize, 1), reloaded.counts().favorites);
 }
 
 test "V3 presets have complete semantic tokens opaque ANSI and protected identities" {

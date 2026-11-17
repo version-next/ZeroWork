@@ -2,6 +2,8 @@
  * Run before/after with the same binary mode, geometry and machine workload.
  * CPU windows issue no Harness RPC. One fully occupied CPU core is 100%.
  * Timings are evidence, not hardware-independent pass/fail thresholds. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {mkdir, mkdtemp, realpath, open, readFile, writeFile, rm} from 'node:fs/promises';
@@ -9,6 +11,7 @@ import {resolve, join} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as h from '../vendor/zenit/e2e/client.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
+import {aiToggleId} from './ai_entry.ts';
 
 const [binaryArg, outArg] = process.argv.slice(2);
 assert(binaryArg && outArg, 'binary output-directory; ZW_TEST_PYTHON must provide paramiko');
@@ -43,12 +46,12 @@ async function authenticate(password: string) {
     }
 }
 function resource(pid: number) {
-    const parts = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'time=,rss='], {encoding: 'utf8'}).trim().split(/\s+/);
+    const parts = psCompat(['-p', String(pid), '-o', 'time=,rss=']).trim().split(/\s+/);
     const threads: {id: number; cpu_ns: number}[] = threadProbe ? JSON.parse(execFileSync(threadProbe, [String(pid)], {encoding: 'utf8'})).threads : [];
     return {cpu_seconds: parts[0].split(':').map(Number).reduce((a, b) => a * 60 + b, 0), rss_kib: Number(parts[1]), threads, time_ms: performance.now()};
 }
 function compilers() {
-    return execFileSync('/bin/ps', ['-axo', 'pid=,%cpu=,comm='], {encoding: 'utf8'})
+    return psCompat(['-axo', 'pid=,%cpu=,comm='])
         .split('\n').filter(line => /\/(zig|clang|clang\+\+)$/.test(line.trim()));
 }
 let app: ReturnType<typeof spawn> | undefined, appEnded: Promise<unknown> | undefined, appLog: Awaited<ReturnType<typeof open>> | undefined;
@@ -131,8 +134,8 @@ try {
         const closedTree = (await windows()).windows[0].tree_nodes;
         assert(closedTree < openTree, 'closed settings leaves the traversed tree');
         await click('toolbar.settings'); await visible('settings.panel'); await click('settings.close');
-        await click('ai.strip'); await click('ai.prompt'); await h.type_('PERFORMANCE_LOCAL_DRAFT');
-        await click('ai.collapse'); await click('ai.strip'); await visible('ai.prompt');
+        await click(await aiToggleId()); await click('ai.prompt'); await h.type_('PERFORMANCE_LOCAL_DRAFT');
+        await click('ai.collapse'); await click(await aiToggleId()); await visible('ai.prompt');
         assert.equal((await h.inputState('ai.prompt')).buffer, 'PERFORMANCE_LOCAL_DRAFT', 'AI draft survives retained detach/reopen');
         await h.key('a', {cmd: true}); await h.key('backspace'); await click('ai.collapse');
         await click('terminal.input'); await h.key('f', {cmd: true}); await click('terminal.search.query'); await h.type_('AUDIT_SCREEN');

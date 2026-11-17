@@ -1,4 +1,5 @@
 /** Real Local PTY regression for cell graphics; --baseline records the old gaps. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';

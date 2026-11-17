@@ -1,8 +1,10 @@
-# zenit API Stability
+# zenit API Stability (v1.0 Freeze Audit)
 
-zenit is pre-1.0. Breaking changes are recorded in [MIGRATION.md](MIGRATION.md).
-The tiers below describe the proposed v1 surface, not a compatibility guarantee
-for the current development version.
+**Date**: 2026-07-30 (A2 audit deliverable; text capability update 2026-08-01)
+**Semantics**: `v0.14.x` is the current pre-1.0 semver development track; minor versions
+may still break (must be recorded in `MIGRATION.md`). This document describes the API
+surface planned to be frozen at `v1.0.0`; it does not mean the existing tag already
+carries a v1 compatibility promise.
 
 ## Tiers
 
@@ -52,50 +54,163 @@ VirtualList / ScrollArea / Grid / Form / GlassBox
 What is frozen: **the props struct + the mount entry signature + the existing fields of
 the returned struct**.
 
+Additive, default-preserving props: `Checkbox` `size: ?f32 = null` (box edge; the glyph
+scales 12:16) and `label_font_size: ?f32 = null`; `Progress` `sweep: ProgressSweep = .gloss`
+(`.flat` drops the indeterminate bar highlight) and `ProgressStatus.warning`. Control colors
+read the component role tokens listed in `src/tokens/roles.zig` (see
+DESIGN_SYSTEM_TOKENS.md 8.0).
+
+Not in the frozen list: `ControlShell` (the Yix layout + style base Button / Input /
+Select / DatePicker / Chip compose, exported as `ui.widgets.ControlShell` with
+`ControlVariant` / `ControlSize` / `IconFit`) is still settling its parameters. Pooled
+widgets' raw callback fields are plumbing, not app API: Table's `render_cell`
+(`CellRenderFn`, which now receives the cell's owning `*Scope`) and VirtualList's
+`mountScoped` / `mountWithContext` sit below `.cells(ctx, cell)` / `.rows(ctx, row)`.
+
 ## Unstable (explicitly exempted in v1)
 
 - `ui.hit` (hit-test queries): bound to internal index structures
-- `ui.path` (path geometry and mesh caching)
+- `ui.path` (path geometry): ~~pipeline Phase C unfinished~~ Phase C (cross-frame mesh
+  cache: keyed by geometry hash + scale + stroke params; on a hit it skips
+  flatten/earclip/stroke expand) landed on 2026-07-30; the API stays labeled Unstable
+  for one more release of observation
 - `ui.devtools` / `ui.Inspector`
 - `ui.a11y_tree` / `ui.a11y_router` / `ui.a11y_macos_bridge`
 - `ui.gesture`
 - The slot-customization surface of `ui.select_headless` (`render_trigger` / `render_item` ctx structs)
-- The `FrameStats` field set
+- The `FrameStats` **field set** (observability is still expanding: encode/flush breakdown, draw counts added on 2026-07-30)
 - DevTools presentation helpers, the recipe system (`ConditionalStyle` parsing details)
-- `ui.fx`, `GlassParams / GlassSurface` (Liquid Glass is still iterating)
+- `ui.fx`, `GlassParams / GlassSurface` (Liquid Glass is still iterating), including
+  `GlassParams.capture_source` (`GlassCaptureSource`: `.window_backdrop` default, or
+  `.current_surface` to blur what an offscreen layer has drawn so far)
+- App extension points: `World.structure_revision`,
+  `Node.ownedTreeStructureRevision` / `Node.invalidateTreeStructure` (window-local tree
+  topology serial next to the global `Node.treeStructureRevision`)
+- `ui.types` (raw `core/types.zig` definitions; prefer the top-level aliases such as
+  `Display / Overflow / TextOverflow / TextSpan / StyleOverride`)
 - `ui.control_flow` (exports beyond `Show/For/Match`)
 - Fields labeled "internal" in mount results (e.g. `InputResult.state`)
 - Harness developer entry points: `installHarnessClient` in `build.zig`, the installed
   TypeScript client API, and the file-RPC protocol (`-Dtest-mode=true` only; may evolve
   per minor; production builds do not provide this capability)
 - Icon provider build entry points: the `icon-set` dependency option, `IconProvider`,
-  `attachWithOptions`. Lucide is the public default; provider injection may evolve.
+  `attachWithOptions`. Shipping Lucide as the public default is the stable direction,
+  but until the private-package split is done, the provider injection structure may
+  still converge across minors.
+- Exact numeric font weights (default off): `FontDescriptor.numeric_weight: ?u16 = null`,
+  `FontRegistry.setExactWeight(family, enabled)` / `exactWeight(family)`, `Font.variableWeight()`
+  (CoreText), and the C exports `coretext_find_font_exact_weight`,
+  `coretext_font_weight_range(family, *min, *max, *default) int` and
+  `coretext_font_weight_value(font) double` (-1 = non-variable). With the switch off, lookup
+  stays on the 9-tier path; when it is on, variable faces get the exact `wght` coordinate and
+  non-variable faces get the nearest tier.
 
 ## Internal
 
 - Everything in `ui.core` not re-exported at the top level (render_engine / lowering / layerize / hit_runtime …)
-- `src/render`, `src/gpu`, `src/platform`, `src/system_sdk` (below the `App` abstraction)
+- `src/render`, `src/gpu`, `src/platform`, `src/system_sdk` (below the `App` abstraction).
+  macOS application extension points living here are kept compatible but are not part of
+  the v1 frozen surface: `MacOSWindow.setTrafficLightsLayout(center_x, center_y, ?diameter)`
+  and the native event filter (`native/macos/zenit_native_event_filter.h`,
+  `MacOSWindow.addNativeEventFilter` / `removeNativeEventFilter`), which lets an app's own
+  AppKit panel take events before zenit routes them.
 - The `test_harness` Zig module and its queue/executor implementation (externally you
   only use the TypeScript facade above)
 
-## Application API
+## Naming conventions (v1 convergence decisions)
 
-Use `ui.view` to compose widgets and scope-owned signals for reactive state.
-See [Signal-first props](SIGNAL_API_DESIGN.md) and [migration notes](MIGRATION.md)
-for controlled values and callback conventions.
+- **Callbacks**: always `?core.HandlerRef`. **Converged on 2026-07-31.**
+  This entry previously claimed "already unified, Input is the exception"; measurement
+  showed a half-and-half split of 16 HandlerRef-style vs 17 bare `fn(T, *anyopaque)`,
+  with incompatible signatures: migrating directly would **silently drop the payload**
+  (callers still compile; the value is gone).
 
-String payloads passed through `invokeWithStr` are valid only during the callback;
-copy them if they must outlive it.
+  The approach adds an optional payload channel to `HandlerRef` instead of cutting the
+  ability to carry values:
+
+  | Need | Constructor | Widget-side trigger |
+  |---|---|---|
+  | Only "it changed" | `cx.handlerFrom(S, ptr, m)` | `h.invoke()` |
+  | Need the new bool value | `cx.boolHandlerFrom(S, ptr, m)` | `h.invokeWithBool(v)` |
+  | Need the new text/id | `cx.strHandlerFrom(S, ptr, m)` | `h.invokeWithStr(v)` |
+
+  Widgets may call `invokeWith*` unconditionally: if the registrant used a no-arg
+  handler, it **degrades to a no-arg call rather than dropping the event**. All 54
+  existing `.invoke()` call sites required zero changes.
+
+  Payloads support only `bool` / `[]const u8` (measured across the whole repo, the
+  payloads of value-carrying callbacks are exactly these two kinds). Deliberately no
+  generics: HandlerRef is stored in Node, and generics would turn `EventHandlers` into
+  a comptime type parameter, polluting the types of the entire tree.
+
+  ⚠ The slice from `invokeWithStr` is **valid only during the callback** (it usually
+  points into the widget's internal buffer); dupe it yourself if you need to keep it.
+- **Text props**: the widget's primary content = `label` (Button/Chip); a form field's
+  attached label = `label_text` (Input/Switch/ComboBox).
+  Corrected 2026-07-31: this entry previously said "already consistent today"; in fact
+  `form/form_field.zig` used `label` for the attached label, contradicting the rule;
+  it has been renamed to `label_text`.
+
+- **mount-only props always take the `initial_` prefix** (added 2026-07-31).
+  A prop that is read once at mount and ignored afterwards must carry the prefix
+  explicitly, or callers will mistake it for controlled ("I changed the props, why
+  didn't the UI move?"). Renamed:
+
+  | Widget | Old name | New name |
+  |---|---|---|
+  | Checkbox / Switch | `checked` | `initial_checked` |
+  | Slider | `value` | `initial_value` |
+  | Steps | `current` | `initial_current` |
+  | Input | `value` | `initial_value` |
+
+  Exception: `Radio.checked` keeps its original name; it is a purely presentational
+  leaf driven by RadioGroup on every render, a genuine render input rather than
+  mount-only state.
+
+  To change content after the first frame, use the widget's imperative API (below).
+
+- **Imperative setter convention** (filled in 2026-07-31).
+  A `state` exposed in the mount result must be paired with a write entry that
+  **actually works**. Widgets where writing the state field directly does not repaint
+  are a trap ("looks like it drives something but has no effect"). Added:
+
+  | Widget | setter |
+  |---|---|
+  | Input / Textarea | `setText(...)` / `clearText()` |
+  | Slider | `setValue(v)` (syncs visuals + the a11y value) |
+  | Rate | `setValue(v)` (clamps to [0, count]) |
+  | DatePicker | `setSelectedDate(?d)` / `clearSelection()` |
+  | Table | `setSort(col, dir)` / `clearSort()` |
+  | Calendar / NumberStepper / Tree | already existed |
+
+  Semantics unified: **programmatic sets do not fire on_change** (that is the semantics
+  of user interaction); call the callback yourself if you need to notify.
+- **Application code builds UI with `ui.view`** (docs/VIEW_DSL.md): widget builders
+  `Widget(props)` are used directly as view children, `v.with(Widget(...), .{ ... })` fills
+  their slots, `v.ref(handle, ...)` tracks a scope-owned nullable result (create it with `v.createRef`); `v.capture(&dest, ...)` takes synchronous mount output, and pooled widgets take view
+  functions via `.rows(ctx, row)` (VirtualList) / `.cells(ctx, cell)` (Table, Grid).
+- **Widget protocol** (what `ui.view` consumes; also the form for custom widgets):
+  1. `Widget(props).mount(scope, cx)` returning `*Node`, or a Result struct with
+     `viewParts()`;
+  2. optional `viewMount(scope, cx)` on the builder when the view needs a different mount
+     (slot / state handle);
+  3. `XxxOf(T).create(...)` (comptime generic: Form).
+  Calling `.mount` and wiring nodes by hand remains available for widget implementations
+  and node-level escape hatches, but it is not the application-level API.
 
 ## Escape hatch
 
-`Node.style.ensureExt()` and writing `behavior.events.*` directly are escape hatches
+`Node.style.ensureExtFallible()` and writing `behavior.events.*` directly are escape hatches
 kept deliberately. What is Stable is the **existence** of the fields; deep
 customization done through them is not protected by semver.
 
-## Capabilities and limitations
+## Known not supported (explicitly not promised in v1)
 
-### Bidirectional text editing (macOS)
+This is written down so users can judge "can this framework build my project" up front,
+instead of finding out only after stepping in. Everything below is an
+**architectural gap**, not a bug waiting to be fixed.
+
+### ~~RTL / bidirectional text editing~~: **the deterministic path is supported as of 2026-08-01**
 
 The macOS configuration path hands the whole text to a single CoreText `CTLine`.
 Static drawing, visual caret order in Input and Textarea, click hit-testing, cross-line
@@ -121,7 +236,7 @@ Arabic/Hebrew/CJK input sources, VoiceOver editing, and the storybook RTL pixel 
 are still `NOT RUN` at the current release revision. The degraded path without a Font provider is still usable, but its
 estimated coordinates are not part of the macOS production correctness claim.
 
-### Grapheme clusters
+### ~~Grapheme cluster~~: **supported as of 2026-07-31**
 
 `src/text_core/grapheme.zig` implements UAX #29 extended grapheme clusters
 (GB1-GB999: CRLF / Hangul syllables / Extend / ZWJ / SpacingMark / Prepend /
@@ -134,7 +249,7 @@ UCD: SpacingMark / Prepend for rare scripts may be missing, degrading to "one ex
 break" (the caret stops one extra cell; it does not crash).
 No legacy grapheme cluster definition and no ICU-style tailoring.
 
-### Color emoji (macOS)
+### ~~Color emoji~~: **supported as of 2026-07-31**
 
 Color glyphs are detected from the font tables (sbix / COLR / CBDT +
 `kCTFontTraitColorGlyphs`) and rasterized as BGRA premultiplied; the atlas gains BGRA8
@@ -170,6 +285,10 @@ node.behavior.events.on_drop =
 // paths = newline-separated path list; iterate with std.mem.splitScalar(u8, paths, '\n')
 ```
 
+On macOS a file whose name contains a newline is delivered as one percent-encoded
+`file://` URL entry (decode it with your URL parser) instead of a plain path, so the
+newline-separated list can never be split into forged entries.
+
 ⚠ The `paths` slice is **valid only during the callback** (it points into the backend's
 per-frame buffer); you must dupe it yourself if you need to keep it. This is the same general
 rule as `invokeWithStr`.
@@ -194,6 +313,11 @@ scenarios.
 
 ### Platforms
 
-macOS uses Metal. This development branch also provides a Windows D3D12 backend;
-see [Windows acceptance](WINDOWS_ACCEPTANCE.md) for build and runtime checks.
-Linux remains experimental.
+macOS only. The RHI migration is mid-flight: renderer orchestration uses the typed
+resource/pass/binding contract of `gpu.Backend`, Renderer Core's native Metal references
+are locked to zero by the boundary gate, and a standalone Null RHI covers resources,
+surfaces, and the pass state machine. But `gpu.zig` still selects the single Metal
+production backend at compile time; the Null RHI is not yet a swappable, complete render
+backend, and non-macOS hits `@compileError`.
+`platform/linux.zig` and `windows.zig` are mock scaffolding only; do not claim
+portability from them.

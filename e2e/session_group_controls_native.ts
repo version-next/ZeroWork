@@ -2,6 +2,7 @@
  * node e2e/session_group_controls_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  * --prepare-only 1 writes a plan without starting an app.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn, execFileSync } from "node:child_process";
@@ -136,7 +137,7 @@ try {
  await dragTab(order[1],order[0]);
  await waitFor(async()=>(await panes()).length===2||null,15000);
  assert.equal((await tabs()).length,2,"two sessions become one group tab");
- let groupTab=(await tabs()).find(n=>n.children?.some((c:any)=>c.test_id==="tabs.group_marker"));
+ let groupTab=(await tabs()).find(n=>n.children?.some((c:any)=>c.test_id==="groups.tab.count"));
  if(!groupTab)groupTab=(await tabs()).find(n=>n.test_id!==order[2]);assert(groupTab);
  await dragTab(order[2],groupTab.test_id);
  await waitFor(async()=>(await panes()).length===3||null,15000);

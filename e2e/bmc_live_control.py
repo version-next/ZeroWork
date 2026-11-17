@@ -15,6 +15,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 
 def prepare_payload(value: object, phase: str, deadline_seconds: int = 180) -> bytearray:
@@ -83,6 +88,7 @@ def main() -> int:
         text = ""
         value = None
     executable = options.binary.resolve() if options.binary else Path(__file__).resolve().parents[1] / "zig-out/bin/bmc-live-readonly"
+    build_mode_guard.assert_runner_binary(executable)
     args = [str(executable)]
     if options.validate_stdin:
         args.append("--validate-stdin")

@@ -65,6 +65,14 @@ void zenit_test_drag_enqueue(void *ptr, const uint8_t *bytes, size_t length, uin
  [w.metalView.dragEventQueue addObject:@{@"x":@12,@"y":@34,@"kind":@(kind),@"paths":paths,@"payloadKind":@1,@"sourceToken":@123456789,@"operation":@2}];
 }
 #ifndef ZENIT_DRAG_EVENTS_NO_MAIN
+// Minimal dragging info: pushDragEvent reads only the pasteboard and location.
+@interface NewlineDragInfo : NSObject
+@property (strong) NSPasteboard *pasteboard;
+@end
+@implementation NewlineDragInfo
+- (NSPasteboard *)draggingPasteboard { return self.pasteboard; }
+- (NSPoint)draggingLocation { return NSMakePoint(5, 5); }
+@end
 int main(void) {
  @autoreleasepool {
   void *ptr=zenit_test_drag_window_create();
@@ -107,8 +115,32 @@ int main(void) {
   assert(length==5 && memcmp(bytes,"/x\xEF\xBF\xBD",5)==0);
   assert(macos_consume_drag_event(ptr,token)==1);
   assert(macos_peek_drag_event(ptr,&x,&y,&kind,&bytes,&length,&token,&pk,&source,&op)==0);
+  // File URLs whose names contain a newline travel as one percent-encoded
+  // file:// entry of the newline-separated file_or_url list, never as
+  // several forged entries; ordinary names stay plain paths.
+  {
+   NSPasteboard *pb=[NSPasteboard pasteboardWithUniqueName];
+   NSURL *plain=[NSURL fileURLWithPath:@"/tmp/plain name.txt"];
+   NSURL *hostile=[NSURL fileURLWithPath:@"/tmp/evil\n/etc/passwd"];
+   NSURL *crlf=[NSURL fileURLWithPath:@"/tmp/a\r\nb"];
+   [pb clearContents];
+   NSArray<NSURL *> *urls=@[plain,hostile,crlf];
+   assert([pb writeObjects:urls]);
+   NewlineDragInfo *info=[NewlineDragInfo new];info.pasteboard=pb;
+   [w.metalView pushDragEvent:(id<NSDraggingInfo>)info kind:3 withPaths:YES];
+   NSDictionary *event=w.metalView.dragEventQueue.lastObject;
+   assert([event[@"payloadKind"] intValue]==1);
+   NSArray<NSString *> *entries=[event[@"paths"] componentsSeparatedByString:@"\n"];
+   assert(entries.count==3);
+   assert([entries[0] isEqualToString:@"/tmp/plain name.txt"]);
+   assert([entries[1] hasPrefix:@"file:///tmp/evil%0A"]);
+   assert([[NSURL URLWithString:entries[1]].path isEqualToString:hostile.path]);
+   assert([[NSURL URLWithString:entries[2]].path isEqualToString:crlf.path]);
+   [w.metalView.dragEventQueue removeAllObjects];
+   [pb releaseGlobally];
+  }
   zenit_test_drag_window_destroy(ptr);
-  fprintf(stderr,"PASS: long drag retry, immutable peek lifetime, matching consumption, NUL and completion metadata\n");
+  fprintf(stderr,"PASS: long drag retry, immutable peek lifetime, matching consumption, NUL, completion metadata and newline file names as file:// entries\n");
  }
  return 0;
 }

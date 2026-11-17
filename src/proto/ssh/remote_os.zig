@@ -1,5 +1,14 @@
-//! Read-only OS identification. Output is captured by a separate SSH exec
-//! channel, never written into the interactive PTY or inferred from a hostname.
+//! Read-only OS identification, never inferred from a hostname.
+//!
+//! Two sources, by host kind:
+//! - SSH terminal hosts (vt/ssh_worker.zig): `command` on a separate bounded
+//!   exec channel, opened only after the user's own shell channel; its output
+//!   never reaches the interactive PTY.
+//! - SFTP-only hosts (sftp_readonly.zig): no exec or shell request, ever.
+//!   `fromSftp` combines what the SFTP connection itself exposes, in order: the
+//!   server identification banner, `/etc/os-release` or `/usr/lib/os-release`
+//!   read over SFTP, and the path style of the SFTP home directory. When none
+//!   of them decides, the result is `.unknown`; there is no exec fallback.
 const std = @import("std");
 pub const Kind = enum(u8) {
     unknown,
@@ -75,6 +84,7 @@ pub fn parse(bytes: []const u8) Kind {
             if (std.ascii.eqlIgnoreCase(id, "sled")) return .sles;
             inline for (.{ "opensuse", "opensuse-leap", "opensuse-tumbleweed", "opensuse-microos", "opensuse-slowroll" }) |name| if (std.ascii.eqlIgnoreCase(id, name)) return .opensuse;
             if (std.ascii.eqlIgnoreCase(id, "amzn")) return .amazonlinux;
+            if (std.ascii.eqlIgnoreCase(id, "freebsd")) return .freebsd;
             if (std.ascii.eqlIgnoreCase(id, "openbsd")) return .openbsd;
             if (std.ascii.eqlIgnoreCase(id, "netbsd")) return .netbsd;
             if (id.len > 0 and kernel == .unknown) kernel = .linux;
@@ -126,6 +136,80 @@ test "OS identification distinguishes domestic distributions from their upstream
     try std.testing.expectEqual(Kind.linux, parse("Linux\nID=custom\nID_LIKE=\"openEuler kylin uos\"\n"));
     try std.testing.expectEqual(Kind.linux, parse("Linux\nID=kylin-custom\n"));
     try std.testing.expectEqual(Kind.unknown, parse("Welcome to Kylin Linux Advanced Server\n"));
+}
+/// The SSH identification string ("SSH-2.0-<software> <comments>", RFC 4253
+/// 4.2). Only explicit vendor markers decide; a bare "OpenSSH_9.6" is unknown.
+/// Debian/Ubuntu packaging tags are also shipped by derivatives (UOS, Kylin,
+/// Deepin...), so `fromSftp` lets a readable os-release refine them.
+pub fn parseBanner(banner: []const u8) Kind {
+    const line = std.mem.trim(u8, banner, " \t\r\n");
+    if (!std.mem.startsWith(u8, line, "SSH-")) return .unknown;
+    var buffer: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(buffer[0..@min(line.len, buffer.len)], line[0..@min(line.len, buffer.len)]);
+    if (std.mem.indexOf(u8, lower, "for_windows") != null or std.mem.indexOf(u8, lower, "winsshd") != null) return .windows;
+    // Distribution tags live in the comments after the software version.
+    var words = std.mem.tokenizeAny(u8, lower, " \t");
+    _ = words.next();
+    while (words.next()) |word| {
+        inline for (.{ .{ "ubuntu", Kind.ubuntu }, .{ "debian", Kind.debian }, .{ "raspbian", Kind.linux }, .{ "freebsd", Kind.freebsd }, .{ "netbsd", Kind.netbsd } }) |case| {
+            if (std.mem.startsWith(u8, word, case[0])) return case[1];
+        }
+    }
+    return .unknown;
+}
+/// Windows SFTP servers report drive-letter paths ("/C:/Users/me", "C:\\Users").
+/// Any other path style is not evidence of a particular OS.
+pub fn parseSftpPath(path: []const u8) Kind {
+    const rest = if (std.mem.startsWith(u8, path, "/")) path[1..] else path;
+    if (rest.len < 2 or !std.ascii.isAlphabetic(rest[0]) or rest[1] != ':') return .unknown;
+    if (rest.len == 2 or rest[2] == '/' or rest[2] == '\\') return .windows;
+    return .unknown;
+}
+/// Only a banner naming a system without os-release ends SFTP detection early.
+pub fn bannerIsFinal(kind: Kind) bool {
+    return switch (kind) {
+        .windows, .freebsd, .netbsd, .openbsd, .macos => true,
+        else => false,
+    };
+}
+/// SFTP-only evidence, strongest last-resort ordering: banner, then os-release
+/// (exact ID refines a Debian/Ubuntu packaging tag), then path style.
+pub fn fromSftp(banner: Kind, os_release: Kind, path_style: Kind) Kind {
+    if (bannerIsFinal(banner)) return banner;
+    if (os_release != .unknown) {
+        // os-release alone defaults an unlisted ID to generic Linux; keep the
+        // more specific banner tag then.
+        if (os_release == .linux and banner != .unknown) return banner;
+        return os_release;
+    }
+    if (banner != .unknown) return banner;
+    return path_style;
+}
+
+test "SFTP OS identification uses banner, os-release and path style without exec" {
+    try std.testing.expectEqual(Kind.ubuntu, parseBanner("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5\r\n"));
+    try std.testing.expectEqual(Kind.debian, parseBanner("SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"));
+    try std.testing.expectEqual(Kind.windows, parseBanner("SSH-2.0-OpenSSH_for_Windows_9.5"));
+    try std.testing.expectEqual(Kind.freebsd, parseBanner("SSH-2.0-OpenSSH_9.7 FreeBSD-20240806"));
+    try std.testing.expectEqual(Kind.netbsd, parseBanner("SSH-2.0-OpenSSH_9.0 NetBSD_Secure_Shell-20220604"));
+    try std.testing.expectEqual(Kind.unknown, parseBanner("SSH-2.0-OpenSSH_9.8"));
+    try std.testing.expectEqual(Kind.unknown, parseBanner("SSH-2.0-paramiko_5.1.0"));
+    try std.testing.expectEqual(Kind.unknown, parseBanner("Ubuntu"));
+    try std.testing.expectEqual(Kind.windows, parseSftpPath("/C:/Users/me"));
+    try std.testing.expectEqual(Kind.windows, parseSftpPath("D:\\data"));
+    try std.testing.expectEqual(Kind.windows, parseSftpPath("/C:"));
+    try std.testing.expectEqual(Kind.unknown, parseSftpPath("/home/me"));
+    try std.testing.expectEqual(Kind.unknown, parseSftpPath("/"));
+    try std.testing.expectEqual(Kind.unknown, parseSftpPath("/ab:c"));
+    // os-release read over SFTP has no `uname -s` line.
+    try std.testing.expectEqual(Kind.freebsd, parse("NAME=FreeBSD\nID=freebsd\n"));
+    try std.testing.expectEqual(Kind.uos, fromSftp(.debian, parse("ID=uos\nID_LIKE=debian\n"), .unknown));
+    try std.testing.expectEqual(Kind.ubuntu, fromSftp(.ubuntu, parse("ID=custom\n"), .unknown));
+    try std.testing.expectEqual(Kind.ubuntu, fromSftp(.ubuntu, .unknown, .unknown));
+    try std.testing.expectEqual(Kind.windows, fromSftp(.windows, .linux, .unknown));
+    try std.testing.expectEqual(Kind.rocky, fromSftp(.unknown, parse("ID=\"rocky\"\n"), .unknown));
+    try std.testing.expectEqual(Kind.windows, fromSftp(.unknown, .unknown, .windows));
+    try std.testing.expectEqual(Kind.unknown, fromSftp(.unknown, .unknown, .unknown));
 }
 pub fn local() Kind {
     return switch (@import("builtin").os.tag) {

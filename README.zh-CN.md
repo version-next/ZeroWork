@@ -82,7 +82,7 @@ node e2e/reported_ui_regressions.ts /tmp/zerowork-ui-check
 
 隔离测试包装脚本会创建已规范化真实路径的临时数据目录，并在退出时清理。运行测试目标时应使用该脚本，避免录制和配置进入账户的正式应用数据。普通应用的数据位于 `~/Library/Application Support/com.zerowork.app`，缓存位于 `~/Library/Caches/com.zerowork.app`，诊断日志位于 `~/Library/Logs/com.zerowork.app`；已保存的凭据存于应用的钥匙串凭据库。启动时会迁移已有的 `~/.zerowork`。通过「设置 → 数据与日志 → 导出与清理 → 清除全部应用数据…」可清理应用所属数据并退出；仅删除 `.app` 会保留用户数据。
 
-开发者可使用 `scripts/ssh_smoke.sh` 对临时测试环境执行 SSH 集成验证；它接受的环境变量不会配置或启用已安装 App 的功能。密码模式读取 `ZEROWORK_SSH_PASSWORD`；公钥模式另外读取 `ZEROWORK_SSH_KEY`，并将密码值视为可选的私钥口令；代理模式设置 `ZEROWORK_SSH_AGENT=1`。凭据不会保存在仓库中。Zig 管理的 Session 冒烟测试为 `src/ssh_session_smoke.zig`，使用相同的环境变量凭据，在临时虚拟机上验证正式的 libssh2 Session 资源所有者。
+开发者可使用 `scripts/ssh_smoke.sh` 对临时测试环境执行 SSH 集成验证；它接受的环境变量不会配置或启用已安装 App 的功能。密码模式读取 `ZEROWORK_SSH_PASSWORD`；公钥模式另外读取 `ZEROWORK_SSH_KEY`，并将密码值视为可选的私钥口令；代理模式设置 `ZEROWORK_SSH_AGENT=1`。凭据不会保存在仓库中。Zig 管理的 Session 冒烟测试为 `src/proto/ssh/acceptance/ssh_session_smoke.zig`，使用相同的环境变量凭据，在临时虚拟机上验证正式的 libssh2 Session 资源所有者。
 
 原生 Zenit 应用通过 UI 打开已保存连接或快速连接目标。在「设置 → AI」中配置服务商、端点、模型和 API Key；已保存的密钥使用 macOS 钥匙串。已安装 App 忽略应用及框架的环境变量覆盖，使用当前 macOS 账户的标准数据目录，无需 shell 初始化或环境变量配置。网络连接仅由对应的 App 操作发起。自动化数据隔离与框架诊断仅编译进显式启用测试模式的构建。
 

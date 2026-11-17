@@ -1,0 +1,9 @@
+{
+  "source": "zenit",
+  "ref": "main",
+  "commit": "57b10e64d89db90367263a75ed59c7bbab0af16a",
+  "commit_date": "2026-11-16T18:59:58+09:00",
+  "files": 3782,
+  "sha256": "ba786a25beebe07160d5f452537f980a1b9ee750f4ec6e0b0ddb8fdd9f5e0daf",
+  "hash_algorithm": "sorted paths relative to vendor/zenit; per file: u64be path length, path, u64be content length, content"
+}

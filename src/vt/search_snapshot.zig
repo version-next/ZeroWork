@@ -70,7 +70,7 @@ fn sameStyle(a: Span, b: Span) bool {
 }
 pub const Row = struct {
     id: vt.RowId,
-    presentation: @import("../ui/terminal_record_geometry.zig").Layout = .{},
+    presentation: @import("terminal_record_geometry.zig").Layout = .{},
     application_kind: u8 = 0,
     application_state: u8 = 0,
     timestamp_ms: ?i64 = null,

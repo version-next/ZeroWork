@@ -14,7 +14,16 @@ pub const build_environment = .{
 pub const Mode = enum { native, custom, frameless };
 pub const ControlsPolicy = enum { automatic, application };
 pub const UnsupportedPolicy = enum { use_native, fail };
-pub const Custom = struct { controls: ControlsPolicy = .automatic, unsupported: UnsupportedPolicy = .use_native };
+/// Native title-bar metrics under a custom caption.
+pub const TitlebarMetrics = enum {
+    /// The platform's plain title bar.
+    standard,
+    /// A window with a toolbar. AppKit gives such a window its larger corner radius and lays
+    /// the traffic lights out for it (macOS 26: radius 26, close button at 19/19, step 23), the
+    /// geometry a floating sidebar is concentric with. Other backends ignore this.
+    toolbar,
+};
+pub const Custom = struct { controls: ControlsPolicy = .automatic, unsupported: UnsupportedPolicy = .use_native, titlebar: TitlebarMetrics = .standard };
 pub const Frameless = struct { unsupported: UnsupportedPolicy = .use_native };
 pub const Config = union(Mode) { native, custom: Custom, frameless: Frameless };
 pub const ControlsOwner = enum { native, framework, application, none };

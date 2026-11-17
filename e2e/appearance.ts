@@ -3,6 +3,8 @@
  * Seeds ordinary isolated config + a valid PNG; this does NOT test a native picker.
  * Uses public Harness input/query APIs and real Metal screenshots, never the full tree.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10,7 +12,10 @@ import { mkdir, mkdtemp, open, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep, request } from "../zig-out/share/zenit/harness/client.ts";
+// Two-level Settings window (overview → subpage; no close button, Cmd+W closes): shared navigation.
+import { settingsNav } from "./settings_nav.ts";
+const nav = settingsNav();
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -50,6 +55,9 @@ transparency = 25
 `;
 await writeFile(configPath, baseline);
 await writeFile(join(output, "config-before.toml"), baseline);
+// The regression runner's isolation guard appends `[updates] auto_check=false` to any config.toml it
+// sees written: the committed file is what is actually on disk.
+const committedBaseline = await readFile(configPath, "utf8");
 process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
 const log = await open(join(output, "app.log"), "w");
 const child = spawn(binary, [], { cwd: root, env: {
@@ -86,8 +94,10 @@ async function click(id: string): Promise<void> {
   // The public click API brings the target into its real ScrollArea viewport.
   assert((await clickTestId(id)).ok, `Click ${id}`);
 }
+// Committed numeric fields are now shown in their canonical format (line height "1.80"): compare numbers.
+const sameValue = (buffer: string, value: string) => buffer === value || (/^-?[0-9.]+$/.test(value) && /^-?[0-9.]+$/.test(buffer) && Number(buffer) === Number(value));
 async function expectInput(id: string, value: string): Promise<void> {
-  await waitFor(async () => (await inputState(id)).buffer === value || null);
+  await waitFor(async () => sameValue((await inputState(id)).buffer, value) || null);
 }
 async function edit(id: string, value: string): Promise<void> {
   await click(id);
@@ -96,16 +106,24 @@ async function edit(id: string, value: string): Promise<void> {
   assert((await key("return")).ok);
   await expectInput(id, value);
 }
+// Floating Save Bar (H-save): it shows "未保存" / "有设置需要修正" (was "请修正设置中的错误") while a draft exists
+// and hides once the draft is saved or there is none (was a persistent "已保存" footer).
+const footerText: Record<string, string> = { "请修正设置中的错误": "有设置需要修正" };
 async function footer(value: string): Promise<void> {
-  await waitFor(async () => (await visible("settings.footer.state")).text === value || null);
+  if (value === "已保存") { await waitFor(async () => !(await query("settings.footer")).some(shown) || null); return; }
+  const want = footerText[value] ?? value;
+  await waitFor(async () => (await visible("settings.footer.state")).text === want || null);
 }
 async function openSettings(): Promise<void> {
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  await visible("settings.appearance.font.header");
+  await nav.toSub("appearance", "font");
+  await visible("settings.appearance.font");
+}
+/** Cmd+W asks to close the Settings window (the old settings.close button). */
+async function requestClose(): Promise<void> {
+  assert((await key("w", { cmd: true })).ok, "Cmd+W");
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -118,7 +136,7 @@ function descendants(): { pid: number; parent: number; command: string }[] {
   return all.filter((process) => process.pid !== child.pid && owned.has(process.pid));
 }
 const evidenceIds = [
-  "settings.close", "settings.footer.state", "settings.appearance.font.header",
+  "settings.panel", "settings.page.title", "settings.footer.state", "settings.appearance.font",
   "settings.field.font_family", "settings.field.font_size", "settings.field.line_height",
   "settings.font.status", "settings.background.state", "settings.field.transparency",
   "settings.field.blur_px", "settings.materials.preview.actions", "settings.confirmation",
@@ -142,6 +160,22 @@ function configValue(source: string, section: string, field: string): unknown {
   }
   throw new Error(`Missing persisted ${section}.${field}`);
 }
+// The full-window material preview is shown in the owning main window (SettingsHost.setMaterialPreview activates
+// it), but test-mode automation stays bound to the preferences window. Bind the harness to the main window for
+// the preview, then reopen Settings from its toolbar (presentWindow rebinds the harness to the preferences window).
+async function bindMainWindow(): Promise<void> {
+  const snapshot = await request("POST", "/zerowork/windows", { action: "snapshot" });
+  assert((await request("POST", "/zerowork/windows", { action: "select", window: snapshot.windows[0].window })).ok, "bind main window");
+}
+async function boundWindow(): Promise<string | undefined> { return (await request("GET", "/windows")).windows.find((w: any) => w.bound)?.window_id; }
+async function bindSettingsWindow(): Promise<void> {
+  const main = await boundWindow();
+  await click("toolbar.settings");
+  await waitFor(async () => (await boundWindow()) !== main || null);
+  const panel = await visible("settings.panel"), viewport = await visible("settings.viewport");
+  // Returning from the preview keeps the Settings layout inside its 960×780 window (Save Bar reachable).
+  assert(panel.rect.h <= 780.5 && viewport.rect.y + viewport.rect.h <= panel.rect.y + panel.rect.h + 0.5, `settings layout fits its window after the material preview: panel ${JSON.stringify(panel.rect)} viewport ${JSON.stringify(viewport.rect)}`);
+}
 let failure: unknown;
 try {
   await waitForServerReady();
@@ -149,60 +183,86 @@ try {
   assert.equal(Number(owner.pid), child.pid, "Harness must belong to this isolated process");
   report.descendants_at_start = descendants();
   assert((await resizeWindow(1440, 900)).ok);
-  await openSettings();
-  await hidden("settings.field.font_size");
-  await click("settings.appearance.themes.header");
-  await click("settings.appearance.font.header");
-  await expectInput("settings.field.font_size", "14");
+  // Panes no longer fold: the font fields live on the 字体与排版 subpage and are absent from the 主题 subpage.
+  await nav.toSub("appearance", "theme");
   await waitFor(async () => (await visible("settings.background.state")).text?.includes("本地 · 1 × 1") || null);
+  await hidden("settings.field.font_size");
+  await openSettings();
+  await expectInput("settings.field.font_size", "14");
   await capture("appearance-entry");
-  checks.push("Production toolbar and Appearance navigation open the real page; font section expands; saved PNG is prepared by the real worker");
+  checks.push("Production toolbar and Appearance overview open the real subpages; the font subpage shows the font fields; saved PNG is prepared by the real worker");
 
+  // The family Select is now searchable and virtualized: filter to 自定义字体… before choosing it.
   await click("settings.field.font_family");
+  assert((await key("a", { cmd: true })).ok && (await key("backspace")).ok); // the search text starts as the current family
+  assert((await type_("自定义")).ok);
   await click("settings.option.font_family.custom");
   await edit("settings.field.font_family", "Monaco");
   await edit("settings.field.font_size", "18");
   await edit("settings.field.line_height", "1.8");
   await footer("未保存");
-  await click("settings.appearance.font.header");
-  await hidden("settings.field.font_size");
-  await click("settings.appearance.font.header");
+  // Was: fold and unfold the font pane. Panes no longer fold; a draft belongs to its subpage, and leaving
+  // the subpage asks first. Continue Editing keeps the subpage and its draft.
+  await click("settings.nav.appearance");
+  await visible("settings.confirmation");
+  await click("settings.confirmation.cancel");
+  await hidden("settings.confirmation");
+  await nav.waitTitle("字体与排版");
+  await footer("未保存");
   await expectInput("settings.field.font_size", "18");
-  assert.equal(await readFile(configPath, "utf8"), baseline, "Editing must not publish config");
+  assert.equal(await readFile(configPath, "utf8"), committedBaseline, "Editing must not publish config");
   await capture("appearance-font-draft");
-  await click("settings.close");
+  await requestClose();
   await click("settings.confirmation.cancel");
   await hidden("settings.confirmation");
   await expectInput("settings.field.font_size", "18");
-  await click("settings.close");
+  await requestClose();
   await click("settings.confirmation.discard");
-  await hidden("settings.close");
-  assert.equal(await readFile(configPath, "utf8"), baseline, "Discard must preserve the committed file");
+  await hidden("settings.panel");
+  // The preferences window retires at the runtime's next safe boundary: reopen only after it is gone.
+  await waitFor(async () => (await request("GET", "/windows")).windows.length === 1 || null);
+  assert.equal(await readFile(configPath, "utf8"), committedBaseline, "Discard must preserve the committed file");
   await openSettings();
   await expectInput("settings.field.font_family", "Menlo");
   await expectInput("settings.field.font_size", "14");
   await expectInput("settings.field.line_height", "1.5");
+  await nav.toSub("appearance", "theme");
   await waitFor(async () => (await visible("settings.background.state")).text?.includes("本地 · 1 × 1") || null);
   await footer("已保存");
-  checks.push("Real custom-family, size and line-height edits survive fold and Continue Editing; Discard reopens the previous committed values without writing config");
+  await nav.toSub("appearance", "font");
+  checks.push("Real custom-family, size and line-height edits survive the leave-subpage prompt and Continue Editing; Discard reopens the previous committed values without writing config");
 
   await edit("settings.field.font_family", "Monaco");
   await edit("settings.field.font_size", "16");
   await edit("settings.field.line_height", "1.75");
+  // Typography and materials are separate subpages: leaving the font subpage saves its draft from the prompt.
+  await click("settings.nav.appearance");
+  await click("settings.confirmation.save");
+  await hidden("settings.confirmation");
+  const typography = await readFile(configPath, "utf8");
+  for (const [field, expected] of [["font_family", "Monaco"], ["font_size", 16], ["line_height", 1.75]] as const) assert.equal(configValue(typography, "ui", field), expected, `Prompt Save persisted ui.${field}`);
+  assert.equal(configValue(typography, "ui.materials.background", "transparency"), 25, "Typography save leaves materials untouched");
+  await nav.toSub("appearance", "theme");
+  await nav.reveal("settings.field.transparency");
   await edit("settings.field.transparency", "42");
   await edit("settings.field.blur_px", "12");
+  await nav.reveal("settings.materials.preview.open");
   await click("settings.materials.preview.open");
+  await bindMainWindow();
   await visible("settings.materials.preview.actions");
-  await hidden("settings.close");
+  await hidden("settings.panel");
   await capture("appearance-material-preview");
   await click("settings.materials.preview.return");
   await hidden("settings.materials.preview.actions");
-  await visible("settings.close");
-  await expectInput("settings.field.font_size", "16");
+  await bindSettingsWindow();
   await expectInput("settings.field.transparency", "42");
   await expectInput("settings.field.blur_px", "12");
+  // Typography (16) was saved from the leave-subpage prompt before the preview; reaching the font subpage now
+  // would ask about the material draft. Its value is held by the file, checked unchanged right below.
+  assert.equal(configValue(await readFile(configPath, "utf8"), "ui", "font_size"), 16, "Typography survives the material preview");
+  await expectInput("settings.field.blur_px", "12");
   await footer("未保存");
-  assert.equal(await readFile(configPath, "utf8"), baseline, "Material preview must not publish config");
+  assert.equal(await readFile(configPath, "utf8"), typography, "Material preview must not publish config");
   await capture("appearance-preview-return");
   checks.push("Material preview opens against the prepared image and returns with typography and material drafts intact, without changing the committed file");
 
@@ -216,6 +276,7 @@ try {
     ["ui.materials.background", "transparency", 42],
   ] as const) assert.equal(configValue(saved, section, field), expected, `Persisted ${section}.${field}`);
   assert(Number(configValue(saved, "meta", "config_revision")) > 1, "Save must advance the real configuration revision");
+  assert(Number(configValue(saved, "meta", "config_revision")) > Number(configValue(typography, "meta", "config_revision")), "Material Save advances past the typography save");
   await writeFile(join(output, "config-after.toml"), saved);
   await capture("appearance-saved");
   checks.push("Save completes the production configuration transaction; actual config.toml contains Monaco/16/1.75, blur 12, transparency 42 and a newer revision");

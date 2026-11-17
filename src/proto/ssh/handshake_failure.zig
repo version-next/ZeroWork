@@ -13,18 +13,7 @@ pub fn fromCode(code: c_int) anyerror {
     };
 }
 
-pub fn description(err: anyerror) ?[]const u8 {
-    return switch (err) {
-        error.SshHandshakeReceiveFailed => "SSH 握手接收失败，请检查网络或服务端日志（详情见应用日志）",
-        error.SshHandshakeSendFailed => "SSH 握手发送失败，请检查网络或服务端日志（详情见应用日志）",
-        error.SshHandshakeDisconnected => "SSH 握手期间连接已断开（详情见应用日志）",
-        error.SshHandshakeBannerFailed => "未能读取 SSH 服务标识，请检查目标端口（详情见应用日志）",
-        error.SshHandshakeNegotiationFailed => "SSH 密钥交换或算法协商失败（详情见应用日志）",
-        error.SshHandshakeTimedOut => "SSH 握手超时，请检查网络与服务端状态（详情见应用日志）",
-        error.HandshakeFailed => "SSH 握手失败，尚未进行登录认证（详情见应用日志）",
-        else => null,
-    };
-}
+// 用户文案在 shared/base/error_text.zig（唯一目录，copy-terms）；这里只做 libssh2 错误码 → 错误名的分类。
 
 /// Server-provided text must not inject extra lines into the diagnostic log.
 pub fn logMessage(buffer: []u8, message: []const u8) []const u8 {
@@ -38,8 +27,9 @@ pub fn logMessage(buffer: []u8, message: []const u8) []const u8 {
 test "handshake diagnostics classify receive errors and preserve unknown fallback" {
     try std.testing.expectEqual(error.SshHandshakeReceiveFailed, fromCode(-43));
     try std.testing.expectEqual(error.HandshakeFailed, fromCode(-999));
-    try std.testing.expect(description(fromCode(-43)) != null);
-    try std.testing.expect(description(error.AuthenticationFailed) == null);
+    const catalog = @import("../../shared/base/error_text.zig");
+    try std.testing.expect(catalog.describe(fromCode(-43)).?.in_log);
+    try std.testing.expect(!catalog.describe(error.AuthenticationFailed).?.in_log);
     var buffer: [8]u8 = undefined;
     try std.testing.expectEqualStrings("bad  msg", logMessage(&buffer, "bad\r\nmsg extra"));
 }

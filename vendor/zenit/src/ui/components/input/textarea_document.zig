@@ -58,10 +58,17 @@ pub const TextareaDocument = struct {
         candidate.text.appendSliceAssumeCapacity(self.text.items[0..start]);
         candidate.text.appendSliceAssumeCapacity(input);
         candidate.text.appendSliceAssumeCapacity(self.text.items[end..]);
-        try candidate.line_starts.append(self.allocator, 0);
-        for (candidate.text.items, 0..) |byte, i| {
-            if (byte == '\n') try candidate.line_starts.append(self.allocator, i + 1);
+        // Existing starts at or before start stay valid. Starts after end
+        // come from untouched newlines and only need an offset adjustment.
+        // A first setText may populate a zero-initialized display document.
+        const prefix: []const usize = if (start == 0) &.{0} else self.line_starts.items[0 .. self.offsetToLineCol(start).line + 1];
+        const suffix: []const usize = if (end == self.totalLength()) &.{} else self.line_starts.items[self.offsetToLineCol(end).line + 1 ..];
+        try candidate.line_starts.ensureTotalCapacityPrecise(self.allocator, prefix.len + std.mem.count(u8, input, "\n") + suffix.len);
+        candidate.line_starts.appendSliceAssumeCapacity(prefix);
+        for (input, 0..) |byte, i| {
+            if (byte == '\n') candidate.line_starts.appendAssumeCapacity(start + i + 1);
         }
+        for (suffix) |offset| candidate.line_starts.appendAssumeCapacity(start + input.len + (offset - end));
         return .{ .owner = self, .candidate = candidate };
     }
 
@@ -501,4 +508,33 @@ pub fn displayLineBoundaries(allocator: std.mem.Allocator, doc: *const TextareaD
     }
     if (result.items[result.items.len - 1] != length) try result.append(allocator, @intCast(length));
     return result.toOwnedSlice(allocator);
+}
+
+test "TextareaDocument: replacement line index matches a fresh scan at every boundary" {
+    const original = "ab\n\n中\ncd\n";
+    const insertions = [_][]const u8{ "", "x", "\n", "ab\n中\n" };
+    var doc = TextareaDocument{ .allocator = std.testing.allocator };
+    defer doc.deinit();
+    try doc.setTextChecked(original);
+    for (0..original.len + 1) |start| {
+        for (start..original.len + 1) |end| {
+            for (insertions) |input| {
+                var prepared = try doc.prepareReplace(start, end, input);
+                defer prepared.deinit();
+                const result = prepared.candidate.getText();
+                try std.testing.expectEqualSlices(u8, original[0..start], result[0..start]);
+                try std.testing.expectEqualSlices(u8, input, result[start..][0..input.len]);
+                try std.testing.expectEqualSlices(u8, original[end..], result[start + input.len ..]);
+                const starts = prepared.candidate.line_starts.items;
+                try std.testing.expectEqual(@as(usize, 0), starts[0]);
+                var line: usize = 1;
+                for (result, 0..) |byte, i| if (byte == '\n') {
+                    try std.testing.expect(line < starts.len);
+                    try std.testing.expectEqual(i + 1, starts[line]);
+                    line += 1;
+                };
+                try std.testing.expectEqual(line, starts.len);
+            }
+        }
+    }
 }

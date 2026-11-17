@@ -1,0 +1,65 @@
+old_path	new_path	layer	mixed	note
+src/background_asset_tests.zig	src/features/shell/tests/background_asset_tests.zig	tests	no	只 import config/background_*，实测对象是 core 配置；若 settings 包想认领可裁决
+src/background_surface_tests.zig	src/features/shell/tests/background_surface_tests.zig	tests	no	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/chrome_policy_tests.zig	src/features/shell/tests/chrome_policy_tests.zig	tests	no	import ui/focus_fill.zig(shared-ui 件)与 app_theme，按名称认领
+src/fullscreen_titlebar_tests.zig	src/features/shell/tests/fullscreen_titlebar_tests.zig	tests	no	
+src/material_performance_tests.zig	src/features/shell/tests/material_performance_tests.zig	tests	no	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/material_popup_tests.zig	src/features/shell/tests/material_popup_tests.zig	tests	no	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/sidebar_view_tests.zig	src/features/shell/tests/sidebar_view_tests.zig	tests	no	
+src/status_connection_view_tests.zig	src/features/shell/tests/status_connection_view_tests.zig	tests	no	
+src/status_controller_tests.zig	src/features/shell/tests/status_controller_tests.zig	tests	no	
+src/status_detail_tests.zig	src/features/shell/tests/status_detail_tests.zig	tests	no	
+src/ui/application_host.zig	src/features/shell/host/application_host.zig	host	yes	混合型巨型文件(4456行)，主线程到 SSH/Local runtime 的桥，P5 再拆。被 plugins import: src/plugins/sftp/provider_host.zig
+src/ui/background_layers.zig	src/features/shell/view/background_layers.zig	view	no	
+src/ui/background_repeat.zig	src/features/shell/model/background_repeat.zig	model	no	e2e/material_geometry.ts 文本引用旧路径
+src/ui/background_texture.zig	src/features/shell/model/background_texture.zig	model	no	另被 src/main.zig 与 src/ui/auxiliary_appearance.zig 使用
+src/ui/compact_overlay_layout.zig	src/shared/ui/components/compact_overlay_layout.zig	shared_ui	no	被 connections(auth_challenge_view/connection_details_view/connection_logs_view)与 workspace(broadcast_view/group_close_view) 共用，建议下沉 shared/ui
+src/ui/layer_materials.zig	src/shared/ui/styles/layer_materials.zig	shared_ui	no	跨 feature 材质辅助；被 core import: src/config/settings_parts/settings_controls.zig(将搬 settings)；另被 plugins import: src/plugins/bmc_ikvm/views.zig
+src/ui/log_typography.zig	src/shared/ui/styles/log_typography.zig	shared_ui	no	被 connection_logs_view/connection_progress_view(connections)与 transfer_events_view(transfer) 共用
+src/ui/material_geometry.zig	src/shared/ui/styles/material_geometry.zig	shared_ui	no	被 ai_step_view/ai_step_disclosure/ai_turn_status_view/command_error_hint_view/layer_materials 共用
+src/ui/overlay_anchor.zig	src/shared/base/overlay_anchor.zig	shared_base	no	ui=0 纯模型；被 context_menu_view/group_context(workspace)与 status_controller/status_detail_view(shell)共用
+src/ui/overlay_model.zig	src/features/shell/model/overlay_model.zig	model	no	被 application_host.zig 与 src/root.zig 引用
+src/ui/shell/_styles.yss.zig	src/features/shell/view/shell/_styles.yss.zig	view	no	yss 生成孪生，随 styles.yss；shell_styles.zig 以 shell/_styles.yss.zig 引用，搬迁时需同步相对路径
+src/ui/shell/styles.yss	src/features/shell/view/shell/styles.yss	view	no	目录 shell/ 保留以免与 view/ 内文件混淆，孪生同目录
+src/ui/shell_styles.zig	src/features/shell/view/shell_styles.zig	view	no	其中 ThemePublication 之后会单独拆到 shared/ui/theme，P1 仍整体归 shell view/。被 plugins import: src/plugins/bmc_ikvm/styles.zig
+src/ui/sidebar_collapsed_view.zig	src/features/shell/view/sidebar_collapsed_view.zig	view	no	
+src/ui/sidebar_model.zig	src/features/shell/model/sidebar_model.zig	model	no	
+src/ui/sidebar_new_button.zig	src/features/shell/view/sidebar_new_button.zig	view	no	
+src/ui/sidebar_styles.zig	src/features/shell/view/sidebar_styles.zig	view	no	
+src/ui/sidebar_view.zig	src/features/shell/view/sidebar_view.zig	view	no	
+src/ui/startup_styles.zig	src/features/shell/view/startup_styles.zig	view	no	
+src/ui/startup_transition.zig	src/features/shell/model/startup_transition.zig	model	no	
+src/ui/startup_view.zig	src/features/shell/view/startup_view.zig	view	no	
+src/ui/status_connection_extras.zig	src/features/shell/model/status_connection_extras.zig	model	no	ui=0 但 import workspace.zig
+src/ui/status_connection_styles.zig	src/features/shell/view/status_connection_styles.zig	view	no	
+src/ui/status_connection_view.zig	src/features/shell/view/status_connection_view.zig	view	no	
+src/ui/status_controller.zig	src/features/shell/model/status_controller.zig	model	no	ui=0；被 src/main.zig 使用
+src/ui/status_detail_styles.zig	src/features/shell/view/status_detail_styles.zig	view	no	
+src/ui/status_detail_view.zig	src/features/shell/view/status_detail_view.zig	view	no	
+src/ui/status_hover_preview.zig	src/features/shell/view/status_hover_preview.zig	view	no	
+src/ui/status_theme_styles.zig	src/features/shell/view/status_theme_styles.zig	view	no	
+src/ui/status_theme_view.zig	src/features/shell/view/status_theme_view.zig	view	no	
+src/ui/status_transfer_styles.zig	src/features/shell/view/status_transfer_styles.zig	view	no	
+src/ui/status_transfer_view.zig	src/features/shell/view/status_transfer_view.zig	view	no	
+src/ui/tab_color_picker.zig	src/features/shell/view/tab_color_picker.zig	view	no	
+src/ui/tab_picker.zig	src/features/shell/view/tab_picker.zig	view	no	
+src/ui/tab_rename.zig	src/features/shell/view/tab_rename.zig	view	no	
+src/ui/tab_strip_layout.zig	src/features/shell/model/tab_strip_layout.zig	model	no	被 workspace.zig/workspace_chrome.zig 使用
+src/ui/v3_geometry.zig	src/config/v3_geometry.zig	core	no	ui=0 纯常量；被 core import: src/config/ai_model_editor.zig、settings_content_view.zig、settings_styles.zig；建议下沉 src/config/(这些将随 settings 搬迁，P1 末复核)
+# CONTESTED src/ui/donation_qr.zig terminal 仅被 terminal_* 与 main 使用，terminal_record_geometry(将下沉 vt)也 import 它，可能需下沉 vt/
+# CONTESTED src/ui/donation_qr_view.zig terminal 仅被 terminal_surface/terminal_view 使用
+# CONTESTED src/ui/shell_assets.zig shared_ui 自动生成的 tab ear SVG 资源注册(*_assets.zig 规则)；被 workspace.zig 使用
+# CONTESTED src/ui/assets/shell/README.md shared_ui 资源目录，与 shell_assets.zig 配套
+# CONTESTED src/ui/assets/shell/tab-ear-left.svg shared_ui 资源，shell_assets.zig 的生成源
+# CONTESTED src/ui/assets/shell/tab-ear-right.svg shared_ui 资源，shell_assets.zig 的生成源
+# CONTESTED src/ui/assets/sidebar_footer_frame.svg shared_ui 名字属 sidebar 但在 assets/ 下
+# CONTESTED src/ui/plugin_window_host.zig connections 插件窗口宿主，import application_host.zig；被 ai_tools/terminal_surface/main/bmc_tests 使用，无明确 feature
+# CONTESTED src/ui/plugin_content_host.zig connections 窗口内容 facade，仅被 plugin_window_host 与 bmc_composition_tests 使用
+# CONTESTED src/ui/plugin_challenge_presenter.zig connections 共享挑战 UI，被 challenge_window_host/connection_host/probe_connection_host 使用
+# CONTESTED src/ui/plugin_editor_host.zig connections 嵌套注册编辑器，import wizard.zig，被 wizard.zig/main 使用
+# CONTESTED src/theme_layer_tests.zig shared_ui 主题矩阵测试，import ai/file/transfer/terminal/shell 等十余模块，并聚合 material_performance_tests 与 status_detail_tests
+# E2E e2e/material_geometry.ts 引用了 src/ui/background_repeat.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/ui/application_host.zig
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/ui/layer_materials.zig
+# E2E docs/DESIGN/V0.1.3_SSH_CONNECTIONS.md 引用了 src/ui/sidebar_model.zig
+# TESTID status. sidebar. tabs. groups. workspace.sidebar workspace.statusbar startup. (appearance.* 待查，可能属 settings)

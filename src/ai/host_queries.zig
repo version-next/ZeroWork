@@ -78,7 +78,10 @@ pub fn metadataOnly(raw: Session) Session {
 pub const Group = struct { id: u64, name: []const u8, membership_revision: u64, members: []const identity.SessionHandle };
 pub const Snapshot = struct {
     context: host.Context,
+    /// 对话最初的归属（`initial_kind` 只报告它是单个会话还是会话组）。
     initial_binding: scope.Owner,
+    /// 最初绑定的 tab 仍在时它的内容（由控制器从工作区派生）；null 时按 `initialKind` 推断。
+    initial_content: ?scope.Content = null,
     execution_policy: config.ExecutionPolicy,
     permission_mode: config.PermissionMode,
     lifecycle_management: bool = false,
@@ -138,7 +141,7 @@ pub fn sameHistoricalBinding(origin: host.Context, current: host.Context) bool {
     return origin.conversation_id.eql(current.conversation_id) and origin.binding.eql(current.binding);
 }
 fn boundSession(snapshot: Snapshot, handle: identity.SessionHandle) bool {
-    return switch (snapshot.context.binding) {
+    return switch (snapshot.context.contentOf()) {
         .session => |id| @backingInt(handle.session_id) == id,
         .group => |id| blk: {
             for (snapshot.groups) |group| {
@@ -149,6 +152,16 @@ fn boundSession(snapshot: Snapshot, handle: identity.SessionHandle) bool {
         },
     };
 }
+/// 模型可见的 `initial_kind`（与 M10 之前逐字相同）：旧归属直接取种类；tab 归属与当前绑定相同时
+/// 取当前内容，否则它是交接前的单卡 tab（只有单卡 tab 会交接给容器 tab）。
+fn initialKind(snapshot: Snapshot) []const u8 {
+    if (snapshot.initial_content) |held| return @tagName(held);
+    return switch (snapshot.initial_binding) {
+        .session => "session",
+        .group => "group",
+        .tab => if (snapshot.initial_binding.eql(snapshot.context.binding)) @tagName(snapshot.context.contentOf()) else "session",
+    };
+}
 fn retainedSession(snapshot: Snapshot, item: Session) bool {
     return if (item.retained_context) |context| context.eql(snapshot.context) and std.mem.eql(u8, item.state, "closed") else false;
 }
@@ -157,7 +170,7 @@ fn visibleSession(snapshot: Snapshot, item: Session) bool {
     return boundSession(snapshot, item.handle);
 }
 fn visibleGroup(snapshot: Snapshot, id: u64) bool {
-    return snapshot.context.binding.eql(.{ .group = id });
+    return snapshot.context.contentOf().eql(.{ .group = id });
 }
 /// This check uses only the current binding's allowlist. It must precede any
 /// lookup of a requested object's state, metadata or generation.
@@ -167,7 +180,7 @@ pub fn permitsSessionId(snapshot: Snapshot, id: u64) bool {
         return false;
     }
     for (snapshot.sessions) |item| if (@backingInt(item.handle.session_id) == id and retainedSession(snapshot, item)) return true;
-    return switch (snapshot.context.binding) {
+    return switch (snapshot.context.contentOf()) {
         .session => |bound| id == bound,
         .group => |bound| blk: {
             for (snapshot.groups) |group| {
@@ -249,7 +262,7 @@ fn sessionView(a: std.mem.Allocator, snapshot: Snapshot, raw: Session) !SessionV
 }
 const GroupView = struct { group_ref: []const u8, name: []const u8, membership_revision: u64, member_count: usize, current_binding: bool, closing: bool = false };
 fn groupView(a: std.mem.Allocator, snapshot: Snapshot, item: Group) !GroupView {
-    return .{ .group_ref = try groupRef(a, snapshot.context, item.id), .name = boundedText(item.name, 256), .membership_revision = item.membership_revision, .member_count = item.members.len, .current_binding = snapshot.context.binding.eql(.{ .group = item.id }) };
+    return .{ .group_ref = try groupRef(a, snapshot.context, item.id), .name = boundedText(item.name, 256), .membership_revision = item.membership_revision, .member_count = item.members.len, .current_binding = snapshot.context.contentOf().eql(.{ .group = item.id }) };
 }
 pub fn execute(raw_snapshot: Snapshot, invocation: host.Invocation, allocator: std.mem.Allocator) !host.Result {
     var snapshot = raw_snapshot;
@@ -266,7 +279,7 @@ pub fn execute(raw_snapshot: Snapshot, invocation: host.Invocation, allocator: s
     if (args != .object) return error.InvalidArguments;
     var body: []const u8 = undefined;
     if (std.mem.eql(u8, invocation.tool_id, "host.get_current_context")) {
-        const binding_ref = switch (snapshot.context.binding) {
+        const binding_ref = switch (snapshot.context.contentOf()) {
             .session => |id| blk: {
                 for (snapshot.sessions) |item| if (@backingInt(item.handle.session_id) == id) break :blk try sessionRef(a, snapshot.context, item.handle);
                 return error.ContextUnavailable;
@@ -275,7 +288,7 @@ pub fn execute(raw_snapshot: Snapshot, invocation: host.Invocation, allocator: s
         };
         var trusted_pty_execution = false;
         for (snapshot.sessions) |item| trusted_pty_execution = trusted_pty_execution or (boundSession(snapshot, item.handle) and !item.metadata_only and item.trusted_pty_execution);
-        body = try std.json.Stringify.valueAlloc(a, .{ .conversation_id = snapshot.context.conversation_id, .task_id = snapshot.context.task_id, .initial_kind = @tagName(snapshot.initial_binding), .current_binding = snapshot.context.binding, .binding_ref = binding_ref, .binding_revision = snapshot.context.binding_revision, .mode = @tagName(snapshot.execution_policy.execution_mode), .execution_mode = @tagName(snapshot.execution_policy.execution_mode), .retention = @tagName(snapshot.execution_policy.session_retention), .permission_mode = @tagName(snapshot.permission_mode), .grants = .{ .read_state = true, .inventory = @as([]const u8, if (snapshot.inventory_grant != null) "workspace_open_metadata" else "current_binding"), .metadata_only = snapshot.inventory_grant != null, .duration = if (snapshot.inventory_grant) |grant| @as(?[]const u8, @tagName(grant.duration)) else null, .expires_at = if (snapshot.inventory_grant) |grant| if (grant.duration == .legacy) @as(?i64, grant.expires_at) else null else null, .selection_revision = if (snapshot.inventory_grant) |grant| @as(?u64, grant.selection.revision()) else null, .grant_revision = snapshot.context.grant_revision }, .capabilities = .{ .discovery = true, .trusted_pty_execution = trusted_pty_execution, .lifecycle_management = snapshot.lifecycle_management }, .observed_at = snapshot.observed_at, .source_revision = snapshot.source_revision, .truncated = false, .next_cursor = @as(?[]const u8, null) }, .{});
+        body = try std.json.Stringify.valueAlloc(a, .{ .conversation_id = snapshot.context.conversation_id, .task_id = snapshot.context.task_id, .initial_kind = initialKind(snapshot), .current_binding = snapshot.context.contentOf(), .binding_ref = binding_ref, .binding_revision = snapshot.context.binding_revision, .mode = @tagName(snapshot.execution_policy.execution_mode), .execution_mode = @tagName(snapshot.execution_policy.execution_mode), .retention = @tagName(snapshot.execution_policy.session_retention), .permission_mode = @tagName(snapshot.permission_mode), .grants = .{ .read_state = true, .inventory = @as([]const u8, if (snapshot.inventory_grant != null) "workspace_open_metadata" else "current_binding"), .metadata_only = snapshot.inventory_grant != null, .duration = if (snapshot.inventory_grant) |grant| @as(?[]const u8, @tagName(grant.duration)) else null, .expires_at = if (snapshot.inventory_grant) |grant| if (grant.duration == .legacy) @as(?i64, grant.expires_at) else null else null, .selection_revision = if (snapshot.inventory_grant) |grant| @as(?u64, grant.selection.revision()) else null, .grant_revision = snapshot.context.grant_revision }, .capabilities = .{ .discovery = true, .trusted_pty_execution = trusted_pty_execution, .lifecycle_management = snapshot.lifecycle_management }, .observed_at = snapshot.observed_at, .source_revision = snapshot.source_revision, .truncated = false, .next_cursor = @as(?[]const u8, null) }, .{});
     } else if (std.mem.eql(u8, invocation.tool_id, "host.get_session")) {
         const item = try resolveSession(snapshot, try stringArg(args, "session_ref"));
         body = try std.json.Stringify.valueAlloc(a, .{ .session = try sessionView(a, snapshot, item), .observed_at = snapshot.observed_at, .source_revision = snapshot.source_revision, .truncated = false, .next_cursor = @as(?[]const u8, null) }, .{});
@@ -377,14 +390,14 @@ fn page(a: std.mem.Allocator, snapshot: Snapshot, invocation: host.Invocation) !
 
 test "host discovery pages a complete grant and fences cursors and references" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     var sessions: [300]Session = undefined;
     var handles: [300]identity.SessionHandle = undefined;
     for (&sessions, &handles, 1..) |*item, *handle, id| {
         handle.* = .{ .session_id = @fromBackingInt(id), .generation = 9 };
         item.* = .{ .handle = handle.*, .title = "Local", .protocol = "local", .state = "attached", .ready = true };
     }
-    var snapshot: Snapshot = .{ .context = context, .initial_binding = .{ .session = 1 }, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &sessions, .groups = &.{.{ .id = 7, .name = "工作组", .membership_revision = 8, .members = &handles }} };
+    var snapshot: Snapshot = .{ .context = context, .initial_binding = .{ .tab = 1 }, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &sessions, .groups = &.{.{ .id = 7, .name = "工作组", .membership_revision = 8, .members = &handles }} };
     var first = try testQuery(a, snapshot, "host.list_sessions", "{\"limit\":200}");
     defer first.deinit(a);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, first.blocks[0].structured, .{});
@@ -416,8 +429,8 @@ test "host discovery pages a complete grant and fences cursors and references" {
 
 test "host discovery supports an empty group without inventing a session authority" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
-    const snapshot: Snapshot = .{ .context = context, .initial_binding = .{ .session = 1 }, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &.{}, .groups = &.{.{ .id = 7, .name = "empty", .membership_revision = 1, .members = &.{} }} };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 1 };
+    const snapshot: Snapshot = .{ .context = context, .initial_binding = .{ .tab = 1 }, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &.{}, .groups = &.{.{ .id = 7, .name = "empty", .membership_revision = 1, .members = &.{} }} };
     var current = try testQuery(a, snapshot, "host.get_current_context", "{}");
     defer current.deinit(a);
     try current.validate(context, 1);
@@ -442,7 +455,7 @@ test "host discovery supports an empty group without inventing a session authori
 
 test "host discovery reports frozen execution retention and permission independently" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 3 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 3 };
     var sessions = [_]Session{.{ .handle = .{ .session_id = @fromBackingInt(1) }, .title = "Local", .protocol = "local", .state = "attached", .ready = true, .trusted_pty_execution = true }};
     var snapshot: Snapshot = .{ .context = context, .initial_binding = context.binding, .execution_policy = .{ .execution_mode = .new_pty, .session_retention = .auto_idle }, .permission_mode = .confirm, .lifecycle_management = true, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &sessions, .groups = &.{} };
     var current = try testQuery(a, snapshot, "host.get_current_context", "{}");
@@ -473,7 +486,7 @@ test "host discovery reports frozen execution retention and permission independe
 
 test "host discovery exposes only an associated saved source and preserves session references" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     const handles = [_]identity.SessionHandle{ .{ .session_id = @fromBackingInt(1) }, .{ .session_id = @fromBackingInt(2), .generation = 3 } };
     const source: identity.AssetOwner = .{ .id = @fromBackingInt(9), .revision = 4 };
     const sessions = [_]Session{
@@ -508,7 +521,7 @@ fn testQuery(a: std.mem.Allocator, snapshot: Snapshot, tool: []const u8, args: [
 
 test "BMC host discovery exposes transport state without replacing attachment lifecycle" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 83 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 83 }, .content = .{ .session = 83 }, .binding_revision = 1, .grant_revision = 1 };
     const handle: identity.SessionHandle = .{ .session_id = @fromBackingInt(83), .generation = 7 };
     const snapshot: Snapshot = .{ .context = context, .initial_binding = context.binding, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 10, .source_revision = 11, .cursor_key = @splat(7), .sessions = &.{.{ .handle = handle, .title = "BMC", .protocol = "bmc_ikvm", .state = "attached", .connection_state = "public_script", .ready = false, .connected = false }}, .groups = &.{} };
     const reference = try sessionRef(a, context, handle);
@@ -544,7 +557,7 @@ test "current-tab scope ignores historical workspace grants and rejects external
     const current: identity.SessionHandle = .{ .session_id = @fromBackingInt(4), .generation = 2 };
     const other: identity.SessionHandle = .{ .session_id = @fromBackingInt(8), .generation = 7 };
     const sessions = [_]Session{ .{ .handle = current, .title = "current", .protocol = "local", .state = "attached", .ready = true, .read_terminal = true }, .{ .handle = other, .title = "secret-external-title", .protocol = "secret-protocol", .state = "failed", .ready = false, .trusted_pty_execution = true } };
-    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 8 };
+    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 4 }, .content = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 8 };
     const selection = try inventory.captureSelection(a, &.{ current, other }, &.{});
     var old: inventory.Controller = .{};
     const grant = try old.allowFromUi(try old.capture(context, selection, 99), context, selection, 100);
@@ -583,7 +596,7 @@ test "current-tab group queries lose removed members immediately and never expos
     const one: identity.SessionHandle = .{ .session_id = @fromBackingInt(4), .generation = 2 };
     const two: identity.SessionHandle = .{ .session_id = @fromBackingInt(8), .generation = 3 };
     var groups = [_]Group{ .{ .id = 7, .name = "current-group", .membership_revision = 1, .members = &.{ one, two } }, .{ .id = 99, .name = "external-group", .membership_revision = 9, .members = &.{two} } };
-    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 8 };
+    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 8 };
     var snapshot: Snapshot = .{ .context = context, .initial_binding = context.binding, .execution_policy = .{ .execution_mode = .auto, .session_retention = .ask }, .permission_mode = .confirm, .observed_at = 100, .source_revision = 11, .cursor_key = @splat(7), .sessions = &.{ .{ .handle = one, .title = "one", .protocol = "local", .state = "attached", .ready = true }, .{ .handle = two, .title = "two", .protocol = "local", .state = "attached", .ready = true } }, .groups = &groups };
     const reference = try sessionRef(a, context, two);
     defer a.free(reference);
@@ -610,7 +623,7 @@ test "current-tab group queries lose removed members immediately and never expos
 
 test "current-tab historical directory requires an exact closed receipt context and grants no live content" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 8 };
+    const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 8 };
     const closed: identity.SessionHandle = .{ .session_id = @fromBackingInt(44), .generation = 3 };
     var sessions = [_]Session{.{ .handle = closed, .title = "own closed recording", .protocol = "local", .state = "closed", .ready = false, .recording_id = "0123456789abcdef0123456789abcdef".*, .recording_generation = 1, .metadata_only = true, .retained_context = context }};
     var snapshot: Snapshot = .{ .context = context, .initial_binding = context.binding, .execution_policy = .{ .execution_mode = .auto, .session_retention = .keep }, .permission_mode = .confirm, .observed_at = 1, .source_revision = 2, .cursor_key = @splat(3), .sessions = &sessions, .groups = &.{.{ .id = 7, .name = "own group", .membership_revision = 1, .members = &.{} }} };
@@ -632,7 +645,8 @@ test "current-tab historical directory requires an exact closed receipt context 
     snapshot.context.task_id.bytes[0] += 1;
     try std.testing.expectError(error.TargetNotAuthorized, resolveSession(snapshot, reference));
     snapshot.context = context;
-    snapshot.context.binding = .{ .group = 8 };
+    snapshot.context.binding = .{ .tab = 8 };
+    snapshot.context.content = .{ .group = 8 };
     try std.testing.expectError(error.TargetNotAuthorized, resolveSession(snapshot, reference));
 }
 

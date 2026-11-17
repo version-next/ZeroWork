@@ -26,14 +26,19 @@
  * Use visual_verified:true/screenshot_status:"captured_masked"/field_masked:true
  * only when the real collector's masked pixels were actually inspected.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {readPasteboardText} from './private_pasteboard.ts';
 import {createHash,randomBytes} from 'node:crypto';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,open,realpath,access,stat} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-patch-main-native');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
 const binarySha256=createHash('sha256').update(await readFile(binary)).digest('hex');
@@ -113,12 +118,13 @@ const assertRecorded=(body:any,stage:Stage)=>{
  assert.equal(s.local_released,true);assert.equal(s.remote_effect_unknown,false);assert.equal(s.grant,null);assert(body.output.includes(markers[stage]));
  const bytes=typeof s.command_hash==='string'?[...Buffer.from(s.command_hash,'utf8')]:s.command_hash;assert.deepEqual(bytes,[...createHash('sha256').update(commands[stage]).digest()]);
 };
-// Observe a genuine result, then wait for at most three real revisions. A
+// Observe a genuine result, then wait on real revisions for at most 90 s (by time, not by the number of revisions: a
+// revision that is not yet the required receipt must not use the wait up). A
 // fixture timer or a disk marker never substitutes for a private PTY receipt.
 const settle=(body:any,res:any,results:Map<string,any>,id:string,reference:string,predicate:(value:any)=>boolean)=>{
  let observation=result(results,id);if(!observation){emit(body,res,id,'host.get_execution',{execution_ref:reference,max_bytes:8192});return null}
- for(let attempt=1;!predicate(observation)&&attempt<=3;attempt++){
-  const nextId=id+'-'+attempt,next=result(results,nextId);if(!next){emit(body,res,nextId,'host.wait_execution',{execution_ref:reference,after_revision:observation.source_revision,wait_ms:30000,max_bytes:8192});return null}observation=next;
+ for(let attempt=1;!predicate(observation);attempt++){
+  const nextId=id+'-'+attempt,next=result(results,nextId);if(!next){if(!pollWithin(id,90000))break;emit(body,res,nextId,'host.wait_execution',{execution_ref:reference,after_revision:observation.source_revision,wait_ms:30000,max_bytes:8192});return null}observation=next;
  }assert(predicate(observation),`${id} never reached the required real receipt: ${JSON.stringify(observation)}`);return observation;
 };
 const validateWire=(body:any)=>{
@@ -134,8 +140,8 @@ const validateWire=(body:any)=>{
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'input-native-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;assert(!raw.includes(syntheticSecret),'synthetic secure input leaked into the provider request');
-  const body=JSON.parse(raw);validateWire(body);
+  const raw=await readRequestText(req);assert(!raw.includes(syntheticSecret),'synthetic secure input leaked into the provider request');
+  const body=JSON.parse(raw);if(isTitleRequest(body))return skipTitle(res);validateWire(body);
   for(const line of(await readFile(join(out,'app.log'),'utf8')).split('\n')){const start=line.indexOf('AI_TOOL_TRACE ');if(start<0)continue;try{const event=JSON.parse(line.slice(start+14));if(event.event==='host_result')fullHostResults.set(event.call_id,event.result)}catch{}}
   const boundary=body.messages.findLastIndex((m:any)=>m.role==='user'&&/\[NATIVE-(INPUT|TAKEOVER|SECRET)\]/.test(String(m.content)));
   const stage=/\[NATIVE-(INPUT|TAKEOVER|SECRET)\]/.exec(String(body.messages[boundary]?.content??''))?.[1] as Stage;assert(stage);assert.equal(stage,currentStage);
@@ -151,11 +157,11 @@ const server=createServer(async(req,res)=>{
   if(stage==='SECRET')assert.notEqual(context.task_id,states.TAKEOVER.context.task_id);
   Object.assign(state,{context,session});
   let facts:any;
-  for(let attempt=0;attempt<3;attempt++){
+  for(let attempt=0;;attempt++){
    const id=base+'-capability'+(attempt?'-'+attempt:'');facts=result(results,id);
-   if(!facts){if(attempt)await h.sleep(500);return emit(body,res,id,'host.get_session',{session_ref:session.session_ref})}
+   if(!facts){assert(pollWithin(base+'-capability',15000),'private PTY never became ready within 15 s of read-only observations');if(attempt)await h.sleep(500);return emit(body,res,id,'host.get_session',{session_ref:session.session_ref})}
    assert.equal(facts.session.ready,true);assert(['ready','initializing','busy'].includes(facts.session.capabilities.trusted_pty_state),JSON.stringify(facts));
-   if(facts.session.capabilities.trusted_pty_execution)break;assert(attempt<2,'private PTY never became ready during bounded read-only observations');
+   if(facts.session.capabilities.trusted_pty_execution)break;
   }state.capability=facts.session.capabilities;
   const run=result(results,base+'-run');if(!run)return emit(body,res,base+'-run','host.run_in_terminal',{session_ref:session.session_ref,command:commands[stage],request_key:requestKey+'-'+base+'-run'});
   state.execution_ref=run.execution_ref;
@@ -222,16 +228,16 @@ const absent=(id:string)=>h.waitFor(async()=>!(await h.query(id)).some(shown)||n
 const click=async(id:string)=>{report.last_action=id;const node=await visible(id);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id)};
 const capture=async(name:string)=>{await h.mouseMove(1,1);assert((await h.screenshot(join(out,name+'.png'))).ok);const view={panel:await h.query('ai.panel'),terminal:await h.query('terminal.surface'),tabs:await h.query('tabs.strip')};assert(!JSON.stringify(view).includes(syntheticSecret),'secure input leaked to the Zenit query tree');await writeFile(join(out,name+'.json'),JSON.stringify(view,null,2))};
 async function approvePending(approved:Set<string>){
- if(!(await h.query('ai.host_approval')).some(shown))return;assert(activeCall,'approval has no current provider call');if(approved.has(activeCall.id))return;
+ if(!(await h.query('ai.interaction.panel')).some(shown))return;assert(activeCall,'approval has no current provider call');if(approved.has(activeCall.id))return;
  const call=activeCall;assert(call.name==='host.run_in_terminal'||call.name==='host.send_execution_input');assert.equal(call.arguments.host_secret_request,undefined,'secret input must use its own real AppKit collector');
- const expected=call.arguments.command??call.arguments.text??'按下 Enter（提交已接收的当前行）';assert.equal(text(await visible('ai.host_approval.summary')),queryText(expected));const target=text((await h.query('ai.host_approval.target')).filter((node:any)=>node.hidden!==true));assert.equal(target,call.arguments.session_ref?'会话 #'+states[currentStage!].session.session_id:'','human approval header must not expose opaque references');
+ const expected=call.arguments.command??call.arguments.text??'按下 Enter（提交已接收的当前行）';assert.equal(text(await visible('ai.interaction.command')),queryText(expected));const target=text((await h.query('ai.interaction.target')).filter((node:any)=>node.hidden!==true));/* 交互卡把 s1: / x1: 引用解析成所属终端「tab 标题 · #会话号」（ai_host.zig updateComposerInteraction） */assert.equal(target,states[currentStage!].session.title+' · #'+states[currentStage!].session.session_id,'human approval header must not expose opaque references');assert(!target.includes('s1:')&&!target.includes('x1:'),'human approval header must not expose opaque references');
  if(call.name==='host.run_in_terminal'){
   const path=currentStage==='INPUT'?paths.inputReady:currentStage==='TAKEOVER'?paths.takeoverReady:paths.secretReady;assert.equal(await exists(path),false,'command has no effect before exact native approval');
-  await click('ai.host_approval.copy');assert.equal((await promisify(execFile)('/usr/bin/pbpaste',[],{encoding:'utf8'})).stdout,expected,'full native approval copy changed the exact command');
+  await click('ai.interaction.copy');assert.equal((await readPasteboardText()),expected,'full native approval copy changed the exact command');
  }else{
-  assert.equal(await exists(paths.inputDone),false,'ordinary text and pending Enter must leave the helper waiting');const impact=text(await visible('ai.host_approval.impact'));assert(impact.includes('向当前等待输入的程序发送内容')&&impact.includes('本次输入可能影响后续命令行为'));assert(!impact.includes('等待序号')&&!impact.includes('已接收输入序号'),'trusted fences must stay out of approval copy');
+  assert.equal(await exists(paths.inputDone),false,'ordinary text and pending Enter must leave the helper waiting');const impact=text(await visible('ai.interaction.impact'));assert(impact.includes('向当前等待输入的程序发送内容')&&impact.includes('本次输入可能影响后续命令行为'));assert(!impact.includes('等待序号')&&!impact.includes('已接收输入序号'),'trusted fences must stay out of approval copy');
  }
- const record={call_id:call.id,name:call.name,summary:queryText(expected),target:call.arguments.session_ref??call.arguments.execution_ref,at:new Date().toISOString()};report.approvals.push(record);await capture(call.id+'-approval');approved.add(call.id);await click('ai.host_approval.accept');
+ const record={call_id:call.id,name:call.name,summary:queryText(expected),target:call.arguments.session_ref??call.arguments.execution_ref,at:new Date().toISOString()};report.approvals.push(record);await capture(call.id+'-approval');approved.add(call.id);await click('ai.interaction.approve');
 }
 async function normalQuit(){
  if(app.exitCode!==null||app.signalCode!==null)return;
@@ -251,7 +257,7 @@ async function scanLeaks(){
  assert.deepEqual(leaks,[],'synthetic secure input persisted outside its private native consumer');return{files_checked:checked.length,provider_requests_checked:requests.length,original_calls_checked:emitted.size,matches:leaks.length};
 }
 try{
- await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  for(const stage of stages){
   currentStage=stage;activeCall=null;finalEmitted=false;const approved=new Set<string>();
   await click('ai.prompt');await h.key('a',{cmd:true});await h.type_(`[NATIVE-${stage}] 验收受控本机输入，仅按明确审批执行。`);await click('ai.send');
@@ -272,7 +278,7 @@ try{
    if(held?.kind==='takeover-before-user-input'){
     await visible('ai.stop');assert.equal(await exists(paths.takeoverDone),false);await click('ai.collapse');await absent('terminal.ai_control');const surface=await visible('terminal.surface');
     assert((await h.clickAt(surface.rect.x+surface.rect.w/2,surface.rect.y+surface.rect.h/2)).ok);assert((await h.type_(userInput)).ok);assert((await h.key('return')).ok);
-    await h.waitFor(async()=>{try{return await readFile(paths.takeoverDone,'utf8')===userInput+'\n'||null}catch{return null}},15000);await click('toolbar.ai');await visible('ai.stop');await capture('takeover-original-helper-ended-by-user');release('takeover-before-user-input',[get('takeover-finished',states.TAKEOVER.execution_ref)]);
+    await h.waitFor(async()=>{try{return await readFile(paths.takeoverDone,'utf8')===userInput+'\n'||null}catch{return null}},15000);await click(await aiToggleId());await visible('ai.stop');await capture('takeover-original-helper-ended-by-user');release('takeover-before-user-input',[get('takeover-finished',states.TAKEOVER.execution_ref)]);
    }
    if(held?.kind==='secret-awaiting-arm'){
     if(await exists(join(out,'collector-armed.json'))){const armed=JSON.parse(await readFile(join(out,'collector-armed.json'),'utf8'));assert.equal(armed.run_id,token);assert(armed.cua_bound===true||armed.cua_bound===false&&armed.bind_on_collector===true,'arming needs either a real bound app or explicit deferred binding to the collector');states.SECRET.cua_armed=true;states.SECRET.cua_arm_mode=armed.cua_bound?'bound_app':'bind_on_collector';release('secret-awaiting-arm',[{id:'secret-request',name:'host.send_execution_input',arguments:{execution_ref:states.SECRET.execution_ref,request_key:requestKey+'-secret',host_secret_request:true}}])}
@@ -299,9 +305,9 @@ try{
  }
  await normalQuit();assert(report.normal_app_close,'successful acceptance requires the actual normal Quit route');
  const trace:any[]=[];for(const line of(await readFile(join(out,'app.log'),'utf8')).split('\n')){const start=line.indexOf('AI_TOOL_TRACE ');if(start>=0)try{trace.push(JSON.parse(line.slice(start+14)))}catch{}}
- const identities=trace.filter(event=>event.event==='request_identity');assert.equal(identities.length,stages.length,'handoff must not create another Task');assert(!trace.some(event=>event.event==='conversation_rollback'));
+ /* request_identity 追踪事件已在 fcec7cb4 移除；改用每个宿主结果回执里的 task_id：每个阶段恰好一个 Task */const taskIds=new Set([...observations.values()].map((o:any)=>o.envelope.receipt.task_id));assert.equal(taskIds.size,stages.length,'handoff must not create another Task');assert(!trace.some(event=>event.event==='conversation_rollback'));
  for(const call of emitted.values()){const first=trace.find(event=>event.event==='tool_feedback'&&event.call_id===call.id);assert(first,`${call.id} needs real production feedback`);assert.equal(trace.filter(event=>event.event==='tool_feedback'&&event.call_id===call.id&&event.turn_id===first.turn_id).length,1,`${call.id} must settle once in its original turn`)}
- const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8')),runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal'),inputs=journal.records.filter((record:any)=>record.tool_id==='host.send_execution_input');assert.equal(runs.length,stages.length);assert.equal(inputs.length,inputOnly?3:4,'same-key ordinary and secret calls must reuse their original operations');
+ const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8')),runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal'),inputs=journal.records.filter((record:any)=>record.tool_id==='host.send_execution_input');assert.equal(runs.length,stages.length);assert.equal(inputs.length,inputOnly?3:4,'same-key ordinary and secret calls must reuse their original operations');
  for(const stage of stages){const run=runs.find((record:any)=>record.original_call===stage.toLowerCase()+'-run');assert(run);assert.equal(run.stage,'succeeded');assert.equal(run.execution_receipt.execution_id,states[stage].finished.snapshot.execution_id);assert.equal(run.execution_receipt.interval_saved,true);assert.equal(run.execution_receipt.output_scope,'session_interval');assert.equal(run.remote_effect_unknown,false)}
  for(const id of(inputOnly?['input-text-a','input-text-b','input-enter']:['input-text-a','input-text-b','input-enter','secret-request'])){const record=inputs.find((item:any)=>item.original_call===id);assert(record,id);assert.equal(record.stage,'succeeded');assert.equal(record.execution_receipt.input_receipt.stage,'consumed');assert.equal(record.remote_effect_unknown,false)}
  await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));
@@ -314,7 +320,7 @@ try{
  quitting=true;if(held){clearInterval(held.heartbeat);held.res.end('data: [DONE]\n\n');held=null}
  try{if(app.exitCode===null&&app.signalCode===null)await normalQuit()}catch(error){report.normal_quit_error=String(error)}
  await writeFile(join(out,'provider-requests.json'),JSON.stringify(requests,null,2));await writeFile(join(out,'original-calls-and-results.json'),JSON.stringify({calls:[...emitted.values()],results:[...observations].map(([id,observation])=>({id,...observation}))},null,2));
- if(report.status==='failed')try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.json')))}catch{}
+ if(report.status==='failed')try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.v4.json')))}catch{}
  try{report.final_leak_scan=await scanLeaks()}catch(error){report.status='failed';report.security_leak_failure=String(error);process.exitCode=1}
  report.states=states;report.isolation={directory:iso,data,rpc,zdot,preserved:true};report.cleanup={exit_code:app.exitCode,signal:app.signalCode,forced:false};
  if(app.exitCode===null&&app.signalCode===null){report.status='failed';report.error??='normal Quit did not close the App; native slot requires operator attention';process.exitCode=1;app.unref()}

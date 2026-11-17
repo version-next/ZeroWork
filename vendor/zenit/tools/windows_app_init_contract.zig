@@ -125,7 +125,7 @@ pub const ReusedAllocator = struct {
 
 fn externalFonts(app: *App) !void {
     const allocator = app.allocator;
-    const temp = try @import("zenit_environment").getOwned(allocator, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(allocator, "TEMP");
     defer allocator.free(temp);
     const path = try std.fmt.allocPrintSentinel(allocator, "{s}\\zenit-selector-字体-{x}.ttf", .{ temp, randomId(app.cx.io) }, 0);
     defer allocator.free(path);
@@ -285,7 +285,7 @@ fn registryFonts(io: std.Io) !void {
     try first.painter.update(first.cx, &first.win);
     const drawn = zenit_d3d11_contract_last_text_font(first.painter.native) orelse return error.AppFontConfigContractFailed;
     try require(zenit_dwrite_font_identity(drawn) == zenit_dwrite_font_identity(registry.resolve(courier, 32, 700, false).?.native));
-    const temp = try @import("zenit_environment").getOwned(allocator, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(allocator, "TEMP");
     defer allocator.free(temp);
     const bitmap = try std.fmt.allocPrintSentinel(allocator, "{s}\\zenit-registry-{x}.bmp", .{ temp, randomId(io) }, 0);
     defer allocator.free(bitmap);

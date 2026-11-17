@@ -14,6 +14,9 @@
 //! 3. Reactive sources only via explicit marker (zenit_reactive), no duck typing;
 //! 4. Anonymous struct literal recursively constructs by field;
 //! 5. Rest delegated to @as for normal coercion.
+//! A plain-value field (not Source / Model) given a reactive source of its own type takes the
+//! source's current value once, at conversion (a Yix parameter forwarded to `appendText` / `width`:
+//! read when the element mounts, not followed; see readsOnce).
 //! All custom errors start with <Props>.<field>:
 const std = @import("std");
 const source = @import("source.zig");
@@ -91,13 +94,51 @@ fn changeHandlerField(comptime P: type, comptime A: type, comptime name: []const
 fn coerceField(comptime P: type, comptime F: type, comptime name: []const u8, v: anytype) F {
     if (comptime isSourceType(F)) return toSourceProp(P, F.Value, name, v);
     if (comptime isModelType(F)) return toModelProp(P, F.Value, name, v);
+    if (comptime readsOnce(F, @TypeOf(v))) return readOnce(P, F, name, v);
     return coerceValue(P, F, name, v);
+}
+
+/// A plain-value prop (not Source / Model: structural or layout configuration such as
+/// `Input.append_text`, `Select.width`, `size`) given a reactive source: the value it holds when
+/// the props are converted, i.e. when the widget is built. In a Yix template that is the
+/// element's mount, so `<W.Input appendText={unit} />` in a row component takes the parameter's
+/// value then and does not follow it (same as `testId` / `focusId` / `ui.view.atMount`); props
+/// that follow their source are the ones declared `Source(T)` / `Model(T)`.
+fn readsOnce(comptime F: type, comptime X: type) bool {
+    if (comptime isContainer(F) and @hasDecl(F, "zenit_look") and F.accepts(X)) return false;
+    if (comptime isContainer(X) and @hasDecl(X, "zenit_source")) return true;
+    if (comptime source.reactiveKindOf(X) == null) return false;
+    // A raw *Signal / *Memo into a single-item pointer field (an `*anyopaque` context) keeps
+    // plain pointer coercion.
+    const Plain = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
+    return switch (@typeInfo(Plain)) {
+        .pointer => |ptr| ptr.size == .slice,
+        else => true,
+    };
+}
+
+fn readOnce(comptime P: type, comptime F: type, comptime name: []const u8, v: anytype) F {
+    const X = @TypeOf(v);
+    const V = source.SourceValueOf(X);
+    const Plain = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
+    // A Yix struct literal over a parameter (`scrollEdge={.{ .height = h }}`) is lifted to a
+    // source of the anonymous literal: convert its current value field by field.
+    if (V != F and V != Plain and comptime isAnonStructLiteral(V) and @typeInfo(Plain) == .@"struct") return coerceValue(P, F, name, source.toSource(v).peek());
+    if (V != F and V != Plain) {
+        @compileError(prefix(P, name) ++ "this prop is a plain " ++ @typeName(F) ++ " (read once when the widget is built), but got a source of " ++
+            @typeName(V) ++ " (" ++ @typeName(X) ++ ")");
+    }
+    return source.toSource(v).peek();
 }
 
 fn toSourceProp(comptime P: type, comptime T: type, comptime name: []const u8, v: anytype) Source(T) {
     const X = @TypeOf(v);
     if (X == Source(T)) return v;
     if (X == T) return .{ .value = v };
+    // A value type that converts other values itself (ui.view.Look takes a style part, or a
+    // source of one, as written): before the reactive checks, since a source of a part is a
+    // source of a different value type.
+    if (comptime isContainer(T) and @hasDecl(T, "zenit_look") and T.accepts(X)) return .{ .value = T.from(v) };
     // Source of different value type (e.g. Source(*const [4:0]u8) to Source([]const u8)):
     // error on type mismatch, not obscure @as error.
     if (comptime isContainer(X) and @hasDecl(X, "zenit_source")) mismatch(P, name, T, X, X.Value);
@@ -150,6 +191,7 @@ fn toModelProp(comptime P: type, comptime T: type, comptime name: []const u8, v:
 fn coerceValue(comptime P: type, comptime T: type, comptime name: []const u8, v: anytype) T {
     const X = @TypeOf(v);
     if (X == T) return v;
+    if (comptime isContainer(T) and @hasDecl(T, "zenit_look") and T.accepts(X)) return T.from(v);
     // Handlers with deferred value type (ui.on.bindAny, Yix component events):
     // instantiate by callback type.
     if (comptime @typeInfo(X) == .@"struct" and @hasDecl(X, "zenit_any_handler")) {
@@ -372,4 +414,34 @@ test "coerce: canonical struct passes through, decl literals work" {
     const p = coerce(DemoProps, DemoProps{ .id = 4, .label = .of("x"), .checked = .of(true) });
     try testing.expectEqualStrings("x", p.label.get());
     try testing.expect(p.checked.local);
+}
+
+test "coerce: a plain-value prop given a source takes its value once (a Yix parameter forwarded to a builder widget)" {
+    const owner = try SignalOwner.init(testing.allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(testing.allocator, null, owner);
+    defer scope.dispose();
+    const P = struct {
+        append_text: ?[]const u8 = null,
+        width: f32 = 0,
+        mode: Mode = .compact,
+        context: ?*anyopaque = null,
+        label: Source([]const u8) = .{ .value = "" },
+    };
+    const unit: Source([]const u8) = .{ .value = "MB" };
+    const width = try scope.createSignal(f32, 120);
+    const mode = try scope.createSignal(Mode, .comfortable);
+    const label = try scope.createSignal([]const u8, "Size");
+    const p = coerce(P, .{ .append_text = unit, .width = width, .mode = source.toSource(mode), .label = label });
+    try testing.expectEqualStrings("MB", p.append_text.?);
+    try testing.expectEqual(@as(f32, 120), p.width);
+    try testing.expectEqual(Mode.comfortable, p.mode);
+    // The plain props keep the value they had; the Source prop follows.
+    width.set(40);
+    label.set("Width");
+    try testing.expectEqual(@as(f32, 120), p.width);
+    try testing.expectEqualStrings("Width", p.label.get());
+    // A raw *Signal into a single-item pointer field stays pointer coercion (an opaque context).
+    const q = coerce(P, .{ .context = width });
+    try testing.expect(q.context.? == @as(*anyopaque, @ptrCast(width)));
 }

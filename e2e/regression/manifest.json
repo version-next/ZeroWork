@@ -1,0 +1,5543 @@
+{
+ "version": 1,
+ "entries": [
+  {
+   "name": "README.md",
+   "script": "e2e/README.md",
+   "class": "helper"
+  },
+  {
+   "name": "__pycache____fixed_forward.cpython-312.pyc",
+   "script": "e2e/__pycache__/fixed_forward.cpython-312.pyc",
+   "class": "helper"
+  },
+  {
+   "name": "ai_answer_recovery_native",
+   "script": "e2e/ai_answer_recovery_native.ts",
+   "class": "runnable",
+   "preview": [
+    "ai-recovery-preview"
+   ],
+   "args": [
+    "{out}"
+   ],
+   "zigOut": true
+  },
+  {
+   "name": "ai_attachments_fixture_native",
+   "script": "e2e/ai_attachments_fixture_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "AI 本地附件表驱动：test-mode 对话框注入（ZEROWORK_E2E_DIALOG_DIR）+ 脚本生成的夹具目录"
+  },
+  {
+   "name": "ai_auto_scope_native",
+   "script": "e2e/ai_auto_scope_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_batch_pagination_native",
+   "script": "e2e/ai_batch_pagination_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_builtin_commands_native",
+   "script": "e2e/ai_builtin_commands_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_card_scroll_approval_native",
+   "script": "e2e/ai_card_scroll_approval_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "输入区审批卡长命令与恢复卡（原生 Alert）详情 ai.recovery.details.scroll（≤120）都有空闲滚动条、边界滚轮留在内部、外层不动"
+  },
+  {
+   "name": "ai_card_scroll_controls_native",
+   "script": "e2e/ai_card_scroll_controls_native.ts",
+   "class": "runnable",
+   "preview": [
+    "execution-result-preview"
+   ],
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "note": "执行结果步骤行（Kaf7E A6，143c4c7b）：折叠 24 行点开后详情体限高 150、闲置保留竖向滑块；终端输出为原生 CodeBlock 井（43eada2b），横向滚轮 / 触控板相位与惯性只横移输出、井上竖向输入滚动外层详情体，井的横向滑块在横向输入时出现于裁剪区内",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "ai_card_scroll_native",
+   "script": "e2e/ai_card_scroll_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "工具卡滚动归属：有界正文（头 24 / 正文≤150 / 页脚 28）内滚轮、触控板相位与拖动滚动条不带动外层对话，流式重建保留阅读位置，折叠 / 展开；复制核对走私有 pasteboard"
+  },
+  {
+   "name": "ai_child_defaults_handoff_native",
+   "script": "e2e/ai_child_defaults_handoff_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_child_dialog_native",
+   "script": "e2e/ai_child_dialog_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_child_recovery_native",
+   "script": "e2e/ai_child_recovery_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_close_confirmation_component_native",
+   "script": "e2e/ai_close_confirmation_component_native.ts",
+   "class": "runnable",
+   "preview": [
+    "close-confirmation-preview"
+   ],
+   "args": [
+    "{prefix}/bin/close-confirmation-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "AI 关闭确认为共享 confirm(spec) → zenit 原生 ConfirmDialog（cabb8e5a）：320 宽居中、运行 / 空闲两种问句、确认文案恒为“结束 AI 会话”、焦点在“取消”；Esc / 取消 / 点遮罩不结束且遮罩点击不穿透；确认只回调一次；换对话后 Tab+Return 确认",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "zigOut": true
+  },
+  {
+   "name": "ai_compact_approval_native",
+   "script": "e2e/ai_compact_approval_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "ai_composer_defaults_native",
+   "script": "e2e/ai_composer_defaults_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_composer_interactions_native",
+   "script": "e2e/ai_composer_interactions_native.ts",
+   "class": "runnable",
+   "note": "目标产物是主程序 {prefix}/bin/zerowork（生产输入区 + 真实问答 / 审批 Broker + 本地确定性模型端 + 真实 Local PTY），不是 composer-interaction-preview；原先按“夹具编译不过”排除不属实（usage-e2e-debt 核对脚本后改回）",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "ai_composer_width_sweep_native",
+   "script": "e2e/ai_composer_width_sweep_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "timeout": 300,
+   "note": "AI 输入区宽度扫描（用户反馈“AI chat的内容UI元素都溢出了”）：浮动 320→640 每 20、停靠 560 / 800，工具行与输入框的每个子节点都在面板内容矩形内；收缩顺序：先截断模型名，再权限、再运行方式收成原生图标按钮；用量与发送始终在；提示 Tooltip 在窗口内"
+  },
+  {
+   "name": "ai_context_compaction.py",
+   "script": "e2e/ai_context_compaction.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Own loopback model + real native transport compaction contract. No credentials.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ai_context_compaction_native",
+   "script": "e2e/ai_context_compaction_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_context_threshold_native",
+   "script": "e2e/ai_context_threshold_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_context_usage_native",
+   "script": "e2e/ai_context_usage_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_context_usage_restart_native",
+   "script": "e2e/ai_context_usage_restart_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_conversation_input_native",
+   "script": "e2e/ai_conversation_input_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_conversation_native",
+   "script": "e2e/ai_conversation_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}"
+   ],
+   "env": {
+    "ZW_AI_TEST_BINARY": "{bin}"
+   },
+   "note": "对话生命周期（波动标签、审批、回退 / 改写 / 分叉、缺用量标注、860×480 状态行、无效工具参数不留步骤转圈——转圈判定改为 ai.step.status 内的原生 Spinner）"
+  },
+  {
+   "name": "ai_copy_feedback_native",
+   "script": "e2e/ai_copy_feedback_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "note": "复制反馈经运行器给的私有 pasteboard（ZENIT_E2E_PASTEBOARD）断言：代码块 / 回合摘要 / 用户消息复制写入的精确内容，确认图标出现、续期、2 秒复位（截图像素），代码换行双向，分叉保留原对话；provider 夹具区分标题请求与对话轮次（各 1 次）。亮暗各连续 2 次通过",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "ai_dock_sessions_native",
+   "script": "e2e/ai_dock_sessions_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "ai_redesign_c_native",
+   "script": "e2e/ai_redesign_c_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "ai-redesign-c（P6 弹层 / P7 空状态、宽度规则、新消息提示）：未配置时空状态与输入区 Alert 互斥；会话列表 / 子智能体弹层不超出面板；新消息提示（上翻来新回复 → 居中显示，点击平滑回底并恢复跟随，自己滚到底消失）；停靠 ≥ 760 共用 720 居中列；浮动窄宽标题不被截断；停靠时 launcher 让位"
+  },
+  {
+   "name": "ai_effort_inheritance_native",
+   "script": "e2e/ai_effort_inheritance_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_empty_recent_component_native",
+   "script": "e2e/ai_empty_recent_component_native.ts",
+   "class": "runnable",
+   "preview": [
+    "ai-empty-recent-preview"
+   ],
+   "args": [
+    "{prefix}/bin/ai-empty-recent-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "脚本已按 P7 欢迎页（355b4694）与 O7 会话行重写：整宽行 63 高、原生 xs 图标按钮、短标题无提示、查看按指针 / Return 打开；停在“截断标题的提示须完整显示原标题”——zenit 原生 Tooltip 标签最多 3 行（tooltip/styles.zig:33；zw/usage-e2e-debt2 起截断处带省略号但仍 3 行），完整显示需 Tooltip 可配行数等上游能力或改用其他组件，待用户判定",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "zigOut": true,
+   "tags": [
+    "e2e-debt"
+   ]
+  },
+  {
+   "name": "ai_entry",
+   "script": "e2e/ai_entry.ts",
+   "class": "helper",
+   "note": "AI 入口 test_id 辅助（ai.launcher / ai.collapse）"
+  },
+  {
+   "name": "ai_entry_disconnected_native",
+   "script": "e2e/ai_entry_disconnected_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_execution_input_native",
+   "script": "e2e/ai_execution_input_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}",
+    "ZW_AI_TEST_EXPECTED_SHA256": "{sha}",
+    "ZW_AI_TEST_INPUT_ONLY": "1"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "默认完整模式第三阶段需要 CUA 安全输入；回归用 README 记载的 ZW_AI_TEST_INPUT_ONLY=1 自动模式",
+   "pass": [
+    "passed_input_only"
+   ]
+  },
+  {
+   "name": "ai_execution_input_result_component_native",
+   "script": "e2e/ai_execution_input_result_component_native.ts",
+   "class": "runnable",
+   "preview": [
+    "execution-result-preview"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "执行 / 输入回执步骤行（143c4c7b）：折叠 24、展开 = 行 + 详情（+ 页脚）；输入回执只显示输入结果 / 类型 / 说明，不显示输入或等待序号（04750679）与命令的输出和控件",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "zigOut": true
+  },
+  {
+   "name": "ai_execution_lifecycle_native",
+   "script": "e2e/ai_execution_lifecycle_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}",
+    "ZW_AI_TEST_EXPECTED_SHA256": "{sha}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_execution_provider_live_native",
+   "script": "e2e/ai_execution_provider_live_native.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "真实模型网关（ZW_AI_TEST_GATEWAY/MODEL）"
+  },
+  {
+   "name": "ai_execution_result_component_native",
+   "script": "e2e/ai_execution_result_component_native.ts",
+   "class": "runnable",
+   "note": "私有 pasteboard 断言“复制输出 / 复制记录”。interval-only（dark）、refused-only（dark / light / sauber）连续 2 次通过；matrix 变体在 360 宽 + 长输出时“复制记录”点击被所在详情区自己的竖向叠加滚动条（常显：ai_card_scroll.zig showOverflowScrollbar 直接写 zenit 内部 fade_speed = 0，命中带 4 + hover_slop 6）截走，按钮贴在滚动条下（r2z 以 ZENIT_DEVTOOLS_HIT_DEBUG 实测，zenit 命中按祖先裁剪正确），等 AI 卡片侧修复",
+   "preview": [
+    "execution-result-preview"
+   ],
+   "args": [
+    "{prefix}/bin/execution-result-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "matrix",
+    "interval-only",
+    "refused-only"
+   ],
+   "zigOut": true,
+   "tags": [
+    "e2e-debt"
+   ]
+  },
+  {
+   "name": "ai_execution_route_native",
+   "script": "e2e/ai_execution_route_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}",
+    "ZW_AI_TEST_EXPECTED_SHA256": "{sha}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_execution_settings_native",
+   "script": "e2e/ai_execution_settings_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "env": {
+    "ZW_EXECUTION_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "【r2e 重写为现行契约，当前因产品问题失败，等产品修复】运行方式 / 权限 / 附件为原生 ContextMenu、模型 / 用量为原生 Popover，收缩规则按可见树判定；失败点：运行方式菜单“任务会话处理”子菜单行（说明行不换行 + 右侧值 + 箭头）宽 297–319，超出 300 宽面板的 292 列，箭头画到面板外（zenit Menu described 子菜单行）"
+  },
+  {
+   "name": "ai_extensions_native",
+   "script": "e2e/ai_extensions_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_fixture_discovery",
+   "script": "e2e/ai_fixture_discovery.ts",
+   "class": "helper"
+  },
+  {
+   "name": "provider_fixture",
+   "script": "e2e/provider_fixture.ts",
+   "class": "helper",
+   "note": "内联假 provider / MCP 夹具的共享实现：readRequestText / readRequestJson（请求体整体按严格 UTF-8 解码）、pollWithin（跨多次 provider 请求的等待按时限而非次数）"
+  },
+  {
+   "name": "provider_fixture_selftest",
+   "script": "e2e/provider_fixture_selftest.ts",
+   "class": "runnable",
+   "note": "provider_fixture 的自测：多字节字符切在块边界上逐字节一致、旧的逐块拼接写法作对照会出 U+FFFD、非法 UTF-8 报错、等待预算按时限（不启动应用）",
+   "args": [
+    "{out}"
+   ],
+   "timeout": 60
+  },
+  {
+   "name": "ai_float_geometry_native",
+   "script": "e2e/ai_float_geometry_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "4c-3 + #52 + #61：浮动区域、就近展开、记住位置、tab 切换收回 / 展开（Z12）、最小窗口"
+  },
+  {
+   "name": "ai_message_width_sweep_native",
+   "script": "e2e/ai_message_width_sweep_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "timeout": 420,
+   "note": "消息流宽度扫描（ai-redesign-b，用户反馈“AI chat 内容溢出”）：浮动 320–640 每 20 一档、停靠 560 / 800，用户气泡、Markdown、代码块、表格、步骤组与步骤行、工具卡、恢复 Alert、回合状态行都不超出对话列；长代码只在代码块里滚动"
+  },
+  {
+   "name": "ai_user_actions",
+   "script": "e2e/ai_user_actions.ts",
+   "class": "helper"
+  },
+  {
+   "name": "float_chrome_native",
+   "script": "e2e/float_chrome_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "float-chrome：AI 面板与会话记录卡片同时浮动，统一窗口外观一致（原生 Card 外框、14 高把手与 Grabber、30 高头部、按钮尺寸；像素采样圆角、把手、阴影）；AI 420 / 320 头部收缩"
+  },
+  {
+   "name": "float_split_native",
+   "script": "e2e/float_split_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}",
+    "anchor"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "float-split：放置动作（作为标签页打开 · 放入分屏）每张浮动卡片都有，不支持时原生 disabled + Tooltip 原因（AI 作为标签页打开、会话记录分屏、测试卡片收起；cards-float 起五个动作每张卡片都显示）；测试卡片 fixture.float 放入分屏再浮动回来（位置、Z12 飞行起止、文字 / 选中 / 滚动保留；组还原成单卡 tab）；fade / reduced 模式另跑：node e2e/float_split_native.ts <bin> <out> <light|dark> <fade|reduced>"
+  },
+  {
+   "name": "cards_float_native",
+   "script": "e2e/cards_float_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}",
+    "anchor"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "cards-float：本地终端（后台持续输出）在单卡 tab ⇄ 浮动 ⇄ tab body 往返（输入不丢、输出持续、焦点 / ⌘F 搜索 / 输入法 / 拖选 / 右键菜单在浮动卡片内正常、Esc 不关卡片、tab 留在标签栏并显示“卡片已浮动”）；外框五个动作顺序与收起置灰；分屏成员浮动出去 / 切 tab 收回 / 放回分屏；AI 放进单卡 tab 的分屏（会话窗格头部 · 同一内容节点 · launcher 保留并聚焦）再浮动回去、组还原成单卡 tab；fade / reduced 模式另跑：node e2e/cards_float_native.ts <bin> <out> <light|dark> <fade|reduced>"
+  },
+  {
+   "name": "float_swipe_collapse_native",
+   "script": "e2e/float_swipe_collapse_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}",
+    "motion"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "swipe-collapse（Pencil AveHg）：AI 面板贴底时按住把手（Grabber 36 → 48、强调色）；快速下甩 → 下滑淡出（探针 anchor swipe，非 Z12 飞行）、launcher 锚角淡入、点图标恢复对话与草稿；慢拖超过 1/3 收起、不到 1/3 弹回；不贴底下甩只是普通拖动 + 惯性、不收起；终端卡片（不支持收起）下甩跟手后弹回。减少动态效果另跑：node e2e/float_swipe_collapse_native.ts <bin> <out> <light|dark> reduced"
+  },
+  {
+   "name": "float_drag_inertia_native",
+   "script": "e2e/float_drag_inertia_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}",
+    "motion"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "drag-inertia（Pencil JmcNv「不贴底时下甩只是普通拖动 + 惯性」）：AI 面板不贴底时快速甩动 → 松手后继续滑行、逐帧单调减速、不过冲，停下的位置收起再打开仍在（记住位置）；甩向左边缘停在拖动区域边缘 x = 8、不越过不回弹；慢拖松手不滑行；贴底下甩仍走下滑收起。减少动态效果另跑：node e2e/float_drag_inertia_native.ts <bin> <out> <light|dark> reduced"
+  },
+  {
+   "name": "ai_float_motion_native",
+   "script": "e2e/ai_float_motion_native.ts",
+   "class": "runnable",
+   "timeout": 480,
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "通用卡片浮动层出入场：anchor（Z12）/ fade（Z12b fade_scale）/ 减少动态效果（ZENIT_A11Y_PREFS=reduce_motion）。三种表现各一轮锁时钟逐帧截图（4 个场景 × 约 60 帧），通过时整轮约 300 s，超时预算 480 s（tip-fix）"
+  },
+  {
+   "name": "ai_followup_timing_native",
+   "script": "e2e/ai_followup_timing_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}"
+   ],
+   "note": "引导：回合进行中空输入只显示停止（Kaf7E A8），有草稿时发送提示“引导当前任务”；回应边界消费、停止后暂停的补充可恢复到输入框且不自动重发"
+  },
+  {
+   "name": "ai_fork_retention_native",
+   "script": "e2e/ai_fork_retention_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_group_handoff_retention_native",
+   "script": "e2e/ai_group_handoff_retention_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "ai_dock_float_selection_native",
+   "script": "e2e/ai_dock_float_selection_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ]
+  },
+  {
+   "name": "lifecycle_budget_native",
+   "script": "e2e/lifecycle_budget_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ]
+  },
+  {
+   "name": "ai_authority_at_rest_native",
+   "script": "e2e/ai_authority_at_rest_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "LIFECYCLE.md §5.2：等待审批时 AI 静止（无宿主轮、不轮询），关闭会话所在页签时待批立即撤回、命令不进 PTY，由环境发布触发"
+  },
+  {
+   "name": "ai_history_dock_float_native",
+   "script": "e2e/ai_history_dock_float_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ]
+  },
+  {
+   "name": "ai_history_performance_native",
+   "script": "e2e/ai_history_performance_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_host_catalog_native",
+   "script": "e2e/ai_host_catalog_native.mts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_host_discovery_live_native",
+   "script": "e2e/ai_host_discovery_live_native.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "真实模型网关（ZW_AI_TEST_GATEWAY/MODEL）"
+  },
+  {
+   "name": "ai_host_fetch_native",
+   "script": "e2e/ai_host_fetch_native.ts",
+   "class": "excluded",
+   "reason": "network",
+   "note": "默认抓取 https://example.com（公网），断网沙箱下不可用"
+  },
+  {
+   "name": "ai_host_step_approval_native",
+   "script": "e2e/ai_host_step_approval_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_idle_after_completion_native",
+   "script": "e2e/ai_idle_after_completion_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_inventory_grant_component_native",
+   "script": "e2e/ai_inventory_grant_component_native.ts",
+   "class": "runnable",
+   "preview": [
+    "inventory-grant-preview"
+   ],
+   "args": [
+    "{prefix}/bin/inventory-grant-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "按需会话清单授权卡：三个原生 sm 按钮（高 24、间距 6、右对齐、主按钮色调区分）；拒绝 / 仅此一次 / 持续允许流程；窄行时执行权限收为图标按钮，原生 Menu 里撤销；原生禁用（不派发、移出焦点序、disabled-bg）与失效反馈",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "zigOut": true
+  },
+  {
+   "name": "ai_journal_performance_native",
+   "script": "e2e/ai_journal_performance_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_limits_native",
+   "script": "e2e/ai_limits_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "568 次工具调用 / 20 轮 / >512 条消息无上限；引导前后两个步骤分组（原生 Disclosure 触发行 28）夹住已消费的补充消息"
+  },
+  {
+   "name": "ai_live_permission_native",
+   "script": "e2e/ai_live_permission_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_local_picker_native",
+   "script": "e2e/ai_local_picker_native.ts",
+   "class": "manual",
+   "reason": "manual",
+   "note": "手动用例：弹真实 macOS 系统文件选择框（NSOpenPanel），需要人在场选择；批量回归改用 ai_attachments_fixture_native（测试注入对话框 + 夹具目录）"
+  },
+  {
+   "name": "ai_markdown_resize_native",
+   "script": "e2e/ai_markdown_resize_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_model_refresh_native",
+   "script": "e2e/ai_model_refresh_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_native_stream",
+   "script": "e2e/ai_native_stream.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "默认 --config /tmp/zerowork-mimo-native-*.toml：用户私有的真实 MiMo 模型配置"
+  },
+  {
+   "name": "ai_native_tail_follow",
+   "script": "e2e/ai_native_tail_follow.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_native_tools",
+   "script": "e2e/ai_native_tools.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "默认 --config /tmp/zerowork-mimo-native-*.toml：用户私有的真实 MiMo 模型配置"
+  },
+  {
+   "name": "ai_notification_conversation_native",
+   "script": "e2e/ai_notification_conversation_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ],
+   "env": {
+    "ZW_AI_TEST_BINARY": "{bin}"
+   }
+  },
+  {
+   "name": "ai_ordered_timeline_native",
+   "script": "e2e/ai_ordered_timeline_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_patch_queries_native",
+   "script": "e2e/ai_patch_queries_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}",
+    "ZW_AI_TEST_EXPECTED_SHA256": "{sha}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "tags": [
+    "e2e-debt"
+   ]
+  },
+  {
+   "name": "ai_permission_settings_matrix",
+   "script": "e2e/ai_permission_settings_matrix.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "真实 MiMo 模型（强制 --real --config 私有配置）"
+  },
+  {
+   "name": "ai_preview_recovery_native",
+   "script": "e2e/ai_preview_recovery_native.ts",
+   "class": "excluded",
+   "reason": "writes-real-home",
+   "note": "把应用包成临时 .app（bundle id local.zerowork.previewcheck）启动；系统按 bundle id 在真实 ~/Library/Preferences、~/Library/Caches 留下 local.zerowork.* 偏好与缓存（真实家目录里已有此类残留）。home-isolation 修好前排除。home-isolation 已关闭应用自有的偏好写入，但 AppKit / CFNetwork 按 bundle id 写入的系统文件（Saved Application State、URL 缓存等）不经本应用路径；放回前须单独 --jobs 1 实测前后比对，本批不放回"
+  },
+  {
+   "name": "ai_provider_image_live.py",
+   "script": "e2e/ai_provider_image_live.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Opt-in real gateway vision acceptance; uses only Python's standard library.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "ai_readonly_verification_native",
+   "script": "e2e/ai_readonly_verification_native.ts",
+   "class": "runnable",
+   "preview": [
+    "ai-recovery-preview"
+   ],
+   "args": [
+    "{out}"
+   ],
+   "zigOut": true
+  },
+  {
+   "name": "ai_remote_file_snapshot.py",
+   "script": "e2e/ai_remote_file_snapshot.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Original domain FileBindingHost -> production bounded AI capture -> RAM SFTP.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ai_remote_picker_native",
+   "script": "e2e/ai_remote_picker_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ai_remote_picker_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ai_remote_picker_peer.py",
+   "script": "e2e/ai_remote_picker_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned memory-only SSH/SFTP peer for AI selection; never executes shell input.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ai_remote_vt_native",
+   "script": "e2e/ai_remote_vt_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ai_restore_complete_native",
+   "script": "e2e/ai_restore_complete_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_session_controls_native.py",
+   "script": "e2e/ai_session_controls_native.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Isolated native regression for AI group sending, live effort and Shift+Return.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ai_sessions_popover_native",
+   "script": "e2e/ai_sessions_popover_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_sessions_tags_native",
+   "script": "e2e/ai_sessions_tags_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_settings_catalog_native",
+   "script": "e2e/ai_settings_catalog_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "env": {
+    "ZW_AI_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "ai_settings_refresh_native",
+   "script": "e2e/ai_settings_refresh_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_shared_file_pagination.py",
+   "script": "e2e/ai_shared_file_pagination.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned RAM-only SFTP peer for the real shared SSH IO-owner pagination test.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ai_single_connection_restore_native",
+   "script": "e2e/ai_single_connection_restore_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_steer_steps_native",
+   "script": "e2e/ai_steer_steps_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_step_aggregation_native",
+   "script": "e2e/ai_step_aggregation_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_step_sizing_native",
+   "script": "e2e/ai_step_sizing_native.ts",
+   "class": "runnable",
+   "note": "步骤尺寸（Kaf7E A6）：思考行 24、说明井上限 150 且可回滚；本机 run_command 短 / 空 / 30 行结果卡 24+正文≤150+页脚 28，空结果收起标签与复制，复制经私有 pasteboard 粘回 / 核对全文",
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "ai_stream_performance_native",
+   "script": "e2e/ai_stream_performance_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_tab_context_native",
+   "script": "e2e/ai_tab_context_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ],
+   "note": "host.tab_context（M11 + ai-followup 查询参数）：模拟模型调用内置工具，断言卡片条目、参数与错误"
+  },
+  {
+   "name": "ai_tab_presentation_native",
+   "script": "e2e/ai_tab_presentation_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_table_render_native",
+   "script": "e2e/ai_table_render_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_task_finish_component_native",
+   "script": "e2e/ai_task_finish_component_native.ts",
+   "class": "runnable",
+   "preview": [
+    "task-finish-preview"
+   ],
+   "args": [
+    "{prefix}/bin/task-finish-preview",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_task_gateway_native",
+   "script": "e2e/ai_task_gateway_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_terminal_history_close_native",
+   "script": "e2e/ai_terminal_history_close_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_thinking_scroll_native",
+   "script": "e2e/ai_thinking_scroll_native.ts",
+   "class": "runnable",
+   "note": "展开的思考跟随流式尾部、手动上翻暂停并保留阅读位置、滚到底恢复跟随、折叠再开保留最新位置（思考在步骤分组内）",
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "ai_titles_native",
+   "script": "e2e/ai_titles_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_turn_usage_native",
+   "script": "e2e/ai_turn_usage_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_v3_native",
+   "script": "e2e/ai_v3_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_v3_states_native",
+   "script": "e2e/ai_v3_states_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_v3_unconfigured_native",
+   "script": "e2e/ai_v3_unconfigured_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_welcome_close_native",
+   "script": "e2e/ai_welcome_close_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_welcome_native",
+   "script": "e2e/ai_welcome_native.ts",
+   "class": "runnable",
+   "note": "欢迎页（Pencil A2 / ai-redesign-c）：sparkles 20、两个等分起始按钮；首发即移除欢迎组；最近会话为真实会话、最新在前、最多两条，查看 / 恢复 / 续聊置顶；860×480 下可滚回顶部、输入区可达",
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "ai_welcome_recent_native",
+   "script": "e2e/ai_welcome_recent_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ai_worker_release_native",
+   "script": "e2e/ai_worker_release_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "app_icon_native",
+   "script": "e2e/app_icon_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "app_update_check_native",
+   "script": "e2e/app_update_check_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "app_update_deleted_drafts_native",
+   "script": "e2e/app_update_deleted_drafts_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "app_update_feedback_native",
+   "script": "e2e/app_update_feedback_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "app_update_full_native",
+   "script": "e2e/app_update_full_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py, scripts/update_manifest.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "app_update_host_native",
+   "script": "e2e/app_update_host_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "app_update_native.py",
+   "script": "e2e/app_update_native.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Run the real helper against disposable signed apps; never touch installed app/data.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "app_update_runtime_native.py",
+   "script": "e2e/app_update_runtime_native.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Exercise the real runtime -> helper bridge using disposable signed apps.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "appearance",
+   "script": "e2e/appearance.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "appearance_catalog_native",
+   "script": "e2e/appearance_catalog_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "appearance_choices_native",
+   "script": "e2e/appearance_choices_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "appearance_edges",
+   "script": "e2e/appearance_edges.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ],
+   "pass": [
+    "passed",
+    "functional_checks_passed"
+   ],
+   "note": "脚本的功能检查通过后报告 functional_checks_passed（截图仍待人工视觉复核）"
+  },
+  {
+   "name": "appearance_v3_native",
+   "script": "e2e/appearance_v3_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_APPEARANCE_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "async_logging_native",
+   "script": "e2e/async_logging_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "auth_challenge_native",
+   "script": "e2e/auth_challenge_native.ts",
+   "class": "runnable",
+   "note": "r2f：改为断言主程序现行认证 UI（plugin.challenge.*，主机密钥“仅本次信任”→ 密码 → 取消卡片 → 860×480 → 文件工作区，不保存密码）；等产品修复：密码框标题图标沿用上一问的主机密钥图标（画面未刷新）、取消后进度卡片盖住整窗",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "python": true,
+   "tags": [
+    "e2e-debt"
+   ]
+  },
+  {
+   "name": "background_resume_native",
+   "script": "e2e/background_resume_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "background_rotation_native",
+   "script": "e2e/background_rotation_native.ts",
+   "class": "manual",
+   "reason": "desktop-automation",
+   "note": "用 osascript 驱动 System Events 向前台进程发送真实按键（系统文件面板），需要辅助功能权限并会操作用户桌面"
+  },
+  {
+   "name": "bmc_kvm_native",
+   "script": "e2e/bmc_kvm_native.ts",
+   "class": "runnable",
+   "preview": [
+    "bmc-kvm-preview"
+   ],
+   "args": [
+    "--binary",
+    "{prefix}/bin/bmc-kvm-preview",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "bmc_kvm_video_frames_native",
+   "script": "e2e/bmc_kvm_video_frames_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{prefix}/bin/bmc-kvm-preview",
+    "--out",
+    "{out}"
+   ],
+   "preview": [
+    "bmc-kvm-preview"
+   ],
+   "pass": [
+    "passed",
+    "none"
+   ],
+   "note": "报告无 status 字段，以退出码为准"
+  },
+  {
+   "name": "bmc_live_control.py",
+   "script": "e2e/bmc_live_control.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Explicit, fixed-plan native KVM acceptance; credentials stay in stdin memory.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "bmc_live_readonly.py",
+   "script": "e2e/bmc_live_readonly.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Pass one hidden, in-memory connection JSON line to the native runner.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "bmc_redfish_readonly.py",
+   "script": "e2e/bmc_redfish_readonly.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Bounded Sugon Redfish evidence collector; connection JSON enters hidden TTY.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "bmc_redfish_readonly_tests.py",
+   "script": "e2e/bmc_redfish_readonly_tests.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Offline request-guard, pin-before-credentials, graph, and redaction checks.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "bmc_select_surface_native",
+   "script": "e2e/bmc_select_surface_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{prefix}/bin/bmc-kvm-preview",
+    "--out",
+    "{out}"
+   ],
+   "preview": [
+    "bmc-kvm-preview"
+   ]
+  },
+  {
+   "name": "builtin_clear_native",
+   "script": "e2e/builtin_clear_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "builtin_download_progress.py",
+   "script": "e2e/builtin_download_progress.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real libssh2/PTY/SFTP check with an owned RAM-only peer; no external host.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "builtin_full_flow_native",
+   "script": "e2e/builtin_full_flow_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "timeout": 420,
+   "note": "后台模式；@dl 用对话框注入选下载目录；点文件名打开详情 Popover，核对下载实际使用的完整远程来源路径及文件 SHA-256；面板关闭焦点回触发按钮；@theme 无名补全。"
+  },
+  {
+   "name": "builtin_records_dispatch_native",
+   "script": "e2e/builtin_records_dispatch_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "builtin_records_native",
+   "script": "e2e/builtin_records_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "builtin_records_ssh_native",
+   "script": "e2e/builtin_records_ssh_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}",
+    "{variant}"
+   ],
+   "variants": [
+    "zsh",
+    "plain-bash"
+   ],
+   "timeout": 300,
+   "note": "真实 ZSH 与不带 OSC 133 的 Bash；首段文字及 Return 原序到达独立 SSH 对端，验证指令面板和原生复制。"
+  },
+  {
+   "name": "builtin_records_ssh_peer.py",
+   "script": "e2e/builtin_records_ssh_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Disposable loopback SSH server forwarding one actual local ZSH PTY.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "builtin_records_test.sh",
+   "script": "e2e/builtin_records_test.sh",
+   "class": "excluded",
+   "reason": "shell",
+   "note": "shell 脚本，由 zig build test-builtin-records 使用"
+  },
+  {
+   "name": "builtin_timestamps_native",
+   "script": "e2e/builtin_timestamps_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ],
+   "timeout": 300,
+   "note": "r2f：真实回环 SSH 里三次 @ts，记录头与时间戳栏一致且对齐；侧栏改为单击选中后点“连接”按钮（fe28ab5b）"
+  },
+  {
+   "name": "button_constraints_native",
+   "script": "e2e/button_constraints_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "note": "亮暗主题验证最小窗口与标准窗口的按钮约束，包括文件传输摘要和 AI 权限说明的文本边界。",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "button_policy_native",
+   "script": "e2e/button_policy_native.ts",
+   "class": "runnable",
+   "preview": [
+    "button-policy-preview"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}"
+   ],
+   "note": "按钮策略预览一次轮换全部 39 个内置配色（含亮暗，故无变体）：原生控件保持同一节点、文字不截断；禁用态按 zenit 原生表现断言（disabled-bg、标签墨色变淡、不可聚焦、不派发；启用后回到 secondary 色调并可派发），各配色实测墨色 / 对比度写入 report.json 的 disabled，是否“足够可辨”待用户判定"
+  },
+  {
+   "name": "canvas_material_pixels.py",
+   "script": "e2e/canvas_material_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Check the final 50% canvas mix in all four cards, not just style alpha.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "chromeless_controls_native",
+   "script": "e2e/chromeless_controls_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "command_annotations_ai_native",
+   "script": "e2e/command_annotations_ai_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "command_annotations_native",
+   "script": "e2e/command_annotations_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}",
+    "{variant}"
+   ],
+   "note": "【脚本已按现行契约重写，等产品修复】命令历史弹层记录卡片未撑满列宽（record w≈170 vs 列宽 312，长命令卡 334 超出弹层 336−24）：command_history_view.zig makeRow 的 W.Tooltip 未用 fill；其余断言（标注标签、悬停隐藏、点击保持、历史开合、清屏后对齐、关闭 command_info）r2c-3 两变体通过",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "command_info_settings_native",
+   "script": "e2e/command_info_settings_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{bin}",
+    "{variant}"
+   ],
+   "note": "命令信息设置：全局开关（外观与主题 › 终端与工作区，Switch 旋钮位置判状态）保存 / 重开保持；主机编辑器独立窗口 720×640 与最小 600×420 下命令信息 / 自动会话初始化两个原生 Select 同行等宽等高、与上一行列对齐；主机覆盖“隐藏”保存后经右键 › 编辑主机配置重开保持，改回“继承”删掉覆盖",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "compact_connection_native",
+   "script": "e2e/compact_connection_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "内联对端 import e2e/ssh_aux_download_loopback.py——该文件未经主会话审计（excluded_review.cjs 的已审计集合只有 builtin_records_ssh_peer / sftp_conflict_loopback / sftp_upload_loopback / sftp_v3_peer / build_mode_guard），不运行。Python 启动已改为 $ZW_TEST_PYTHON -I。界面步骤仍是旧版：双击行连接（现为选中后点“连接”）、底部状态栏几何（工作区外框不呈现状态栏，b319da83）、status.connection.identity 当按钮（现为页签上只作几何的区域）、sidebar.rail.expand / status.connection.footer（已删除）；审计或改用已审计对端后需整体按现行界面重写"
+  },
+  {
+   "name": "compact_popovers_native",
+   "script": "e2e/compact_popovers_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "complete_group_ai",
+   "script": "e2e/complete_group_ai.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "真实 Anthropic 兼容模型（--config 私有 MiMo 配置）+ 私有凭据里的真实 SSH VM（--credentials，脚本还经 paramiko 在远端建 / 删 nonce 目录）：断网沙箱与批量回归里不可运行。Python 已改为 $ZW_TEST_PYTHON -I；仍引用已删除的 ai.approval* 等 id（AI 审批 UI 已重做），未按现行界面核对。组执行的假 provider 覆盖在 ai_execution_route_native"
+  },
+  {
+   "name": "completion_nested_ssh_native",
+   "script": "e2e/completion_nested_ssh_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ],
+   "timeout": 300,
+   "note": "r2f：本地 zsh 别名进嵌套 /usr/bin/ssh，自动历史候选 / Esc / → / Return / Tab 字节精确，860×480 菜单不出窗；对端 python 改用审计解释器"
+  },
+  {
+   "name": "completion_tab_ssh_native",
+   "script": "e2e/completion_tab_ssh_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ],
+   "timeout": 300,
+   "note": "r2f：真实 bash 对端里 Tab 原样转发补全文件名，历史候选 → 只发缺失后缀；对端 python 改用审计解释器"
+  },
+  {
+   "name": "confirm_undo_native",
+   "script": "e2e/confirm_undo_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 240,
+   "note": "确认与撤销（CONSISTENCY_AUDIT #2）：删除主机与清空会话记录可撤销（原生 Toast 带“撤销”，Toast 离场后才写盘），关闭页签不可逆（共享原生确认框：焦点在取消、危险的“关闭页签”）；亮暗各截 Toast 与 Modal"
+  },
+  {
+   "name": "connection_credentials_native",
+   "script": "e2e/connection_credentials_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "timeout": 300,
+   "note": "r2f：密码认证框（plugin.challenge.*）勾选保存 → password_ref 无明文，@new 复用凭据不再弹框、焦点在新终端；侧栏改点“连接”按钮"
+  },
+  {
+   "name": "connection_failure_native",
+   "script": "e2e/connection_failure_native.ts",
+   "class": "runnable",
+   "preview": [
+    "connection-progress-preview"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "design-r3 稿 1 连接失败 / 重试视图：生产视图 + 本地夹具事实，不建立 SSH"
+  },
+  {
+   "name": "connection_progress_layout_native",
+   "script": "e2e/connection_progress_layout_native.ts",
+   "class": "runnable",
+   "preview": [
+    "connection-progress-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "--theme={variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "connection_progress_v3_native",
+   "script": "e2e/connection_progress_v3_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "connection_route_draft_native",
+   "script": "e2e/connection_route_draft_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "note": "新建主机编辑窗口（720×640，最小 600×420）里跳板路线草稿：原生 16pt 保存密码 Checkbox、高级区主机密钥策略 Select / 压缩 RadioGroup / 启动命令 Textarea、两跳选择在直连 ↔ 跳板切换后恢复且核对页顺序正确；亮暗各连续 3 次通过（r2b-1/8/9）"
+  },
+  {
+   "name": "connection_transport_owned.py",
+   "script": "e2e/connection_transport_owned.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production libssh2 facade: 1/2/8 SSH nodes, two owners, concurrent streams.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "connection_wizard_three_step_native",
+   "script": "e2e/connection_wizard_three_step_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "context_menu_width_native",
+   "script": "e2e/context_menu_width_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "copy_feedback_native",
+   "script": "e2e/copy_feedback_native.ts",
+   "class": "runnable",
+   "note": "复制断言读私有 pasteboard（哨兵）；详情为点文件名打开的 Popover（transfer.task.detail_popup），点面板内文件名面板保持打开；像素检查在 Node 内解码 PNG。亮暗在 b5（预览 runner 挂载修复）上连续 2 次通过",
+   "preview": [
+    "transfer-controls-preview",
+    "connection-progress-preview"
+   ],
+   "env": {
+    "ZW_COPY_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "cursor_styles",
+   "script": "e2e/cursor_styles.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "domestic_os_native",
+   "script": "e2e/domestic_os_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/domestic_os_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "domestic_os_peer.py",
+   "script": "e2e/domestic_os_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback SSH peer for OS discovery; no commands run on this machine.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "dots_native",
+   "script": "e2e/dots_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "download_inline_native",
+   "script": "e2e/download_inline_native.ts",
+   "class": "excluded",
+   "reason": "writes-real-home",
+   "note": "把应用包成临时 .app（bundle id local.zerowork.inline.<pid>）启动；系统按 bundle id 在真实 ~/Library/Preferences、~/Library/Caches 留下 local.zerowork.* 偏好与缓存（真实家目录里已有此类残留）。home-isolation 修好前排除。home-isolation 已关闭应用自有的偏好写入，但 AppKit / CFNetwork 按 bundle id 写入的系统文件（Saved Application State、URL 缓存等）不经本应用路径；放回前须单独 --jobs 1 实测前后比对，本批不放回"
+  },
+  {
+   "name": "ended_states_idle_native",
+   "script": "e2e/ended_states_idle_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "timeout": 300,
+   "note": "结束态闲置审计：AI 完成 / 失败 / 停止、连接失败视图、SFTP 上传完成（会话上传托盘）及传输列表打开后，3 秒内不持续重绘、节点不变。核对回环上传的 SHA-256、资源释放及托盘完成态；使用 e2e/sftp_v3_peer.py 与本地假 provider。"
+  },
+  {
+   "name": "file_route_factory.py",
+   "script": "e2e/file_route_factory.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "RouteFactory -> real libssh2 Route -> read-only SFTP loopback acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "file_workspace_native",
+   "script": "e2e/file_workspace_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{prefix}/bin/file-workspace-preview",
+    "--out",
+    "{out}",
+    "--theme",
+    "{variant}"
+   ],
+   "preview": [
+    "file-workspace-preview"
+   ],
+   "note": "--binary 必须是 file-workspace-preview 组件夹具（误传主程序会以真实数据目录启动）",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "fixed_forward.py",
+   "script": "e2e/fixed_forward.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real local/remote/SOCKS traffic on one production SSH owner + PTY.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "fixed_forward_regressions.py",
+   "script": "e2e/fixed_forward_regressions.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned SSH regressions: both half-close directions, recovery and startup stop.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "fixtures__lark_cli_mcp.py",
+   "script": "e2e/fixtures/lark_cli_mcp.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "飞书 lark-cli 只读 MCP 适配器（lark_cli_mcp_native.ts 用）",
+   "audit": "真实外部账号，不建议在回归中运行"
+  },
+  {
+   "name": "fixtures__mcp-reference__package-lock.json",
+   "script": "e2e/fixtures/mcp-reference/package-lock.json",
+   "class": "helper",
+   "note": "MCP 参考服务的 npm 依赖清单（mcp_reference_native.ts 用，需要 npm ci 联网安装）"
+  },
+  {
+   "name": "fixtures__mcp-reference__package.json",
+   "script": "e2e/fixtures/mcp-reference/package.json",
+   "class": "helper",
+   "note": "MCP 参考服务的 npm 依赖清单（mcp_reference_native.ts 用，需要 npm ci 联网安装）"
+  },
+  {
+   "name": "float_card_transition_settings_native",
+   "script": "e2e/float_card_transition_settings_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "设置 › 浮动卡片切换动画（Z12b）原生 RadioGroup 与保存"
+  },
+  {
+   "name": "floating_input_native",
+   "script": "e2e/floating_input_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "focus_handoff_native",
+   "script": "e2e/focus_handoff_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "font_support_native",
+   "script": "e2e/font_support_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "font_weight_choices_native",
+   "script": "e2e/font_weight_choices_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "forward_controls_native",
+   "script": "e2e/forward_controls_native.ts",
+   "class": "runnable",
+   "python": true,
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "forward_load_compare.py",
+   "script": "e2e/forward_load_compare.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Opt-in real-host comparison of production WorkerThread forwarding and OpenSSH.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "global_history_native",
+   "script": "e2e/global_history_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/global_history_theme_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "global_history_theme_pixels.py",
+   "script": "e2e/global_history_theme_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Check actual glyph ink inside the exact captured history row rectangles.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "global_notification_content_native",
+   "script": "e2e/global_notification_content_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{prefix}/bin/notification-preview"
+   ]
+  },
+  {
+   "name": "group_borderless_native",
+   "script": "e2e/group_borderless_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "group_broadcast_native",
+   "script": "e2e/group_broadcast_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "group_close_native",
+   "script": "e2e/group_close_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--ssh",
+    "0",
+    "--local-count",
+    "4"
+   ],
+   "note": "组关闭真实路径，只用本机终端成员（--ssh 0）；SSH 成员需要私有实机配置（--config），批量里不跑"
+  },
+  {
+   "name": "group_mixed_peer.py",
+   "script": "e2e/group_mixed_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Disposable SSH terminal + readonly SFTP peer for mixed-group acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "group_mixed_resize_native",
+   "script": "e2e/group_mixed_resize_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/group_mixed_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "group_tabs_native",
+   "script": "e2e/group_tabs_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "group_workspace_native",
+   "script": "e2e/group_workspace_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}",
+    "--theme",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "h_ai_capture",
+   "script": "e2e/h_ai_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "F-set-ai 包的验收采集"
+  },
+  {
+   "name": "h_appearance_capture",
+   "script": "e2e/h_appearance_capture.ts",
+   "class": "runnable",
+   "pass": [
+    "captured",
+    "passed",
+    "none"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "报告按主题分 runs，无顶层 status，以退出码为准"
+  },
+  {
+   "name": "h_keys_capture",
+   "script": "e2e/h_keys_capture.ts",
+   "class": "runnable",
+   "pass": [
+    "captured",
+    "passed"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "h_modals_capture",
+   "script": "e2e/h_modals_capture.ts",
+   "class": "runnable",
+   "preview": [
+    "auth-challenge-preview"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "pass": [
+    "captured",
+    "passed"
+   ]
+  },
+  {
+   "name": "h_opaque_capture",
+   "script": "e2e/h_opaque_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "H-opaque-popups 包的验收采集"
+  },
+  {
+   "name": "h_plugins_capture",
+   "script": "e2e/h_plugins_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "F-set-plugins 包的验收采集"
+  },
+  {
+   "name": "h_save_capture",
+   "script": "e2e/h_save_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "pass": [
+    "captured",
+    "passed"
+   ]
+  },
+  {
+   "name": "h_shell_capture",
+   "script": "e2e/h_shell_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "h_tokens_capture",
+   "script": "e2e/h_tokens_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "pass": [
+    "captured",
+    "passed"
+   ]
+  },
+  {
+   "name": "history_log_native",
+   "script": "e2e/history_log_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "input_controls_native",
+   "script": "e2e/input_controls_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_INPUT_BINARY": "{bin}"
+   },
+   "note": "原生输入路径：终端 IME 预编辑落在光标行、提示符之后、清空即消失；AI 输入区多行预编辑 / 提交在光标处插入；主机编辑器（右键 › 编辑主机配置）启动命令 Textarea 多行光标、中文插入、自动换行纵向滚动、Cmd+↑ 回到开头，取消不落盘",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "input_host_geometry_native",
+   "script": "e2e/input_host_geometry_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_GEOMETRY_BINARY": "{bin}"
+   },
+   "note": "主机行悬停：快速连接按钮出现在行尾区域内并垂直居中，名称让位不重叠，默认宽度与拖宽侧栏后都成立；主机编辑器名称输入框光标末尾 / 中间定位与中文插入（UTF-8 字节偏移），取消不落盘",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "input_selection_native",
+   "script": "e2e/input_selection_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "主机编辑器 SSH 名称与 BMC · iKVM 名称输入框拖拽选区：选区非空、文本不变、选区背景确实绘制（编辑器窗口自身缩放下进程内解码 PNG 比对）、输入替换恰好是选区",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "issues_20261027_native",
+   "script": "e2e/issues_20261027_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "keybinding_v3_native",
+   "script": "e2e/keybinding_v3_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "kvm_ai_layout_native",
+   "script": "e2e/kvm_ai_layout_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "AI 面板 420 / 320 两档（亮、暗）：输入区控件行每个子控件都在面板内；窄宽度权限、执行方式收成原生图标按钮 + Tooltip（bugfix-2）"
+  },
+  {
+   "name": "kvm_overlays_native",
+   "script": "e2e/kvm_overlays_native.ts",
+   "class": "runnable",
+   "preview": [
+    "bmc-kvm-preview"
+   ],
+   "args": [
+    "{prefix}/bin/bmc-kvm-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "KVM 卡片浮层（Pencil j8WXoF，需求 #58）：本地合成帧 / AI 活动 / 电源阶段"
+  },
+  {
+   "name": "kvm_toolbar_native",
+   "script": "e2e/kvm_toolbar_native.ts",
+   "class": "runnable",
+   "preview": [
+    "bmc-kvm-preview"
+   ],
+   "args": [
+    "{prefix}/bin/bmc-kvm-preview",
+    "{out}"
+   ]
+  },
+  {
+   "name": "lark_cli_mcp_native",
+   "script": "e2e/lark_cli_mcp_native.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "真实飞书账号（lark-cli 登录 + ZW_LARK_TEST_DOC_FILE），并依赖 e2e/fixtures/lark_cli_mcp.py"
+  },
+  {
+   "name": "layer_hierarchy_native",
+   "script": "e2e/layer_hierarchy_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "tags": [
+    "e2e-debt"
+   ],
+   "timeout": 1200,
+   "note": "39 个主题逐个验证；缩窗后等待一次性侧栏提示关闭，再检查紧凑权限菜单。300 秒只完成了前 20 个主题。"
+  },
+  {
+   "name": "layer_regression_pixels.py",
+   "script": "e2e/layer_regression_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Reject the formerly flat opaque AI shell in real Metal captures.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "layer_regressions_native",
+   "script": "e2e/layer_regressions_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/layer_regression_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "layout_motion_native",
+   "script": "e2e/layout_motion_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "亮暗主题验证编辑窗口高级区尺寸过渡、认证切换、快速反转、箭头像素方向及侧栏分组折叠。",
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "legacy_auth_native",
+   "script": "e2e/legacy_auth_native.ts",
+   "class": "runnable",
+   "preview": [
+    "auth-challenge-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "live_ai_message_alignment",
+   "script": "e2e/live_ai_message_alignment.ts",
+   "class": "excluded",
+   "reason": "private-config",
+   "note": "读 /tmp/zerowork-live-acceptance-*.json（私有实机 AI 验收配置）"
+  },
+  {
+   "name": "local_execution_protocol_feasibility.py",
+   "script": "e2e/local_execution_protocol_feasibility.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Phase A only: real zsh private-channel/PTY boundary feasibility.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "local_reconnect_native",
+   "script": "e2e/local_reconnect_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "local_session_edges",
+   "script": "e2e/local_session_edges.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "local_shell_semantics.py",
+   "script": "e2e/local_shell_semantics.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production shell integration in real system-zsh PTYs; no application launch.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "local_terminal",
+   "script": "e2e/local_terminal.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "local_trusted_edit.py",
+   "script": "e2e/local_trusted_edit.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Headless system-zsh/ZLE proof; never opens the native application.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "material_geometry",
+   "script": "e2e/material_geometry.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ],
+   "pass": [
+    "passed",
+    "functional_checks_passed"
+   ],
+   "note": "脚本的功能检查通过后报告 functional_checks_passed（截图仍待人工视觉复核）"
+  },
+  {
+   "name": "material_ratio_native",
+   "script": "e2e/material_ratio_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_RATIO_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "mcp_reference_native",
+   "script": "e2e/mcp_reference_native.ts",
+   "class": "excluded",
+   "reason": "npm",
+   "note": "需要 npm ci 安装官方 MCP 参考服务依赖（联网）并打开浏览器"
+  },
+  {
+   "name": "menu_bar_idle_native",
+   "script": "e2e/menu_bar_idle_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "menu_bar_native",
+   "script": "e2e/menu_bar_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 scripts/macos_signing.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "mist_workspace_native",
+   "script": "e2e/mist_workspace_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "layout",
+    "--live-transfer"
+   ],
+   "timeout": 300,
+   "note": "晴霜工作区版式（Island B v3）：空页签条原生“+”、侧栏 264 自窗口顶、视图栏 44、岛右 / 下 6、7 个 32 工具、终端 [10,16] 内边距、AI 浮钮右 24 / 下 20、五页签悬停关闭、侧栏搜索与清除、⌘B 隐藏 / 恢复、会话卡片、紧凑窗口、Dark → 晴霜主题切换不改几何；--live-transfer 另做真实 SFTP 上传（回环对端 e2e/sftp_v3_peer.py）并核对文件两列 (W−2×4−4)/2 与托盘堆叠、对端 SHA-256"
+  },
+  {
+   "name": "model_editor_native",
+   "script": "e2e/model_editor_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "model_settings_controls_native",
+   "script": "e2e/model_settings_controls_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "multihop_socks_native_fixture.py",
+   "script": "e2e/multihop_socks_native_fixture.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned three-peer fixture for serial main-app SOCKS acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "multiwindow_retained_native",
+   "script": "e2e/multiwindow_retained_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/multiwindow_task_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "multiwindow_shared_native",
+   "script": "e2e/multiwindow_shared_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--sha",
+    "{sha}",
+    "--menu-only",
+    "1"
+   ],
+   "note": "批量回归跑 --menu-only 1（主机右键菜单在真实窗口里的尺寸与行，不建连接）。完整多窗口模式见 multiwindow_shared_native_live。usage-b3-titlebar：脚本自 a46bf0f4（2026-10-26）起少一个花括号、node 无法解析，已修。"
+  },
+  {
+   "name": "multiwindow_shared_native_live",
+   "script": "e2e/multiwindow_shared_native.ts",
+   "class": "excluded",
+   "reason": "private-config",
+   "note": "完整多窗口验收：读取 --config（默认 /tmp/zerowork-next-acceptance-20261021.json）里的真实远端 SSH 主机与凭据并联网登录，断网沙箱与无凭据环境下不能运行"
+  },
+  {
+   "name": "multiwindow_task_peer.py",
+   "script": "e2e/multiwindow_task_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned immutable SFTP peer with enough real IO slices to pause mid-file.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "multiwindow_tasks_native",
+   "script": "e2e/multiwindow_tasks_native.ts",
+   "class": "helper",
+   "note": "供多窗口 runner import 的共享任务辅助"
+  },
+  {
+   "name": "native_close",
+   "script": "e2e/native_close.ts",
+   "class": "excluded",
+   "reason": "writes-real-home",
+   "note": "把应用包成临时 .app（bundle id local.zerowork.native-close.<pid>）启动；系统按 bundle id 在真实 ~/Library/Preferences、~/Library/Caches 留下 local.zerowork.* 偏好与缓存（真实家目录里已有此类残留）。home-isolation 修好前排除。home-isolation 已关闭应用自有的偏好写入，但 AppKit / CFNetwork 按 bundle id 写入的系统文件（Saved Application State、URL 缓存等）不经本应用路径；放回前须单独 --jobs 1 实测前后比对，本批不放回"
+  },
+  {
+   "name": "native_input",
+   "script": "e2e/native_input.ts",
+   "class": "manual",
+   "reason": "cua",
+   "note": "前台窗口 + CUA 物理输入（不是 Harness 合成输入），并向 LaunchServices 注册临时 bundle"
+  },
+  {
+   "name": "native_owned_cleanup",
+   "script": "e2e/native_owned_cleanup.ts",
+   "class": "helper"
+  },
+  {
+   "name": "native_protocol_local_tools",
+   "script": "e2e/native_protocol_local_tools.ts",
+   "class": "excluded",
+   "reason": "private-config",
+   "note": "需要 --config 私有配置（kind = ... 的实机连接配置），批量里没有；单独提供私有配置后手工运行"
+  },
+  {
+   "name": "native_surfaces_theme_native",
+   "script": "e2e/native_surfaces_theme_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "usage-b4-materials：原生 Menu / Popover（含嵌套子菜单）在透明度 50 下保持 zenit 不透明表面；主窗口 + 设置窗口同开时切主题再切回，逐个重开核对底色"
+  },
+  {
+   "name": "native_theme_data",
+   "script": "e2e/native_theme_data.mjs",
+   "class": "helper"
+  },
+  {
+   "name": "native_theme_data.py",
+   "script": "e2e/native_theme_data.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "从 theme_presets.zig 读主题色（已由 native_theme_data.mjs 的纯 JS 实现取代，不再被调用）",
+   "audit": "已无调用方，无需运行"
+  },
+  {
+   "name": "native_thread_cpu.c",
+   "script": "e2e/native_thread_cpu.c",
+   "class": "helper"
+  },
+  {
+   "name": "native_window_list.swift",
+   "script": "e2e/native_window_list.swift",
+   "class": "helper"
+  },
+  {
+   "name": "network_socks_loopback.py",
+   "script": "e2e/network_socks_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real production libssh2 + SOCKS controlled localhost byte/stop check.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "notification_avoidance_fixture",
+   "script": "e2e/notification_avoidance_fixture.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ],
+   "note": "通知避让夹具 runner"
+  },
+  {
+   "name": "notification_avoidance_native",
+   "script": "e2e/notification_avoidance_native.ts",
+   "class": "helper",
+   "note": "供其它脚本 import 的通知避让断言库"
+  },
+  {
+   "name": "notification_countdown_native",
+   "script": "e2e/notification_countdown_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "notification_clear_undo_native",
+   "script": "e2e/notification_clear_undo_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "提醒“清除已结束”可撤销（CONSISTENCY_AUDIT #2）：立即隐藏 + 原生 Toast 带“撤销”，Toast 离场才清除；生产历史视图 + 夹具事实"
+  },
+  {
+   "name": "notification_history_native",
+   "script": "e2e/notification_history_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "notification_policy_app_native",
+   "script": "e2e/notification_policy_app_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "notification_policy_native",
+   "script": "e2e/notification_policy_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "notification_read_native",
+   "script": "e2e/notification_read_native.ts",
+   "class": "manual",
+   "reason": "manual",
+   "note": "默认只做准备（prepared_not_run）；--run 需要 CUA 物理点击与 handoff.json 交接，人工在场"
+  },
+  {
+   "name": "notification_v3_native",
+   "script": "e2e/notification_v3_native.ts",
+   "class": "runnable",
+   "preview": [
+    "notification-preview"
+   ],
+   "env": {
+    "ZW_NOTIFICATION_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "offline_ui_native",
+   "script": "e2e/offline_ui_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_tab_connections_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "operation_error_notification_native",
+   "script": "e2e/operation_error_notification_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "overlay_themes",
+   "script": "e2e/overlay_themes.ts",
+   "class": "excluded",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "reason": "writes-real-home",
+   "note": "把应用包成临时 .app（bundle id local.zerowork.overlay.<pid>）启动；系统按 bundle id 在真实 ~/Library/Preferences、~/Library/Caches 留下 local.zerowork.* 偏好与缓存（真实家目录里已有此类残留）。home-isolation 修好前排除。home-isolation 已关闭应用自有的偏好写入，但 AppKit / CFNetwork 按 bundle id 写入的系统文件（Saved Application State、URL 缓存等）不经本应用路径；放回前须单独 --jobs 1 实测前后比对，本批不放回"
+  },
+  {
+   "name": "panel_contract_native",
+   "script": "e2e/panel_contract_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 420,
+   "note": "面板契约（overlay-focus，CONSISTENCY_AUDIT #1）：每个面板 / 菜单 / 浮动卡片 / 确认框同一套断言——焦点进入、Tab 圈在里面、Esc 只关最上层并归还焦点、点外部关闭且焦点留在被点处（浮动卡片点外部不关、Esc 要求焦点在卡片里）；设 ZW_TEST_PYTHON（paramiko）时加跑 SSH 才有的通信链路 / 端口转发 / 关闭 SSH 会话确认"
+  },
+  {
+   "name": "menu_contract_native",
+   "script": "e2e/menu_contract_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 420,
+   "note": "菜单契约（menus 包，CONSISTENCY_AUDIT #3）：每个菜单都是原生 Menu、只经 app_menu 构建——行是 MenuItem / MenuHeader / MenuSeparator（无 Button 仿制），各菜单行高、字号、文字色、危险色、面板底色一致；常用在前、危险项最后且前有分隔线；快捷键文字等于路由（[keys] 重映射）；侧栏主机提示在菜单打开时让开（无 Tooltip 盖在菜单上）；↓ 移动原生高亮、Esc 关闭；每个菜单截图"
+  },
+  {
+   "name": "panel_heads_native",
+   "script": "e2e/panel_heads_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 300,
+   "note": "panel-heads（CONSISTENCY_AUDIT #4）：标题栏同级面板（提醒 · 会话记录浮动 / 作为 tab · 通信链路 · 端口转发 · 传输 · 命令历史）头部高 30、关闭按钮同一颗原生 ghost sm 图标按钮且提示“关闭 · Esc”（作为 tab 的会话记录不带关闭）、空状态是原生 W.Empty（图标 + 标题 + 说明、居中）；SSH 面板用 builtin_records_ssh_peer.py（审计过的 Python，--python）；输出各面板截图与对照图 <theme>-sheet.png。AI 的头部与空状态归 ai-redesign-a/b/c，不在此覆盖"
+  },
+  {
+   "name": "patch_history_native",
+   "script": "e2e/patch_history_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "plugin_disable_native",
+   "script": "e2e/plugin_disable_native.ts",
+   "class": "excluded",
+   "reason": "needs-build-option",
+   "note": "需要 -Dplugin-fixture=true 构建（fixture_probe 插件），默认回归前缀里没有；单独构建后手工运行"
+  },
+  {
+   "name": "plugin_settings_v3_native",
+   "script": "e2e/plugin_settings_v3_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "provider_v3_native",
+   "script": "e2e/provider_v3_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "ps_compat",
+   "script": "e2e/ps_compat.ts",
+   "class": "helper"
+  },
+  {
+   "name": "quick_connect_themes_native",
+   "script": "e2e/quick_connect_themes_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "regression__exit_guard",
+   "script": "e2e/regression/exit_guard.mjs",
+   "class": "helper",
+   "note": "运行器预加载：脚本结束 / 失败 / 超时时结束其子进程"
+  },
+  {
+   "name": "regression__fixtures__late_writer_item.mjs",
+   "script": "e2e/regression/fixtures/late_writer_item.mjs",
+   "class": "helper"
+  },
+  {
+   "name": "regression__fixtures__ws__config.toml",
+   "script": "e2e/regression/fixtures/ws/config.toml",
+   "class": "helper",
+   "note": "运行器夹具"
+  },
+  {
+   "name": "regression__build_mode_guard",
+   "script": "e2e/regression/build_mode_guard.mjs",
+   "class": "helper",
+   "note": "test-mode 启动守卫（teardown-guard）：启动任何 ZeroWork 产物前按字节查 ZEROWORK_BUILD_MODE=test-mode 标记，不执行被检查的二进制；每个导入 node:child_process 的脚本都先导入它"
+  },
+  {
+   "name": "regression__build_mode_guard_py",
+   "script": "e2e/regression/build_mode_guard.py",
+   "class": "helper",
+   "note": "同一守卫的 Python 版（ai_session_controls_native.py、app_update_native.py、app_update_runtime_native.py 用）"
+  },
+  {
+   "name": "regression__build_mode_guard_selftest",
+   "script": "e2e/regression/build_mode_guard_selftest.ts",
+   "class": "excluded",
+   "reason": "formal-binary",
+   "note": "启动守卫的负向测试：需要一个装在 /private/tmp/zw-<包>-formal 的正式构建（运行器只拿得到 test-mode 前缀），由包级门禁单独跑：node e2e/regression/build_mode_guard_selftest.ts --formal /private/tmp/zw-<包>-formal/bin/zerowork --binary <test-mode zerowork> --out <dir>。不启动任何应用"
+  },
+  {
+   "name": "regression__guard_selftest",
+   "script": "e2e/regression/guard_selftest.ts",
+   "class": "runnable",
+   "note": "私有 HOME 守卫的负向测试（不启动应用）",
+   "args": [
+    "{out}"
+   ],
+   "timeout": 60
+  },
+  {
+   "name": "regression__tree_cleanup_selftest",
+   "script": "e2e/regression/tree_cleanup_selftest.ts",
+   "class": "runnable",
+   "note": "运行器负向测试：条目的子进程树（如 zsh 退出时写回 .zsh_history）全部退出后才删除私有根目录（不启动应用）",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ],
+   "timeout": 120
+  },
+  {
+   "name": "regression__home_guard",
+   "script": "e2e/regression/home_guard.mjs",
+   "class": "helper",
+   "note": "私有 HOME 的创建、隔离断言与真实家目录快照比对"
+  },
+  {
+   "name": "regression__isolation_guard",
+   "script": "e2e/regression/isolation_guard.mjs",
+   "class": "helper",
+   "note": "运行器预加载：私有 HOME 根目录、mkdtemp 重定向、启动应用前的隔离断言、config.toml 关闭更新检查"
+  },
+  {
+   "name": "regression__manifest.json",
+   "script": "e2e/regression/manifest.json",
+   "class": "helper",
+   "note": "本清单"
+  },
+  {
+   "name": "regression__run",
+   "script": "e2e/regression/run.ts",
+   "class": "helper",
+   "note": "全量回归运行器本身"
+  },
+  {
+   "name": "remaining_connection_native",
+   "script": "e2e/remaining_connection_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "内联对端 import e2e/ssh_aux_download_loopback.py——该文件未经主会话审计（excluded_review.cjs 的已审计集合只有 builtin_records_ssh_peer / sftp_conflict_loopback / sftp_upload_loopback / sftp_v3_peer / build_mode_guard），不运行。Python 启动已改为 $ZW_TEST_PYTHON -I。界面步骤仍是旧版：双击行连接（现为选中后点“连接”）、底部状态栏几何（工作区外框不呈现状态栏，b319da83）、status.connection.identity 当按钮（现为页签上只作几何的区域）、sidebar.rail.expand / status.connection.footer（已删除）；审计或改用已审计对端后需整体按现行界面重写"
+  },
+  {
+   "name": "remote_session_notice_native",
+   "script": "e2e/remote_session_notice_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/remote_session_notice_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "remote_session_notice_peer.py",
+   "script": "e2e/remote_session_notice_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Disposable loopback SSH peer for exit/loss/retry notice acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "reported_connection_native",
+   "script": "e2e/reported_connection_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ],
+   "timeout": 300,
+   "note": "r2f：分组主机保存 SOCKS 转发并真实握手、链路详情三次重开、组内 @new 复用已存密码不再弹框；成员状态改断言窗格头部圆点与会话页签圆点同一色调（groups.pane.status_dot），组页签按 groups.tab.count 识别"
+  },
+  {
+   "name": "reported_ui_regressions",
+   "script": "e2e/reported_ui_regressions.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "note": "本地身份区域严格覆盖活动页签（侧栏展开/收起/窄窗）；窄条已删（a46bf0f4），改测主机身份提示贴合文字并在离开时关闭；真实 PTY 彩色行与 ls -C 分栏",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "session_creation_native",
+   "script": "e2e/session_creation_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "note": "原生新建会话菜单（宽随内容、行 28 / 标题 24 / 分隔 9、贴 + 按钮下 4pt）、“更多 ›”子菜单行与同级等宽且开在父菜单旁、空态、⌘K、编辑窗口、最近主机、KVM 编辑器、外点关闭、回车新建；亮暗在 b5（zenit Menu 嵌套行修复）上连续 2 次通过"
+  },
+  {
+   "name": "session_export_verify.py",
+   "script": "e2e/session_export_verify.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Read-only checks for real live-session exports made through NSSavePanel.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "session_group_controls_native",
+   "script": "e2e/session_group_controls_native.ts",
+   "class": "excluded",
+   "reason": "writes-real-home",
+   "note": "把应用包成临时 .app（bundle id local.zerowork.controls.<pid>）启动；系统按 bundle id 在真实 ~/Library/Preferences、~/Library/Caches 留下 local.zerowork.* 偏好与缓存（真实家目录里已有此类残留）。home-isolation 修好前排除。home-isolation 已关闭应用自有的偏好写入，但 AppKit / CFNetwork 按 bundle id 写入的系统文件（Saved Application State、URL 缓存等）不经本应用路径；放回前须单独 --jobs 1 实测前后比对，本批不放回"
+  },
+  {
+   "name": "session_menu_kvm_native",
+   "script": "e2e/session_menu_kvm_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "session_menu_review_native",
+   "script": "e2e/session_menu_review_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "session_menu_saved_native",
+   "script": "e2e/session_menu_saved_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "env": {
+    "ZEROWORK_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "settings_confirmation_controls_native",
+   "script": "e2e/settings_confirmation_controls_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "settings_default_folds_native",
+   "script": "e2e/settings_default_folds_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_followup_native",
+   "script": "e2e/settings_followup_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "settings_hierarchy_native",
+   "script": "e2e/settings_hierarchy_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_material_regressions_native",
+   "script": "e2e/settings_material_regressions_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/canvas_material_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "settings_nav",
+   "script": "e2e/settings_nav.ts",
+   "class": "helper"
+  },
+  {
+   "name": "settings_other_v3_native",
+   "script": "e2e/settings_other_v3_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_preview_windows_native",
+   "script": "e2e/settings_preview_windows_native.ts",
+   "class": "runnable",
+   "preview": [
+    "settings-preview-runner"
+   ],
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{prefix}/bin/settings-preview-runner",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "settings_previews",
+   "script": "e2e/settings_previews.ts",
+   "class": "runnable",
+   "preview": [
+    "settings-preview-runner"
+   ],
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{prefix}/bin/settings-preview-runner",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "settings_remaining_native.README.md",
+   "script": "e2e/settings_remaining_native.README.md",
+   "class": "helper"
+  },
+  {
+   "name": "settings_remaining_native",
+   "script": "e2e/settings_remaining_native.ts",
+   "class": "manual",
+   "reason": "manual",
+   "note": "附着到已运行的主窗口（--live live.json），并读取 dist/ 下私有审计文件；不是独立回归"
+  },
+  {
+   "name": "settings_revamp_native",
+   "script": "e2e/settings_revamp_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）；截图基线来源，勿改"
+  },
+  {
+   "name": "settings_save_feedback_native",
+   "script": "e2e/settings_save_feedback_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_scroll_edge_native",
+   "script": "e2e/settings_scroll_edge_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--theme",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "人工验收反馈 3 回归：静止时页头下第一行文字清晰（像素强边缘），滚动后 scroll edge 磨砂出现"
+  },
+  {
+   "name": "settings_search_v3_native",
+   "script": "e2e/settings_search_v3_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_summaries_native",
+   "script": "e2e/settings_summaries_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_copy_native",
+   "script": "e2e/settings_copy_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "settings-copy：字体与排版子页紧凑实时预览随草稿变化；chunk_kb / ring_mb 摘要与后缀按 shared/base/format；亮暗截图"
+  },
+  {
+   "name": "settings_theme_contrast_native",
+   "script": "e2e/settings_theme_contrast_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "settings_thumbnail_native",
+   "script": "e2e/settings_thumbnail_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/settings_thumbnail_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "settings_thumbnail_pixels.py",
+   "script": "e2e/settings_thumbnail_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "settings_v3_native",
+   "script": "e2e/settings_v3_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "settings_visual_capture",
+   "script": "e2e/settings_visual_capture.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "sftp_active_fin_loopback.py",
+   "script": "e2e/sftp_active_fin_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "No-GUI active READ FIN reproduction; no application or injected pause/fault.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_conflict_loopback.py",
+   "script": "e2e/sftp_conflict_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Read-only loopback SFTP peer for the real application's download conflict UI.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_conflict_native",
+   "script": "e2e/sftp_conflict_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--python",
+    "{python}"
+   ],
+   "timeout": 300,
+   "note": "SFTP 下载同名冲突 → 本地覆盖二次确认 → MD5 一致；只读回环对端 e2e/sftp_conflict_loopback.py（审计过的 Python，--python）。入口：侧栏选中主机后点原生“连接”（design-r3 A2），认证走 plugin.challenge；单位按 IEC（B / KiB / MiB，1024 进制）"
+  },
+  {
+   "name": "sftp_directory_recovery.py",
+   "script": "e2e/sftp_directory_recovery.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback peer for standalone directory FIN/recovery; no GUI or writes.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_directory_recovery_native",
+   "script": "e2e/sftp_directory_recovery_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--python",
+    "{python}",
+    "--theme",
+    "{variant}",
+    "--visual-errors",
+    "1"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 300,
+   "note": "SFTP 目录连接被对端 FIN → 旧列表与选中保留、不自动重连 → 显式“恢复”重新认证 → 同一页签 / 路径 / 选中恢复；缺失 / 拒绝目录的错误态；只读回环对端 e2e/sftp_conflict_loopback.py --directory-fin。亮暗主题下，860×480 和 1440×900 的错误区恢复及重载控件均可聚焦，按钮与 AI 启动器互不遮挡。"
+  },
+  {
+   "name": "sftp_fault_loopback.py",
+   "script": "e2e/sftp_fault_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real no-GUI transfer Runtime faults on an owned read-only loopback peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_feedback_native",
+   "script": "e2e/sftp_feedback_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ],
+   "timeout": 300,
+   "note": "SFTP 反馈：被拒绝的 TCP 连接的失败视图（稿 1：标题 / 地址 Alert / 尝试 1 日志 / 立即重试 = 尝试 2 / Esc 关闭且保持关闭）、侧栏底部新建主机向导的原生认证单选（密码 / 私钥 / Agent，保存密码默认勾选，取消不落盘）、150 项虚拟列表滚动、跨栏拖拽上传与下载；回环对端 e2e/sftp_v3_peer.py"
+  },
+  {
+   "name": "sftp_mkdir_loopback.py",
+   "script": "e2e/sftp_mkdir_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Gated in-memory SFTP directory peer for the production mkdir handler.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_probe_loopback.py",
+   "script": "e2e/sftp_probe_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real wizard Controller/SFTP probe against isolated read-only loopback peers.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_readonly.py",
+   "script": "e2e/sftp_readonly.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Actual production SFTP service against a read-only in-memory loopback peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_resume_loopback.py",
+   "script": "e2e/sftp_resume_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Actual libssh2 pause/resume against a gated, read-only Paramiko peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_retained_failure_native",
+   "script": "e2e/sftp_retained_failure_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--python",
+    "{python}",
+    "--mode",
+    "{variant}"
+   ],
+   "variants": [
+    "resume",
+    "tamper",
+    "fin"
+   ],
+   "timeout": 420,
+   "note": "关闭来源页签后保留的上传任务：悬停出关闭按钮、原生关闭确认写明保留续传、续传完成（resume）、远端前缀被改后拒绝续写并取消（tamper）、传输中对端 FIN 后暂停再显式恢复（fin）；状态按“状态词 百分比”读；回环对端 e2e/sftp_v3_peer.py"
+  },
+  {
+   "name": "sftp_retained_fault_loopback.py",
+   "script": "e2e/sftp_retained_fault_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Prepare/run the actual main application's retained-connection FIN recovery.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_retained_fault_native",
+   "script": "e2e/sftp_retained_fault_loopback.py",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}"
+   ],
+   "timeout": 540,
+   "note": "由 Python 驱动 e2e/sftp_retained_fault_loopback.py 运行 e2e/sftp_retained_fault_native.ts：续传连接收到真实 TCP FIN 后保留同一任务，再次续传尝试 3 MD5 通过；单位按 IEC（B / KiB / MiB，1024 进制）"
+  },
+  {
+   "name": "sftp_retained_loopback.py",
+   "script": "e2e/sftp_retained_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Drive the real main app against one bounded, read-only SFTP peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_retained_native",
+   "script": "e2e/sftp_retained_loopback.py",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}"
+   ],
+   "timeout": 420,
+   "note": "由 Python 驱动 e2e/sftp_retained_loopback.py 起对端并运行 e2e/sftp_retained_native.ts：暂停 → 关闭原 SFTP 页签 → 在本地页签续传同一任务（重新信任+密码）→ 尝试 2 MD5 通过；暂停时指针停在暂停按钮上，全局列表须自行变为 已暂停；单位按 IEC（B / KiB / MiB，1024 进制）"
+  },
+  {
+   "name": "sftp_route_failure_native",
+   "script": "e2e/sftp_route_failure_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}"
+   ],
+   "env": {
+    "ZW_ROUTE_BINARY": "{bin}"
+   }
+  },
+  {
+   "name": "sftp_upload_loopback.py",
+   "script": "e2e/sftp_upload_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback upload peer; extends conflict fixture transport/auth auditing.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "sftp_upload_native",
+   "script": "e2e/sftp_upload_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--python",
+    "{python}",
+    "--theme",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 300,
+   "note": "SFTP 上传：本地卡片选中 → 下载/上传确认 Modal → 对端写入、MD5、事件、远程刷新；回环对端 e2e/sftp_upload_loopback.py；单位按 IEC（B / KiB / MiB，1024 进制）"
+  },
+  {
+   "name": "sftp_v3_native",
+   "script": "e2e/sftp_v3_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--expected-sha",
+    "{sha}",
+    "--out",
+    "{out}",
+    "--python",
+    "{python}",
+    "--theme",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "timeout": 300,
+   "note": "文件工作区 V3（Island B v3）：选中行“连接”（A2）、插件挑战认证、两卡等宽 (W−2×4−4)/2、路径栏 28 / 行 26、本地卡片内拖拽与外部多文件拖入上传、确认浮层、上传托盘（卡片下 4、行高 54）、全局列表文件名详情弹层与批量选择、紧凑窗口远端→本地拖拽下载；--theme 即应用主题；“复制完整路径”写系统剪贴板只断言存在；回环对端 e2e/sftp_v3_peer.py"
+  },
+  {
+   "name": "sftp_v3_peer.py",
+   "script": "e2e/sftp_v3_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Disposable in-memory SFTP peer for native V3 file/transfer acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "shared_forward.py",
+   "script": "e2e/shared_forward.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real one-connection PTY + SOCKS payload/stop and same-port reconnect.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "shell_controls_native",
+   "script": "e2e/shell_controls_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "shortcut_dispatch_native",
+   "script": "e2e/shortcut_dispatch_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "shortcut_text_consistency_native",
+   "script": "e2e/shortcut_text_consistency_native.ts",
+   "class": "runnable",
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "shortcuts 包：注册表里每个快捷键在 Tooltip、菜单（菜单栏 / 终端右键 / 页签菜单）、设置 › 快捷键 显示的文字一致，且随 [keys] 变化"
+  },
+  {
+   "name": "sidebar_drag_native",
+   "script": "e2e/sidebar_drag_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "sidebar_final_native",
+   "script": "e2e/sidebar_final_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/sidebar_final_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "sidebar_final_pixels.py",
+   "script": "e2e/sidebar_final_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Assert captured production sidebar tint/shape from native pixels; no editing.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "sidebar_host_menu",
+   "script": "e2e/sidebar_host_menu.ts",
+   "class": "helper"
+  },
+  {
+   "name": "sidebar_hover_native",
+   "script": "e2e/sidebar_hover_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}",
+    "{variant}"
+   ],
+   "note": "侧栏主机行契约（行高 28、▶ 24 贴右 4、路由徽标常驻、悬停只让出 ▶ 槽、选中行原生“连接”、双击只选中、徽标点击不连接、右键菜单承接复制/编辑）；四种模式变体各在 dark/light/sauber 三主题内跑",
+   "variants": [
+    "full",
+    "minimum",
+    "double",
+    "status"
+   ]
+  },
+  {
+   "name": "sidebar_kvm_route_native",
+   "script": "e2e/sidebar_kvm_route_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "sidebar_layout_r3_native",
+   "script": "e2e/sidebar_layout_r3_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "design-r3 侧栏 A2 / C2 / 稿 2 分屏布局，拒连 loopback 主机，不建立连接"
+  },
+  {
+   "name": "sidebar_review_native",
+   "script": "e2e/sidebar_review_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ],
+   "note": "主页原生 md 按钮（同行、间距 8、居中）与侧栏（264 宽、仅 ▶ 一个行内按钮、跳数、分组独立折叠、开会话不收侧栏、⌘B/恢复）；脚本内覆盖 dark/light/空态"
+  },
+  {
+   "name": "sidebar_selection_native",
+   "script": "e2e/sidebar_selection_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "socks_background_runtime.py",
+   "script": "e2e/socks_background_runtime.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback acceptance for the registered no-Tab SSH background runtime.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "socks_route_host.py",
+   "script": "e2e/socks_route_host.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production SocksRouteHost -> SourceFactory -> real libssh2 Route/Listener.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_auth_loopback.py",
+   "script": "e2e/ssh_auth_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real SSH authentication packets over loopback; no shell/channel/remote IO.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_auth_theme_native",
+   "script": "e2e/ssh_auth_theme_native.ts",
+   "class": "excluded",
+   "reason": "external-fixture",
+   "note": "需要另行启动的加密密钥 SSH 对端及其 peer.json（由 .py 对端产出）"
+  },
+  {
+   "name": "ssh_aux_download_loopback.py",
+   "script": "e2e/ssh_aux_download_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Loopback SSH terminal + separate read-only SFTP connections for native UI.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_aux_download_native",
+   "script": "e2e/ssh_aux_download_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_bootstrap_loopback.py",
+   "script": "e2e/ssh_bootstrap_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real loopback SSH/SFTP + native disposable BootstrapV1 shell acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_bootstrap_product_loopback.py",
+   "script": "e2e/ssh_bootstrap_product_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Exercise real product Controller/AppHost/ConnectJob/SSH Bootstrap wiring.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_bootstrap_protocol_feasibility.py",
+   "script": "e2e/ssh_bootstrap_protocol_feasibility.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Controlled local BootstrapV1 resource proof, never a real-host deployment.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_connection_details.py",
+   "script": "e2e/ssh_connection_details.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real control-channel RTT and negotiated metadata, with no remote commands.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_connection_wait.py",
+   "script": "e2e/ssh_connection_wait.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real SSH creation waits against owned loopback servers; no remote commands.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_disconnect_loopback.py",
+   "script": "e2e/ssh_disconnect_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Disposable real SSH/PTY peer for AppHost explicit disconnect acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_exec_service.py",
+   "script": "e2e/ssh_exec_service.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production Exec mailbox over actual loopback SSH channels; no processes.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_hardening.py",
+   "script": "e2e/ssh_hardening.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned idle SSH peers: fallback negotiation and authenticated liveness.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_key_auth_native",
+   "script": "e2e/ssh_key_auth_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_key_native_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_key_native_peer.py",
+   "script": "e2e/ssh_key_native_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback RSA peer and actual disposable ZSH PTY for native key auth.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_linux_bash42.py",
+   "script": "e2e/ssh_linux_bash42.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Validate the macOS production worker against an explicit disposable Linux/Bash 4.2 peer.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "ssh_mixed_load.py",
+   "script": "e2e/ssh_mixed_load.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned PTY + SFTP + 16 active forwards + one exhausted-window forward.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_nested_shell_native",
+   "script": "e2e/ssh_nested_shell_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_nested_shell_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_nested_shell_peer.py",
+   "script": "e2e/ssh_nested_shell_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Isolated real-PTY SSH peer for native nested-shell acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_output_performance_native",
+   "script": "e2e/ssh_output_performance_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_nested_shell_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_owned_creation_native",
+   "script": "e2e/ssh_owned_creation_native.mts",
+   "class": "runnable",
+   "note": "真实回环连接与 AI 批准打开；普通连接及首个握手被重置后均需正常退出并释放原生会话。",
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "env": {
+    "ZW_AI_TEST_PREFIX": "{prefix}"
+   },
+   "variants": [
+    "ordinary",
+    "reset-first",
+    "reject-auth",
+    "reject-host-key"
+   ],
+   "python": true
+  },
+  {
+   "name": "ssh_probe_loopback.py",
+   "script": "e2e/ssh_probe_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Exercise the production wizard probe over isolated loopback SSH fixtures.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_quit_native",
+   "script": "e2e/ssh_quit_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_tab_connections_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_raw_diagnostic_native",
+   "script": "e2e/ssh_raw_diagnostic_native.ts",
+   "class": "runnable",
+   "preview": [
+    "connection-progress-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "ssh_raw_diagnostic_production_native",
+   "script": "e2e/ssh_raw_diagnostic_production_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ssh_reconnect_loopback.py",
+   "script": "e2e/ssh_reconnect_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Headless production SessionHost/Workspace reconnect; isolated loopback only.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_release_receipts.py",
+   "script": "e2e/ssh_release_receipts.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Actual native release receipts against an owned loopback SSH peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_saved_dedicated_native",
+   "script": "e2e/ssh_saved_dedicated_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_settings_native_fixture.md",
+   "script": "e2e/ssh_settings_native_fixture.md",
+   "class": "helper"
+  },
+  {
+   "name": "ssh_settings_native_fixture.py",
+   "script": "e2e/ssh_settings_native_fixture.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Loopback observer for root-owned main-app SSH settings acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_shared_connection.py",
+   "script": "e2e/ssh_shared_connection.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production host/worker sharing and reconnect against an owned loopback peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_shell_auto_attach_native",
+   "script": "e2e/ssh_shell_auto_attach_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_nested_shell_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_shell_end.py",
+   "script": "e2e/ssh_shell_end.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real SSH packets to the production Zig IO worker; loopback only, no GUI.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_shell_execution_loopback.py",
+   "script": "e2e/ssh_shell_execution_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Production SSH worker + real disposable shell, one PTY, no upload facility.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_shell_integration.py",
+   "script": "e2e/ssh_shell_integration.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Exercise the production session-only initializer in real bash/zsh PTYs.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_shell_product_loopback.py",
+   "script": "e2e/ssh_shell_product_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real product open_session and AI execution over a no-upload SSH fixture.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "ssh_startup_commands.py",
+   "script": "e2e/ssh_startup_commands.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Actual SSH worker + Bash/Zsh PTY startup timing; only disposable loopback IO.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "ssh_tab_connections_native",
+   "script": "e2e/ssh_tab_connections_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_tab_connections_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "ssh_tab_connections_peer.py",
+   "script": "e2e/ssh_tab_connections_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback fixture: independent real ZSH PTYs on each SSH channel.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "startup_background_native",
+   "script": "e2e/startup_background_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "status_hover_native",
+   "script": "e2e/status_hover_native.ts",
+   "class": "runnable",
+   "note": "标题栏点击语义（工作区外框现行契约）：SSH / 本地页签悬停不开卡片、不移焦点，页签菜单“会话详情”开 status.connection / status.detail；通信链路、端口转发点击开、再点 / 点外部 / Esc 关；@theme 与菜单栏“显示 › 外观…”同页（1440 / 860）；传输入口为 toolbar.transfers；Cmd+D 成组后组广播只在组页签出现、860×480 进 ⋯ 菜单。回环对端 builtin_records_ssh_peer.py（$ZW_TEST_PYTHON -I）。亮暗在 b5（页签行绑定与身份区确定性就位修复）上连续 2 次通过",
+   "args": [
+    "{out}",
+    "{bin}",
+    "{variant}"
+   ],
+   "python": true,
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "status_transfer_native",
+   "script": "e2e/status_transfer_native.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-controls-preview"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}/bin/transfer-controls-preview",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "底栏传输控件（transfer-controls-preview --status-transfer，原先误传主程序导致 0 个节点）；速率文案按 shared/base/format（units-iec）"
+  },
+  {
+   "name": "statusbar_alignment",
+   "script": "e2e/statusbar_alignment.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "内联对端 import e2e/ssh_aux_download_loopback.py——该文件未经主会话审计（excluded_review.cjs 的已审计集合只有 builtin_records_ssh_peer / sftp_conflict_loopback / sftp_upload_loopback / sftp_v3_peer / build_mode_guard），不运行。Python 启动已改为 $ZW_TEST_PYTHON -I。界面步骤仍是旧版：双击行连接（现为选中后点“连接”）、底部状态栏几何（工作区外框不呈现状态栏，b319da83）、status.connection.identity 当按钮（现为页签上只作几何的区域）、sidebar.rail.expand / status.connection.footer（已删除）；审计或改用已审计对端后需整体按现行界面重写"
+  },
+  {
+   "name": "switch_initial_state_native",
+   "script": "e2e/switch_initial_state_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "pass": [
+    "passed",
+    "none"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）；报告无 status 字段，以退出码为准"
+  },
+  {
+   "name": "tab_color_native",
+   "script": "e2e/tab_color_native.ts",
+   "class": "manual",
+   "reason": "manual",
+   "note": "每个阶段写 handoff.json 等 CUA 物理操作完成的 .done 标记，人工在场"
+  },
+  {
+   "name": "tab_icon_states_native",
+   "script": "e2e/tab_icon_states_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/domestic_os_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "tab_shortcuts",
+   "script": "e2e/tab_shortcuts.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ],
+   "note": "页签快捷键：十个拒连 SSH 页签（夹具在私有 TMPDIR 自备：127.0.0.1:1 + 1 s 超时），⌘1–9、⌄ n 溢出、Ctrl+Tab MRU"
+  },
+  {
+   "name": "tabs_v3_native",
+   "script": "e2e/tabs_v3_native.ts",
+   "class": "runnable",
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "env": {
+    "ZW_TEST_PREFIX": "{prefix}"
+   },
+   "note": "V3 页签：悬停几何、失败连接关闭、⌄ n 溢出。只跑默认模式（裸可执行副本，无 .app 包）；--pointer-checks 需要 CUA 且打包成临时 .app（会在真实家目录留下按 bundle id 的偏好），仍只作手动验收"
+  },
+  {
+   "name": "terminal_aids",
+   "script": "e2e/terminal_aids.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_cell_graphics_native",
+   "script": "e2e/terminal_cell_graphics_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/terminal_cell_graphics_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_cell_graphics_pixels.py",
+   "script": "e2e/terminal_cell_graphics_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Measure uninterrupted ink across eight actual terminal rows, not node bounds.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "terminal_composite_rebuild_native",
+   "script": "e2e/terminal_composite_rebuild_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_files_native",
+   "script": "e2e/terminal_files_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/terminal_files_ssh_peer.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_files_scripts.py",
+   "script": "e2e/terminal_files_scripts.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Execute the production SSH file scripts in disposable directories, no SFTP.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "terminal_files_ssh_peer.py",
+   "script": "e2e/terminal_files_ssh_peer.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned SSH peer running only the production file scripts in a disposable root.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "terminal_latency",
+   "script": "e2e/terminal_latency.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_output",
+   "script": "e2e/terminal_output.ts",
+   "class": "runnable",
+   "note": "自有 Paramiko 回声对端。问候语出现后立即键入 ZW_FLOOD，核对 262144 行及精确读取字节数。",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "python": true
+  },
+  {
+   "name": "terminal_perf_patch",
+   "script": "e2e/terminal_perf_patch.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_pixel_scroll_native",
+   "script": "e2e/terminal_pixel_scroll_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_rendering",
+   "script": "e2e/terminal_rendering.ts",
+   "class": "runnable",
+   "pass": ["functional_checks_passed_pixels_pending"],
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_resources_native",
+   "script": "e2e/terminal_resources_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_right_click_native",
+   "script": "e2e/terminal_right_click_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "终端右键菜单（design-r3 B1），本地终端；--ssh 夹具需 python 对端，批量里只跑本地"
+  },
+  {
+   "name": "terminal_scrollback_host_live_native",
+   "script": "e2e/terminal_scrollback_host_live_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_scrollback_live_native",
+   "script": "e2e/terminal_scrollback_live_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_scrollback_native",
+   "script": "e2e/terminal_scrollback_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_selection_autoscroll_native",
+   "script": "e2e/terminal_selection_autoscroll_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/ssh_aux_download_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "terminal_tab_follow_native",
+   "script": "e2e/terminal_tab_follow_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "terminal_types.py",
+   "script": "e2e/terminal_types.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Installed terminfo contract for built-in TERM declarations, via a real PTY.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "terminal_types_native",
+   "script": "e2e/terminal_types_native.ts",
+   "class": "runnable",
+   "python": true,
+   "note": "三个 TERM 均用测试解释器运行自有 SSH 对端；profile 路径只执行已审计的 terminal_types.py（标准库、私有 PTY 与输出目录）。",
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "terminal_types_settings_native",
+   "script": "e2e/terminal_types_settings_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_action_pixels.py",
+   "script": "e2e/theme_action_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Check filled action and translucent bubble ink against native gradient pixels.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "theme_ansi_overlay_native",
+   "script": "e2e/theme_ansi_overlay_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "timeout": 1800,
+   "note": "全部内置主题 × 黑 / 白两种 24 位底色，各截终端 / 快速连接 / AI 面板 / 权限菜单四张；每个主题重启一次应用（约 20 秒 / 主题），默认 300 秒不够"
+  },
+  {
+   "name": "theme_auxiliary_native",
+   "script": "e2e/theme_auxiliary_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "timeout": 1800,
+   "note": "39 个主题逐个截图（约 33 秒 / 主题）；默认 300 秒只够跑完 9 个"
+  },
+  {
+   "name": "theme_auxiliary_pixels.py",
+   "script": "e2e/theme_auxiliary_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Measure actual native screenshot glyph cores, including small helper text.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "theme_completeness_native",
+   "script": "e2e/theme_completeness_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_THEME_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_components_native",
+   "script": "e2e/theme_components_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "每个变体一个内置调色板：侧栏行悬停几何、窗口式连接向导与字段错误、四个设置分类、@ 命令弹层、忙碌进程关闭确认（点名 sleep）；默认不带参数时跑全部 39 个调色板",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "theme_files_native",
+   "script": "e2e/theme_files_native.ts",
+   "class": "runnable",
+   "args": [
+    "{prefix}/bin/file-workspace-preview",
+    "{out}"
+   ],
+   "preview": [
+    "file-workspace-preview"
+   ],
+   "timeout": 1500,
+   "note": "目标产物是组件夹具 file-workspace-preview（脚本用 --theme= / --state= 启动它、等 files.workspace）；清单自生成（0c928a56）起误传主程序 {bin}，主程序不认这些参数、也没有 files.workspace，所以一直超时。全部内置主题 × normal / empty / failed 三态，每态重启一次夹具"
+  },
+  {
+   "name": "theme_inline_native",
+   "script": "e2e/theme_inline_native.ts",
+   "class": "runnable",
+   "env": {
+    "ZW_APPEARANCE_TEST_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_material_native",
+   "script": "e2e/theme_material_native.ts",
+   "class": "runnable",
+   "timeout": 1500,
+   "env": {
+    "ZW_THEME_MATERIAL_PREFIX": "{prefix}"
+   },
+   "args": [
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_save_feedback_native",
+   "script": "e2e/theme_save_feedback_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_terminal_boundary_pixels.py",
+   "script": "e2e/theme_terminal_boundary_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Check terminal default and highlighted prompt ink over native wallpaper captures.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "theme_terminal_selection_native",
+   "script": "e2e/theme_terminal_selection_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_terminal_selection_pixels.py",
+   "script": "e2e/theme_terminal_selection_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Measure exact default-ink cores on the actual opaque native selection.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "theme_wallpaper_native",
+   "script": "e2e/theme_wallpaper_native.ts",
+   "class": "runnable",
+   "timeout": 1800,
+   "note": "settings-3f：走两级导航后完整跑完约 1300 秒（逐张壁纸 / 轮播），默认 300 秒不够",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "theme_wallpaper_selection_native",
+   "script": "e2e/theme_wallpaper_selection_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "captured"
+   ],
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "three_fixes_native",
+   "script": "e2e/three_fixes_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "top_toolbar_click_native",
+   "script": "e2e/top_toolbar_click_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "top_toolbar_popovers_native",
+   "script": "e2e/top_toolbar_popovers_native.ts",
+   "class": "runnable",
+   "note": "标题栏点击语义：页签右键关闭 / 取消提示；1440 与 860 下悬停任何标题栏工具不开面板；通信链路 → 端口转发互斥、在触发器下 6、不出视口；页签菜单“会话详情”卡片宽 min(320, vw−16)、高 min(420, 页签下剩余)、与页签对齐，无重新连接，网格与窗格头一致；连接日志可开（复制信息写剪贴板，不点）。回环对端 builtin_records_ssh_peer.py（$ZW_TEST_PYTHON -I）。亮暗在 b5（会话卡网格刷新修复）上连续 2 次通过",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "python": true,
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "transfer_conflict_native",
+   "script": "e2e/transfer_conflict_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{prefix}/bin/transfer-conflict-preview",
+    "--out",
+    "{out}"
+   ],
+   "preview": [
+    "transfer-conflict-preview"
+   ],
+   "note": "目标产物是组件夹具 transfer-conflict-preview（脚本用 --scene= 启动它、等 transfer.conflict）；清单自生成（0c928a56）起误传主程序 {bin}，所以等不到对话框"
+  },
+  {
+   "name": "transfer_controls_native",
+   "script": "e2e/transfer_controls_native.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-controls-preview"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{prefix}/bin/transfer-controls-preview",
+    "{out}",
+    "fixture",
+    "{variant}"
+   ],
+   "note": "全局传输浮窗任务行与控件（transfer-controls-preview，global_popover，与应用相同挂在 Popover wrapper）：浮窗锚定右上回退锚点、行高 54、列对齐、文字不截断、进度 = 百分比 = 字节、按状态的直接动作、管理任务复选框、文件名点击详情、三种关闭；复制按钮写剪贴板，只断言存在。亮暗在 b5 上连续 2 次通过"
+  },
+  {
+   "name": "transfer_controls_native_main",
+   "script": "e2e/transfer_controls_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "main"
+   ],
+   "note": "同一脚本的 main 模式：正式应用标题栏“传输管理”打开空的传输浮窗（原生 Popover：触发器下 8、与触发器右对齐），X / Escape / 空白岛内点击关闭后进程存活并可重新打开"
+  },
+  {
+   "name": "transfer_defaults_native",
+   "script": "e2e/transfer_defaults_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/transfer_policy_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "transfer_entrypoints_native",
+   "script": "e2e/transfer_entrypoints_native.ts",
+   "class": "runnable",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "records",
+    "--live-transfers"
+   ],
+   "timeout": 300,
+   "note": "传输入口：工具栏“传输”打开右上全局列表（底部 status.transfer 在工作区外框中不呈现）、Esc / 再点关闭、紧凑窗口；--live-transfers 变体做真实 SFTP 上传并核对对端 SHA-256。records 变体用 builtin_records_ssh_peer.py（SSH）；单位按 IEC（B / KiB / MiB，1024 进制）"
+  },
+  {
+   "name": "transfer_events_native",
+   "script": "e2e/transfer_events_native.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-events-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}"
+   ],
+   "env": {
+    "ZEROWORK_TRANSFER_PREVIEW_BINARY": "{prefix}/bin/transfer-events-preview"
+   }
+  },
+  {
+   "name": "transfer_policy_loopback.py",
+   "script": "e2e/transfer_policy_loopback.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned read-only peer: hold its first READ until runner releases queue evidence.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "transfer_policy_native",
+   "script": "e2e/transfer_policy_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/transfer_policy_loopback.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "transfer_startup_failure_native",
+   "script": "e2e/transfer_startup_failure_native.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-events-preview"
+   ],
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{prefix}/bin/transfer-events-preview"
+   ]
+  },
+  {
+   "name": "transfer_upload_cwd_native",
+   "script": "e2e/transfer_upload_cwd_native.ts",
+   "class": "manual",
+   "reason": "manual",
+   "note": "手动用例：@up / @dl 弹真实 AppKit 面板，靠外部 CUA 写 continue-N 交接。@dl 已走测试对话框注入（dialog_port pick_folder），但 @up 的多选上传面板 zw_pick_upload_files（src/platform/macos_transfer_picker.m）绕过 ZEROWORK_E2E_DIALOG_DIR，批量跑会弹真实 NSOpenPanel；产品把它接入注入后可改成 runnable。连接入口已改为选中行后点原生“连接”；其余步骤未在当前界面验证",
+   "python": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "trusted_startup_native",
+   "script": "e2e/trusted_startup_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "ui_background_refresh_native",
+   "script": "e2e/ui_background_refresh_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{prefix}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "ui_scroll_performance_native",
+   "script": "e2e/ui_scroll_performance_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "note": "40 主机：shell 等于窗口高、侧栏列表溢出且可滚到最后一行、底部行不动（shell 根 flex-basis 0 / min-height 0）；设置窗口主题页与 AI 行为页滚轮/触控板；大注册表 Select",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "update_manifest_contracts.py",
+   "script": "e2e/update_manifest_contracts.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Validate stable release artifacts with temporary ZIPs; never publish or rotate keys.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "upload_picker_native",
+   "script": "e2e/upload_picker_native.ts",
+   "class": "manual",
+   "reason": "desktop-automation",
+   "note": "手动用例：@up 的真实 NSOpenPanel（前台、真实激活），osascript 驱动 System Events 按 Esc 取消（需辅助功能权限、操作用户桌面），swiftc 编译 e2e/native_window_list.swift 取窗口号截图；脚本不继承 ZEROWORK_E2E_DIALOG_DIR。未在本轮运行",
+   "python": true,
+   "args": [
+    "{bin}",
+    "{out}"
+   ]
+  },
+  {
+   "name": "v02_fixture_native",
+   "script": "e2e/v02_fixture_native.ts",
+   "class": "excluded",
+   "reason": "private-config",
+   "note": "需要 --config 私有实机 Provider 配置（0600），批量里没有；单独提供私有配置后手工运行"
+  },
+  {
+   "name": "v02_grok_continuation.py",
+   "script": "e2e/v02_grok_continuation.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Strict real Grok continuation acceptance; run only with exclusive native UI ownership.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "v02_grok_gateway.py",
+   "script": "e2e/v02_grok_gateway.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Run one Grok-only native production Client/Manager image acceptance.",
+   "audit": "真实外部主机 / 网关 / 私有凭据，不建议在回归中运行"
+  },
+  {
+   "name": "v02_live_native",
+   "script": "e2e/v02_live_native.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "v0.2 实机验收：真实 VM/SSH（ZEROWORK_ACCEPTANCE_CONFIG 私有配置），内联对端还需要 paramiko"
+  },
+  {
+   "name": "v02_local_quick",
+   "script": "e2e/v02_local_quick.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "v02_loopback_run.py",
+   "script": "e2e/v02_loopback_run.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Run the real native acceptance client against an owned loopback SSH peer.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "v02_loopback_server.py",
+   "script": "e2e/v02_loopback_server.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Owned loopback SSH/SFTP peer for native libssh2 acceptance.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 paramiko"
+  },
+  {
+   "name": "v02_macos_data_native",
+   "script": "e2e/v02_macos_data_native.ts",
+   "class": "manual",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "reason": "manual",
+   "note": "写 recovery-handoff.json，等人工处理真实启动恢复提示（最长 180 s）"
+  },
+  {
+   "name": "v02_plugins_ui",
+   "script": "e2e/v02_plugins_ui.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}"
+   ]
+  },
+  {
+   "name": "v02_run",
+   "script": "e2e/v02_run.mjs",
+   "class": "excluded",
+   "reason": "private-config",
+   "note": "v0.2 外层包装：local/local_edges/vm 套件，需要外部私有 ZEROWORK_ACCEPTANCE_CONFIG；local/local_edges 已直接作为 local_terminal / local_session_edges 收录"
+  },
+  {
+   "name": "v02_ui_fixes_native",
+   "script": "e2e/v02_ui_fixes_native.ts",
+   "class": "runnable",
+   "pass": [
+    "passed",
+    "passed_pending_pixel_review"
+   ],
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--sha",
+    "{sha}",
+    "--themes",
+    "{variant}"
+   ],
+   "note": "亮暗主题验证侧栏和设置窗口、快速连接空结果与其他状态统一的 16pt 底边距，以及关窗和应用退出。",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "v02_window_transfer",
+   "script": "e2e/v02_window_transfer.ts",
+   "class": "excluded",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--sha",
+    "{sha}"
+   ],
+   "note": "需要 -Dplugin-fixture=true 构建（fixture_probe 外部插件：fixture.canvas / ContentContext 迁移窗口），默认回归前缀的向导协议只有 SSH / SFTP / BMC，脚本在“新建主机 › 协议”处无法继续；与 plugin_disable_native 同。usage-e2e-debt2 r2h 只按源码把主机行连接改为 A2（选中行“连接”），全屏 / 标题栏几何（tabs.strip x=90、全屏左移 72、目标窗口标题栏 x=8）仍是 Island B v3 之前的数值，未在 fixture 构建上核对",
+   "reason": "needs-build-option"
+  },
+  {
+   "name": "vanta_components_native",
+   "script": "e2e/vanta_components_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "vanta_error_states_native",
+   "script": "e2e/vanta_error_states_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "vanta_real_services_native",
+   "script": "e2e/vanta_real_services_native.ts",
+   "class": "excluded",
+   "reason": "live",
+   "note": "用户真实 MiMo 与 SSH/SFTP 端点，需要 ZEROWORK_ACCEPT_PRIVATE_INPUT 私有凭据"
+  },
+  {
+   "name": "vanta_typography_native",
+   "script": "e2e/vanta_typography_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "variable_font_weight_native",
+   "script": "e2e/variable_font_weight_native.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "{out}",
+    "{bin}"
+   ]
+  },
+  {
+   "name": "visual_audit_capture",
+   "script": "e2e/visual_audit_capture.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-events-preview",
+    "file-workspace-preview",
+    "auth-challenge-preview"
+   ],
+   "zigOut": true,
+   "pass": [
+    "captured",
+    "passed",
+    "none"
+   ],
+   "args": [
+    "{variant}",
+    "light",
+    "wide",
+    "{out}"
+   ],
+   "variants": [
+    "empty",
+    "populated",
+    "auth",
+    "files",
+    "transfer"
+   ]
+  },
+  {
+   "name": "window_hide_native",
+   "script": "e2e/window_hide_native.ts",
+   "class": "excluded",
+   "reason": "launchservices",
+   "note": "用 /usr/bin/open 经 LaunchServices 重新打开临时 bundle；匹配失败时会在沙箱外、不带隔离数据目录启动新实例；另依赖 scripts/macos_signing.py"
+  },
+  {
+   "name": "terminal_search_teardown_native",
+   "script": "e2e/terminal_search_teardown_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}"
+   ],
+   "timeout": 120,
+   "note": "窗口拆除回归（teardown-guard）：本地终端打开 ⌘F 搜索后正常退出，必须 exit 0 且日志无 panic（原先拆除阶段 terminal_search.paintCount 对已释放信号 set；修正顺序后又会在本地会话收尾处空转）"
+  },
+  {
+   "name": "fixture_window_native",
+   "script": "e2e/fixture_window_native.ts",
+   "class": "runnable",
+   "preview": [
+    "transfer-controls-preview",
+    "connection-progress-preview",
+    "auth-challenge-preview",
+    "forward-config-preview",
+    "ai-launcher-preview",
+    "close-confirmation-preview",
+    "ai-recovery-preview",
+    "execution-result-preview",
+    "task-finish-preview",
+    "ai-empty-recent-preview",
+    "inventory-grant-preview",
+    "notification-preview",
+    "button-policy-preview",
+    "socks-info-preview",
+    "composer-interaction-preview"
+   ],
+   "args": [
+    "{prefix}",
+    "{out}"
+   ],
+   "timeout": 420,
+   "note": "夹具窗口框架（usage-b3-titlebar，shared/ui/window/fixture_window.zig）：全部 15 个预览 / 夹具 runner 逐个在真实窗口里核对标题栏 fixture.titlebar（窗口顶部、40 高、整宽）、标题栏里的夹具控件在红绿灯右侧、内容从标题栏下缘开始并占满其余窗口。15 个产物都在 home_guard.PRODUCT_POLICY 的审计名单里（usage-e2e-debt 补齐 close-confirmation / ai-recovery / execution-result / task-finish / ai-empty-recent / inventory-grant / button-policy / socks-info / composer-interaction，依据见 e2e/README.md「预览产物审计」）"
+  },
+  {
+   "name": "window_chrome_regions_native",
+   "script": "e2e/window_chrome_regions_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "foreground": true,
+   "timeout": 420,
+   "note": "窗口 chrome（usage-b3-titlebar）：主窗口、设置窗口、连接向导窗口都用 zenit window chrome（.custom、原生红绿灯）。阶段 1（后台）：红绿灯位置、标题栏空白处是拖动区、按钮 / 页签 / 输入框 / 正文不是、标题栏以下没有拖动点、侧栏收起、主窗口 + 设置窗口同开时切主题。阶段 2（前台，键盘隔离）：经 zenit 测试入口把真实 NSEvent 投进本进程事件队列——标题栏空白处的按下被标题栏接走（开始拖动）且不进 UI、按钮上的按下照常生效、双击缩放 / 还原、向导不可缩放、原生全屏下的 chrome 状态与拖动 / 缩放停用及退出恢复。会短暂激活应用并让主窗口进入全屏"
+  },
+  {
+   "name": "window_render_smoke_native",
+   "script": "e2e/window_render_smoke_native.ts",
+   "class": "runnable",
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "timeout": 180,
+   "note": "真实窗口渲染冒烟（空白窗口回归 43c46538）：主窗口、本地终端、设置窗口三张截图按像素方差 ≥ 20、颜色数 ≥ 64 拒绝纯色画面"
+  },
+  {
+   "name": "wizard_advanced_native",
+   "script": "e2e/wizard_advanced_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "wizard_copy_native",
+   "script": "e2e/wizard_copy_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "note": "编辑窗口内“从已有主机复制”原生 Modal（440 宽、窗口居中、最小窗口仍在界内）：取消 / Esc 不动草稿、应用后复制字段与“-副本”身份；资产分组组合框选空分组、压缩与启动命令仅保存时落盘，经侧栏右键 context.menu.edit_host 读回；亮暗各连续 ≥2 次通过（r2b-8/9）"
+  },
+  {
+   "name": "wizard_discard_native",
+   "script": "e2e/wizard_discard_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ],
+   "tags": [
+    "e2e-debt"
+   ],
+   "note": "【r2b 已按现行契约重写，等产品修复】编辑窗口取消 / Esc 直接关闭不确认、测试中取消释放探测连接、不落盘全部通过；末段断言失败：核对页“连接预检”标题行 wizard.test.toggle 宽 668 溢出测试卡片（editor.zig paintButtons 用 S.button(668,18) 覆盖 .width=.fill()）"
+  },
+  {
+   "name": "wizard_field_errors_native",
+   "script": "e2e/wizard_field_errors_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "wizard_jump_guide_native",
+   "script": "e2e/wizard_jump_guide_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "design-r3 稿 4 跳板引导：只做离线保存"
+  },
+  {
+   "name": "wizard_v3_revision_native",
+   "script": "e2e/wizard_v3_revision_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "dark",
+    "light"
+   ]
+  },
+  {
+   "name": "workspace",
+   "script": "e2e/workspace.ts",
+   "class": "runnable",
+   "zigOut": true,
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--fixture-dir",
+    "{fixtures}/ws"
+   ],
+   "note": "lead 批末门禁套件（gate-main.sh settings）"
+  },
+  {
+   "name": "workspace_v3_semantics_native",
+   "script": "e2e/workspace_v3_semantics_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}"
+   ]
+  },
+  {
+   "name": "workspace_visual_native",
+   "script": "e2e/workspace_visual_native.ts",
+   "class": "runnable",
+   "args": [
+    "--binary",
+    "{bin}",
+    "--out",
+    "{out}",
+    "--expected-sha",
+    "{sha}",
+    "--theme",
+    "{variant}"
+   ],
+   "note": "主页启动本地终端（侧栏无本地入口，83a600af）、开会话保留侧栏、⌘B 隐藏；@grp 两成员组左右/上下 4pt 几何；截图待人工看",
+   "variants": [
+    "light",
+    "dark"
+   ]
+  },
+  {
+   "name": "xterm_capabilities.py",
+   "script": "e2e/xterm_capabilities.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Real-PTY xterm-256color contract. UI drives keys/mouse/paste between stages.",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）"
+  },
+  {
+   "name": "xterm_capabilities_native",
+   "script": "e2e/xterm_capabilities_native.ts",
+   "class": "excluded",
+   "reason": "depends-py",
+   "note": "依赖 e2e/builtin_records_ssh_peer.py, e2e/terminal_types.py, e2e/xterm_capabilities.py, e2e/xterm_pixels.py（.py 未经 lead 审计不运行；scripts/ 下的不运行）"
+  },
+  {
+   "name": "xterm_pixels.py",
+   "script": "e2e/xterm_pixels.py",
+   "class": "excluded",
+   "reason": "py",
+   "note": "Check actual native pixels of all indexed-color swatches (16..255).",
+   "audit": "需 lead 审计后才可运行（本地回环 / 像素检查 / 本地 PTY）；依赖 Pillow"
+  },
+  {
+   "name": "yix_spike_native",
+   "script": "e2e/yix_spike_native.ts",
+   "class": "runnable",
+   "preview": [
+    "mockup-yix_spike"
+   ],
+   "args": [
+    "{prefix}/bin/mockup-yix_spike",
+    "{out}"
+   ],
+   "note": "需要 mockup 预览：zig build mockup -Dmockup=yix_spike -Dtest-mode=true --prefix <同一 prefix>（脚本启动的是 mockup-yix_spike，不是 zerowork）"
+  },
+  {
+   "name": "ai_launcher_native",
+   "script": "e2e/ai_launcher_native.ts",
+   "class": "runnable",
+   "args": [
+    "{bin}",
+    "{out}",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "PL4c 4c-2：每个 tab 的浮动 AI 图标（入口、状态、拖放、分屏、KVM）"
+  },
+  {
+   "name": "ai_launcher_preview",
+   "script": "e2e/ai_launcher_preview.ts",
+   "class": "runnable",
+   "preview": [
+    "ai-launcher-preview"
+   ],
+   "args": [
+    "--binary",
+    "{prefix}/bin/ai-launcher-preview",
+    "--out",
+    "{out}",
+    "--theme",
+    "{variant}"
+   ],
+   "variants": [
+    "light",
+    "dark"
+   ],
+   "note": "ai.launcher 状态矩阵（tfmv1 / cVXd5）"
+  }
+ ]
+}

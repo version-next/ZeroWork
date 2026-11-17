@@ -1,6 +1,7 @@
 //! OpenSSH known_hosts with byte-preserving edits and checked atomic commits.
 //! A legacy fingerprint is not a public key and cannot establish new trust.
 const std = @import("std");
+const persist = @import("../../shared/base/persist.zig");
 const c = @import("generated_ssh_session");
 const Library = @import("session.zig").Library;
 
@@ -466,15 +467,13 @@ pub const HostKeyStore = struct {
         const lock = try lockFile(self.allocator, io, dir, path);
         defer lock.close(io);
         try checkDisk(io, dir, path, expected.file_hash);
-        var atomic = try dir.createFileAtomic(io, path, .{ .permissions = private_permissions, .make_path = true, .replace = true });
-        defer atomic.deinit(io);
-        var buffer: [16 * 1024]u8 = undefined;
-        var writer = atomic.file.writer(io, &buffer);
-        try writer.interface.writeAll(encoded);
-        try writer.interface.flush();
-        try atomic.file.sync(io);
+        var atomic = try persist.AtomicWriter.begin(io, dir, path, .{ .make_path = true });
+        defer atomic.deinit();
+        try atomic.file().writePositionalAll(io, encoded, 0);
+        // 落盘后、发布前再核对一次磁盘上的旧内容（外部改动检测）。
+        try atomic.syncData();
         try checkDisk(io, dir, path, expected.file_hash);
-        try atomic.replace(io);
+        try atomic.commit();
         // All allocations preceded rename. Publish cannot fail after disk did.
         self.deinit();
         self.* = next;
@@ -725,16 +724,9 @@ fn backupLegacy(io: std.Io, dir: std.Io.Dir, path: []const u8, source: []const u
         if (!std.mem.eql(u8, bytes, source)) return error.LegacyBackupConflict;
         return;
     }
-    var atomic = try dir.createFileAtomic(io, path, .{ .permissions = private_permissions, .replace = false });
-    defer atomic.deinit(io);
-    var buffer: [16 * 1024]u8 = undefined;
-    var writer = atomic.file.writer(io, &buffer);
-    try writer.interface.writeAll(source);
-    try writer.interface.flush();
-    try atomic.file.sync(io);
-    try atomic.link(io);
+    try persist.writeAtomic(io, dir, path, source, .{ .publish = .create_new });
 }
-const private_permissions: std.Io.File.Permissions = @fromBackingInt(0o600);
+const private_permissions: std.Io.File.Permissions = persist.private_file;
 fn checkDisk(io: std.Io, dir: std.Io.Dir, path: []const u8, expected: ?Digest) !void {
     const source = dir.readFileAlloc(io, path, std.heap.page_allocator, .limited(max_file_bytes)) catch |err| switch (err) {
         error.FileNotFound => if (expected == null) return else return error.FileConflict,
@@ -744,10 +736,8 @@ fn checkDisk(io: std.Io, dir: std.Io.Dir, path: []const u8, expected: ?Digest) !
     if (!std.meta.eql(expected, @as(?Digest, digest(source)))) return error.FileConflict;
 }
 fn lockFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
-    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
-    defer allocator.free(lock_path);
-    return dir.createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true, .permissions = private_permissions });
+    _ = allocator;
+    return persist.acquireLock(io, dir, path);
 }
 fn advance(value: u64) !u64 {
     if (value == std.math.maxInt(u64)) return error.RevisionExhausted;

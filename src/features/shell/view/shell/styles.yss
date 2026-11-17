@@ -1,0 +1,45 @@
+//! ZeroWork window shell, Island B v3 (Pencil `aPxql` 本地终端, 1440×900).
+//! The sidebar starts at the window top (the native traffic lights sit in
+//! its header); the content column is a 44pt view bar over a stage whose
+//! focused island carries the workspace. Values are the design's numbers;
+//! colors are zenit semantic tokens plus ZeroWork's zw-* island tokens.
+const ui = @import("ui");
+
+/// Window root. It paints nothing: the ground between islands is the window background layer
+/// (`appearance.background`, features/shell/view/background_layers.zig), so the wallpaper and
+/// its tint show through.
+///
+/// `flex-basis: 0; min-height: 0`: the root is a growing item of the runtime's viewport column. With the default
+/// automatic minimum (its content's min-content height) a long sidebar list made the whole shell taller than the
+/// window — the list then had nothing to scroll and the sidebar footer and the rows below the fold were unreachable
+/// (zenit MIGRATION「明确填充和固定留白」: the outermost root mounted into the viewport host must state this).
+style root { width: fill; height: fill; flex-basis: 0; min-height: 0; direction: column; gap: 0; padding: 0; }
+/// Sidebar | content.
+style body { width: fill; height: fill; flex: 1; min-height: 0; direction: row; gap: 0; }
+
+/// Sidebar column: 264 wide, transparent over the ground.
+style sidebar { width: 264; height: fill; flex-shrink: 0; direction: column; overflow: hidden; }
+/// Sidebar content: padding [12, 8], gap 12.
+style sidebar_full { width: fill; height: fill; min-height: 0; direction: column; align-items: stretch; gap: space300; padding: space300 space200; }
+/// Sidebar header row (28): traffic lights (6 + 52) and the toggle (6 + 24 + 6) precede the title.
+style sidebar_header { height: 28; direction: row; align-items: center; gap: space150; padding: 0 space150 0 94; flex-shrink: 0; }
+
+/// View bar: 44 high, padding [0, 6, 0, 12]; tabs sit on the island edge.
+style view_bar { width: fill; height: 44; flex-shrink: 0; direction: row; align-items: end; padding: 0 space150 0 space300; background: transparent; }
+/// Tab strip: tabs bottom-aligned, gap 2.
+style tabs { direction: row; align-items: end; gap: 2; height: fill; background: transparent; }
+/// Toolbar controls: gap 8, 4pt above the island; holds zenit's native md icon buttons (32 × 32).
+style toolbar { direction: row; align-items: center; gap: space200; height: 36; padding: 0 0 space100 0; flex-shrink: 0; }
+
+/// Focused view island: stage padding [0, 6, 6, 0], radius 12. Its plate is painted by the window
+/// background layer (`appearance.canvas.card`, in the canvas tint group) from this box's rect and
+/// radius; the box itself declares no background, so nothing has to clear one after a theme replay.
+style island { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; margin: 0 space150 space150 0; corner-radius: island; overflow: hidden; }
+/// Pane header (ZW2 / Pane Header): 30 high, padding [0, 4, 0, 12], gap 6.
+style pane_header { width: fill; height: 30; flex-shrink: 0; direction: row; align-items: center; gap: space150; padding: 0 space100 0 space300; background: transparent; }
+/// Toolbar group (ZW5 / View Tools · Split / Actions): plain icon buttons.
+style toolbar_group { direction: row; align-items: center; gap: space150; height: 32; flex-shrink: 0; background: transparent; }
+/// 1×16 hairline between toolbar groups.
+style toolbar_divider { width: 1; height: 16; flex-shrink: 0; background: border-strong; }
+/// Sidebar search row (ZW5 / Sidebar › Search): full width, 28 high, radius 8, under the header.
+style sidebar_search { width: fill; height: 28; min-width: 0; flex-shrink: 0; direction: row; align-items: center; gap: space100; padding: 0 2 0 space200; corner-radius: 8; overflow: hidden; }

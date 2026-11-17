@@ -1,6 +1,9 @@
 {
   "name": "zenit-native-visual-tests",
   "private": true,
+  "scripts": {
+    "glass:pixelmatch": "playwright test --config playwright.glass.config.ts"
+  },
   "devDependencies": {
     "@playwright/test": "1.63.0"
   }

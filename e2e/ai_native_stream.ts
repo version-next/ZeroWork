@@ -2,6 +2,7 @@
  * Network/provider stays real; all input uses the public synthetic Harness.
  * Copy the binary at startup so concurrent builds cannot change the run.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -9,6 +10,7 @@ import { copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { waitForServerReady, waitFor, tree, query, clickTestId, inputState, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
 
 const args = process.argv.slice(2), options: Record<string, string> = {};
 for (let i = 0; i < args.length; i += 2) {
@@ -60,7 +62,7 @@ async function click(id: string): Promise<void> {
 async function assistantTree(): Promise<any> {
   const panel = (await query("ai.panel")).find(shown);
   if (panel) return panel;
-  const current: any = await tree();
+  const current: any = await tree({ root: "ai.content" });
   assert(!current.error, `Cannot inspect current AI UI: ${current.error}; use the scoped ai.panel test ID`);
   return current;
 }
@@ -89,7 +91,7 @@ try {
   assert((await resizeWindow(1440, 900)).ok);
   await click("workspace.empty.local");
   await visible("terminal.surface");
-  await click("toolbar.ai");
+  await click(await aiToggleId());
   await visible("ai.prompt");
   await capture("00-ai-ready");
   await submit(longPrompt);

@@ -9,18 +9,24 @@ const Padding = core.Padding;
 
 /// Menu item: root (row, hover / keyboard virtual highlight use list-hover-bg), label (text), icon
 /// (icon, color follows text).
-/// lit is menu's current virtual highlight (pointer enter and keyboard move both write it); danger
-/// is per-item kind; disabled overrides danger and highlight.
-recipe MenuRow slots(root, label, icon) {
+/// Lit represents either the hovered row or the independent keyboard highlight.
+/// Disabled colors override danger and highlight.
+recipe MenuRow slots(root, label, icon, description) {
   base {
-    root { width: grow; height: 32; direction: row; align-items: center; justify: space-between; padding: 0 10; corner-radius: 3; background: transparent; }
-    label { font-size: 13; color: fg-primary; }
+    root { width: grow; height: 28; direction: row; align-items: center; justify: space-between; gap: space200; padding: 0 space200; corner-radius: md; background: transparent; }
+    label { font-size: md; color: fg-primary; }
     icon { width: 16; height: 16; icon-color: fg-primary; }
+    description { color: fg-secondary; }
   }
+  /// A description line under the label: the row grows (6 8 padding, at least 28) and its content
+  /// aligns to the top, so the icon and the tag sit on the label's line.
+  flag described { root { height: fit; min-height: 28; padding: space150 space200; align-items: start; } }
   flag danger { label { color: danger; } icon { icon-color: danger; } }
   flag lit;
-  flag disabled { label { color: fg-disabled; } icon { icon-color: fg-disabled; } } else { root { cursor: pointer; } }
-  when lit & !disabled { root { background: list-hover-bg; } }
+  flag disabled { label { color: fg-disabled; } icon { icon-color: fg-disabled; } description { color: fg-disabled; } } else {
+    root { cursor: pointer; :active { background: bg-active; } }
+  }
+  when lit & !disabled { root { background: bg-hover; } }
 }
 
 /// Item list in panel
@@ -28,6 +34,39 @@ style list { width: grow; height: fit; direction: column; padding: 4; }
 
 /// Divider outer: vertical padding, line itself 1px
 style separator { width: grow; height: fit; padding: 4 0; }
-style separator_line { width: grow; height: 1; background: separator; }
-style item_left { width: fit; height: fit; direction: row; align-items: center; gap: 8; }
-style shortcut { color: fg-disabled; font-size: 11; }
+style separator_line { width: grow; height: 1; background: border; }
+/// Group heading (`MenuItem.kind = .header`): caption in the secondary colour, aligned with the
+/// row labels, no hover or cursor.
+style header { width: grow; height: 24; direction: row; align-items: center; padding: 0 space200; }
+style header_text { font-size: xs; color: fg-secondary; }
+/// Leading part: icon + label (and description). A described row aligns it to the top.
+style item_left($top: bool) { width: fit; min-width: 0; height: fit; direction: row; align-items: center; gap: 8; when $top { align-items: start; } }
+/// Label (+ disabled reason) on one line.
+style item_label_line { width: fit; height: fit; direction: row; align-items: center; gap: 8; }
+/// Label line over the description line (`MenuItem.description`).
+style item_text { width: fit; min-width: 0; height: fit; direction: column; gap: space50; }
+/// `MenuItem.description`: xs, wraps inside the panel.
+style description { font-size: xs; line-height: 1.5; wrap: word; }
+style item_right { width: fit; height: fit; direction: row; align-items: center; gap: 8; }
+style submenu_arrow { width: 12; height: 12; icon-color: fg-secondary; }
+/// Why a disabled row is unavailable (`MenuItem.disabled_reason`), after the label.
+style reason { color: fg-secondary; font-size: xs; }
+style shortcut { color: fg-secondary; font-size: xs; }
+
+/// Body text line height from COMPONENTS.json Menu rows.
+pub fn rowText(t: *const ui.ThemeTokens) ui.TextStyle {
+    return .{ .font_size = t.tokens.font_size.md, .line_height = 1.4, .color = t.tokens.color.fg_primary };
+}
+
+/// Menu uses aria-activedescendant: the keyboard ring follows the virtual row,
+/// while pointer highlight only paints bg-hover. Foundations: 2px ring + 2px offset.
+style virtual_focus($visible: bool) {
+  when $visible { outline: {ui.Outline{ .color = t.tokens.color.focus_ring, .width = t.tokens.border_width.focus, .offset = t.tokens.size.focus_offset }}; }
+}
+
+/// `MenuItem.icon_tint` row icon: same box as the recipe's icon, colour from the item (swatch rows).
+style tinted_icon { width: 16; height: 16; }
+/// The swatch colour itself (`tint` of `tinted_icon`).
+pub fn itemTint(tint: Color, _: *const ui.ThemeTokens) Color {
+    return tint;
+}

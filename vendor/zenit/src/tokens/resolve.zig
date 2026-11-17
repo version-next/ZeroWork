@@ -1,13 +1,22 @@
 //! Strict, source-located token declarations and per-mode dependency resolution.
+//!
+//! A theme is one JSON file, or an ordered stack of layers (`parseLayers`): a base followed by
+//! overlays. Overlays add tokens, groups and modes; replacing a path a lower layer declared needs
+//! an explicit `{"$override": true, "$value": ...}` on that token (or `"$override": true` in the
+//! mode object), so nothing is replaced silently.
 const std = @import("std");
 const m = @import("token_model");
+/// Component role defaults (see roles.zig); exported for tests and tools.
+pub const roles = @import("roles.zig");
 const A = std.mem.Allocator;
 const E = error{ InvalidInput, OutOfMemory };
 const Obj = std.StringArrayHashMapUnmanaged(*Node);
 const Node = struct {
     offset: usize,
     pointer: []const u8,
-    value: union(enum) { object: Obj, string: []const u8, number: []const u8, other },
+    value: union(enum) { object: Obj, string: []const u8, number: []const u8, boolean: bool, other },
+    /// Input layer the node was read from.
+    layer: usize = 0,
 };
 const Rule = struct { category: m.Category, secondary: ?m.Category = null, signed: bool = false };
 const Field = struct { name: []const u8, expr: *Expr };
@@ -19,44 +28,68 @@ const Expr = struct {
 const Draft = struct { token: m.Token, node: *Node, expr: ?*Expr = null };
 const ModeDraft = struct { name: []const u8, scheme: m.Scheme, fallback_name: ?[]const u8, node: ?*Node };
 
+pub const Layer = m.Layer;
+
+/// Single-file theme.
 pub fn parse(allocator: A, source: []const u8) A.Error!m.Document {
+    return parseLayers(allocator, &.{.{ .name = "", .source = source }});
+}
+
+/// Layered theme: `layers[0]` is the base, later layers are overlays merged in order. Names are
+/// used in diagnostics and in generated metadata pointers (`name#/json/pointer`).
+pub fn parseLayers(allocator: A, layers: []const Layer) A.Error!m.Document {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    // Enforce the byte limit before copying untrusted input into the arena.
-    if (source.len > 8 * 1024 * 1024) return .{
-        .arena = arena,
-        .diagnostic = .{ .offset = 0, .pointer = "", .message = "input exceeds 8 MiB" },
-    };
     const a = arena.allocator();
-    const owned = try a.dupe(u8, source);
-    var scanner = std.json.Scanner.initCompleteInput(a, owned);
-    defer scanner.deinit();
-    var p: Parser = .{ .a = a, .source = owned, .scanner = &scanner };
+    if (layers.len == 0) return .{ .arena = arena, .diagnostic = .{ .offset = 0, .pointer = "", .message = "no input" } };
+    // Enforce the byte limit before copying untrusted input into the arena.
+    for (layers, 0..) |layer, i| if (layer.source.len > 8 * 1024 * 1024) return .{
+        .arena = arena,
+        .diagnostic = .{ .offset = 0, .pointer = "", .message = "input exceeds 8 MiB", .layer = i },
+    };
+    const owned = try a.alloc(Layer, layers.len);
+    for (layers, owned) |layer, *o| o.* = .{ .name = try a.dupe(u8, layer.name), .source = try a.dupe(u8, layer.source) };
+    var p: Parser = .{ .a = a, .layers = owned, .source = owned[0].source };
     p.run() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidInput => {},
     };
-    return .{ .arena = arena, .source = owned, .tokens = p.tokens, .modes = p.modes, .diagnostic = p.diagnostic };
+    return .{ .arena = arena, .source = owned[0].source, .layers = owned, .tokens = p.tokens, .modes = p.modes, .diagnostic = p.diagnostic };
 }
 
 const Parser = struct {
     a: A,
+    layers: []const Layer,
+    /// Layer currently being read.
+    layer: usize = 0,
     source: []const u8,
-    scanner: *std.json.Scanner,
+    scanner: *std.json.Scanner = undefined,
     diagnostic: ?m.Diagnostic = null,
     drafts: std.ArrayList(Draft) = .empty,
     groups: std.StringHashMapUnmanaged(*Node) = .empty,
     paths: std.StringHashMapUnmanaged(*Node) = .empty,
+    /// path -> index into drafts (before sorting), for overrides.
+    draft_index: std.StringHashMapUnmanaged(usize) = .empty,
+    mode_drafts: std.ArrayList(ModeDraft) = .empty,
     sources: std.StringHashMapUnmanaged(usize) = .empty,
     tokens: []m.Token = &.{},
     modes: []m.Mode = &.{},
 
-    fn fail(p: *Parser, offset: usize, pointer: []const u8, comptime fmt: []const u8, args: anytype) E {
-        p.diagnostic = .{ .offset = offset, .pointer = pointer, .message = std.fmt.allocPrint(p.a, fmt, args) catch return error.OutOfMemory };
+    fn failIn(p: *Parser, layer: usize, offset: usize, pointer: []const u8, comptime fmt: []const u8, args: anytype) E {
+        p.diagnostic = .{ .offset = offset, .pointer = pointer, .layer = layer, .message = std.fmt.allocPrint(p.a, fmt, args) catch return error.OutOfMemory };
         return error.InvalidInput;
     }
+    fn fail(p: *Parser, offset: usize, pointer: []const u8, comptime fmt: []const u8, args: anytype) E {
+        return p.failIn(p.layer, offset, pointer, fmt, args);
+    }
     fn bad(p: *Parser, n: *const Node, comptime fmt: []const u8, args: anytype) E {
-        return p.fail(n.offset, n.pointer, fmt, args);
+        return p.failIn(n.layer, n.offset, n.pointer, fmt, args);
+    }
+    /// `file#/pointer` of a node for messages that name two declarations.
+    fn where(p: *Parser, n: *const Node) E![]const u8 {
+        const name = p.layers[n.layer].name;
+        if (name.len == 0) return n.pointer;
+        return p.formatAlloc("{s}#{s}", .{ name, n.pointer });
     }
     fn formatAlloc(p: *Parser, comptime f: []const u8, args: anytype) E![]const u8 {
         return std.fmt.allocPrint(p.a, f, args);
@@ -89,7 +122,7 @@ const Parser = struct {
     }
     fn read(p: *Parser, t: std.json.Token, offset: usize, pointer: []const u8, depth: usize) E!*Node {
         const n = try p.a.create(Node);
-        n.* = .{ .offset = offset, .pointer = pointer, .value = .other };
+        n.* = .{ .offset = offset, .pointer = pointer, .value = .other, .layer = p.layer };
         switch (t) {
             .object_begin => {
                 if (depth > 64) return p.bad(n, "JSON nesting exceeds 64", .{});
@@ -108,7 +141,9 @@ const Parser = struct {
             .array_begin => return p.bad(n, "arrays are not token declarations", .{}),
             .string, .allocated_string => |s| n.value = .{ .string = s },
             .number, .allocated_number => |s| n.value = .{ .number = s },
-            .true, .false, .null => {},
+            .true => n.value = .{ .boolean = true },
+            .false => n.value = .{ .boolean = false },
+            .null => {},
             else => return p.bad(n, "expected JSON value", .{}),
         }
         return n;
@@ -150,18 +185,34 @@ const Parser = struct {
         return false;
     }
     fn run(p: *Parser) E!void {
-        const first = try p.next("");
-        const root = try p.read(first.token, first.offset, "", 1);
-        if ((try p.next("")).token != .end_of_document) return p.bad(root, "unexpected trailing input", .{});
-        try p.keys(root, &.{ "$version", "$schema", "$modes", "tokens", "semantic" });
-        const version = try p.require(root, "$version");
-        if (version.value != .number) return p.bad(version, "expected $version 1", .{});
-        const v = std.fmt.parseFloat(f64, version.value.number) catch return p.bad(version, "expected $version 1", .{});
-        if (v != 1) return p.bad(version, "unsupported $version", .{});
-        if (root.value.object.get("$schema")) |n| _ = try p.text(n);
-        try p.readModes(root);
-        try p.materials(try p.require(root, "tokens"), "tokens");
-        if (root.value.object.get("semantic")) |n| try p.materials(n, "semantic");
+        try p.mode_drafts.append(p.a, .{ .name = "light", .scheme = .light, .fallback_name = null, .node = null });
+        try p.mode_drafts.append(p.a, .{ .name = "dark", .scheme = .dark, .fallback_name = "light", .node = null });
+        var base_root: *Node = undefined;
+        for (p.layers, 0..) |layer, li| {
+            p.layer = li;
+            p.source = layer.source;
+            var scanner = std.json.Scanner.initCompleteInput(p.a, layer.source);
+            defer scanner.deinit();
+            p.scanner = &scanner;
+            const first = try p.next("");
+            const root = try p.read(first.token, first.offset, "", 1);
+            if ((try p.next("")).token != .end_of_document) return p.bad(root, "unexpected trailing input", .{});
+            if (li == 0) base_root = root;
+            try p.keys(root, &.{ "$version", "$schema", "$modes", "tokens", "semantic" });
+            const version = try p.require(root, "$version");
+            if (version.value != .number) return p.bad(version, "expected $version 1", .{});
+            const v = std.fmt.parseFloat(f64, version.value.number) catch return p.bad(version, "expected $version 1", .{});
+            if (v != 1) return p.bad(version, "unsupported $version", .{});
+            if (root.value.object.get("$schema")) |n| _ = try p.text(n);
+            try p.collectModes(root);
+            // The base must declare `tokens`; an overlay may carry only `semantic`.
+            if (li == 0) {
+                try p.materials(try p.require(root, "tokens"), "tokens");
+            } else if (root.value.object.get("tokens")) |n| try p.materials(n, "tokens");
+            if (root.value.object.get("semantic")) |n| try p.materials(n, "semantic");
+        }
+        try p.finishModes(base_root);
+        try p.defaultRoles();
         std.mem.sort(Draft, p.drafts.items, {}, struct {
             fn less(_: void, l: Draft, r: Draft) bool {
                 return std.mem.lessThan(u8, l.token.path, r.token.path);
@@ -175,23 +226,41 @@ const Parser = struct {
         for (p.drafts.items) |*draft| draft.expr = try p.expression(.{ .category = draft.token.category }, draft.node, std.mem.startsWith(u8, draft.token.source_path, "tokens."), true, true);
         try p.resolveModes();
     }
-    fn readModes(p: *Parser, root: *Node) E!void {
-        var ds: std.ArrayList(ModeDraft) = .empty;
-        try ds.append(p.a, .{ .name = "light", .scheme = .light, .fallback_name = null, .node = null });
-        try ds.append(p.a, .{ .name = "dark", .scheme = .dark, .fallback_name = "light", .node = null });
-        if (root.value.object.get("$modes")) |n| {
-            const obj = try p.object(n);
-            if (obj.count() > 62) return p.bad(n, "mode count exceeds 64 including light/dark", .{});
-            for (obj.keys(), obj.values()) |key, child| {
-                try p.checkName(child, key);
-                for ([_][]const u8{ "light", "dark", "value", "description", "version", "schema", "modes" }) |reserved| if (std.mem.eql(u8, key, reserved)) return p.bad(child, "reserved mode name: {s}", .{key});
-                try p.keys(child, &.{ "scheme", "fallback" });
-                const scheme = try p.text(try p.require(child, "scheme"));
-                const s = std.meta.stringToEnum(m.Scheme, scheme) orelse return p.bad(child, "scheme must be light or dark", .{});
-                const fallback = try p.text(try p.require(child, "fallback"));
-                try ds.append(p.a, .{ .name = key, .scheme = s, .fallback_name = fallback, .node = child });
+    /// `"$override": true` on an object node (token wrapper or mode); any other value is an error.
+    fn overrideFlag(p: *Parser, n: *Node) E!bool {
+        if (n.value != .object) return false;
+        const flag = n.value.object.get("$override") orelse return false;
+        if (flag.value != .boolean or !flag.value.boolean) return p.bad(flag, "$override must be true", .{});
+        return true;
+    }
+    fn collectModes(p: *Parser, root: *Node) E!void {
+        const n = root.value.object.get("$modes") orelse return;
+        const obj = try p.object(n);
+        for (obj.keys(), obj.values()) |key, child| {
+            try p.checkName(child, key);
+            for ([_][]const u8{ "light", "dark", "value", "description", "version", "schema", "modes", "override" }) |reserved| if (std.mem.eql(u8, key, reserved)) return p.bad(child, "reserved mode name: {s}", .{key});
+            try p.keys(child, &.{ "scheme", "fallback", "$override" });
+            const replace = try p.overrideFlag(child);
+            const scheme = try p.text(try p.require(child, "scheme"));
+            const s = std.meta.stringToEnum(m.Scheme, scheme) orelse return p.bad(child, "scheme must be light or dark", .{});
+            const fallback = try p.text(try p.require(child, "fallback"));
+            const draft: ModeDraft = .{ .name = key, .scheme = s, .fallback_name = fallback, .node = child };
+            for (p.mode_drafts.items) |*existing| {
+                if (!std.mem.eql(u8, existing.name, key)) continue;
+                const previous = existing.node.?;
+                if (previous.layer == child.layer) return p.bad(child, "duplicate mode: {s}", .{key});
+                if (!replace) return p.bad(child, "mode {s} is already declared at {s}; add \"$override\": true to this mode to replace it", .{ key, try p.where(previous) });
+                existing.* = draft;
+                break;
+            } else {
+                if (replace) return p.bad(child, "$override on mode {s}, but no lower layer declares it", .{key});
+                if (p.mode_drafts.items.len == 64) return p.bad(n, "mode count exceeds 64 including light/dark", .{});
+                try p.mode_drafts.append(p.a, draft);
             }
         }
+    }
+    fn finishModes(p: *Parser, root: *Node) E!void {
+        const ds = &p.mode_drafts;
         std.mem.sort(ModeDraft, ds.items, {}, struct {
             fn less(_: void, l: ModeDraft, r: ModeDraft) bool {
                 return std.mem.lessThan(u8, l.name, r.name);
@@ -226,18 +295,71 @@ const Parser = struct {
     fn collect(p: *Parser, layer: []const u8, category: m.Category, path: []const u8, n: *Node) E!void {
         const composite = category == .shadow or category == .typography;
         if (!composite and n.value == .object and !hasDollar(n.value.object)) {
-            if (p.paths.get(path)) |previous| return p.bad(n, "token/group conflict: {s}; first declaration {s}", .{ path, previous.pointer });
-            try p.groups.put(p.a, path, n);
+            // A group may span layers (an overlay adds members to a base group).
+            if (p.paths.get(path)) |previous| return p.bad(n, "token/group conflict: {s}; first declaration {s}", .{ path, try p.where(previous) });
+            const slot = try p.groups.getOrPut(p.a, path);
+            if (!slot.found_existing) slot.value_ptr.* = n;
             for (n.value.object.keys(), n.value.object.values()) |key, child| {
                 try p.checkName(child, key);
                 try p.collect(layer, category, try p.formatAlloc("{s}.{s}", .{ path, key }), child);
             }
         } else {
-            if (p.paths.get(path)) |previous| return p.bad(n, "duplicate token: {s}; first declaration {s}", .{ path, previous.pointer });
-            if (p.groups.get(path)) |previous| return p.bad(n, "token/group conflict: {s}; first declaration {s}", .{ path, previous.pointer });
+            const replace = try p.overrideFlag(n);
+            const source_path = try p.formatAlloc("{s}.{s}", .{ layer, path });
+            if (p.groups.get(path)) |previous| return p.bad(n, "token/group conflict: {s}; first declaration {s}", .{ path, try p.where(previous) });
+            if (p.paths.get(path)) |previous| {
+                if (previous.layer == n.layer) return p.bad(n, "duplicate token: {s}; first declaration {s}", .{ path, try p.where(previous) });
+                if (!replace) return p.bad(n, "{s} is already declared at {s}; write {{\"$override\": true, \"$value\": ...}} to replace it", .{ path, try p.where(previous) });
+                const draft = &p.drafts.items[p.draft_index.get(path).?];
+                if (!std.mem.eql(u8, draft.token.source_path, source_path)) return p.bad(n, "an override must stay in the same layer: {s} is declared as {s}", .{ path, draft.token.source_path });
+                draft.node = n;
+                draft.token.offset = n.offset;
+                draft.token.pointer = n.pointer;
+                draft.token.layer = n.layer;
+                try p.paths.put(p.a, path, n);
+                return;
+            }
+            if (replace) return p.bad(n, "$override on {s}, but no lower layer declares it", .{path});
             if (p.drafts.items.len == 65536) return p.bad(n, "token count exceeds 65536", .{});
             try p.paths.put(p.a, path, n);
-            try p.drafts.append(p.a, .{ .token = .{ .path = path, .source_path = try p.formatAlloc("{s}.{s}", .{ layer, path }), .category = category, .offset = n.offset, .pointer = n.pointer }, .node = n });
+            try p.draft_index.put(p.a, path, p.drafts.items.len);
+            try p.drafts.append(p.a, .{ .token = .{ .path = path, .source_path = source_path, .category = category, .offset = n.offset, .pointer = n.pointer, .layer = n.layer }, .node = n });
+        }
+    }
+    /// `path` with `_` in its last segment spelled `-` (the other accepted spelling of a name).
+    fn hyphenated(p: *Parser, path: []const u8) E![]const u8 {
+        const out = try p.a.dupe(u8, path);
+        const start = (std.mem.lastIndexOfScalar(u8, out, '.') orelse 0) + 1;
+        for (out[start..]) |*c| if (c.* == '_') {
+            c.* = '-';
+        };
+        return out;
+    }
+    fn declared(p: *Parser, path: []const u8) E!?[]const u8 {
+        if (p.paths.contains(path) or p.groups.contains(path)) return path;
+        const alt = try p.hyphenated(path);
+        if (p.paths.contains(alt) or p.groups.contains(alt)) return alt;
+        return null;
+    }
+    /// Component roles (roles.zig) the theme omits become aliases of their default target, so a
+    /// theme written before a role existed keeps compiling and keeps its appearance. Declared roles
+    /// and roles whose target the theme lacks are left alone.
+    fn defaultRoles(p: *Parser) E!void {
+        outer: for (roles.component_roles) |role| {
+            if (try p.declared(role.path) != null) continue;
+            const target = (try p.declared(role.target)) orelse continue;
+            const source = for (p.drafts.items) |d| {
+                if (std.mem.eql(u8, d.token.path, target)) break d.token.source_path;
+            } else continue :outer; // the target is a group, not a token
+            const dot = std.mem.indexOfScalar(u8, role.path, '.').?;
+            const category = std.meta.stringToEnum(m.Category, role.path[0..dot]).?;
+            const n = try p.a.create(Node);
+            n.* = .{
+                .offset = 0,
+                .pointer = try p.formatAlloc("/semantic/{s}/{s}", .{ role.path[0..dot], role.path[dot + 1 ..] }),
+                .value = .{ .string = try p.formatAlloc("{{{s}}}", .{source}) },
+            };
+            try p.collect("semantic", category, role.path, n);
         }
     }
     fn newExpr(p: *Parser, rule: Rule, n: *Node) E!*Expr {
@@ -258,7 +380,7 @@ const Parser = struct {
             const obj = n.value.object;
             if (obj.get("$value")) |child| {
                 if (!metadata) return p.bad(n, "metadata wrapper is only allowed at token root", .{});
-                try p.keys(n, &.{ "$value", "$description" });
+                try p.keys(n, &.{ "$value", "$description", "$override" });
                 if (obj.get("$description")) |d| _ = try p.text(d);
                 return p.expression(rule, child, base, false, modes);
             }

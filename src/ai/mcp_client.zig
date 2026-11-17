@@ -704,11 +704,14 @@ pub const Client = struct {
             }
             const end = std.mem.indexOfScalar(u8, self.input.items, '\n').?;
             const elapsed = self.handler_elapsed;
-            const result = try self.message(self.input.items[0..end], number, cancel);
+            // A complete reply is consumed even when JSON-RPC reports an
+            // error. The legacy handshake reuses this stream after a rejected
+            // discovery request and must not see that reply a second time.
+            const result = self.message(self.input.items[0..end], number, cancel);
             deadline += self.handler_elapsed - elapsed;
             std.mem.copyForwards(u8, self.input.items, self.input.items[end + 1 ..]);
             self.input.shrinkRetainingCapacity(self.input.items.len - end - 1);
-            if (result) |response| return response;
+            if (try result) |response| return response;
         }
     }
     pub fn initialize(self: *Client, cancel: ?*Provider.CancelToken) !void {

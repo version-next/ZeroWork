@@ -1,0 +1,15 @@
+//! “新消息”提示（用户拍板新增，Pencil W1PaA 滚动跟随，ai-redesign-c）：读者上翻离开底部后来了新回复时，在对话视口
+//! 底部、输入框上方 8 居中显示原生 `W.Button` secondary sm“新消息”（向下箭头）。点它平滑回到底部并恢复跟随；读者
+//! 自己滚到底时消失。显隐是宿主经 `ai_new_messages_view.zig` 写的信号，规则在 `ai_tail_follow.zig`。
+const ui = @import("ui");
+const W = ui.widgets;
+const IdSpace = @import("../../shared/view/ai_id_space.zig").IdSpace;
+const S = @import("ai_new_messages.yss");
+
+pub fn NewMessages(space: IdSpace, shown: bool, onJump: ?Handler(void) = null) View {
+    return (
+        <row testId={space.id("ai.new_messages")} style={S.holder} visible={shown}>
+            <W.Button testId={space.id("ai.new_messages.jump")} label="新消息" iconAsset={ui.icons.arrow_down} variant={.secondary} size={.sm} a11yLabel="有新消息，回到底部" onClick={onJump} />
+        </row>
+    );
+}

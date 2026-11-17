@@ -1,4 +1,5 @@
 /** Real Metal window evidence using only public Harness queries and actions. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -52,7 +53,8 @@ async function one(id: string): Promise<Node> {
   const nodes = await query(id); assert.equal(nodes.length, 1, id); assert(shown(nodes[0]), id); return nodes[0];
 }
 async function active(): Promise<number> {
-  const nodes = flatten(await one("tabs.strip")).filter(n => /^tabs\.close\.\d+$/.test(n.test_id ?? "") && n.focusable === true);
+  // 稿 3 / ZW4 Tab: only the active surface is 33 high.
+  const nodes = flatten(await one("tabs.strip")).filter(n => /^tabs\.tab\.\d+$/.test(n.test_id ?? "") && Math.abs(n.rect.h - 33) < 0.5);
   assert.equal(nodes.length, 1); return Number(nodes[0].test_id.split(".").at(-1));
 }
 async function click(id: string) { assert((await clickTestId(id)).ok, id); }
@@ -125,12 +127,13 @@ try {
   for (let id = 2; id <= 7; id++) await createTab(id);
   await waitFor(async () => (await query("tabs.all")).some(shown) || null);
   await click("tabs.all");
-  await waitFor(async () => (await query("tabs.picker")).some(shown) || null);
+  await waitFor(async () => (await query("tabs.all.menu")).some(shown) || null);
   await sleep(200);
-  const picker = await one("tabs.picker");
-  await capture("picker", ["tabs.picker", "tabs.strip"]);
-  assert.equal(picker.rect.w, 420); assert.equal(picker.rect.h, 270);
-  report.checks.push({ name: "seven-tab overflow picker", status: "passed", viewport: [860, 480], rect: picker.rect, screenshot: "picker.png" });
+  const picker = await one("tabs.all.menu");
+  await capture("picker", ["tabs.all.menu", "tabs.strip"]);
+  // 稿 3 “⌄ n”: zenit's native Menu, 240 wide, one row per hidden tab.
+  assert.equal(picker.rect.w, 240);
+  report.checks.push({ name: "seven-tab overflow menu", status: "passed", viewport: [860, 480], rect: picker.rect, screenshot: "picker.png" });
   assert((await key("escape")).ok);
   }
   if (child.exitCode === null && child.signalCode === null) report.stats = await stats();
@@ -141,7 +144,7 @@ try {
   report.status = nativeIme ? "captured" : "passed";
 } catch (error) {
   failure = error; report.status = "failed"; report.error = String(error);
-  if (child.exitCode === null && child.signalCode === null) await capture("failure", ["tabs.rename", "tabs.picker", "tabs.strip"]).catch(() => {});
+  if (child.exitCode === null && child.signalCode === null) await capture("failure", ["tabs.rename", "tabs.all.menu", "tabs.strip"]).catch(() => {});
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   await Promise.race([ended, sleep(2000)]);

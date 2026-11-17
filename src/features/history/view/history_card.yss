@@ -1,0 +1,63 @@
+//! 会话记录卡片的排版（设计稿 Pencil「ZW · 会话记录卡片补稿 2026-11-13（PL4b）」）。卡片框、按钮、
+//! 输入框、标签、分隔线、弹层、滚动区都是原生组件默认外观；这里只写布局、正文文字（字号 / 换行 /
+//! token 墨色）与选中行的列表选中底色，不写原生组件的背景、圆角、阴影、玻璃。
+const ui = @import("ui");
+
+/// 卡片根 / 内容根：填满宿主给的槽（统一窗口外观的内容区，或 tab 的内容区）。
+style root { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; }
+
+style header_action { width: fit; height: fit; flex-shrink: 0; }
+
+style body { width: fill; min-width: 0; height: fill; min-height: 0; direction: row; }
+style vertical_divider { width: fit; height: fill; flex-shrink: 0; }
+style horizontal_divider { width: fill; height: fit; flex-shrink: 0; }
+
+/// 列表栏：并排时宽 320；窄卡片只显示列表时填满。
+recipe List {
+  base { height: fill; min-width: 0; min-height: 0; direction: column; flex-shrink: 0; }
+  flag alone { width: grow; flex-shrink: 1; } else { width: 320; }
+}
+style list_body { width: fill; min-width: 0; height: fill; min-height: 0; direction: column; gap: 8; padding: 8; }
+style filters { width: fill; min-width: 0; height: 28; direction: row; align-items: center; gap: 4; flex-shrink: 0; }
+style anchor { direction: column; align-items: end; flex-shrink: 0; }
+style viewport { width: fill; min-width: 0; height: fill; min-height: 0; direction: column; }
+style scroll { width: fill; min-width: 0; height: fill; min-height: 0; }
+style rows { width: fill; min-width: 0; direction: column; gap: 2; }
+style paging { width: fill; height: 28; direction: row; justify: end; align-items: center; gap: 8; flex-shrink: 0; }
+style message_row { width: fill; direction: row; flex-shrink: 0; }
+recipe Message {
+  base { font-size: 12; line-height: 1.4; wrap: word; selectable: false; }
+  flag warning { color: warning; } else { color: fg-secondary; }
+}
+style retry { width: fill; direction: row; flex-shrink: 0; }
+
+recipe Record {
+  base { width: fill; min-width: 0; height: 56; direction: row; align-items: start; gap: 8; padding: 6 6 6 8; corner-radius: 6; flex-shrink: 0; }
+  flag selected { background: list-selection-bg; }
+}
+style record_icon { width: 16; height: 16; flex-shrink: 0; margin: 2 0 0 0; icon-color: fg-secondary; }
+style record_main { width: grow; min-width: 0; direction: column; gap: 2; }
+style record_meta { width: fill; min-width: 0; height: 18; direction: row; align-items: center; gap: 8; }
+style record_tail { width: fill; min-width: 0; height: 26; direction: row; align-items: center; gap: 4; }
+style grow { width: grow; min-width: 0; direction: row; }
+/// 记录标题 / 详情文字节点自身的盒：填满、可收缩到 0，文字单行省略号截断（与设置窗口扩展列表同一写法）。
+style text_box { width: fill; min-width: 0; }
+style record_title { font-size: 12.5; font-weight: 500; color: fg-primary; wrap: none; text-overflow: ellipsis; selectable: false; }
+style record_date { flex-shrink: 0; font-size: 11; color: fg-secondary; selectable: false; }
+style record_detail { font-size: 11; color: fg-secondary; wrap: none; text-overflow: ellipsis; selectable: false; }
+
+/// 空状态的槽：原生 `W.Empty` 填满它。
+style empty { width: fill; height: 240; direction: column; }
+style placeholder { width: fill; height: fill; direction: column; align-items: center; justify: center; gap: 6; padding: 16; }
+style placeholder_hint { font-size: 12; color: fg-secondary; wrap: word; selectable: false; }
+
+style confirmation { width: fill; direction: column; gap: 6; padding: 12; }
+style confirmation_title { font-size: 13; font-weight: 500; color: fg-primary; wrap: word; selectable: false; }
+style confirmation_actions { width: fill; direction: row; align-items: center; gap: 8; padding: 6 0 0 0; }
+
+style detail { width: grow; min-width: 0; height: fill; min-height: 0; direction: column; }
+style detail_header { width: fill; height: 36; direction: row; align-items: center; gap: 8; padding: 0 8 0 12; flex-shrink: 0; }
+style detail_title { flex-shrink: 0; max-width: 240; font-size: 12.5; font-weight: 500; color: fg-primary; text-overflow: ellipsis; selectable: false; }
+style detail_meta { width: grow; min-width: 0; font-size: 11; color: fg-secondary; text-overflow: ellipsis; selectable: false; }
+/// 只读回放表面的插槽（终端视图由宿主放进来，填满）。
+style surface { width: fill; height: fill; min-height: 0; direction: column; }

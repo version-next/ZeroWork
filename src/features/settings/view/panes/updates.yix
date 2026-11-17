@@ -1,0 +1,74 @@
+//! 关于与更新（第 8 类）面板正文（P3 3e 第二批）：版本卡（应用图标、名称、版本 / 构建信息、状态徽标、检查更新）与更新偏好
+//! （自动检查、更新通道、上次检查、发布来源）。文案 / id / 搜索词在 `model/pane_fields.zig` 的 `updates`；
+//! 更新器状态来自宿主（`HostStatus.update`，宿主每帧比较指纹、变了才重新投影），检查更新与发布来源经 `Intent.runCommand`。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const U = @import("updates.yss");
+const F = m.fields.updates;
+
+const version = &F.version;
+const preferences = &F.preferences;
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn versionShown(vm: *m.ViewModel) bool {
+    return vm.paneShown(version);
+}
+/// 状态徽标的颜色（旧 `badgeInk`）：未检查中性、进行中强调、已准备 / 无需更新成功、失败 / 收尾警示。
+fn badgeColor(vm: *m.ViewModel) W.TagColor {
+    return switch (vm.updateTone()) {
+        .idle => .neutral,
+        .active => .accent,
+        .done => .success,
+        .warning => .warning,
+    };
+}
+
+/// 版本卡（`TLM17`）：页头“ZeroWork” + 状态徽标；正文是身份行与更新块。
+fn VersionPane(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.updates.version" style={S.pane} visible={versionShown(vm)}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>ZeroWork</text>
+                <spacer />
+                <W.Tag testId="settings.updates.badge" label={vm.updateBadge()} color={badgeColor(vm)} size={.sm} />
+            </box>
+            <box style={U.card}>
+                <box style={U.identity}>
+                    <box style={U.app_mark}>
+                        <icon src={ui.icons.terminal} style={U.app_mark_icon} />
+                    </box>
+                    <box style={U.identity_text}>
+                        <text style={U.app_name}>ZeroWork</text>
+                        <text testId="settings.updates.version_text" style={U.version_text} box={U.version_text_box}>{vm.updateVersionText()}</text>
+                    </box>
+                </box>
+                <box style={U.Banner.of(.{ .available = vm.updateAvailable() })}>
+                    <box style={U.banner_text}>
+                        <text style={U.banner_title}>{vm.updateTitle()}</text>
+                        <text style={U.banner_note}>Apple Silicon · macOS 13 或更新版本</text>
+                    </box>
+                    <W.Button testId="settings.updates.open" label={vm.updateButton()} variant={.primary} disabled={vm.updateButtonDisabled()} onClick={send(vm, m.Intent.runCommand(.check_updates))} />
+                </box>
+            </box>
+        </box>
+    );
+}
+
+pub fn UpdatesPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.updates" style={S.category_panes}>
+            <VersionPane vm={vm} />
+            <R.Pane vm={vm} pane={preferences}>
+                <R.ToggleRow vm={vm} pane={preferences} row={F.auto_check} />
+                <R.ValueRow vm={vm} pane={preferences} row={F.channel} value={vm.updateChannel()} />
+                <R.ValueRow vm={vm} pane={preferences} row={F.last_check} value={vm.updateLastCheck()} />
+                <R.LinkRow vm={vm} pane={preferences} row={F.source} icon={ui.icons.external_link} />
+            </R.Pane>
+        </box>
+    );
+}

@@ -1,12 +1,13 @@
 /** V3 builtin composite document acceptance through the real Local PTY and native Surface. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
-import {spawn,execFileSync} from 'node:child_process';
+import {spawn} from 'node:child_process';
+import {readPasteboardText} from './private_pasteboard.ts';  // the run's private pasteboard (ZENIT_E2E_PASTEBOARD), never the person's clipboard
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,readdir,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep,scrollAt,mouseDown,mouseMove,mouseUp} from '../zig-out/share/zenit/harness/client.ts';
-const savedClipboard=execFileSync('/usr/bin/pbpaste');
 const out=resolve(process.argv[2]),source=resolve(process.argv[3]);await mkdir(out,{recursive:false});
 const plainBash=process.argv[4]==='plain-bash';
 const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-builtin-records-'))),rpc=join(iso,'rpc'),data=join(iso,'data'),shell=join(iso,'shell');
@@ -17,7 +18,7 @@ await writeFile(join(shell,'.zshrc'),"bindkey -e\nPS1='records%# '\n");
 // Exercise builtins independently of optional automatic shell hook deployment.
 await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_family="Menlo"\nfont_size=14\n[ssh]\nauto_shell_integration=false\n');
 await copyFile(source,join(iso,'zerowork'));await copyFile(join(source,'..','zw_ipc.so'),join(iso,'zw_ipc.so'));
-const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');const peer=spawn('python3',['e2e/builtin_records_ssh_peer.py','--out',peerOut,...(plainBash?['--plain-bash']:[])],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
+const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');assert(process.env.ZW_TEST_PYTHON,'ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used');const peer=spawn(process.env.ZW_TEST_PYTHON,['-I','e2e/builtin_records_ssh_peer.py','--out',peerOut,...(plainBash?['--plain-bash']:[])],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
 const ready=await waitFor(async()=>{try{return JSON.parse(await readFile(join(peerOut,'ready.json'),'utf8'))}catch{return null}},15000);
 await writeFile(join(data,'known_hosts'),ready.known_host);
 await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Owned records SSH"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`);
@@ -36,9 +37,26 @@ async function command(value:string){await palette();await type(value);await pre
 async function outputs(){return (await query('terminal.command.output')).filter(shown).map(content).join('\n')}
 async function records(){return (await query('terminal.command.record')).filter(shown).map(content)}
 try{
- await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await resizeWindow(1200,800);await click('sidebar.host');
- await waitFor(async()=>content(await vis('workspace.pane')).includes('sshrecords')||null,30000);await sleep(450);await click('terminal.surface');
- if(plainBash){await type("for i in {1..48}; do printf 'benchmark-line-%s\\n' \"$i\"; done");await press('return');await waitFor(async()=>content(await vis('workspace.pane')).includes('benchmark-line-48')||null,15000);report.checks.push('Ordinary bash output scrolls the initial prompt out before catalog activation, without OSC 133 prompt hooks')}
+ await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await resizeWindow(1200,800);
+ // 侧栏契约（design-r3 A2，fe28ab5b；sidebar_view.zig HostRow.onEvent）：单击主机行只选中，重复点击不连接；
+ // 选中行行尾的原生“连接”按钮（sidebar.host.connect_button）或 Return 才发起连接。
+ await click('sidebar.host');await vis('sidebar.host.connect_button');
+ // 单击后在 1.5 s 时限内持续观察：欢迎页（workspace.empty.local）一直在、没有终端出现、对端没有收到任何连接。
+ // （欢迎页本身也挂在 workspace.pane 里，所以不能用“没有 workspace.pane”判断。）
+ {const until=Date.now()+1500;while(Date.now()<until){assert((await query('workspace.empty.local')).some(shown)&&!(await query('terminal.surface')).some(shown),'A single row click only selects the host');await sleep(100)}
+  assert(!(await readdir(peerOut)).some(n=>n.startsWith('received-')||n==='pty-request.json'),'A single row click opens no SSH session')}
+ report.checks.push('A single sidebar row click only selects the host; the selected row offers the native Connect button');
+ await click('sidebar.host.connect_button');
+ await waitFor(async()=>content(await vis('workspace.pane')).includes('sshrecords')||null,30000);await click('terminal.surface');
+ if(plainBash){
+  // 提示符已出现、窗格头部圆点已是“已连接”，此时键入的文字必须原样到达远端 Shell（对端审计文件 received-1.bin）。
+  // 输入紧跟提示符，确保首段文字与 Return 原序到达，无需等待启动静默窗口。
+  const loop="for i in {1..48}; do printf 'benchmark-line-%s\\n' \"$i\"; done";await type(loop);await press('return');
+  const seen=new Set<string>();
+  await waitFor(async()=>{for(const n of (await query('notifications.detail')).filter(shown))seen.add(content(n));try{return (await readFile(join(peerOut,'received-1.bin'))).includes(Buffer.from(loop+'\r'))||null}catch{return null}},10000).catch(async()=>{
+   report.peer_received=String(await readFile(join(peerOut,'received-1.bin')).catch(()=>''));report.notifications=[...seen];
+   throw new Error('Text typed at the connected bash prompt never reached the SSH peer (peer received '+JSON.stringify(report.peer_received)+'; notifications '+JSON.stringify(report.notifications)+')')});
+  await waitFor(async()=>content(await vis('workspace.pane')).includes('benchmark-line-48')||null,15000);report.checks.push('Ordinary bash output scrolls the initial prompt out before catalog activation, without OSC 133 prompt hooks')}
  await capture('01-actual-ssh-pty');
  await palette();await capture('01-command-palette');await press('escape');await hidden('terminal.commands');
  await command('help');await waitFor(async()=>{const text=await outputs();return text.includes('@grp')&&text.includes('@up')||null});await capture('02-ssh-inline-help');report.checks.push('SSH source renders full help in the same retained composite document');
@@ -46,14 +64,14 @@ try{
  await type('@ts off');await press('return');await waitFor(async()=>(await outputs()).includes('已关闭时间戳')||null);
  await type('@');await vis('terminal.commands');await type('t');await type('s');await press('return');await waitFor(async()=>(await records()).filter(text=>text.includes('@ts')).length===3||null);report.checks.push('Bare @ opens the catalog; whole and character-by-character @ts execute locally without requiring remote prompt markers');
  const after=join(peerOut,'shell-after.txt');await type(`printf shell-after > ${JSON.stringify(after)}`);await press('return');await waitFor(async()=>{try{return await readFile(after,'utf8')==='shell-after'||null}catch{return null}},15000);await sleep(250);await capture('04-ssh-following-real-shell');report.checks.push('Following SSH bytes execute an actual shell process and appear after app records without overlap');
- const commandRow=(await query('terminal.command.record')).filter(shown).flatMap(flat).find(n=>n.tag==='text'&&n.text==='@ts');assert(commandRow);const cell=commandRow.rect.w/3;const x=commandRow.rect.x,y=commandRow.rect.y+commandRow.rect.h/2;await mouseDown(x+1,y);await mouseMove(x+2.9*cell,y);await mouseUp(x+2.9*cell,y);await sleep(180);assert.equal(execFileSync('/usr/bin/pbpaste',[],{encoding:'utf8'}),'@ts');report.checks.push('Native SSH composite drag copy returns pure command bytes and excludes marker/timestamp');await click('terminal.surface');
+ const commandRow=(await query('terminal.command.record')).filter(shown).flatMap(flat).find(n=>n.tag==='text'&&n.text==='@ts');assert(commandRow);const cell=commandRow.rect.w/3;const x=commandRow.rect.x,y=commandRow.rect.y+commandRow.rect.h/2;await mouseDown(x+1,y);await mouseMove(x+2.9*cell,y);await mouseUp(x+2.9*cell,y);await waitFor(async()=>(await readPasteboardText())!==null||null,5000);assert.equal(await readPasteboardText(),'@ts');report.checks.push('Native SSH composite drag copy returns pure command bytes and excludes marker/timestamp');await click('terminal.surface');
  await press('f',{cmd:true});await vis('terminal.search.query');await type('@ts');await waitFor(async()=>Number(content(await vis('terminal.search.count')).match(/\d+\s*\/\s*(\d+)/)?.[1])>=3||null);await capture('05-ssh-search');await click('terminal.search.close');report.checks.push('SSH search uses the retained composite document');
  await type('printf literal-at:@');assert(!(await query('terminal.commands')).some(shown));await press('u',{ctrl:true});await sleep(150);await type('@');await vis('terminal.commands');await type('@');await hidden('terminal.commands');await press('u',{ctrl:true});await sleep(150);report.checks.push('An @ inside a shell draft stays literal; @@ escapes to the shell and Ctrl+U restores catalog activation');
  const received=await readFile(join(peerOut,'received-1.bin'));assert(!received.includes(Buffer.from('@help')));assert(!received.includes(Buffer.from('@ts')));assert(received.includes(Buffer.from('printf shell-after')));report.checks.push('Actual SSH peer input contains real shell command and contains no app @help/@ts input or fake output');
  await type('exit');await press('return');await waitFor(async()=>{try{const state=JSON.parse(await readFile(join(peerOut,'closed-1.json'),'utf8'));return state.exit_code===0&&!state.transport_active||null}catch{return null}},15000);const tab=flat(await vis('tabs.strip')).find(n=>/^tabs\.tab\.\d+$/.test(n.test_id??''));assert(tab);await mouseMove(tab.rect.x+tab.rect.w-15,tab.rect.y+tab.rect.h/2);await sleep(180);await click(tab.test_id.replace('tabs.tab.','tabs.close.'));await vis('workspace.empty.local');await capture('06-ssh-normal-exit-close');report.checks.push('Actual SSH shell exit 0 and normal tab close release document anchors before native owner teardown; app remains alive with empty workspace');
  report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});process.exitCode=1}
-finally{execFileSync('/usr/bin/pbcopy',{input:savedClipboard});if(app.exitCode===null&&app.signalCode===null){app.kill('SIGTERM');await Promise.race([ended,sleep(3000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended}}peer.kill('SIGTERM');await Promise.race([peerEnded,sleep(3500)]);await peerLog.close();await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({status:report.status,error:report.error,out}))}
+finally{if(app.exitCode===null&&app.signalCode===null){app.kill('SIGTERM');await Promise.race([ended,sleep(3000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended}}peer.kill('SIGTERM');await Promise.race([peerEnded,sleep(3500)]);await peerLog.close();await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({status:report.status,error:report.error,out}))}
 } finally {
  await rm(iso,{recursive:true,force:true});
 }

@@ -1,4 +1,6 @@
 /** Isolated idle-frame measurement; does not open saved hosts or use user data. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,mkdir,copyFile,writeFile,readFile,open,realpath} from 'node:fs/promises';
@@ -17,7 +19,7 @@ execFileSync('/usr/bin/codesign',['--force','--deep','--sign',identity,'--identi
 const log=await open(join(out,'app.log'),'w');process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const app=spawn(binary,[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});
 const closed=new Promise(r=>app.once('close',r));
-const cpuSeconds=()=>{const text=execFileSync('/bin/ps',['-p',String(app.pid),'-o','time='],{encoding:'utf8'}).trim();return text.split(':').reduce((n,v)=>n*60+Number(v),0);};
+const cpuSeconds=()=>{const text=psCompat(['-p',String(app.pid),'-o','time=']).trim();return text.split(':').reduce((n,v)=>n*60+Number(v),0);};
 try{
  await h.waitForServerReady();await h.resizeWindow(1280,800);await h.sleep(2500);
  const start=await h.stats(),cpu0=cpuSeconds(),time0=performance.now();

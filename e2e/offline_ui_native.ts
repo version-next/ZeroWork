@@ -1,4 +1,5 @@
 /** Real Metal UI responsiveness through an owned SSH traffic blackhole. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import {spawn} from 'node:child_process';

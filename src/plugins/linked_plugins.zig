@@ -75,6 +75,13 @@ pub fn registerAll(host: *plugins.PluginHost, adapters: []const sessions.Adapter
         try host.register(.{
             .id = plugins.legacyId(descriptor.plugin_id),
             .display_name = descriptor.display_name,
+            // 说明只写下方 `services` 声明支撑的功能（设置页原样显示）。
+            .summary = switch (descriptor.plugin_id) {
+                .local => "本机 Shell 与终端会话",
+                .ssh => "远程终端、认证与端口转发",
+                .sftp => "目录浏览、文件读写与文件传输",
+                .external => unreachable,
+            },
             .origin = .builtin,
             .order = @intCast(@backingInt(descriptor.plugin_id)),
             .icons = switch (descriptor.plugin_id) {
@@ -111,17 +118,16 @@ pub fn registerAll(host: *plugins.PluginHost, adapters: []const sessions.Adapter
                 .sftp => bindings("sftp", &.{ "list_remote_files", "read_remote_file" }),
                 .external => unreachable,
             },
-            .ai_adapter_factory = switch (descriptor.plugin_id) {
-                .local => @import("../ui/ai_local_tools.zig").createAdapter,
-                .ssh => @import("../ui/ai_ssh_tools.zig").createAdapter,
-                .sftp => @import("../ui/ai_file_tools.zig").createAdapter,
+            // AI 能力不在清单上：由会话呈现的卡片类型声明（PLUGIN_ARCH_PLAN 2.5.8 M9）。
+            .card_type = switch (descriptor.plugin_id) {
+                .local, .ssh => card_types.ids.terminal,
+                .sftp => card_types.ids.file,
                 .external => unreachable,
             },
-            .ai_context = .{ .identity = descriptor.display_name },
             .integration = switch (descriptor.plugin_id) {
-                .local => .{ .ai = true, .retry_after_end = true },
-                .ssh => .{ .retry_after_end = true, .transport_loss = true, .auxiliary_readonly = true, .auxiliary_transfer = true, .ai = true },
-                .sftp => .{ .directory_recovery = true, .ai = true },
+                .local => .{ .retry_after_end = true },
+                .ssh => .{ .retry_after_end = true, .transport_loss = true, .auxiliary_readonly = true, .auxiliary_transfer = true },
+                .sftp => .{ .directory_recovery = true },
                 .external => unreachable,
             },
             .legacy_descriptor = descriptor,
@@ -129,10 +135,30 @@ pub fn registerAll(host: *plugins.PluginHost, adapters: []const sessions.Adapter
         });
     }
 }
+const card_types = @import("../host/card_types.zig");
+/// 宿主内置卡片类型：各 feature 声明放置约束，features/ai 给出会话卡片的 AI 声明（PL4a M1 / M9）。
+/// `kvm` 等插件定义的类型由插件清单的 `cards` 登记。
+pub fn builtinCardTypes() []const card_types.CardTypeDef {
+    const ai_feature = @import("../features/ai/mod.zig");
+    const Static = struct {
+        const definitions = [_]card_types.CardTypeDef{
+            ai_feature.card_ai.withAi(@import("../features/terminal/mod.zig").card_type, ai_feature.card_ai.terminal),
+            ai_feature.card_ai.withAi(@import("../features/files/mod.zig").card_type, ai_feature.card_ai.file),
+            @import("../features/workspace/mod.zig").session_card_type,
+            ai_feature.chat_card_type,
+            @import("../features/history/mod.zig").card_type,
+        };
+    };
+    return &Static.definitions;
+}
 pub fn initRegistry(allocator: std.mem.Allocator, adapters: []const sessions.Adapter, extra_manifests: []const plugins.PluginManifest, extra_renderers: []const plugins.RendererDefinition) !plugins.Registry {
     var host = plugins.PluginHost.init(allocator);
     defer host.deinit();
     host.apis = &supported_apis;
+    // 卡片类型只在组合根登记，随插件注册表一次性发布（在创建第一个窗口之前）；之后没有登记入口。
+    for (builtinCardTypes()) |definition| try host.registerCardType(definition);
+    host.host_tools = &@import("../ai/host_tool_catalog.zig").groups;
+    host.host_native = &@import("../ai/host_tool_catalog.zig").native;
     try registerAll(&host, adapters);
     for (extra_renderers) |renderer| try host.registerRenderer(renderer);
     for (extra_manifests) |manifest| try host.register(manifest);

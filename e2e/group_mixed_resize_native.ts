@@ -3,6 +3,7 @@
  * renderer, not a live BMC. Synthetic public Harness input only.
  * node e2e/group_mixed_resize_native.ts BINARY OUTPUT PYTHON_WITH_PARAMIKO
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -111,7 +112,7 @@ async function openAll(ready:any,run:string){
  await openKvm();assert.equal((await panes()).length,4);
 }
 function byName(ps:any[],name:string){const pane=ps.find(n=>text(n).includes(name));assert(pane,'Pane '+name);return pane}
-function geometry(ps:any[]){return Object.fromEntries(['Local Terminal','Group SSH','Group SFTP','Group KVM'].map(name=>[name,byName(ps,name).rect]))}
+function geometry(ps:any[]){return Object.fromEntries(['本地终端','Group SSH','Group SFTP','Group KVM'].map(name=>[name,byName(ps,name).rect]))}
 try{
  const ready=await h.waitFor(async()=>{if(peerError)throw peerError;try{return JSON.parse(await readFile(join(out,'peer/ready.json'),'utf8'))}catch{return null}},15000);
  const kvm={endpoint:{host:'127.0.0.1',https_port:1},username:'fixture',display:{scale:'fit',read_only_requested:true}};
@@ -125,27 +126,27 @@ try{
   await click('terminal.surface');await h.type_("printf 'Local terminal ready\\n'");await h.key('return');await joinActive(true);
   await savedHost('Group SSH');await settleRemote(ready);await joinActive(true);
   await switchLayout('全部改为上下排列');let ps=await panes();
-  await dock(byName(ps,'Local Terminal'),byName(ps,'Group SSH'),'left');ps=await panes();
+  await dock(byName(ps,'本地终端'),byName(ps,'Group SSH'),'left');ps=await panes();
   let all=flat(await visible('groups.workspace')),horizontal=all.find(n=>/^groups\.separator\./.test(n.test_id??'')&&n.rect.w>n.rect.h);assert(horizontal);await resizeDivider(horizontal,0,-90);
   all=flat(await visible('groups.workspace'));const vertical=all.find(n=>/^groups\.separator\./.test(n.test_id??'')&&n.rect.h>n.rect.w);assert(vertical);await resizeDivider(vertical,90,0);
-  ps=await panes();const f=byName(ps,'Group SFTP').rect,l=byName(ps,'Local Terminal').rect,r=byName(ps,'Group SSH').rect;
+  ps=await panes();const f=byName(ps,'Group SFTP').rect,l=byName(ps,'本地终端').rect,r=byName(ps,'Group SSH').rect;
   assert.equal(ps.length,3);assert(f.y<l.y&&f.y<r.y);assert(Math.abs(l.y-r.y)<2);assert(f.w>l.w+r.w-2);assert(l.w>r.w+100);
   report.checks.push('requested actual layout: SFTP spans top; Local left and SSH right below with unequal widths');
   report.geometry={sftp:f,local:l,ssh:r};await capture('requested-sftp-top-local-ssh-bottom');
  }else{
  await openAll(ready,'first');let ps=await panes();await capture('01-four-existing-cards');
- await dock(byName(ps,'Local Terminal'),byName(ps,'Group SSH'),'top');ps=await panes();
+ await dock(byName(ps,'本地终端'),byName(ps,'Group SSH'),'top');ps=await panes();
  await dock(byName(ps,'Group SFTP'),byName(ps,'Group KVM'),'top');ps=await panes();
- let g=geometry(ps);assert(Math.abs(g['Local Terminal'].x-g['Group SSH'].x)<1);assert(Math.abs(g['Group SFTP'].x-g['Group KVM'].x)<1);assert(g['Group SFTP'].x>g['Local Terminal'].x+100);
+ let g=geometry(ps);assert(Math.abs(g['本地终端'].x-g['Group SSH'].x)<1);assert(Math.abs(g['Group SFTP'].x-g['Group KVM'].x)<1);assert(g['Group SFTP'].x>g['本地终端'].x+100);
  const dividers=flat(await visible('groups.workspace')).filter(n=>/^groups\.separator\./.test(n.test_id??''));
- const left=dividers.find(n=>n.rect.w>n.rect.h&&n.rect.x<g['Group SFTP'].x-5),right=dividers.find(n=>n.rect.w>n.rect.h&&n.rect.x>g['Local Terminal'].x+g['Local Terminal'].w);
+ const left=dividers.find(n=>n.rect.w>n.rect.h&&n.rect.x<g['Group SFTP'].x-5),right=dividers.find(n=>n.rect.w>n.rect.h&&n.rect.x>g['本地终端'].x+g['本地终端'].w);
  assert(left&&right,'Independent horizontal dividers in both columns');
  await resizeDivider(left,0,85);ps=await panes();g=geometry(ps);
  assert(Math.abs(g['Group SSH'].y-g['Group KVM'].y)>60,'Four unequal tiles with offset horizontal boundaries');
  report.checks.push('header edge docking combines horizontal and vertical native splits; independent separator produces offset boundaries');
  await capture('02-four-mixed-offset');
  const vertical=flat(await visible('groups.workspace')).find(n=>/^groups\.separator\./.test(n.test_id??'')&&n.rect.h>n.rect.w);assert(vertical);
- const before=g['Local Terminal'].w;await resizeDivider(vertical,-70,0);ps=await panes();g=geometry(ps);assert(g['Local Terminal'].w<before-45);
+ const before=g['本地终端'].w;await resizeDivider(vertical,-70,0);ps=await panes();g=geometry(ps);assert(g['本地终端'].w<before-45);
  await capture('03-four-mixed-resized');
  const files=await readdir(join(data,'session-group-layouts'));assert.equal(files.length,1);const snapshot=JSON.parse(await readFile(join(data,'session-group-layouts',files[0]),'utf8'));assert.equal(snapshot.version,2);report.saved=snapshot;
  const savedGeometry=geometry(ps),bounds=(await visible('groups.workspace')).rect;
@@ -153,7 +154,7 @@ try{
  await stop();await openAll(ready,'restored');ps=await panes();g=geometry(ps);
  for(const name of Object.keys(g))for(const key of ['x','y','w','h'])assert(Math.abs(g[name][key]-savedGeometry[name][key])<3,'restored '+name+' '+key);
  report.checks.push('restart and explicitly reopen original ordered members: full mixed split structure and all ratios restore');await capture('04-restored-four-mixed');
- await h.resizeWindow(1280,800);await h.sleep(200);ps=await panes();g=geometry(ps);assert(Math.abs(g['Local Terminal'].x-g['Group SSH'].x)<1);assert(Math.abs(g['Group SSH'].y-g['Group KVM'].y)>40);await capture('05-mixed-window-resized');report.checks.push('window resizing preserves mixed split proportions');
+ await h.resizeWindow(1280,800);await h.sleep(200);ps=await panes();g=geometry(ps);assert(Math.abs(g['本地终端'].x-g['Group SSH'].x)<1);assert(Math.abs(g['Group SSH'].y-g['Group KVM'].y)>40);await capture('05-mixed-window-resized');report.checks.push('window resizing preserves mixed split proportions');
  const filePane=byName(ps,'Group SFTP');await click('groups.menu.'+filePane.test_id.split('.').at(-1));const menu=await visible('groups.member_menu');await clickNode(flat(menu).find(n=>n.text==='移出组，保留会话'));await h.sleep(180);assert.equal((await panes()).length,3);
  const fileTab=(await tabNodes()).find(n=>text(n).includes('Group SFTP'));assert(fileTab);await click(fileTab.test_id);await visible('files.workspace');report.checks.push('removing a nested SFTP leaf collapses only its branch and retains original file session');
  }

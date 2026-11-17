@@ -30,13 +30,17 @@ pub fn openFilePanel(sdk_opt: ?*Sdk, buffer: []u8) ?[]const u8 {
 
 // -- Clipboard --
 
+const web_clipboard = if (@import("zenit_environment").web_host) @import("../web/clipboard.zig") else struct {};
+
 pub fn clipboardAvailable(sdk_opt: ?*Sdk) bool {
+    if (comptime @import("zenit_environment").web_host) return true;
     const sdk = sdk_opt orelse return false;
     return sdk.getCapabilities().has(.clipboard);
 }
 
 /// Write to system clipboard. false = no SDK or write failure.
 pub fn clipboardSetText(sdk_opt: ?*Sdk, clip_text: []const u8) bool {
+    if (comptime @import("zenit_environment").web_host) return web_clipboard.setText(clip_text);
     const sdk = sdk_opt orelse return false;
     sdk.clipboardSetText(clip_text) catch return false;
     return true;
@@ -44,6 +48,12 @@ pub fn clipboardSetText(sdk_opt: ?*Sdk, clip_text: []const u8) bool {
 
 /// Read system clipboard into caller's buffer.
 pub fn clipboardGetText(sdk_opt: ?*Sdk, buffer: []u8) ?[]const u8 {
+    if (comptime @import("zenit_environment").web_host) {
+        const t = web_clipboard.getText() orelse return null;
+        const n = @min(t.len, buffer.len);
+        @memcpy(buffer[0..n], t[0..n]);
+        return buffer[0..n];
+    }
     const sdk = sdk_opt orelse return null;
     return sdk.clipboardGetText(buffer) catch null;
 }
@@ -59,6 +69,10 @@ pub fn clipboardGetTextAllocChecked(
     sdk_opt: ?*Sdk,
     alloc: std.mem.Allocator,
 ) system_sdk_mod.SdkError!?[]const u8 {
+    if (comptime @import("zenit_environment").web_host) {
+        const t = web_clipboard.getText() orelse return null;
+        return alloc.dupe(u8, t) catch return error.OutOfMemory;
+    }
     const sdk = sdk_opt orelse return error.NotSupported;
     return sdk.clipboardGetTextAlloc(alloc);
 }
@@ -66,6 +80,11 @@ pub fn clipboardGetTextAllocChecked(
 /// Probe clipboard for available types (text/image/file_urls). No decoding; query on-demand during
 /// Cmd+V.
 pub fn clipboardProbe(sdk_opt: ?*Sdk) system_sdk_mod.ClipboardKinds {
+    if (comptime @import("zenit_environment").web_host) {
+        var k: system_sdk_mod.ClipboardKinds = .{};
+        if (@hasField(system_sdk_mod.ClipboardKinds, "text")) k.text = web_clipboard.getText() != null;
+        return k;
+    }
     const sdk = sdk_opt orelse return .{};
     return sdk.clipboardProbe() catch .{};
 }

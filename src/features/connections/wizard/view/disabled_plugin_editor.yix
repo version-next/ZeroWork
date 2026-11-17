@@ -1,0 +1,27 @@
+//! 编辑协议插件已禁用的已保存主机（PLUGIN_ARCH_PLAN 6.2.1 Q5；Pencil XqqLV 稿 2 的 YWqSG / RfJyL）：插件没有初始化，
+//! 它的协议编辑器不可用，所以这里只改通用字段（名称；分组用侧栏右键“移动到分组”）。协议载荷原样保留、不解码也不改写；
+//! 不能连接、不能测试连接。提示是原生 info `W.Alert`，名称是原生 `W.Input`（外观为 zenit 默认）。
+//! 宿主是向导外壳（`wizard.zig`），它把这棵树挂进插件编辑器槽位，保存时只替换信封的名称。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("disabled_plugin_editor.yss");
+
+pub const ids = struct {
+    pub const root = "wizard.plugin.disabled";
+    pub const notice = "wizard.plugin.disabled.notice";
+    pub const name = "wizard.plugin.disabled.name";
+};
+
+pub fn DisabledPluginEditor(title: []const u8 = "", message: []const u8 = "", name: []const u8 = "", onName: ?Handler([]const u8) = null) View {
+    return (
+        <box testId={ids.root} style={S.root}>
+            <box testId={ids.notice} style={S.notice}>
+                <W.Alert variant={.info} title={title} message={message} />
+            </box>
+            <box style={S.field}>
+                <text style={S.label}>名称</text>
+                <W.Input value={name} onChange={onName} onSubmit={onName} parts={.{ .input_container = ids.name }} />
+            </box>
+        </box>
+    );
+}

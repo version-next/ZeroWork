@@ -12,6 +12,7 @@ const property_tree_mod = @import("property_tree.zig");
 const layer_tree_mod = @import("layer_tree.zig");
 const lowering = @import("render_engine/display_list_lowering.zig");
 const hit_runtime_mod = @import("hit_runtime.zig");
+const genie_warp = @import("zenit_genie_warp");
 
 const Node = node_mod.Node;
 const CachedRenderSlice = node_mod.CachedRenderSlice;
@@ -54,6 +55,10 @@ pub const Snapshot = struct {
     local_bounds: ComputedRect,
     local_transform_origin: Point,
     captured_world_origin: Point,
+    /// The captured node's top-left in snapshot-local space. (0, 0) for `node_rect`; with
+    /// `command_bounds` it is offset by whatever paints above / left of the node (an outer
+    /// shadow), which the local bounds include.
+    node_offset: Point = .{ .x = 0, .y = 0 },
     allocator: Allocator,
 
     fn fromCommands(
@@ -61,34 +66,13 @@ pub const Snapshot = struct {
         commands: []const DisplayItem,
         geometry: SnapshotGeometry,
         capture_origin: Point,
-        blob_store: ?*const text_blob_mod.BlobStore,
     ) !?*Snapshot {
         if (commands.len == 0) return null;
 
+        // The snapshot's own copy, payloads included (text bytes, spans, path geometry, glass):
+        // it outlives the frame and the nodes it was captured from.
         const duped = try node_mod.duplicateDisplayItems(cx.allocator, commands);
         errdefer node_mod.freeDuplicatedDisplayItems(cx.allocator, duped);
-
-        // Stage B S6 R3a: resolve text_run.content from BlobStore, paint pass emits text_run with
-        // content="" content in blob_store. Snapshot spans frames, blob_store may reset, must truly
-        // copy content over. duplicateDisplayItems already dupes content field, but if original
-        // content="" then duped content="". Here override dupe once with real content (free old
-        // empty string before alloc new).
-        if (blob_store) |bs| {
-            for (duped) |*item| {
-                switch (item.*) {
-                    .text_run => |*t| {
-                        if (t.content.len == 0 and t.blob_id != property_tree_mod.INVALID_ID) {
-                            const resolved = display_list_mod.resolveTextRunContent(bs, t.*);
-                            if (resolved.len > 0) {
-                                const new_content = try cx.allocator.dupe(u8, resolved);
-                                t.content = new_content;
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
 
         // Only commands in the capture's outer frame move. Surface contents are
         // already owner-local; shifting them again would displace their clips.
@@ -139,6 +123,7 @@ pub const Snapshot = struct {
             },
             .local_bounds = geometry.local_bounds,
             .local_transform_origin = geometry.local_transform_origin,
+            .node_offset = geometry.node_offset,
             .captured_world_origin = capture_origin,
             .allocator = cx.allocator,
         };
@@ -213,7 +198,7 @@ pub const Snapshot = struct {
         const runtime = scene_runtime.get(node.id) orelse return null;
         const capture_frame_origin = property_tree.transforms.items[runtime.transform_id].world.applyPoint(0, 0);
         const geometry = chooseSnapshotGeometry(node, items, world_origin, options, capture_frame_origin);
-        return fromCommands(cx, items, geometry, geometry.capture_origin, &text_blob_store);
+        return fromCommands(cx, items, geometry, geometry.capture_origin);
     }
 
     pub fn captureDisplayed(cx: anytype, node: *Node) !?*Snapshot {
@@ -224,13 +209,16 @@ pub const Snapshot = struct {
         const node_rect = node.rectFromWorldOrFallback();
         if (node_rect.w <= 0.001 or node_rect.h <= 0.001) return null;
 
-        // Freeze the last emitted subtree while its matching property tree and
-        // blob store are still alive. A dirty node may already contain new state;
-        // re-rendering it here would violate captureDisplayed's contract.
+        // Freeze the last emitted subtree while that frame's data is still alive (display list,
+        // property tree, layer plan, scene runtime: all reset together when the next frame
+        // begins). The tree may have changed since: a dirty node already holds new state, and
+        // nodes inside the subtree may be gone. Everything read here belongs to the frame
+        // (ids, values and payloads the frame copied), nothing is read through a node.
         if (cx.scene_runtime.get(node.id)) |runtime| {
-            const start: usize = runtime.subtree_display_item_start;
-            const end = start + runtime.subtree_display_item_count;
-            if (end > start and end <= cx.display_list.items.items.len) {
+            // Both parts of a subtree split between the prebuild prefix and the paint tail.
+            const segments = runtime.subtreeDisplaySegments();
+            const listed = cx.display_list.items.items.len;
+            if (segments[0].count + segments[1].count > 0 and segments[0].end() <= listed and segments[1].end() <= listed) {
                 var frozen: std.ArrayList(DisplayItem) = .empty;
                 defer frozen.deinit(cx.allocator);
                 var paint: std.ArrayList(@import("paint_table.zig").DisplayItem) = .empty;
@@ -257,7 +245,7 @@ pub const Snapshot = struct {
                     if (cx.scene_runtime.get(parent.id)) |parent_runtime| parent_runtime.effect_id else INVALID_ID
                 else
                     INVALID_ID;
-                try lowering.appendSnapshotDisplayItems(&ctx, start, end, parent_effect_id);
+                try lowering.appendSnapshotDisplayItems(&ctx, &segments, parent_effect_id);
                 var parent_inverse = Transform2D.identity();
                 var effect_id = parent_effect_id;
                 while (effect_id != INVALID_ID and effect_id < cx.property_tree.effects.items.len) {
@@ -271,7 +259,7 @@ pub const Snapshot = struct {
                 const frame_origin = parent_inverse.mul(cx.property_tree.transforms.items[runtime.transform_id].world).applyPoint(0, 0);
                 const world_rect = node.globalRect();
                 const geometry = chooseSnapshotGeometry(node, frozen.items, .{ .x = world_rect.x, .y = world_rect.y }, options, frame_origin);
-                return fromCommands(cx, frozen.items, geometry, geometry.capture_origin, null);
+                return fromCommands(cx, frozen.items, geometry, geometry.capture_origin);
             }
         }
         if (node.frame_state.state_bits.dirty.core.layout) return null;
@@ -286,6 +274,119 @@ pub const Snapshot = struct {
         scale: f32,
     ) !void {
         if (opacity <= 0.001 or scale <= 0.001 or self.commands.commands.len == 0) return;
+        const frame = draw_ctx.content_from_world;
+        const transformed_frame = frame.a != 1 or frame.b != 0 or frame.c != 0 or frame.d != 1 or frame.tx != 0 or frame.ty != 0;
+        const use_layer_transform = transformed_frame or @abs(scale - 1.0) > 0.0001 or origin.x != 0 or origin.y != 0 or opacity < 0.999;
+        const local = Transform2D.translation(origin.x, origin.y).mul(
+            Transform2D.scale(scale, scale, self.local_transform_origin.x, self.local_transform_origin.y),
+        );
+        return self.appendWithTransform(draw_ctx, local, opacity, use_layer_transform, .{});
+    }
+
+    /// Draw the snapshot through an arbitrary affine map from snapshot-local space (the captured
+    /// node's top-left is the origin) to world space, for example a non-uniform scale that maps
+    /// the captured rect onto another rect (anchor transitions). Always composited as one layer,
+    /// so `opacity` applies to the whole picture.
+    pub fn appendTransformed(
+        self: *const Snapshot,
+        draw_ctx: DrawContext,
+        local_to_world: Transform2D,
+        opacity: f32,
+    ) !void {
+        if (opacity <= 0.001 or self.commands.commands.len == 0) return;
+        const t = local_to_world;
+        if (!std.math.isFinite(t.a) or !std.math.isFinite(t.b) or !std.math.isFinite(t.c) or
+            !std.math.isFinite(t.d) or !std.math.isFinite(t.tx) or !std.math.isFinite(t.ty)) return;
+        if (@abs(t.a * t.d - t.b * t.c) <= 0.000001) return;
+        return self.appendWithTransform(draw_ctx, local_to_world, opacity, true, .{});
+    }
+
+    /// How `appendWarped` composites the snapshot.
+    pub const WarpedDraw = struct {
+        /// Affine composite (snapshot-local to world): what backends without a mesh composite
+        /// draw, and the layer's placement when `genie` is null.
+        fallback: Transform2D,
+        /// Where the snapshot rests (snapshot-local to world, no scale): the layer texture is
+        /// rasterized on the target's pixel grid there, so the texture lands texel-for-pixel on
+        /// the live node at rest and stays the same texture for the whole run.
+        rest: Transform2D,
+        opacity: f32,
+        /// Stable identity of the layer texture across frames (GPU retained surface): with the
+        /// content unchanged, the renderer rasterizes the snapshot once and only composites the
+        /// cached texture afterwards. INVALID = rasterize every frame.
+        surface_id: u32 = display_list_mod.INVALID_SURFACE_ID,
+        /// Version of the frozen content under `surface_id` (non-zero; a new snapshot gets a new
+        /// one): the renderer keys the cached texture by it instead of hashing the commands.
+        content_version: u32 = 0,
+        /// Genie mesh composite (window coordinates); `local` is filled in from the captured node
+        /// rect (`node_w` x `node_h` at `node_offset`).
+        genie: ?genie_warp.Warp = null,
+        node_w: f32 = 0,
+        node_h: f32 = 0,
+        /// Transparent margin around the texture (logical px), so the warped outline is filtered
+        /// instead of cut by the mesh edge.
+        margin: f32 = 0,
+    };
+
+    /// Draw the snapshot as one cached layer texture: through `genie` (mesh) where the renderer
+    /// supports it, else through `fallback`. The texture is keyed by `surface_id`.
+    pub fn appendWarped(self: *const Snapshot, draw_ctx: DrawContext, d: WarpedDraw) !void {
+        if (d.opacity <= 0.001 or self.commands.commands.len == 0) return;
+        const t = d.fallback;
+        if (!std.math.isFinite(t.a) or !std.math.isFinite(t.b) or !std.math.isFinite(t.c) or
+            !std.math.isFinite(t.d) or !std.math.isFinite(t.tx) or !std.math.isFinite(t.ty)) return;
+        if (@abs(t.a * t.d - t.b * t.c) <= 0.000001) return;
+        var g: ?genie_warp.Warp = d.genie;
+        if (g) |*w| w.local = .{ self.node_offset.x, self.node_offset.y, d.node_w, d.node_h };
+        return self.appendWithTransform(draw_ctx, d.fallback, d.opacity, true, .{
+            .surface_id = d.surface_id,
+            .content_version = d.content_version,
+            .rest_origin = .{ d.rest.tx, d.rest.ty },
+            .genie = g,
+            .margin = @max(d.margin, 0),
+        });
+    }
+
+    fn restOrigin(frame: Transform2D, r: [2]f32) [2]f32 {
+        const p = frame.applyPoint(r[0], r[1]);
+        return .{ p.x, p.y };
+    }
+
+    fn mapRect(frame: Transform2D, r: [4]f32) [4]f32 {
+        const m = frame.transformRect(.{ .x = r[0], .y = r[1], .w = r[2], .h = r[3] });
+        return .{ m.x, m.y, m.w, m.h };
+    }
+
+    const LayerExtras = struct {
+        surface_id: u32 = display_list_mod.INVALID_SURFACE_ID,
+        content_version: u32 = 0,
+        rest_origin: ?[2]f32 = null,
+        genie: ?genie_warp.Warp = null,
+        margin: f32 = 0,
+    };
+
+    /// Map that draws the snapshot so the captured node's own rect (`node_w` x `node_h` at
+    /// `node_offset`) covers `dst`, whatever geometry mode it was captured with; what paints
+    /// outside the node (an outer shadow) is drawn around `dst`, scaled alike.
+    pub fn nodeRectToRect(self: *const Snapshot, node_w: f32, node_h: f32, dst: ComputedRect) Transform2D {
+        return rectToRect(node_w, node_h, dst).mul(Transform2D.translation(-self.node_offset.x, -self.node_offset.y));
+    }
+
+    /// Map that draws the snapshot so the captured node rect (local `(0, 0, w, h)`) covers `dst`.
+    pub fn rectToRect(node_w: f32, node_h: f32, dst: ComputedRect) Transform2D {
+        const sx = if (node_w > 0.0001) dst.w / node_w else 0;
+        const sy = if (node_h > 0.0001) dst.h / node_h else 0;
+        return Transform2D.translation(dst.x, dst.y).mul(Transform2D.scale(sx, sy, 0, 0));
+    }
+
+    fn appendWithTransform(
+        self: *const Snapshot,
+        draw_ctx: DrawContext,
+        local: Transform2D,
+        opacity: f32,
+        use_layer_transform: bool,
+        extras: LayerExtras,
+    ) !void {
 
         // Snapshot internal IR = DisplayItem (local coords, pulled by offsetDisplayItem to (0,0)
         // origin). appendTo writes two outlets:
@@ -313,27 +414,37 @@ pub const Snapshot = struct {
             .clip_id = if (host) |h| h.clip_id else INVALID_ID,
         };
         const frame = draw_ctx.content_from_world;
-        const transformed_frame = frame.a != 1 or frame.b != 0 or frame.c != 0 or frame.d != 1 or frame.tx != 0 or frame.ty != 0;
-        const use_layer_transform = transformed_frame or @abs(scale - 1.0) > 0.0001 or origin.x != 0 or origin.y != 0 or opacity < 0.999;
 
         var begin_item: ?display_list_mod.DisplayItem = null;
         if (use_layer_transform) {
-            const draw_transform = frame.mul(Transform2D.translation(origin.x, origin.y)).mul(
-                Transform2D.scale(
-                    scale,
-                    scale,
-                    self.local_transform_origin.x,
-                    self.local_transform_origin.y,
-                ),
-            );
-            const draw_bounds = draw_transform.transformRect(self.local_bounds);
+            const draw_transform = frame.mul(local);
+            const m = extras.margin;
+            const bounds: ComputedRect = .{ .x = self.local_bounds.x - m, .y = self.local_bounds.y - m, .w = self.local_bounds.w + 2 * m, .h = self.local_bounds.h + 2 * m };
+            var draw_bounds = draw_transform.transformRect(bounds);
+            var genie: genie_warp.Warp = .{};
+            if (extras.genie) |g0| {
+                // Window coordinates into the content frame (the overlay root: identity).
+                var g = g0;
+                g.home = mapRect(frame, g.home);
+                g.anchor = mapRect(frame, g.anchor);
+                genie = g;
+                // The genie draws in window coordinates (localized like the content frame); the
+                // envelope (damage / cull) covers both the mesh and the affine fallback.
+                const gb = genie_warp.localBounds(g, .{ bounds.x, bounds.y, bounds.w, bounds.h });
+                const wb = frame.transformRect(.{ .x = gb[0], .y = gb[1], .w = gb[2], .h = gb[3] });
+                const x0 = @min(draw_bounds.x, wb.x);
+                const y0 = @min(draw_bounds.y, wb.y);
+                const x1 = @max(draw_bounds.x + draw_bounds.w, wb.x + wb.w);
+                const y1 = @max(draw_bounds.y + draw_bounds.h, wb.y + wb.h);
+                draw_bounds = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+            }
             begin_item = .{
                 .begin_opacity_layer = .{
                     .header = CONTROL,
-                    .x = self.local_bounds.x,
-                    .y = self.local_bounds.y,
-                    .w = self.local_bounds.w,
-                    .h = self.local_bounds.h,
+                    .x = bounds.x,
+                    .y = bounds.y,
+                    .w = bounds.w,
+                    .h = bounds.h,
                     .opacity = opacity,
                     .use_draw_transform = true,
                     .draw_transform = draw_transform,
@@ -341,6 +452,10 @@ pub const Snapshot = struct {
                     .draw_y = draw_bounds.y,
                     .draw_w = draw_bounds.w,
                     .draw_h = draw_bounds.h,
+                    .surface_rest_origin = if (extras.rest_origin) |r| restOrigin(frame, r) else null,
+                    .genie = genie,
+                    .surface_stable_id = extras.surface_id,
+                    .surface_content_version = extras.content_version,
                 },
             };
         }
@@ -370,13 +485,13 @@ pub const Snapshot = struct {
                 .push_clip => |it| {
                     if (it.shape_kind == .polygon) {
                         const dup = try draw_ctx.frame_allocator.create(display_list_mod.ClipPolygon);
-                        dup.* = it.polygon;
+                        dup.* = display_list_mod.ClipPolygon.of(it.polygon);
                         paint_item.clip_polygon_ptr = dup;
                     }
                 },
                 .begin_blur_layer => |it| {
-                    const dup = try draw_ctx.frame_allocator.create(@TypeOf(it.glass));
-                    dup.* = it.glass;
+                    const dup = try draw_ctx.frame_allocator.create(@TypeOf(it.glass.*));
+                    dup.* = it.glass.*;
                     paint_item.glass_ptr = dup;
                 },
                 .icon_rep => |it| {
@@ -467,6 +582,7 @@ fn unionBounds(acc: ?ComputedRect, next: ComputedRect) ComputedRect {
 
 const SnapshotGeometry = struct {
     offset_origin: Point,
+    node_offset: Point = .{ .x = 0, .y = 0 },
     capture_origin: Point,
     local_bounds: ComputedRect,
     local_transform_origin: Point,
@@ -497,6 +613,7 @@ fn chooseSnapshotGeometry(node: *Node, commands: []const DisplayItem, world_orig
     const resolved_origin = node.style.transform_origin().resolve(node_rect.w, node_rect.h);
     const bounds = bounds_opt orelse return .{
         .offset_origin = .{ .x = 0, .y = 0 },
+        .node_offset = capture_frame_origin,
         .capture_origin = world_origin,
         .local_bounds = ComputedRect.init(0, 0, node_rect.w, node_rect.h),
         .local_transform_origin = resolved_origin,
@@ -515,6 +632,7 @@ fn chooseSnapshotGeometry(node: *Node, commands: []const DisplayItem, world_orig
         // Tight command bounds use their own origin; preserve the node's pivot
         // relative to that origin for later scale animation.
         .offset_origin = .{ .x = bounds.x, .y = bounds.y },
+        .node_offset = .{ .x = capture_frame_origin.x - bounds.x, .y = capture_frame_origin.y - bounds.y },
         .capture_origin = world_origin,
         .local_bounds = ComputedRect.init(0, 0, bounds.w, bounds.h),
         .local_transform_origin = .{
@@ -552,4 +670,16 @@ test "snapshot localization preserves text font and fade and rectangle shape" {
         .shape = 1,
     } }, -20, -10).fill_rect;
     try std.testing.expectEqual(@as(u8, 1), ellipse.shape);
+}
+
+test "Snapshot.rectToRect maps the captured rect onto any destination rect" {
+    const m = Snapshot.rectToRect(120, 80, .{ .x = 20, .y = 10, .w = 40, .h = 20 });
+    const r = m.transformRect(.{ .x = 0, .y = 0, .w = 120, .h = 80 });
+    try std.testing.expectApproxEqAbs(@as(f32, 20), r.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), r.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), r.w, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), r.h, 0.0001);
+    // A degenerate source collapses to a zero map instead of dividing by zero.
+    const z = Snapshot.rectToRect(0, 80, .{ .x = 5, .y = 5, .w = 40, .h = 20 });
+    try std.testing.expectEqual(@as(f32, 0), z.a);
 }

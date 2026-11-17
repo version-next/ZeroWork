@@ -1,0 +1,37 @@
+//! The AI composer area (Pencil Kaf7E ③ / ⑤ / A7 / A8 / A11): the request queue, the decision
+//! panel and one native compound `W.Textarea` — attachment chips in its header row, the tool row
+//! (`Controls.ToolRow`, with Send / Stop) in its footer — and the “稍后处理” capsule above it.
+//! The host keeps the Textarea's `TextareaResult` through the `note` handle (IME, paste, drop,
+//! ↑↓ history and the send route stay on its edit state); margins, height, visibility and the
+//! Send / Stop state are the view-model's (`ai_composer_view.zig`).
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("ai_composer.yss");
+const M = @import("ai_composer_view.zig");
+const Controls = @import("ai_composer_controls.yix");
+const Interaction = @import("ai_composer_interaction.yix");
+
+fn keep(vm: *M.View, root: *ui.view.Ref(*ui.Node), queue: *ui.view.Ref(*ui.Node), chips: *ui.view.Ref(*ui.Node), panel: *ui.view.Ref(*ui.Node), capsule: *ui.view.Ref(*ui.Node)) void {
+    vm.keep(root.get(), queue.get(), chips.get(), panel.get(), capsule.get());
+}
+
+pub fn Composer(vm: *M.View, note: *ui.view.Ref(W.input.TextareaResult)) View {
+    const root = ref();
+    const queue = ref();
+    const chips = ref();
+    const panel = ref();
+    const capsule = ref();
+    onMount(keep(vm, root, queue, chips, panel, capsule));
+    return (
+        <col ref={root} testId={vm.space.id("ai.composer")} style={S.area.of(.{ .pad = M.padding(vm), .h = M.height(vm) })} visible={M.shown(vm)}>
+            <box ref={queue} style={S.slot} />
+            <Interaction.Interaction ref={panel} m={M.interaction(vm)} />
+            <W.Textarea ref={note} value={M.prompt(vm)} size={.md} rows={1} autoRows={.{ .min = 1, .max = 6 }} placeholder="继续提问…" onChange={|t| M.promptChanged(vm, t)} visible={M.fieldShown(vm)} headerVisible={M.headerShown(vm)} parts={.{ .input = vm.space.id("ai.prompt") }}
+                header={<box ref={chips} style={S.chips} />}
+                footer={<Controls.ToolRow m={M.controls(vm)} />} />
+            <box style={S.capsule.of(.{ .side = M.side(vm) })}>
+                <Interaction.PendingCapsule ref={capsule} m={M.interaction(vm)} />
+            </box>
+        </col>
+    );
+}

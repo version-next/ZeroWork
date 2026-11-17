@@ -2,6 +2,8 @@
  * node e2e/material_geometry.ts --out DIR [--binary PATH]
  * Requires an existing test-mode binary. No native picker or pixel parity claim.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10,7 +12,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep, request } from "../zig-out/share/zenit/harness/client.ts";
+// Two-level Settings window (overview → 主题 subpage; panes no longer fold): shared navigation.
+import { settingsNav } from "./settings_nav.ts";
+const nav = settingsNav();
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -102,7 +107,7 @@ const report: Record<string, unknown> = {
   status: "running", started_at: new Date().toISOString(), binary, binary_sha256: binaryHash, pid: child.pid,
   source: { ...source, png_sha256: createHash("sha256").update(fixture).digest("hex"), fixture: join(output, "fixture.png"),
     pattern: "quadrant split x=272/y=96: orange, blue, green, yellow; 4px black border; x=288..351 has 8px black/white checks; all pixels opaque" },
-  expected_geometry_source: "docs/DESIGN/V0.1.2_LOCAL_TERMINAL.md §7.3; src/config/background_geometry.zig resolve; src/ui/background_repeat.zig grid. One transform in window logical coordinates; density=1 independent of Retina scale.",
+  expected_geometry_source: "docs/DESIGN/V0.1.2_LOCAL_TERMINAL.md §7.3; src/config/background_geometry.zig resolve; src/features/shell/model/background_repeat.zig grid. One transform in window logical coordinates; density=1 independent of Retina scale.",
   expected_formulas: "Fill: max(W/sw,H/sh); Fit: min(W/sw,H/sh); Center/Tile: scale=1. Origin=(window-image)*alignment fraction (0,0.5,1). Tile first=phase+floor(-phase/period)*period. Alpha=1-transparency/100; blur acts on background, not foreground.",
   visual_review: "pending", cases: [], limits: [
     "Functional pass verifies controls, real persisted config and image-node rectangles, not raster correctness. Actual screenshots require visual review for crop/tiling/alpha/blur and foreground legibility.",
@@ -125,7 +130,8 @@ async function edit(id: string, value: number): Promise<void> {
   assert((await key("return")).ok);
   await waitFor(async () => Number((await inputState(id)).buffer) === value || null);
 }
-const alignNames = [["左上", "上中", "右上"], ["左中", "居中", "右中"], ["左下", "下中", "右下"]];
+// Alignment grid option names (view_model.alignment_names): edge centres are spelled out now.
+const alignNames = [["左上", "顶部居中", "右上"], ["左侧居中", "居中", "右侧居中"], ["左下", "底部居中", "右下"]];
 function alignmentName(c: Case): string { return alignNames[["top", "center", "bottom"].indexOf(c.y)][["left", "center", "right"].indexOf(c.x)]; }
 function configValue(source: string, section: string, field: string): unknown {
   let current = "";
@@ -161,7 +167,7 @@ function sameRects(actual: Rect[], wanted: Rect[]): boolean {
   return actual.length === wanted.length && actual.every((rect, i) => (["x", "y", "w", "h"] as const).every((axis) => Math.abs(rect[axis] - wanted[i][axis]) <= 0.5));
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -183,6 +189,22 @@ async function capture(name: string): Promise<string> {
   await writeFile(join(output, `${name}.queries.json`), JSON.stringify(queries, null, 2));
   return path;
 }
+// The full-window material preview is shown in the owning main window (SettingsHost.setMaterialPreview activates
+// it), but test-mode automation stays bound to the preferences window. Bind the harness to the main window for
+// the preview, then reopen Settings from its toolbar (presentWindow rebinds the harness to the preferences window).
+async function bindMainWindow(): Promise<void> {
+  const snapshot = await request("POST", "/zerowork/windows", { action: "snapshot" });
+  assert((await request("POST", "/zerowork/windows", { action: "select", window: snapshot.windows[0].window })).ok, "bind main window");
+}
+async function boundWindow(): Promise<string | undefined> { return (await request("GET", "/windows")).windows.find((w: any) => w.bound)?.window_id; }
+async function bindSettingsWindow(): Promise<void> {
+  const main = await boundWindow();
+  await click("toolbar.settings");
+  await waitFor(async () => (await boundWindow()) !== main || null);
+  const panel = await visible("settings.panel"), viewport = await visible("settings.viewport");
+  // Returning from the preview keeps the Settings layout inside its 960×780 window (Save Bar reachable).
+  assert(panel.rect.h <= 780.5 && viewport.rect.y + viewport.rect.h <= panel.rect.y + panel.rect.h + 0.5, `settings layout fits its window after the material preview: panel ${JSON.stringify(panel.rect)} viewport ${JSON.stringify(viewport.rect)}`);
+}
 let failure: unknown;
 try {
   await waitForServerReady();
@@ -190,28 +212,31 @@ try {
   assert.equal(Number(owner.pid), child.pid);
   report.descendants_at_start = descendants();
   assert((await resizeWindow(windowSize.width, windowSize.height)).ok);
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  await click("settings.appearance.themes.header");
+  await nav.toSub("appearance", "theme");
+  await nav.reveal("settings.background.state");
   await waitFor(async () => (await visible("settings.background.state")).text?.includes("本地 · 640 × 256") || null);
   let current = { fit: "fill" as Fit, x: "center" as Horizontal, y: "center" as Vertical }, revision = 1;
   for (const c of cases) {
     const result: Record<string, unknown> = { name: c.name, controls: c, expected: expected(c), status: "running" };
     (report.cases as Record<string, unknown>[]).push(result);
+    await nav.reveal("settings.field.fit");
     if (current.fit !== c.fit) {
       await click("settings.field.fit");
+      await sleep(250); // let the chooser finish opening before picking
       await click(`settings.option.fit.${c.fit}`);
       await hidden("settings.chooser.fit");
     }
     if (current.x !== c.x || current.y !== c.y) {
       await click("settings.field.alignment");
+      await sleep(250); // let the chooser finish opening before picking
       await click(`settings.alignment.${alignmentName(c)}`);
       await hidden("settings.chooser.alignment");
     }
     await edit("settings.field.transparency", c.transparency);
     await edit("settings.field.blur_px", c.blur);
     await click("settings.save");
-    await waitFor(async () => (await visible("settings.footer.state")).text === "已保存" || null);
+    // Floating Save Bar hides once the draft is saved (was a persistent "已保存" footer).
+    await waitFor(async () => !(await query("settings.footer")).some(shown) || null);
     const saved = await readFile(configPath, "utf8");
     for (const [field, wanted] of Object.entries({ enabled: true, path: image, fit: c.fit, alignment_x: c.x, alignment_y: c.y, transparency: c.transparency })) {
       assert.equal(configValue(saved, "ui.materials.background", field), wanted, `${c.name}: persisted ${field}`);
@@ -229,9 +254,11 @@ try {
       await key("escape");
       await hidden("settings.chooser.fit");
     }
+    await nav.reveal("settings.materials.preview.open");
     await click("settings.materials.preview.open");
+    await bindMainWindow();
     await visible("settings.materials.preview.actions");
-    await hidden("settings.close");
+    await hidden("settings.panel"); // the Settings window hides during the full-window material preview
     const background = await waitFor(async () => {
       const node = (await query("appearance.background")).find(shown);
       return node && sameRects(imageRects(node), expected(c).image_rects) ? node : null;
@@ -245,7 +272,7 @@ try {
     result.status = "saved_geometry_checked_pixels_pending";
     await click("settings.materials.preview.return");
     await hidden("settings.materials.preview.actions");
-    await visible("settings.close");
+    await bindSettingsWindow();
     current = c;
   }
   report.status = "functional_checks_passed";

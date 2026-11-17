@@ -50,6 +50,8 @@ pub const Prepared = struct {
 };
 pub const Backend = struct {
     context: *anyopaque,
+    /// The UI that polls this runner (its owner binds it): the worker finishing publishes to it.
+    wake: ?*const @import("publication.zig").Wake = null,
     prepare: *const fn (*anyopaque, std.mem.Allocator, std.Io, Context) anyerror!Prepared,
     capture: ?*const fn (*anyopaque, Context) anyerror!void = null,
     completed: ?*const fn (*anyopaque, *Runner) anyerror!void = null,
@@ -114,7 +116,7 @@ pub const Native = struct {
             .openai_compat => .openai_compat,
         });
         owned.binding = .{ .client = &owned.client, .config = self.config };
-        return .{ .provider = owned.binding.asProvider(), .request = self.config.chatRequest(.{ .model = self.config.model, .system = "", .messages = &.{} }), .scope = .{ .owner = context.owner, .members = .{} }, .limits = .{ .context_window = self.config.context_window }, .context = owned, .destroy = Owned.release };
+        return .{ .provider = owned.binding.asProvider(), .request = self.config.chatRequest(.{ .model = self.config.model, .system = "", .messages = &.{} }), .scope = .{ .owner = context.owner, .content = .{ .session = 0 }, .members = .{} }, .limits = .{ .context_window = self.config.context_window }, .context = owned, .destroy = Owned.release };
     }
 };
 pub const Worker = struct {
@@ -198,6 +200,7 @@ pub const Runner = struct {
             self.failure = err;
         }
         self.state.store(if (self.worker.?.cancel.isCancelled()) .stopped else if (self.failure != null) .failed else .done, .release);
+        @import("publication.zig").publish(self.backend.wake);
     }
     fn execute(self: *Runner, io: std.Io) !provider.ChatStats {
         var prepared = try self.backend.prepare(self.backend.context, self.allocator, io, self.context.?);

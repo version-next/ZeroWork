@@ -1,0 +1,14 @@
+//! KVM 卡片浮层的布局：只排位置、尺寸与层级；外观全部是原生组件默认（Tag / Button / TooltipSurface /
+//! HintCapsule / Alert），唯一自画的是 O5 描边（accent token，2 px）。
+const ui = @import("ui");
+
+/// O1：工具栏状态区，跟在连接状态后面，宽度随内容；窄工具栏里可以收缩。
+style status { direction: row; align-items: center; gap: 6; margin: 0 0 0 6; flex-shrink: 1; min-width: 0; overflow: hidden; }
+/// O2：画面右上（宿主给出相对视频卡片的右 / 上边距），不参与命中。
+style hud($right: f32, $top: f32) { position: absolute; inset: {ui.Inset{ .right = .{ .px = $right }, .top = .{ .px = $top } }}; z-index: 2; hit-behavior: pass-through; }
+/// O3：画面底边居中，左右各留出图标列后的区间，不参与命中。
+style hint($left: f32, $width: f32, $bottom: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = $left }, .bottom = .{ .px = $bottom } }}; width: $width; direction: row; justify: center; z-index: 2; hit-behavior: pass-through; }
+/// O4：画面正中（宿主按画面与图标算出左上角与宽度）。
+style waiting($left: f32, $top: f32, $width: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = $left }, .top = .{ .px = $top } }}; width: $width; z-index: 3; }
+/// O5：视频卡片 8 pt 黑边的内侧 2 px（inset 6），不盖远程像素、不参与命中。
+style ai_frame($width: f32, $height: f32) { position: absolute; inset: {ui.Inset{ .left = .{ .px = 6 }, .top = .{ .px = 6 } }}; width: $width; height: $height; border: 2 accent; z-index: 1; hit-behavior: pass-through; }

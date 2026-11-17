@@ -7,7 +7,7 @@
 ///   highlight box geometry follows layout in before_render
 /// - Event-driven: click events via on_event switch tabs
 /// - Focusable, keyboard left/right navigation
-/// - Variants: underline, pill, icon (x size: sm, md)
+/// - Variants: underline, pill, icon, segmented (x size: sm, md)
 /// - Icon variant supports Lucide SVG icons
 /// - Closeable tabs
 /// - on_change / on_close callbacks
@@ -44,6 +44,20 @@ pub const TabsVariant = enum {
     underline,
     pill,
     tab,
+    /// Segmented control: always fills the parent's width with equal segments on a translucent
+    /// ink track (follows whatever surface it sits on), the selected segment a raised slider.
+    segmented,
+};
+
+/// How the selected tab is indicated besides its label and a11y state.
+pub const TabsIndicator = enum {
+    /// The variant's own slider / underline, following the selected tab.
+    auto,
+    /// None: something outside the component shows the selection (for example a
+    /// `W.JoinedSurface` joining the selected tab to its panel, following `active_node`).
+    /// The underline variant's baseline rule (the underline's track) goes too, so
+    /// `.underline` + `.none` is a bare row of labels; the other variants keep their track.
+    none,
 };
 
 /// Tabs size, uniformly uses ControlSize 4-step
@@ -57,6 +71,8 @@ pub const TabItem = struct {
     disabled: bool = false,
     closable: bool = false,
     badge: ?u32 = null,
+    /// Test id of this tab's node (app e2e), kept across rebuilds (items / theme change).
+    test_id: ?[]const u8 = null,
 };
 
 // Style layer (TabsSlotRecipe + variant×size spec table)
@@ -87,12 +103,19 @@ pub const TabsRuntime = struct {
     variant: TabsVariant,
     size: TabsSize,
     closable: bool,
+    block: bool = false,
     tokens: *const theme.ThemeTokens,
+    /// The view effect reads it: a theme switch re-resolves the slots and rebuilds the tabs.
+    theme: *reactive.Signal(*const theme.ThemeTokens),
     allocator: Allocator,
     cx: *Cx,
     scope: *Scope,
     tab_row: *Node,
     highlight_box: *Node,
+    /// Underline variant's bottom rule (null for the other variants)
+    separator: ?*Node = null,
+    /// Output: the selected tab's node (see TabsProps.active_node)
+    active_node: ?*reactive.Signal(?core.NodeHandle) = null,
     slots: TabsSlotRecipe.Slots,
     /// Scope of current tab subtree (hover hook, click context), whole rebuild when items change
     tabs_scope: ?*Scope = null,
@@ -119,6 +142,7 @@ pub const TabsRuntime = struct {
             h.update(std.mem.asBytes(&@intFromPtr(it.id.ptr)));
             h.update(std.mem.asBytes(&@intFromPtr(it.label.ptr)));
             h.update(std.mem.asBytes(&it.badge));
+            if (it.test_id) |tid| h.update(tid);
             h.update(&[_]u8{ @intFromBool(it.disabled), @intFromBool(it.closable), @intFromBool(it.icon_asset != null) });
         }
         return h.final();
@@ -134,6 +158,8 @@ pub const TabsRuntime = struct {
 
     /// View = f(items, active). mount snapshot passes false, effect passes true.
     fn view(self: *TabsRuntime, comptime tracked: bool) !void {
+        const t = if (tracked) self.theme.get() else self.theme.peek();
+        if (t != self.tokens) self.applyTheme(t);
         const items = self.items.read(tracked);
         const index = indexOf(items, self.active.readAs(tracked));
         const key = itemsKey(items);
@@ -145,11 +171,38 @@ pub const TabsRuntime = struct {
             self.shown_index = index;
         }
         self.active_index = index;
+        self.publishActiveNode();
         if (index != self.shown_index) {
             self.applyActiveStyles(items, index);
             self.shown_index = index;
         }
         self.tab_row.markRenderDirty();
+    }
+
+    /// Write the selected tab's node handle to `active_node` (after a rebuild or a selection change).
+    fn publishActiveNode(self: *TabsRuntime) void {
+        const out = self.active_node orelse return;
+        const children = self.tab_row.children.items;
+        const handle: ?core.NodeHandle = if (self.item_count > 0 and self.active_index < self.item_count and self.active_index + 1 < children.len) blk: {
+            const tab = children[self.active_index + 1];
+            const generation = self.cx.node_registry.trackGeneration(tab) catch break :blk null;
+            break :blk .{ .id = tab.id, .generation = generation };
+        } else null;
+        const old = out.peek();
+        const same = if (old) |o| (if (handle) |h| o.id == h.id and o.generation == h.generation else false) else handle == null;
+        if (!same) out.set(handle);
+    }
+
+    /// Theme switch: re-resolve the slots, restyle the row, slider and rule, and drop the built
+    /// key so the tabs rebuild with the new colors (as a fresh mount would build them).
+    fn applyTheme(self: *TabsRuntime, t: *const theme.ThemeTokens) void {
+        self.tokens = t;
+        self.slots = TabsSlotRecipe.resolve(.{ .variant = self.variant, .size = self.size }, t);
+        self.tab_row.setStyleInline(self.allocator, tabRowStyle(self.slots, self.block));
+        self.highlight_box.setStyleInline(self.allocator, highlightStyle(self.slots, self.variant == .underline));
+        if (self.separator) |rule| rule.setBackground(t.tokens.color.separator);
+        self.built_key = null;
+        self.shown_index = std.math.maxInt(usize);
     }
 
     fn viewEffect(self: *TabsRuntime) void {
@@ -170,7 +223,7 @@ pub const TabsRuntime = struct {
             if (i < items.len and items[i].disabled) continue;
             const resolved = if (is_active) active_style else tab_style;
             const text_color = resolved.text_color orelse t.tokens.color.fg_secondary;
-            const icon_tint = if (is_active and self.variant == .tab) t.tokens.color.accent else t.tokens.color.fg_secondary;
+            const icon_tint = if (is_active and self.variant != .underline) t.tokens.color.accent else t.tokens.color.fg_secondary;
             updateTabDescendants(tab_node, text_color, icon_tint, is_active);
         }
     }
@@ -203,6 +256,7 @@ pub const TabsRuntime = struct {
             .is_active = i == c.active,
             .is_disabled = item.disabled,
             .show_close = item.closable or self.closable,
+            .block = self.block,
             .slots = self.slots,
         });
     }
@@ -237,6 +291,15 @@ pub const TabsRuntime = struct {
         }
     }
 
+    /// Home / End: the first / last enabled tab.
+    fn edge(self: *TabsRuntime, last: bool) void {
+        const items = self.items.peek();
+        for (0..items.len) |k| {
+            const i = if (last) items.len - 1 - k else k;
+            if (!items[i].disabled) return self.select(i);
+        }
+    }
+
     /// Arrow keys: skip disabled items, cycle
     fn move(self: *TabsRuntime, forward: bool) void {
         const items = self.items.peek();
@@ -257,11 +320,49 @@ pub const TabsRuntime = struct {
     }
 };
 
+/// tab_row: row container for all tabs + highlight_box, geometry/background all from root slot
+fn tabRowStyle(slots: TabsSlotRecipe.Slots, block: bool) core.BoxStyle {
+    const root_resolved = slots.root.resolve(.{});
+    var style: core.BoxStyle = .{
+        .border_overlay = true,
+        .no_cross_stretch = true,
+        .position = .relative,
+        .gap = root_resolved.gap,
+        .padding = root_resolved.padding,
+        .align_items = .center,
+        .background = root_resolved.background,
+        .border = root_resolved.border,
+        .border_color = root_resolved.border_color,
+        .border_bottom_width = root_resolved.border_bottom_width,
+        .corner_radius = if (root_resolved.corner_radius) |cr| (if (cr > 0) cr else null) else null,
+    };
+    if (block) {
+        // In a column the fill width is a cross-axis stretch: allow it.
+        style.width = core.Sizing.fill();
+        style.no_cross_stretch = false;
+    }
+    return style;
+}
+
+/// highlight_box: absolute positioned, follows active tab (first child of tab_row)
+fn highlightStyle(slots: TabsSlotRecipe.Slots, is_underline: bool) core.BoxStyle {
+    var hl_style = slots.highlight.resolve(.{});
+    hl_style.position = .absolute;
+    // Anchored at the row's padding box: translate_x / margin_top carry the active
+    // tab's parent-relative rect, which already includes the row padding (the static
+    // position, the content box, would add the padding a second time).
+    hl_style.inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 } };
+    // The underline bar overlaps the tabs' bottom edge: paint it over their hover and
+    // pressed backgrounds. Pill and tab sliders stay under the labels.
+    if (is_underline) hl_style.z_index = 1;
+    return hl_style;
+}
+
 // tabsBeforeRender, highlight box follows
 
 /// Update text color, icon tint, and font_weight of tab descendant nodes
 fn updateTabDescendants(parent: *Node, text_color: Color, icon_tint: Color, is_active: bool) void {
-    const target_weight: u16 = if (is_active) 600 else 500;
+    const target_weight: u16 = if (is_active) 500 else 400;
     for (parent.children.items) |child| {
         _ = child.setTint(icon_tint);
         // label_wrapper: [ghost, real_text]
@@ -314,7 +415,7 @@ fn tabsBeforeRender(node: *Node) void {
             hbox.setMarginTop(r.h - 2);
             layout_changed = old_h == null or old_h.? != 2;
         },
-        .pill, .tab => {
+        .pill, .tab, .segmented => {
             const old_h = sizingPxValue(hbox.style.height);
             hbox.style.height = .{ .px = tab_rect.h };
             hbox.setMarginTop(tab_rect.y);
@@ -373,6 +474,8 @@ fn tabsKeyDown(key: core.KeyCode, _: core.Modifiers, context: ?*anyopaque) Event
     switch (key) {
         .left => rt.move(false),
         .right => rt.move(true),
+        .home => rt.edge(false),
+        .end => rt.edge(true),
         else => return .ignored,
     }
     return .handled;
@@ -404,6 +507,14 @@ pub const TabsProps = struct {
     variant: TabsVariant = .underline,
     size: TabsSize = .md,
     closable: bool = false,
+    /// Fill the parent's width, the tabs sharing it equally (a segmented control).
+    block: bool = false,
+    /// `.none` draws no slider / underline (see TabsIndicator)
+    indicator: TabsIndicator = .auto,
+    /// Output: the component writes the selected tab's node handle here (null while there are
+    /// no tabs), after every selection change and rebuild, so other elements can follow the
+    /// selected tab without reaching into the component.
+    active_node: ?*reactive.Signal(?core.NodeHandle) = null,
     /// Called after user switches and lands (the landed id)
     on_change: ?Handler([]const u8) = null,
     /// Click close button (tab id); closing itself is handled by caller updating items
@@ -422,6 +533,7 @@ const TabBuildArgs = struct {
     is_active: bool,
     is_disabled: bool,
     show_close: bool,
+    block: bool = false,
     rt: *TabsRuntime,
     tab_index: usize,
     slots: TabsSlotRecipe.Slots,
@@ -442,25 +554,16 @@ pub const TabsBuilder = struct {
         const p = self.props;
 
         const slots = TabsSlotRecipe.resolve(.{ .variant = p.variant, .size = p.size }, t);
-        const root_resolved = slots.root.resolve(.{});
         const is_underline = p.variant == .underline;
-
-        // tab_row: row container for all tabs + highlight_box, geometry/background all from root
-        // slot
-        const tab_row_style: core.BoxStyle = .{
-            .position = .relative,
-            .gap = root_resolved.gap,
-            .padding = root_resolved.padding,
-            .align_items = .center,
-            .background = root_resolved.background,
-            .corner_radius = if (root_resolved.corner_radius) |cr| (if (cr > 0) cr else null) else null,
-        };
-        // highlight_box: absolute positioned, follows active tab (first child of tab_row)
-        var hl_style = slots.highlight.resolve(.{});
-        hl_style.position = .absolute;
+        const theme_sig = try cx.themeSignal();
+        // A segmented control always shares the parent's width (the segments split it equally).
+        const block = p.block or p.variant == .segmented;
+        const tab_row_style = tabRowStyle(slots, block);
+        const hl_style = highlightStyle(slots, is_underline);
 
         var tab_row: *Node = undefined;
         var highlight_box: *Node = undefined;
+        var separator: ?*Node = null;
         // Selected state's only observable exit: its translate_x points to current active tab (e2e
         // assertion)
         const highlight = ui_view.capture(&highlight_box, ui_view.box(.{ .style = hl_style, .test_id = "tabs.highlight" }, {}));
@@ -468,16 +571,17 @@ pub const TabsBuilder = struct {
         // underline, otherwise is tab_row
         const tablist_a11y: core.A11yProps = .{ .role = .tablist, .required = true };
         const container = try ui_view.render(my_scope, cx, ui_view.branch(is_underline, ui_view.col(.{
+            .style = core.BoxStyle{ .width = if (block) core.Sizing.fill() else core.Sizing{ .fit = .{} } },
             .tag = .button,
             .focusable = true,
             .a11y = tablist_a11y,
         }, .{
             ui_view.capture(&tab_row, ui_view.row(.{ .style = tab_row_style }, .{highlight})),
-            ui_view.box(.{ .style = .{
+            ui_view.capture(&separator, ui_view.box(.{ .style = .{
                 .width = .{ .grow = .{} },
                 .height = .{ .px = 1 },
                 .background = t.tokens.color.separator,
-            } }, {}),
+            } }, {})),
         }), ui_view.capture(&tab_row, ui_view.row(.{
             .style = tab_row_style,
             .tag = .button,
@@ -487,7 +591,13 @@ pub const TabsBuilder = struct {
         // Guard stays armed until return: container remains unowned even after binding
         errdefer cx.freeNode(container);
         highlight_box.meta.ownership.meta.component_name = "TabHighlight";
-        highlight_box.applyTransition(allocator, &comptime recipe_mod.transition("translate-x 150ms ease-out, width 150ms ease-out"));
+        // Decoration only: never takes a pointer from the tab under it.
+        highlight_box.setHitTestVisible(false);
+        if (p.indicator == .none) {
+            highlight_box.setDisplay(.none);
+            if (separator) |rule| rule.setDisplay(.none);
+        }
+        try highlight_box.applyTransition(allocator, &comptime recipe_mod.transition("translate-x 150ms ease-out, width 150ms ease-out"));
 
         container.meta.ownership.meta.component_name = "Tabs";
         try core.bindScopeToNode(my_scope, container);
@@ -513,12 +623,16 @@ pub const TabsBuilder = struct {
             .variant = p.variant,
             .size = p.size,
             .closable = p.closable,
+            .block = block,
             .tokens = t,
+            .theme = theme_sig,
             .allocator = allocator,
             .cx = cx,
             .scope = my_scope,
             .tab_row = tab_row,
             .highlight_box = highlight_box,
+            .separator = separator,
+            .active_node = p.active_node,
             .slots = slots,
         };
         items_adopted = true;
@@ -565,7 +679,7 @@ fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
     const resolved = slots.tab.resolve(.{ .is_selected = is_active });
 
     const text_color = if (is_disabled)
-        t.tokens.color.fg_secondary
+        t.tokens.color.fg_disabled
     else
         resolved.text_color orelse t.tokens.color.fg_secondary;
 
@@ -597,16 +711,25 @@ fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
     if (!is_disabled) close_style.cursor = .pointer;
 
     const icon_sz = styles.tabIconSize(s);
-    const icon_asset: ?svg_assets.Asset = if (v == .tab) item.icon_asset else null;
+    const icon_asset: ?svg_assets.Asset = item.icon_asset;
 
     // All variants unified: row { icon?, label, badge?, close? }
     // Background from highlight_box, tab transparent; geometry from tab slot's derived
     var close_btn: ?*Node = null;
     const tab_node = try ui_view.render(scope, cx, ui_view.row(.{
+        .test_id = item.test_id,
         .style = .{
+            .width = if (args.block) core.Sizing.fill() else core.Sizing{ .fit = .{} },
+            .justify = if (args.block) core.Justify.center else .start,
+            // Segments split the width equally whatever their labels (CSS `flex: 1 1 0`).
+            .flex_basis = if (v == .segmented) @as(?f32, 0) else null,
+            .height = resolved.height,
+            .no_cross_stretch = true,
             .padding = resolved.padding,
             .align_items = .center,
             .gap = resolved.gap,
+            .corner_radius = resolved.corner_radius,
+            .corner_radii = resolved.corner_radii,
             .cursor = if (!is_disabled) core.CursorShape.pointer else null,
         },
         // role=tab + label + selected all required (container is role=tablist)
@@ -618,10 +741,10 @@ fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
             .item_selection = if (is_disabled) null else .{ .context = @ptrCast(click_ctx), .set = setAccessibleTabSelection },
         },
     }, .{
-        // Tab variant: icon
+        // Optional icon (any variant)
         if (icon_asset) |asset| ui_view.icon(.{
             .style = .{ .width = .{ .px = icon_sz }, .height = .{ .px = icon_sz } },
-            .tint = if (is_active) t.tokens.color.accent else t.tokens.color.fg_secondary,
+            .tint = if (is_active and v != .underline) t.tokens.color.accent else t.tokens.color.fg_secondary,
         }, asset) else null,
         // Label: ghost bold text (h=0, prevents jitter) + real text (font_weight switches
         // instantly)
@@ -637,7 +760,7 @@ fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
             ui_view.text(.{ .style = core.TextStyle{
                 .color = text_color,
                 .font_size = font_sz,
-                .font_weight = if (is_active) @as(u16, 600) else @as(u16, 500),
+                .font_weight = if (is_active) @as(u16, 500) else @as(u16, 400),
             } }, item.label),
         }),
         // badge
@@ -654,7 +777,24 @@ fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
     if (!is_disabled) {
         tab_node.behavior.events.on_event = tabClickHandler;
         tab_node.behavior.events.event_context = click_ctx;
-        _ = try hooks.useHover(scope, tab_node);
+        const hover = try hooks.useHover(scope, tab_node);
+        const pressed = try hooks.usePressed(scope, cx, tab_node);
+        const Visual = struct {
+            hover: *reactive.Signal(bool),
+            pressed: *reactive.Signal(bool),
+            node: *Node,
+            rt: *TabsRuntime,
+            index: usize,
+            fn update(c: @This()) void {
+                const hovered = c.hover.get();
+                const down = c.pressed.get();
+                const active = TabsRuntime.indexOf(c.rt.items.read(true), c.rt.active.readAs(true)) == c.index;
+                // The selected tab already shows its slider / bar: no hover or pressed fill over it.
+                const visual = c.rt.slots.tab.resolve(.{ .is_selected = active, .is_hovered = hovered and !active, .is_pressed = down and hovered and !active });
+                c.node.setBackgroundRaw(visual.background orelse Color.TRANSPARENT);
+            }
+        };
+        try scope.createEffect(Visual{ .hover = hover, .pressed = pressed, .node = tab_node, .rt = args.rt, .index = args.tab_index }, Visual.update);
         if (close_btn) |btn| {
             btn.behavior.events.on_event = tabCloseHandler;
             btn.behavior.events.event_context = click_ctx;
@@ -694,7 +834,10 @@ pub const TabPanelBuilder = struct {
     pub fn mount(self: TabPanelBuilder, scope: *Scope, cx: *Cx) !*Node {
         const p = self.props;
         const node = try ui_view.render(scope, cx, ui_view.col(.{
-            .style = .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} } },
+            // Fills what its parent leaves and never more, on both axes (the parent's direction is
+            // the caller's): content larger than the panel stays inside it, so a ScrollArea in
+            // the panel scrolls (docs/design/flex-slot-automatic-minimum.md).
+            .style = .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .min_width = 0, .min_height = 0 },
             .a11y = .{ .role = .tabpanel, .identifier = p.id },
         }, {}));
         errdefer cx.freeNode(node);
@@ -730,6 +873,58 @@ test "TabPanel: ui.view.with puts the children inside the panel, which follows a
     try std.testing.expectEqual(core.Display.none, panel.style.display);
     active.set(true);
     try std.testing.expectEqual(core.Display.flex, panel.style.display);
+}
+
+test "TabPanel: content larger than the panel stays inside it on both axes" {
+    inline for (.{ core.Direction.column, core.Direction.row }) |dir| {
+        var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = dir }, .{});
+        ctx.root = root;
+        const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+        defer scope.dispose();
+        const active = try scope.createSignal(bool, true);
+        const panel = try TabPanel(.{ .id = "files", .active = active }).mount(scope, ctx);
+        try root.appendChild(std.testing.allocator, panel);
+        // A clipping area that would scroll, over-large on both axes, then a fixed trailer.
+        const area = try core.adoptChild(ctx, std.testing.allocator, panel, try box(ctx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .min_width = 0, .min_height = 0, .overflow_hidden = true }, .{}));
+        _ = try core.adoptChild(ctx, std.testing.allocator, area, try box(ctx, .{ .width = .{ .px = 1200 }, .height = .{ .px = 1200 }, .flex_shrink = 0 }, .{}));
+        ctx.layout();
+        const r = panel.rectFromWorldOrFallback();
+        try std.testing.expect(r.w <= 400.5);
+        try std.testing.expect(r.h <= 300.5);
+    }
+}
+
+test "Tabs: indicator none hides the slider; active_node follows selection and rebuilds" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const items_a = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" } };
+    const items_b = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" }, .{ .id = "c", .label = "C" } };
+    const items = try scope.createSignal([]const TabItem, &items_a);
+    const current = try scope.createSignal(?[]const u8, "a");
+    const active_node = try scope.createSignal(?core.NodeHandle, null);
+    const tabs_node = try Tabs(.{ .items = items, .variant = .underline, .active = current, .indicator = .none, .active_node = active_node }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    // underline: column { row, rule }; both the underline and its rule are hidden.
+    const row = tabs_node.children.items[0];
+    try std.testing.expectEqual(core.Display.none, row.children.items[0].style.display);
+    try std.testing.expectEqual(core.Display.none, tabs_node.children.items[1].style.display);
+    const first = active_node.peek().?;
+    try std.testing.expectEqual(row.children.items[1].id, first.id);
+    current.set("b");
+    try std.testing.expectEqual(row.children.items[2].id, active_node.peek().?.id);
+    // Rebuild (new items): a fresh node, a fresh handle that resolves to it.
+    const before = active_node.peek().?;
+    items.set(&items_b);
+    const after = active_node.peek().?;
+    try std.testing.expect(after.id != before.id);
+    try std.testing.expectEqual(row.children.items[2], ctx.node_registry.resolveTracked(after).?);
+    try std.testing.expect(ctx.node_registry.resolveTracked(before) == null);
 }
 
 test "Tabs: basic creation (underline default)" {
@@ -872,6 +1067,71 @@ test "Tabs: pill active tab text styling" {
     try std.testing.expect(Color.eql(inactive_label.getText().?.color, ctx.tokens.tokens.color.fg_secondary));
 }
 
+test "Tabs: segmented variant fills the parent with equal segments on an ink track" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(372, 60);
+
+    const root = try box(ctx, .{ .width = .{ .px = 372 }, .height = .{ .px = 60 }, .direction = .column }, .{});
+    ctx.root = root;
+
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const items = [_]TabItem{
+        .{ .id = "batch", .label = "批处理" },
+        .{ .id = "attached", .label = "当前终端" },
+        .{ .id = "new", .label = "新工作终端" },
+    };
+    const tabs_node = try Tabs(.{ .items = &items, .variant = .segmented, .size = .sm, .active = "attached" }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    ctx.layout();
+    _ = ctx.render();
+    ctx.layout();
+
+    const t = ctx.tokens;
+    // Track: faint primary ink, padding 2, gap 2, outer radius 7 (sm), 28 tall.
+    try std.testing.expect(Color.eql(tabs_node.getBackground(), styles.segmentedTrack(t)));
+    try std.testing.expect(tabs_node.getBackground().a > 0 and tabs_node.getBackground().a < 40);
+    const row = tabs_node.rectFromWorldOrFallback();
+    try std.testing.expectApproxEqAbs(@as(f32, 372), row.w, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 28), row.h, 0.5);
+    // Three equal segments of (372 - 2·2 - 2·2) / 3.
+    const seg_w: f32 = (372.0 - 4.0 - 4.0) / 3.0;
+    for (tabs_node.children.items[1..4], 0..) |seg, i| {
+        const r = seg.rectFromWorldOrFallback();
+        try std.testing.expectApproxEqAbs(seg_w, r.w, 0.5);
+        try std.testing.expectApproxEqAbs(@as(f32, 24), r.h, 0.5);
+        try std.testing.expectApproxEqAbs(@as(f32, 2) + @as(f32, @floatFromInt(i)) * (seg_w + 2), r.x - row.x, 0.5);
+        const label = seg.children.items[0].children.items[1].getText().?;
+        try std.testing.expectApproxEqAbs(@as(f32, 12), label.font_size, 0.01);
+        try std.testing.expectEqual(@as(u16, if (i == 1) 500 else 400), label.font_weight);
+    }
+    // Slider: bg_primary, inner radius 5, follows the selected segment.
+    const hbox = tabs_node.children.items[0];
+    try std.testing.expect(Color.eql(hbox.getBackground(), t.tokens.color.bg_primary));
+    try std.testing.expectApproxEqAbs(seg_w, hbox.rectFromWorldOrFallback().w, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2) + seg_w + 2, hbox.style.translate_x, 0.5);
+}
+
+test "Tabs: an item's test id names its tab and survives a theme rebuild" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 40 }, .direction = .column }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const items = [_]TabItem{ .{ .id = "a", .label = "A", .test_id = "probe.tab.a" }, .{ .id = "b", .label = "B" } };
+    const tabs_node = try Tabs(.{ .items = &items, .variant = .pill }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    ctx.layout();
+    try std.testing.expectEqualStrings("probe.tab.a", tabs_node.children.items[1].meta.ownership.meta.test_id.?);
+    try std.testing.expect(tabs_node.children.items[2].meta.ownership.meta.test_id == null);
+    ctx.setTheme(&theme.dark);
+    ctx.layout();
+    _ = ctx.render();
+    try std.testing.expectEqualStrings("probe.tab.a", tabs_node.children.items[1].meta.ownership.meta.test_id.?);
+}
+
 test "Tabs: icon variant" {
     var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
@@ -894,9 +1154,9 @@ test "Tabs: icon variant" {
     try root.appendChild(std.testing.allocator, tabs_node);
 
     // children = [highlight_box, tab_a, tab_b]
-    // highlight_box should have accent_subtle background
+    // cokFx document tabs: selected page is the primary surface.
     const hbox = tabs_node.children.items[0];
-    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.accent_subtle));
+    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.bg_primary));
 
     // Each tab should have icon + label = 2 children
     const first_tab = tabs_node.children.items[1];
@@ -960,8 +1220,8 @@ test "Tabs: underline highlight box" {
     // tab_row children = [highlight_box, tab_a, tab_b]
     const hbox = tab_row.children.items[0];
     try std.testing.expectEqualStrings("TabHighlight", hbox.meta.ownership.meta.component_name.?);
-    // Underline highlight = accent background, 2px height
-    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.accent));
+    // Underline highlight = primary ink, 2px height
+    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.fg_primary));
     try std.testing.expectEqual(@as(f32, 2), hbox.style.height.px);
 }
 
@@ -1134,6 +1394,32 @@ test "Tabs: bound active — external set and clicks, disabled tab skipped by ar
     _ = tabClickHandler(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, tabs_node.children.items[3].behavior.events.event_context);
     try std.testing.expectEqualStrings("c", current.peek().?);
     try std.testing.expectEqual(@as(u32, 2), rec.changes);
+}
+
+test "Tabs: Home / End select the first / last enabled tab" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const items = [_]TabItem{
+        .{ .id = "a", .label = "A", .disabled = true },
+        .{ .id = "b", .label = "B" },
+        .{ .id = "c", .label = "C" },
+        .{ .id = "d", .label = "D" },
+        .{ .id = "e", .label = "E", .disabled = true },
+    };
+    const current = try scope.createSignal(?[]const u8, "c");
+    const tabs_node = try Tabs(.{ .items = &items, .variant = .pill, .active = current }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    ctx.layout();
+
+    try std.testing.expectEqual(EventResult.handled, ctx.dispatcher.dispatchKeyDown(tabs_node, .{ .key = .end, .modifiers = .{} }));
+    try std.testing.expectEqualStrings("d", current.peek().?); // e is disabled
+    try std.testing.expectEqual(EventResult.handled, ctx.dispatcher.dispatchKeyDown(tabs_node, .{ .key = .home, .modifiers = .{} }));
+    try std.testing.expectEqualStrings("b", current.peek().?); // a is disabled
 }
 
 var swap_buf_a = "Files".*;

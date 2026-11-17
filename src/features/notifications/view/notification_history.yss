@@ -1,0 +1,45 @@
+//! 通知历史弹层的排版。弹层面板、卡片、按钮、角标、提示都是原生组件默认外观；这里只写布局与正文文字
+//! （字号 / 换行 / token 墨色），不写背景、圆角、阴影、玻璃。
+const ui = @import("ui");
+
+/// 原生 Popover 的挂载点：弹层自己挂到窗口浮层根（portal），模板根不能为空，留一个不占位的 box。
+style popover_anchor { position: absolute; width: 0; height: 0; }
+/// 铃铛右上角的角标位置（铃铛按钮是原生 W.Button，角标绝对定位在它里面）。
+style badge_slot { position: absolute; inset: {ui.Inset{ .right = .{ .px = 0 }, .top = .{ .px = 0 } }}; width: fit; height: fit; }
+
+style panel { width: fill; height: fit; direction: column; gap: 8; }
+style filters { width: fill; direction: row; gap: 6; flex-shrink: 0; }
+/// 列表视口：随内容长高，最高 320；空态 152。
+style viewport { width: fill; height: fit; min-height: 152; max-height: 320; flex-shrink: 0; }
+style list { width: fill; direction: column; gap: 6; }
+style footer { width: fill; direction: row; justify: end; flex-shrink: 0; }
+
+/// 空状态的槽：原生 `W.Empty` 填满它（与列表视口的空态高度一致）。
+style empty { width: fill; height: 152; direction: column; }
+style secondary { font-size: 11; line-height: 1.6; color: fg-secondary; text-overflow: ellipsis; selectable: false; }
+
+style record { width: fill; direction: column; gap: 4; }
+style record_main { width: fill; direction: row; align-items: start; gap: 8; }
+recipe Severity {
+  base { width: 14; height: 14; flex-shrink: 0; margin: 2 0 0 0; }
+  variant tone = info {
+    info { icon-color: fg-secondary; }
+    success { icon-color: success; }
+    warning { icon-color: warning; }
+    danger { icon-color: danger; }
+  }
+}
+pub const Tone = Severity.Dim(.tone);
+style record_title { flex: 1; min-width: 0; font-size: 12; font-weight: 500; line-height: 1.5; color: fg-primary; wrap: word; selectable: false; }
+style age { flex-shrink: 0; max-width: 76; font-size: 10.5; line-height: 1.7; color: fg-secondary; selectable: false; }
+style indented { width: fill; padding: 0 0 0 22; }
+/// 详情：完整原因在有界滚动区里（最高 240）。
+style details { width: fill; height: fit; max-height: 240; min-height: 0; }
+style details_content { width: fill; direction: column; gap: 4; padding: 4 0 2 22; }
+recipe Detail {
+  base { font-size: 12; line-height: 1.5; wrap: word; selectable: false; }
+  flag failure { color: danger; } else { color: fg-secondary; }
+}
+style source { width: fill; direction: row; align-items: center; gap: 6; }
+style source_label { flex: 1; min-width: 0; font-size: 11; color: fg-secondary; text-overflow: ellipsis; }
+style actions { width: fill; direction: row; flex-wrap: wrap; align-items: center; justify: end; gap: 6; padding: 4 0 0 22; }

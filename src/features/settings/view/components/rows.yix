@@ -1,0 +1,556 @@
+//! 设置面板正文的行组件（P3 3e 定稿；ARCHITECTURE_PLAN §4.5 `components/rows.yix`）。
+//!
+//! 后续面板包的 API（参数签名）：
+//!
+//!     Pane(vm: *m.ViewModel, pane: *const m.PaneSpec, children: View)
+//!     ToggleRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row)       // 开关
+//!     InputRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row)        // 文本 / 数字，单位后缀、校验提示
+//!     SelectRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, options: []const W.SelectOption)
+//!     CustomSelectRow(vm, pane, row, options, noteId: []const u8, note: []const u8, placeholder: []const u8)  // 选项里有 `custom_choice`：原地编辑
+//!     DirectoryRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row)    // 目录按钮（宿主的系统目录面板）
+//!     InfoRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row)         // 只读值；路径单行省略 + 全文提示
+//!     ActionRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, icon: ?ui.SvgAsset)  // 按钮 → `Intent.runCommand`
+//!
+//! 约定：
+//! - 文案、test_id、焦点标识、单位、依赖、搜索词都在 `model/pane_fields.zig` 的条目里（`m.fields.<分类>.<字段>`），
+//!   面板文件只摆顺序、选控件；行组件不拼字符串。id 落在与旧实现相同的语义节点上：行根 `settings.row.<key>`，
+//!   开关与按钮在控件根（`testId`），输入框在 `input_container`、选择框在 `trigger`（`parts`），校验提示 `settings.error.<key>`，
+//!   帮助按钮 `settings.help.<key>`、提示面板 `….tooltip`、标签下的说明 `settings.help.content.<key>`。
+//! - 控件全部是 zenit 原生（`W.Switch` / `W.Input` / `W.Select` / `W.Button` / `W.Tooltip`），不覆盖几何、字体与颜色；
+//!   样式只在 `../styles.yss`，颜色只用 token。
+//! - 控件是“只读值 + 回调”：值来自 view-model 选择器（按 `revision` 跟随草稿），改动经 `vm.dispatch(Intent)` 上行，
+//!   由 Controller 裁决；改一个字段只让读到它的选择器重算，同页其它节点不动（没有整页重挂）。
+//! - 行的显示（子页面 / 搜索过滤）与“面板最后一行”（它下面没有分隔线）在内容页挂载时定下（`vm.rowShown` / `vm.rowLast`）。
+//! - 横切行为：帮助提示、路径 / 目录全文提示与选择框下拉的开合是 view-model 的 `popup`（整窗 Escape 先收起它）；焦点在输入框上时，
+//!   整窗 Escape 撤回它的原文并清焦点（宿主按真实焦点的 test_id 认出它，`ViewModel.consumeEscape`）；输入框带 `focusId`（`focus:field:<test_id>`，`locate_problem` 与 `focusRestore` 用）。
+const ui = @import("ui");
+/// 浮层规则的唯一来源（OverlayHost `panel`）。
+const O = @import("../../../../shared/ui/overlay/overlay_host.zig");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const S = @import("../styles.yss");
+const K = @import("../panes/keys.yss");
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn shown(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.rowShown(pane, row) and vm.infoShown(row);
+}
+fn last(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.rowLast(pane, row);
+}
+fn label(row: m.Row) []const u8 {
+    return row.label;
+}
+fn help(row: m.Row) []const u8 {
+    return row.help;
+}
+fn tipHelp(row: m.Row) bool {
+    return row.help.len != 0 and !row.inline_help;
+}
+fn inlineHelp(row: m.Row) bool {
+    return row.help.len != 0 and row.inline_help;
+}
+fn rowId(row: m.Row) []const u8 {
+    return row.ids.row;
+}
+fn fieldId(row: m.Row) []const u8 {
+    return row.ids.field;
+}
+fn errorId(row: m.Row) []const u8 {
+    return row.ids.err;
+}
+fn helpId(row: m.Row) []const u8 {
+    return row.ids.help;
+}
+fn helpTipId(row: m.Row) []const u8 {
+    return row.ids.help_tip;
+}
+fn helpTextId(row: m.Row) []const u8 {
+    return row.ids.help_text;
+}
+fn focusId(row: m.Row) []const u8 {
+    return row.ids.focus;
+}
+/// 单位后缀（没有单位时为 null：不建后缀节点，同旧实现）。
+fn unit(row: m.Row) ?[]const u8 {
+    return row.unit;
+}
+fn checked(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.boolOf(row.key.?);
+}
+fn setBool(vm: *m.ViewModel, row: m.Row, value: bool) void {
+    vm.dispatch(m.Intent.editValue(row.key.?, .{ .boolean = value }));
+}
+fn editText(vm: *m.ViewModel, row: m.Row, text: []const u8) void {
+    vm.dispatch(m.Intent.editText(row.key.?, text));
+}
+/// 选择框：“自定义 TERM 声明…”打开原地编辑（`CustomSelectRow`，值不变，下拉按草稿值复位）；其它选项直接写草稿。
+fn pick(vm: *m.ViewModel, row: m.Row, value: ?[]const u8) void {
+    const picked = value orelse return;
+    if (std.mem.eql(u8, picked, custom_choice)) {
+        vm.dispatch(m.Intent.chooseFor(row.key.?));
+        return;
+    }
+    vm.dispatch(m.Intent.editValue(row.key.?, .{ .text = picked }));
+}
+const std = @import("std");
+/// 选择框里要宿主原地编辑的选项值（旧 `settings_controls.Field.select` 的 `__custom`）。
+pub const custom_choice = "__custom";
+/// 目录行全文提示的 id（`settings.directory.tooltip`，同旧实现；也是它在 `popup` 里的名字）。
+const directory_tip = "settings.directory.tooltip";
+fn popup(vm: *m.ViewModel, id: []const u8) bool {
+    return vm.popupOpen(id);
+}
+fn setPopup(vm: *m.ViewModel, id: []const u8, open: bool) void {
+    vm.dispatch(m.Intent.popupChanged(id, open));
+}
+fn problem(vm: *m.ViewModel, row: m.Row) []const u8 {
+    return vm.fieldProblem(row);
+}
+fn invalid(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.fieldInvalid(row);
+}
+fn disabled(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.fieldDisabled(row);
+}
+fn paneId(pane: *const m.PaneSpec) []const u8 {
+    return pane.id;
+}
+fn headerId(pane: *const m.PaneSpec) []const u8 {
+    return pane.header_id;
+}
+fn summaryId(pane: *const m.PaneSpec) []const u8 {
+    return pane.summary_id;
+}
+fn title(pane: *const m.PaneSpec) []const u8 {
+    return pane.title;
+}
+fn meta(vm: *m.ViewModel, pane: *const m.PaneSpec) []const u8 {
+    return vm.paneMeta(pane);
+}
+fn paneShown(vm: *m.ViewModel, pane: *const m.PaneSpec) bool {
+    return vm.paneShown(pane);
+}
+
+/// 面板（`v8NDZM`）：页头（`QGtx5`，标题 + 右侧说明）在上，正文卡片（`V4TNB`）在下；行之间的分隔线由行自己画。
+pub fn Pane(vm: *m.ViewModel, pane: *const m.PaneSpec, children: View) View {
+    return (
+        <box testId={paneId(pane)} style={S.pane} visible={paneShown(vm, pane)}>
+            <box testId={headerId(pane)} style={S.pane_header}>
+                <text style={S.pane_title}>{title(pane)}</text>
+                <spacer />
+                <text testId={summaryId(pane)} style={S.pane_meta} box={S.pane_meta_box}>{meta(vm, pane)}</text>
+            </box>
+            <box style={S.pane_body}>{children}</box>
+        </box>
+    );
+}
+
+/// 标题旁的“?”：原生 ghost 图标按钮 + 原生 Tooltip（上方、450ms，悬停 / 聚焦 / 点击打开）。
+fn HelpTip(vm: *m.ViewModel, row: m.Row) View {
+    const tip = computed(helpTipId(row));
+    return (
+        <box style={S.help_slot} onFocus={setPopup(vm, tip, true)} onBlur={setPopup(vm, tip, false)}>
+            <W.Tooltip text={help(row)} position={.top} width={292} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                <W.Button testId={helpId(row)} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.circle_help} iconSize={14} a11yLabel={help(row)} onClick={setPopup(vm, tip, true)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+/// 文案列：标签（+“?”），易误用字段的说明直接写在标签下。
+fn Copy(vm: *m.ViewModel, row: m.Row) View {
+    return (
+        <box style={S.setting_copy}>
+            <box style={S.setting_heading}>
+                <text style={S.setting_label}>{label(row)}</text>
+                {if (tipHelp(row)) <HelpTip vm={vm} row={row} />}
+            </box>
+            {if (inlineHelp(row)) <text testId={helpTextId(row)} style={S.setting_hint} box={S.setting_hint_box}>{help(row)}</text>}
+        </box>
+    );
+}
+
+/// 行内校验提示（`settings.error.<key>`，无问题时不显示）。
+fn Problem(vm: *m.ViewModel, row: m.Row) View {
+    return <text testId={errorId(row)} style={S.setting_error} visible={invalid(vm, row)}>{problem(vm, row)}</text>;
+}
+
+/// 开关行（`ow4oe` + 原生 `W.Switch`）。
+pub fn ToggleRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    const switch_a11y = computed(switchA11y(vm, row));
+    return (
+        <box testId={rowId(row)} style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Copy vm={vm} row={row} />
+                <W.Switch testId={fieldId(row)} checked={checked(vm, row)} disabled={disabled(vm, row)} a11y={switch_a11y} onChange={|v| setBool(vm, row, v)} />
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+
+/// 输入行：原生 `W.Input`（受控：原文经 view-model 同步落地），校验问题标红并在行下提示。
+/// 单位是原生后缀（`appendText`，挂载时取值；G25 已由上游补上，S-14 收回）。
+pub fn InputRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    const fid = computed(fieldId(row));
+    return (
+        <box testId={rowId(row)} style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Copy vm={vm} row={row} />
+                <W.Input value={vm.fieldText(row)} appendText={unit(row)} width={180} invalid={invalid(vm, row)} disabled={disabled(vm, row)} focusId={focusId(row)} onChange={|t| editText(vm, row, t)} onSubmit={|t| editText(vm, row, t)} parts={.{ .input_container = fid }} />
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+
+/// 选择行：原生 `W.Select`（180 宽，下拉与触发器同宽），下拉开合归 view-model（Escape 收起）。
+pub fn SelectRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, options: []const W.SelectOption) View {
+    const fid = computed(fieldId(row));
+    return (
+        <box testId={rowId(row)} style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Copy vm={vm} row={row} />
+                <W.Select panelWidth={.trigger} options={options} value={vm.selectValue(row)} width={180} disabled={disabled(vm, row)} open={popup(vm, fid)} onOpenChange={|o| setPopup(vm, fid, o)} onChange={|v| pick(vm, row, v)} parts={.{ .trigger = fid }} />
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+
+/// 选择行 + 原地编辑（S-13，“自定义 TERM 声明…”）：选项里的 `custom_choice` 在选择框下方打开原生 `W.Popover`
+/// （手动触发：开合是 view-model 的 `popup`——点外面 / Escape 收起，锚点滚出视口收起；默认面板外观）。
+/// 里面是说明（`noteId`）与原生 `W.Input`（受控：草稿归 view-model，打开即聚焦，Enter 提交，校验失败用原生 `errorMsg`）。
+pub fn CustomSelectRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, options: []const W.SelectOption, noteId: []const u8, note: []const u8, placeholder: []const u8) View {
+    const fid = computed(fieldId(row));
+    return (
+        <box testId={rowId(row)} style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Copy vm={vm} row={row} />
+                <box style={S.custom_anchor}>
+                    <W.Select panelWidth={.trigger} options={options} value={vm.selectValue(row)} width={180} disabled={disabled(vm, row)} open={popup(vm, fid)} onOpenChange={|o| setPopup(vm, fid, o)} onChange={|v| pick(vm, row, v)} parts={.{ .trigger = fid }} />
+                    <W.Popover trigger={.manual} open={popup(vm, m.ViewModel.custom_popup)} onOpenChange={|o| setPopup(vm, m.ViewModel.custom_popup, o)} closeOnAnchorScroll={true} width={264} parts={.{ .chrome = m.ViewModel.custom_popup }} closeOnEscape={O.panel.escape} closeOnOutsideClick={O.panel.outside} consumeOutsideClick={O.consume_outside_click} trapFocus={O.panel.trap_focus}>
+                        {if (popup(vm, m.ViewModel.custom_popup)) <CustomEditor vm={vm} noteId={noteId} note={note} placeholder={placeholder} />}
+                    </W.Popover>
+                </box>
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+fn customEdit(vm: *m.ViewModel, text: []const u8) void {
+    vm.dispatch(m.Intent.customText(text));
+}
+fn customSubmit(vm: *m.ViewModel, text: []const u8) void {
+    vm.dispatch(m.Intent.customSubmit(text));
+}
+fn CustomEditor(vm: *m.ViewModel, noteId: []const u8, note: []const u8, placeholder: []const u8) View {
+    return (
+        <box style={S.custom_editor}>
+            <text testId={noteId} style={S.setting_hint} box={S.setting_hint_box}>{note}</text>
+            <W.Input value={vm.customText()} placeholder={placeholder} autoFocus={true} invalid={vm.customInvalid()} errorMsg={vm.customProblem()} onChange={|t| customEdit(vm, t)} onSubmit={|t| customSubmit(vm, t)} />
+        </box>
+    );
+}
+
+/// 目录行：原生 secondary 按钮显示当前目录（单行省略），点击交宿主的系统目录面板；悬停 / 聚焦显示全文。
+/// 提示开合归 view-model 的 `popup`（同旧 `registerTooltip`：整窗 Escape 先收起它，不关窗）。
+pub fn DirectoryRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Copy vm={vm} row={row} />
+                <W.Tooltip text={vm.fieldText(row)} width={292} open={popup(vm, directory_tip)} onOpenChange={|o| setPopup(vm, directory_tip, o)} parts={.{ .content = directory_tip }}>
+                    <W.Pressable testId={fieldId(row)} a11yLabel={vm.fieldText(row)} disabled={vm.isSaving()} style={S.DirectoryButton.of(.{ .off = vm.isSaving() })} onClick={send(vm, m.Intent.chooseFor(row.key.?))}>
+                        <icon src={ui.icons.folder} style={S.directory_icon} />
+                        <text testId="settings.directory.label" style={S.directory_label} box={S.directory_label_box}>{vm.fieldText(row)}</text>
+                    </W.Pressable>
+                </W.Tooltip>
+            </box>
+        </box>
+    );
+}
+
+/// 只读行：值右对齐；路径单行省略，悬停 / 聚焦显示全文（`settings.path.<标签>`）。提示开合归 view-model 的 `popup`
+/// （同旧 `HintFocus` + `registerTooltip`：聚焦即打开，整窗 Escape 先收起它，不关窗）。
+pub fn InfoRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    const tip = computed(helpTipId(row));
+    const value = computed(vm.infoValue(row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <text style={S.setting_label} box={S.info_label_box}>{label(row)}</text>
+                {if (vm.infoIsPath(row)) <W.Tooltip text={vm.infoValue(row)} width={292} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                    <box testId={fieldId(row)} style={S.info_value_box} focusable={true} a11y={.{ .label = value }} onFocus={setPopup(vm, tip, true)} onBlur={setPopup(vm, tip, false)}>
+                        <text style={S.info_path} box={S.info_path_box}>{vm.infoValue(row)}</text>
+                    </box>
+                </W.Tooltip> else <text style={S.info_value} box={S.info_value_box}>{vm.infoValue(row)}</text>}
+            </box>
+        </box>
+    );
+}
+
+/// 动作行：标签 + 原生按钮（危险操作用 danger 色调）；不可用且有原因时悬停 / 聚焦说明原因（`<按钮 id>.tooltip`）。
+pub fn ActionRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, icon: ?ui.SvgAsset) View {
+    const tip = computed(buttonTipId(row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <text style={S.setting_label} box={S.info_label_box}>{label(row)}</text>
+                {if (hasReason(vm, row)) <W.Tooltip text={vm.actionReason(row)} parts={.{ .content = tip }}>
+                    <ActionButton vm={vm} row={row} icon={icon} />
+                </W.Tooltip> else <ActionButton vm={vm} row={row} icon={icon} />}
+            </box>
+        </box>
+    );
+}
+fn ActionButton(vm: *m.ViewModel, row: m.Row, icon: ?ui.SvgAsset) View {
+    return <W.Button testId={fieldId(row)} label={buttonLabel(row)} variant={variant(row)} size={.sm} iconAsset={icon} iconSize={14} a11yLabel={actionA11y(vm, row)} disabled={!vm.actionEnabled(row)} focusId={actionFocus(row)} onClick={send(vm, m.Intent.runCommand(row.command.?))} />;
+}
+fn hasReason(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.actionReason(row).len != 0;
+}
+fn buttonLabel(row: m.Row) []const u8 {
+    return row.button;
+}
+fn buttonTipId(row: m.Row) []const u8 {
+    return row.ids.button_tip;
+}
+fn variant(row: m.Row) W.ButtonVariant {
+    return if (row.danger) .danger else .secondary;
+}
+fn actionA11y(vm: *m.ViewModel, row: m.Row) []const u8 {
+    const reason = vm.actionReason(row);
+    return if (reason.len != 0) reason else row.button;
+}
+/// 清理按钮的焦点标识（清理流程结束 / 取消后宿主经 `requestFocus` 回焦）；其它按钮没有。
+fn actionFocus(row: m.Row) []const u8 {
+    const command = row.command orelse return "";
+    return switch (command) {
+        .clear_all => m.focus_ids.data_clear_all,
+        .clear_logs => m.focus_ids.data_clear_logs,
+        else => "",
+    };
+}
+/// 开关的无障碍属性（原生 `label` 会把文字画在开关旁边，所以名字只进 a11y，同旧 `a11y.label = label`）。
+fn switchA11y(vm: *m.ViewModel, row: m.Row) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = row.label, .checked = vm.boolOf(row.key.?), .disabled = vm.fieldDisabled(row) };
+}
+
+// ── 快捷键行（P3 3e 第二批，人工验收反馈第 7 条；交互设计见 docs/ui-revamp/YIX_SPIKE.md“快捷键行的编辑交互”） ──
+//
+//     KeybindingRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row)   // row = m.fields.keys.row(<动作>)
+//
+// 动作名（固定动作带锁、改过未保存带“未保存”徽标）+ 键帽区（原生 `W.Pressable`：原生 `W.Kbd` 键帽，每个修饰键 / 主键一个，
+// 录制 / 无效 / 冲突用它的 accent / danger / warning 色调；
+// 淡色铅笔；悬停 / 聚焦有原生 Tooltip）+ 行尾单行恢复默认（原生 ghost 图标按钮）；行下是无效原因或冲突提示与【交换】【取消】。
+// 录制状态是 view-model 的 `key_edit` 信号，键帽区的 `onKeyDown`（组件根捕获槽）把按键交给 `vm.keyDown`；
+// 焦点离开键帽区（Tab、点别处）由它的 `onBlurWithin` 结束录制（G31；冲突态只是不再接按键）。
+
+fn act(row: m.Row) m.KeyAction {
+    return row.shortcut.?;
+}
+fn isFixed(row: m.Row) bool {
+    return m.keybinding_edit.fixed(row.shortcut.?);
+}
+fn markId(row: m.Row) []const u8 {
+    return row.ids.mark;
+}
+fn resetId(row: m.Row) []const u8 {
+    return row.ids.reset;
+}
+fn resetTipId(row: m.Row) []const u8 {
+    return row.ids.reset_tip;
+}
+fn swapId(row: m.Row) []const u8 {
+    return row.ids.swap;
+}
+fn cancelId(row: m.Row) []const u8 {
+    return row.ids.cancel;
+}
+fn fixedTipId(row: m.Row) []const u8 {
+    return row.ids.button_tip;
+}
+fn capTone(vm: *m.ViewModel, row: m.Row) W.KbdTone {
+    return switch (vm.keyTone(row.shortcut.?)) {
+        .rest => .neutral,
+        .recording => .accent,
+        .invalid => .danger,
+        .conflict => .warning,
+    };
+}
+/// 键帽区的提示只在静止时打开：录制 / 无效 / 冲突时行内已有说明，而且打开着的提示会先吃掉 Escape（框架先收起提示），
+/// 用户按一次 Esc 就该取消录制。
+fn tipOpen(vm: *m.ViewModel, row: m.Row, id: []const u8) bool {
+    return vm.popupOpen(id) and !vm.keyActive(row.shortcut.?);
+}
+fn pencilShown(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.keyEditable(row.shortcut.?) and !vm.keyActive(row.shortcut.?);
+}
+fn invalidShown(vm: *m.ViewModel, row: m.Row) bool {
+    return vm.keyPhase(row.shortcut.?) == .invalid;
+}
+fn keyDown(vm: *m.ViewModel, row: m.Row, e: ui.view.KeyPress) void {
+    if (vm.keyDown(row.shortcut.?, e.key, e.modifiers)) e.stop();
+}
+fn keyUp(vm: *m.ViewModel, row: m.Row, e: ui.view.KeyPress) void {
+    if (vm.keyUp(row.shortcut.?, e.key, e.modifiers)) e.stop();
+}
+/// 固定动作的锁：原生 ghost 图标按钮 + 原生 Tooltip “保留给应用，不可修改”（同旧 `controls.inlineHint`；悬停 / 聚焦 / 点击打开）。
+/// 聚焦开合写在外层盒子的 `onFocusWithin` / `onBlurWithin`（G31）：焦点落在里面的按钮上，盒子自己的 `onFocus` / `onBlur` 收不到。
+fn FixedHint(vm: *m.ViewModel, row: m.Row) View {
+    const tip = computed(fixedTipId(row));
+    return (
+        <box style={S.help_slot} onFocusWithin={setPopup(vm, tip, true)} onBlurWithin={setPopup(vm, tip, false)}>
+            <W.Tooltip text="保留给应用，不可修改" position={.top} width={292} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                <W.Button testId={helpId(row)} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.lock} iconSize={14} a11yLabel="保留给应用，不可修改" onClick={setPopup(vm, tip, true)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+
+pub fn KeybindingRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    const tip = computed(helpTipId(row));
+    const reset_tip = computed(resetTipId(row));
+    return (
+        <box testId={rowId(row)} style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <box style={S.setting_heading}>
+                    <text style={S.setting_label}>{label(row)}</text>
+                    {if (isFixed(row)) <FixedHint vm={vm} row={row} />}
+                    <W.Badge testId={markId(row)} label="未保存" status={.info} size={.sm} visible={vm.keyModified(act(row))} />
+                </box>
+                <box style={K.key_slot}>
+                    <W.Tooltip text={vm.keyTip(act(row))} position={.top} open={tipOpen(vm, row, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                        <W.Pressable testId={fieldId(row)} focusId={focusId(row)} a11yLabel={vm.keyA11y(act(row))} disabled={!vm.keyEditable(act(row))} selected={vm.keyActive(act(row))} style={K.KeyArea.of(.{ .tone = vm.keyTone(act(row)), .fixed = isFixed(row) })} onClick={send(vm, m.Intent.recordKey(act(row)))} onBlurWithin={send(vm, m.Intent.blurKey(act(row)))} onKeyDown={|e| keyDown(vm, row, e)} onKeyUp={|e| keyUp(vm, row, e)}>
+                            <W.Kbd keys={vm.keyCaps(act(row))} tone={capTone(vm, row)} />
+                            <text style={K.key_prompt} visible={vm.keyRecording(act(row))}>按下新快捷键…</text>
+                            <text style={K.key_escape} visible={vm.keyRecording(act(row))}>Esc 取消</text>
+                            <icon src={ui.icons.pencil} style={K.key_pencil} visible={pencilShown(vm, row)} />
+                        </W.Pressable>
+                    </W.Tooltip>
+                </box>
+                <box style={K.key_reset_slot}>
+                    <W.Tooltip text="恢复默认快捷键" position={.top} parts={.{ .content = reset_tip }}>
+                        <W.Button testId={resetId(row)} visible={vm.keyResettable(act(row))} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.rotate_ccw} iconSize={14} a11yLabel="恢复默认快捷键" onClick={send(vm, m.Intent.resetKey(act(row)))} />
+                    </W.Tooltip>
+                </box>
+            </box>
+            <box testId={errorId(row)} style={K.key_problem} visible={vm.keyProblemShown(act(row))}>
+                <text style={K.key_problem_text} box={K.key_problem_text_box} visible={invalidShown(vm, row)}>{vm.keyProblem(act(row))}</text>
+                <text style={K.key_conflict_text} box={K.key_problem_text_box} visible={vm.keyConflict(act(row))}>{vm.keyProblem(act(row))}</text>
+                <W.Button testId={swapId(row)} visible={vm.keyConflict(act(row))} label="交换" variant={.secondary} size={.xs} onClick={send(vm, m.Intent.swapKey())} />
+                <W.Button testId={cancelId(row)} visible={vm.keyConflict(act(row))} label="取消" variant={.ghost} size={.xs} onClick={send(vm, m.Intent.cancelKey())} />
+            </box>
+        </box>
+    );
+}
+
+// ── 关于与更新用到的行（P3 3e 第二批） ──
+//
+//     ValueRow(vm, pane, row: m.Row, value: Text)                 // 标签 + 右侧只读值（值由调用方给，跟随信号）
+//     LinkRow(vm, pane, row: m.Row, icon: ?ui.SvgAsset)           // 标签 + 原生 link 按钮（`row.button` / `row.command`）
+
+/// 只读值行：标签左、值右（12，次要墨色，单行），值的 test_id 是 `row.ids.field`（同旧 `settings_updates.factRow`）。
+pub fn ValueRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, value: Text) View {
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <text style={S.setting_label} box={S.info_label_box}>{label(row)}</text>
+                <text testId={fieldId(row)} style={S.info_value} box={S.info_value_box}>{value}</text>
+            </box>
+        </box>
+    );
+}
+
+/// 链接行：标签 + 原生 link 按钮（尾随外链图标：`iconPosition={.trailing}`，G33），点击发 `row.command`；保存中不可用（同旧“发布来源”）。
+pub fn LinkRow(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, icon: ?ui.SvgAsset) View {
+    const name = computed(linkA11y(row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <text style={S.setting_label} box={S.info_label_box}>{label(row)}</text>
+                <W.Button testId={fieldId(row)} label={buttonLabel(row)} variant={.link} size={.sm} iconAsset={icon} iconPosition={.trailing} iconSize={12} a11yLabel={name} disabled={vm.isSaving()} onClick={send(vm, m.Intent.runCommand(row.command.?))} />
+            </box>
+        </box>
+    );
+}
+fn linkA11y(row: m.Row) []const u8 {
+    return row.match;
+}
+
+// ── 两级导航的列表行（F-set-plugins 起；协议插件列表 `T5k96`，AI 辅助 › 服务提供方等列表页可复用） ──
+//
+//     DrillRow(vm: *m.ViewModel, item: m.DrillItem)
+//
+// 原生 `W.Pressable`（可点击根，`item.row_id`）：30 方块图标底（`item.icon` 是 `ui.icons` 的名字，找不到用 plug）+ 标题 / 摘要两行
+// （13 / 11.5，gap 1）+ 尾注（11.5，空串不显示）+ 状态标签（原生 `W.Tag`，`item.badge`，空串不显示）+ 箭头；被禁用的插件
+// （`item.muted`）图标与标题降为次要色；行内 padding [9, 0]、gap 8，与图标底 gap 12；除本组最后一行
+// （`item.last`）外底部一条发丝线（人工验收反馈 6）。点击发 `item.target`；保存中不可点（同概览行）。
+// 标题 / 摘要 / 尾注的 test_id 是 `item.title_id` / `summary_id` / `trail_id`。
+
+fn drillIcon(item: m.DrillItem) ui.SvgAsset {
+    return ui.icons.get(item.icon) orelse ui.icons.plug;
+}
+fn drillRowId(item: m.DrillItem) []const u8 {
+    return item.row_id;
+}
+fn drillTitleId(item: m.DrillItem) []const u8 {
+    return item.title_id;
+}
+fn drillSummaryId(item: m.DrillItem) []const u8 {
+    return item.summary_id;
+}
+fn drillTrailId(item: m.DrillItem) []const u8 {
+    return item.trail_id;
+}
+fn drillTitle(item: m.DrillItem) []const u8 {
+    return item.title;
+}
+fn drillSummary(item: m.DrillItem) []const u8 {
+    return item.summary;
+}
+fn drillTrail(item: m.DrillItem) []const u8 {
+    return item.trail;
+}
+fn drillHasTrail(item: m.DrillItem) bool {
+    return item.trail.len != 0;
+}
+fn drillHasBadge(item: m.DrillItem) bool {
+    return item.badge.len != 0;
+}
+fn drillBadgeColor(item: m.DrillItem) W.TagColor {
+    return if (item.badge_warning) .warning else .neutral;
+}
+fn drillLast(item: m.DrillItem) bool {
+    return item.last;
+}
+fn drillOpen(vm: *m.ViewModel, item: m.DrillItem) void {
+    vm.dispatch(item.target);
+}
+fn drillLocked(vm: *m.ViewModel) bool {
+    return vm.controlsLocked();
+}
+
+pub fn DrillRow(vm: *m.ViewModel, item: m.DrillItem) View {
+    return (
+        <W.Pressable testId={drillRowId(item)} a11yLabel={drillTitle(item)} disabled={drillLocked(vm)} onClick={drillOpen(vm, item)} style={S.DrillRow.of(.{ .locked = drillLocked(vm) })}>
+            <box style={S.overview_tile}>
+                <icon src={drillIcon(item)} style={S.DrillIcon.of(.{ .muted = item.muted })} />
+            </box>
+            <box style={S.DrillInner.of(.{ .last = drillLast(item) })}>
+                <box style={S.drill_copy}>
+                    <text testId={drillTitleId(item)} style={S.DrillTitle.of(.{ .muted = item.muted })} box={S.drill_text_box}>{drillTitle(item)}</text>
+                    <text testId={drillSummaryId(item)} style={S.drill_summary} box={S.drill_text_box}>{drillSummary(item)}</text>
+                </box>
+                <text testId={drillTrailId(item)} style={S.drill_trail} box={S.drill_trail_box} visible={drillHasTrail(item)}>{drillTrail(item)}</text>
+                {if (drillHasBadge(item)) <W.Tag testId={item.badge_id} label={item.badge} color={drillBadgeColor(item)} size={.sm} />}
+                <icon src={ui.icons.chevron_right} style={S.overview_chevron} />
+            </box>
+        </W.Pressable>
+    );
+}

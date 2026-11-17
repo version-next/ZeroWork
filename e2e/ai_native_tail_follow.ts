@@ -1,13 +1,18 @@
-/** Native conversation tail-follow regression. Explicit production mock mode,
- * no external provider or SSH requests, isolated background main application.
+/** Native conversation tail-follow regression. Own local SSE fixture provider
+ * (the env-driven ZEROWORK_AI_MOCK provider no longer exists in src), no external
+ * provider or SSH requests, isolated background main application.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { waitForServerReady, waitFor, query, clickTestId, inputState, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 
 const options: Record<string, string> = {}, args = process.argv.slice(2);
 for (let index = 0; index < args.length; index += 2) {
@@ -21,11 +26,22 @@ const rpc = join(isolated, "rpc"), data = join(isolated, "data");
 await Promise.all([mkdir(output, { recursive: true }), mkdir(rpc), mkdir(data)]);
 const binary = join(output, "zerowork-frozen"), appLog = join(output, "app.log");
 await copyFile(sourceBinary, binary);
-await writeFile(join(data, "config.toml"), '[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\nfont_size = 14\n[ai]\npermission_mode = "confirm"\n');
+const providerRequests: any[] = [], titleRequests: any[] = [];
+const server = createServer(async (req, res) => {
+  if (req.method !== "POST") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ data: [{ id: "tail-fixture", context_window: 200000 }] })); return; }
+  const body = await readRequestJson(req);
+  // The one automatic conversation-title request is not a conversation round.
+  if (String(body.messages?.find((m: any) => m.role === "system")?.content ?? "").startsWith("将用户的问题概括为简短的会话标题")) { titleRequests.push(body); res.writeHead(200, { "content-type": "text/event-stream" }); res.end("data: [DONE]\n\n"); return; }
+  providerRequests.push(body);
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: "AI provider response" } }] }) + "\n\ndata: [DONE]\n\n");
+});
+await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+const port = (server.address() as any).port;
+await writeFile(join(data, "config.toml"), `[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\nfont_size = 14\n[ai]\ndefault_provider = "tail-fixture"\npermission_mode = "confirm"\n[[ai.providers]]\nid = "tail-fixture"\nkind = "openai_compat"\nendpoint = "http://127.0.0.1:${port}/v1/chat/completions"\nenabled = true\n[[ai.providers.models]]\nname = "tail-fixture"\ncontext_window = 200000\ndefault = true\n`);
 const environment = {
   ...process.env, ZENIT_E2E_FILE_RPC_DIR: rpc, ZENIT_E2E_BACKGROUND: "1", ZENIT_E2E_ISOLATE_POINTER: "1", ZEROWORK_DATA_DIR: data,
-  ZEROWORK_AUTOCONNECT: "0", ZEROWORK_AI_MOCK: "1", ZEROWORK_AI_TOOL_TRACE: "1", ZEROWORK_AI_PROVIDER: "openai_compat",
-  ZEROWORK_AI_ENDPOINT: "http://127.0.0.1:9/v1/chat/completions", ZEROWORK_AI_MODEL: "mock", OPENAI_API_KEY: "", ANTHROPIC_API_KEY: "",
+  ZEROWORK_AUTOCONNECT: "0", ZEROWORK_AI_TOOL_TRACE: "1", OPENAI_API_KEY: "", ANTHROPIC_API_KEY: "",
 };
 process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
 const log = await open(appLog, "w");
@@ -36,10 +52,10 @@ child.once("error", error => { launchError = error; });
 const report: Record<string, any> = {
   status: "running", started_at: new Date().toISOString(), source_binary: sourceBinary, binary,
   binary_sha256: createHash("sha256").update(await readFile(binary)).digest("hex"), isolated, pid: child.pid,
-  provider: { real: false, mock_enabled: true, expected_response: "AI provider response", network_requests: 0, remote_ssh_requests: 0 },
+  provider: { real: false, local_sse_fixture: true, expected_response: "AI provider response", external_network_requests: 0, remote_ssh_requests: 0 },
   native_window: { real: true, background_isolated: true }, input: { synthetic: true, method: "public file-RPC Harness" },
   stages: [], rounds: [], checks: [],
-  limits: ["The provider is intentionally mocked; this verifies native scrolling and layout, not live transport.", "No SSH session or tool execution is requested.", "No wheel input or programmatic scroll is sent by the runner; visibility must result from production tail-follow.", "Own-process SIGTERM is not normal application close lifecycle evidence."],
+  limits: ["The provider is an own loopback SSE fixture; this verifies native scrolling and layout, not live transport.", "No SSH session or tool execution is requested.", "No wheel input or programmatic scroll is sent by the runner; visibility must result from production tail-follow.", "Own-process SIGTERM is not normal application close lifecycle evidence."],
 };
 type Rect = { x: number; y: number; w: number; h: number };
 let viewport: Rect = { x: 0, y: 0, w: 1440, h: 900 };
@@ -75,7 +91,7 @@ async function latestVisible(round: number): Promise<any> {
   return waitFor(async () => {
     if ((await query("ai.stop")).some(shown)) return null;
     const current = await panel();
-    const answers = flatten(current).filter(node => node.tag === "text" && node.text === "AI provider response");
+    const answers = flatten(current).filter(node => (node.tag === "text" || node.tag === "box") && node.text === "AI provider response");
     if (answers.length < round) return null;
     const projection = project(current, answers.at(-1));
     report.last_projection = projection;
@@ -112,7 +128,7 @@ try {
   assert((await resizeWindow(viewport.w, viewport.h)).ok);
   await click("workspace.empty.local");
   await visible("terminal.surface");
-  await click("toolbar.ai");
+  await click(await aiToggleId());
   await visible("ai.prompt");
   await capture("00-native-mock-ready");
   await submit(1);
@@ -131,8 +147,10 @@ try {
   await capture("03-second-overflow-answer-visible", second.current);
   report.checks.push("After compact resize and a second long prompt, both replies remain in history and the newest reply automatically returns fully into the real clipped viewport");
   const contents = await readFile(appLog, "utf8");
-  assert(!/AI_TOOL_TRACE .*"event":"(?:wire_request|exec_started|host_received|terminal_read)"/.test(contents), "No provider HTTP serialization or tool dispatch in explicit mock regression");
-  report.trace_check = { wire_requests: 0, exec_starts: 0, tool_calls: 0 };
+  assert(!/AI_TOOL_TRACE .*"event":"(?:exec_started|host_received|terminal_read)"/.test(contents), "No tool dispatch in the fixture regression");
+  assert.equal(providerRequests.length, 2, "Exactly one loopback provider request per submitted round");
+  assert(providerRequests.every(body => !JSON.stringify(body.messages ?? []).includes('"role":"tool"')), "No tool results reach the provider");
+  report.trace_check = { provider_requests: providerRequests.length, title_requests: titleRequests.length, exec_starts: 0, tool_calls: 0 };
   report.status = "passed";
 } catch (error) {
   failure = launchError ?? error;
@@ -147,6 +165,7 @@ try {
   report.finished_at = new Date().toISOString();
   await writeFile(join(output, "report.json"), JSON.stringify(report, null, 2));
   await log.close();
+  server.closeAllConnections(); await new Promise<void>(done => server.close(() => done()));
 }
 console.log(`${report.status}: ${join(output, "report.json")}`);
 if (failure) throw failure;

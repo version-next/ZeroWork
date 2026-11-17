@@ -1,0 +1,4 @@
+//! “卡片已浮动”空状态的外框（cards-float，Pencil MSg5W）：撑满 tab body；内容是原生 `W.Empty`（默认外观）。
+const ui = @import("ui");
+
+style root { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; }

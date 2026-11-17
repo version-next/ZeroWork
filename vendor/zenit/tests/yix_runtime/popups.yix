@@ -1,0 +1,29 @@
+//! Runtime fixture for the template forms of trigger components (YIX_COMPONENTS): Tooltip and Menu
+//! take their trigger as children, Popover as the `trigger` named slot (children are its panel);
+//! `parts={.{ .content = … }}` names the tooltip's hint panel.
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub fn Help(tip: []const u8 = "") View {
+    return (
+        <W.Tooltip text={tip} openDelayMs={450} testId="help.wrap" parts={.{ .content = "help.content" }}>
+            <W.Button label="?" testId="help" />
+        </W.Tooltip>
+    );
+}
+
+pub fn More() View {
+    return (
+        <W.Menu items={&[_]W.MenuItem{.{ .label = "Copy" }}}>
+            <W.Button label="More" testId="more" />
+        </W.Menu>
+    );
+}
+
+pub fn Info() View {
+    return (
+        <W.Popover trigger={<W.Button label="Info" testId="info" />}>
+            <text testId="info.panel">details</text>
+        </W.Popover>
+    );
+}

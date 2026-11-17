@@ -1,10 +1,14 @@
 /** Turn usage shows provider totals, request counts and missing-usage states. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, writeFile, open, realpath, readFile, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? 'zig-out');
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
 const out = resolve(process.argv[2] ?? '/tmp/zw-turn-usage-results');
@@ -19,9 +23,7 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({data: [{id: 'idle-fixture'}]}));
         return;
     }
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (body.messages[0]?.content?.startsWith('将用户的问题概括')) {
         res.end(frame('中文回合闲置检查'));
@@ -68,10 +70,10 @@ try {
     await h.waitForServerReady(60000);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
     await h.resizeWindow(1440, 900);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
     await click('ai.prompt'); await h.type_('请检查用量'); await click('ai.send');
     await visible('ai.turn.complete');
-    assert.equal(text(await visible('ai.turn.tokens')), '本回合用量 2.6K');
+    assert.equal(text(await visible('ai.turn.tokens')), '用量 2.6K');
     assert((await h.screenshot(join(out, 'turn-usage.png'))).ok);
     await click('ai.turn.tokens');
     const details = await visible('ai.turn.usage.details');
@@ -95,7 +97,7 @@ try {
     await click('ai.prompt'); await h.type_('服务商不返回用量'); await click('ai.send');
     await h.waitFor(async () => (await h.query('ai.turn.complete')).filter(shown).length === 2 || null, 15000);
     const usages = (await h.query('ai.turn.tokens')).filter(shown);
-    assert.equal(text(usages.at(-1)), '本回合用量未返回');
+    assert.equal(text(usages.at(-1)), '用量未返回');
     report.checks.push('Missing provider usage stays unknown');
     report.status = 'passed';
 } catch (error) {

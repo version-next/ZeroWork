@@ -56,8 +56,17 @@ pub fn validateOwner(owner: identity.SessionHandle, key: operation.OperationKey)
 pub fn validateString(value: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidText;
 }
+/// A missing directory means the user's home, resolved once by
+/// platform/user_dirs.zig; the native layer never consults the account itself.
+/// Every local child is spawned through here. In isolated (test) builds the
+/// child inherits HOME, so a missing or real-account HOME is refused before
+/// any shell starts, even when an explicit directory is given.
 pub fn cwdZ(allocator: std.mem.Allocator, cwd: ?[]const u8) !?[:0]u8 {
-    const value = cwd orelse return null;
+    const user_dirs = @import("../platform/user_dirs.zig");
+    if (comptime user_dirs.isolated) if (cwd != null) allocator.free(try user_dirs.home(allocator));
+    const home = if (cwd == null) try user_dirs.home(allocator) else null;
+    defer if (home) |value| allocator.free(value);
+    const value = cwd orelse home.?;
     try validateString(value);
     if (value.len == 0 or value[0] != '/') return error.InvalidDirectory;
     return try allocator.dupeSentinel(u8, value, 0);

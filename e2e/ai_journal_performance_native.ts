@@ -2,19 +2,24 @@
  * All writes, terminals and model responses belong to a private data directory.
  * An optional ZW_AI_JOURNAL_FIXTURE is copied, never edited in place.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {execFileSync, spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, readFile, writeFile, copyFile, open, realpath, stat} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? '/tmp/zw-ai-journal-build');
 const out = resolve(process.argv[2] ?? '/tmp/zw-ai-journal-results');
 await mkdir(out, {recursive: true});
 const isolated = await realpath(await mkdtemp('/tmp/zw-ai-journal-'));
 const data = join(isolated, 'data'), rpc = join(isolated, 'rpc');
 await mkdir(data); await mkdir(rpc);
-const journal = join(data, 'ai-sessions.jsonl');
+const journal = join(data, 'ai-sessions.v4.jsonl');
 const fixture = process.env.ZW_AI_JOURNAL_FIXTURE;
 if (fixture) await copyFile(fixture, journal);
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
@@ -22,8 +27,7 @@ const event = (content: string) => 'data: ' + JSON.stringify({choices: [{index: 
 let requests = 0;
 const server = createServer(async (req, res) => {
     if (req.method !== 'POST') { res.end(JSON.stringify({data: [{id: 'journal-fixture'}]})); return; }
-    let raw = ''; for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (!body.tools?.length) { res.end(event('会话存储验证') + 'data: [DONE]\n\n'); return; }
     requests++;
@@ -68,7 +72,7 @@ async function launch() {
     await h.waitForServerReady(60000);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
     await h.resizeWindow(1440, 1000);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
 }
 async function quit() {
     assert((await h.request('POST', '/zerowork/windows', {action: 'quit'})).ok);
@@ -88,7 +92,7 @@ async function confirm() {
     if ((await h.query('ai.session.close.accept')).some(shown)) await click('ai.session.close.accept');
 }
 const rows = async () => text((await h.query('ai.message.user.text')).filter(shown));
-const cpuMs = () => execFileSync('/bin/ps', ['-p', String(app.pid), '-o', 'time='], {encoding: 'utf8'}).trim().split(':').map(Number).reduce((a, b) => a * 60 + b, 0) * 1000;
+const cpuMs = () => psCompat(['-p', String(app.pid), '-o', 'time=']).trim().split(':').map(Number).reduce((a, b) => a * 60 + b, 0) * 1000;
 try {
     if (!fixture) {
         await launch();
@@ -126,8 +130,10 @@ try {
     const actual = after.trim().split('\n');
     for (const line of [...expected, ...lastPresentation.values()]) assert(actual.includes(line), 'Every non-display event and latest complete chat snapshot must survive byte-for-byte');
     assert.equal(requests, fixture ? 0 : 1, 'Reopening must not replay model or tools');
-    await click('ai.sessions');
-    const buttons = flat(await h.query('ai.sessions.menu')).filter(n => shown(n) && /^ai\.session\.jump\.\d+$/.test(n.test_id ?? ''));
+    // M10: after restart the historical conversation is unbound (未绑定 · 历史连接环境) and is not one of this tab's
+    // sessions (ai.sessions lists 0); the welcome page's 最近会话 list (ai.empty.recent) offers its view/restore/copy actions.
+    await visible('ai.empty.recent');
+    const buttons = flat(await h.query('ai.empty.recent')).filter(n => shown(n) && /^ai\.session\.jump\.\d+$/.test(n.test_id ?? ''));
     assert(buttons.length > 0, 'Historical sessions must remain listed');
     const id = buttons[0].test_id.split('.').at(-1);
     await click(`ai.session.jump.${id}`);
@@ -137,14 +143,14 @@ try {
     await click('ai.history.close');
     const eventCount = async (kind: string) => (await readFile(journal, 'utf8')).trim().split('\n').map(JSON.parse).filter(row => row.event?.kind === kind).length;
     const forks = await eventCount('fork_bound'), bindings = await eventCount('bind');
-    await click('ai.sessions'); await click(`ai.session.copy_use.${id}`); await confirm();
+    await visible('ai.empty.recent'); await click(`ai.session.copy_use.${id}`); await confirm();
     await h.waitFor(async () => (await eventCount('fork_bound')) === forks + 1 || null, 10000);
     await h.waitFor(async () => (await rows()).length > 0 || null, 20000);
     const originalText = await rows();
     for (const node of (await h.query('ai.message.user.text')).filter(shown)) assert(historicalText.includes(text(node)));
     assert((await h.screenshot(join(out, '01-history-copy.png'))).ok);
     await click('ai.session.new'); await confirm();
-    await click('ai.sessions'); await click(`ai.session.restore.${id}`); await confirm();
+    await visible('ai.empty.recent'); await click(`ai.session.restore.${id}`); await confirm();
     await h.waitFor(async () => (await eventCount('bind')) === bindings + 1 || null, 10000);
     await h.waitFor(async () => (await rows()) === originalText || null, 20000);
     assert.equal(requests, fixture ? 0 : 1, 'Viewing, copying and restoring history never resends a request');
@@ -166,7 +172,7 @@ try {
     report.status = 'failed'; report.error = String(error); process.exitCode = 1;
     if (alive()) {
         await h.screenshot(join(out, 'failure.png')).catch(() => {});
-        await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree().catch(() => null), null, 2));
+        await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }).catch(() => null), null, 2));
     }
 } finally {
     if (alive()) { app.kill('SIGTERM'); await ended; }

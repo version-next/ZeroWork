@@ -1,10 +1,14 @@
 const std = @import("std");
+const shared = @import("../shared/base/retry.zig");
+/// AI 模型请求的重试退避（共享 `Backoff`，参数与改造前一致：3 次，1,2,4 s，超出表长沿用最后一项）。
 pub const Policy = struct {
     max_attempts: u8 = 3,
     delays_ms: [3]u32 = .{ 1000, 2000, 4000 },
+    pub fn backoff(self: *const Policy) shared.Backoff {
+        return .{ .max_retries = self.max_attempts, .schedule = .{ .millis_repeat_last = &self.delays_ms } };
+    }
     pub fn delay(self: Policy, attempt: u8) !u32 {
-        if (attempt >= self.max_attempts) return error.Exhausted;
-        return self.delays_ms[@min(attempt, self.delays_ms.len - 1)];
+        return @intCast(self.backoff().delayMs(attempt) orelse return error.Exhausted);
     }
 };
 
@@ -39,18 +43,7 @@ pub fn wait(delay_ms: u32, token: ?*@import("provider.zig").CancelToken) !void {
 /// The optional request deadline is absolute and shared by all attempts.
 /// Nanosecond precision also keeps Retry-After from rounding down a wait.
 pub fn waitWithTiming(delay_ms: u32, token: ?*@import("provider.zig").CancelToken, deadline_ns: ?i128, timing: anytype) !void {
-    const until = timing.now() + @as(i128, delay_ms) * std.time.ns_per_ms;
-    while (true) {
-        if (token) |cancel| if (cancel.isCancelled()) return error.Cancelled;
-        const now = timing.now();
-        if (deadline_ns) |deadline| if (now >= deadline) return error.Timeout;
-        if (now >= until) return;
-        var remaining = until - now;
-        if (deadline_ns) |deadline| {
-            remaining = @min(remaining, deadline - now);
-        }
-        timing.sleep(@intCast(@min(remaining, 50 * std.time.ns_per_ms)));
-    }
+    return shared.wait(delay_ms, token, .{ .at_ns = deadline_ns }, timing);
 }
 test "provider retry policy backs off and exhausts" {
     const p: Policy = .{};
@@ -80,10 +73,10 @@ const TestTiming = struct {
     sleeps: usize = 0,
     last_sleep_ns: u64 = 0,
     stop: ?*@import("provider.zig").CancelToken = null,
-    fn now(self: *@This()) i128 {
+    pub fn now(self: *@This()) i128 {
         return self.ns;
     }
-    fn sleep(self: *@This(), ns: u64) void {
+    pub fn sleep(self: *@This(), ns: u64) void {
         self.sleeps += 1;
         self.last_sleep_ns = ns;
         self.ns += self.advance_ns;

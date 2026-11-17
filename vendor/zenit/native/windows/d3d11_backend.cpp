@@ -1,4 +1,5 @@
 #include "dual_source_validation.h"
+#include "../automation_environment.h"
 // D3D11 implementation of the shared renderer ABI. The d12 prefix is an ABI
 // name only: this translation unit uses D3D11 and DXGI exclusively.
 #include "d3d12_resources.h"
@@ -257,7 +258,7 @@ static constexpr uint32_t MAP_READ = 1, MAP_WRITE = 2, COPY_SRC = 4,
 static bool cpu_timing_trace_enabled() {
   static const bool enabled = [] {
     char flag[2] = {};
-    return GetEnvironmentVariableA("ZENIT_WINDOWS_FRAME_TIMING", flag,
+    return zenitAutomationEnvironmentA("ZENIT_WINDOWS_FRAME_TIMING", flag,
                                    sizeof(flag)) && flag[0] == '1';
   }();
   return enabled;
@@ -438,7 +439,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
   }
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   char env[8] = {};
-  if (GetEnvironmentVariableA("ZENIT_D3D11_DEBUG", env, sizeof(env)) &&
+  if (zenitAutomationEnvironmentA("ZENIT_D3D11_DEBUG", env, sizeof(env)) &&
       env[0] == '1')
     flags |= D3D11_CREATE_DEVICE_DEBUG;
   D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0},
@@ -475,7 +476,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
     }
   if (!d->raw) {
     if (!force_warp &&
-        GetEnvironmentVariableA("ZENIT_D3D11_REQUIRE_HARDWARE", nullptr, 0)) {
+        zenitAutomationEnvironmentA("ZENIT_D3D11_REQUIRE_HARDWARE", nullptr, 0)) {
       delete d;
       return 2;
     }
@@ -518,6 +519,10 @@ extern "C" int zenit_d12_device_is_software(ZenitD12Device *d) {
 extern "C" void *zenit_d12_device_native(ZenitD12Device *d) {
   return d ? d->raw.p : nullptr;
 }
+// ZENIT_GPU_LEDGER is a D3D12 diagnostic; the shared wrapper labels every
+// resource, so this backend accepts and ignores the labels.
+extern "C" void zenit_d12_texture_ledger_label(ZenitD12Texture *, const char *, size_t) {}
+extern "C" void zenit_d12_buffer_ledger_label(ZenitD12Buffer *, const char *, size_t) {}
 extern "C" int zenit_d12_buffer_create(ZenitD12Device *d, uint64_t size,
                                        uint32_t usage, ZenitD12Buffer **out) {
   D11_PROF("buffer_create");
@@ -1753,7 +1758,7 @@ extern "C" int zenit_d12_commands_elapsed_micros(ZenitD12Commands *c,
     return 1;
   *micros = 0;
   char trace_flag[2] = {};
-  const bool trace = GetEnvironmentVariableA("ZENIT_D11_TIMESTAMP_TRACE",
+  const bool trace = zenitAutomationEnvironmentA("ZENIT_D11_TIMESTAMP_TRACE",
                                              trace_flag, sizeof(trace_flag)) &&
                      trace_flag[0] == '1';
   if (trace)
@@ -2986,6 +2991,39 @@ extern "C" int zenit_d12_render_pass_draw(ZenitD12RenderPass *p,
   unbind_srvs(c->context);
   return 0;
 }
+// Entry form of render_pass_draw (see d3d12_resources.h): the D3D11 backend
+// keeps bind groups as plain entry lists, so build them and draw.
+extern "C" int zenit_d12_render_pass_draw_entries(
+    ZenitD12RenderPass *p, ZenitD12RenderPipeline *pipeline,
+    const ZenitD12Draw *draw, const ZenitD12BindingEntry *entries,
+    const uint32_t *group_counts, uint32_t group_count) {
+  if (!p || !pipeline || !draw || draw->group_count ||
+      group_count > 4 || (group_count && !group_counts))
+    return 1;
+  ZenitD12BindGroup *groups[4] = {};
+  int status = 0;
+  uint32_t created = 0;
+  for (uint32_t g = 0, at = 0; g < group_count; at += group_counts[g], ++g) {
+    status = zenit_d12_bind_group_create(p->commands->owner, pipeline->layout,
+                                         g, entries + at, group_counts[g],
+                                         &groups[g]);
+    if (status) {
+      if (status == 1)
+        status = 6; // bind_group_create rejection: error.InvalidBindGroup
+      break;
+    }
+    ++created;
+  }
+  if (!status) {
+    ZenitD12Draw grouped = *draw;
+    grouped.groups = groups;
+    grouped.group_count = group_count;
+    status = zenit_d12_render_pass_draw(p, pipeline, &grouped);
+  }
+  for (uint32_t g = 0; g < created; ++g)
+    zenit_d12_bind_group_release(groups[g]);
+  return status;
+}
 extern "C" int zenit_d12_render_pass_end(ZenitD12RenderPass *p) {
   D11_PROF("render_pass_end");
   if (!p || !p->commands->pass)
@@ -3077,10 +3115,9 @@ static HRESULT surface_update_composition(ZenitD12Surface *s) {
   }
   return hr;
 }
-extern "C" int zenit_d12_surface_create(ZenitD12Queue *q, void *hwnd,
-                                        uint32_t width, uint32_t height,
-                                        uint32_t format, uint32_t buffers,
-                                        ZenitD12Surface **out) {
+static int surface_create(ZenitD12Queue *q, void *hwnd, uint32_t width,
+                          uint32_t height, uint32_t format, uint32_t buffers,
+                          bool sequential, ZenitD12Surface **out) {
   if (!out)
     return 1;
   *out = nullptr;
@@ -3117,7 +3154,10 @@ extern "C" int zenit_d12_surface_create(ZenitD12Queue *q, void *hwnd,
   // Never stretch an older buffer over a resized client: until the new
   // extent is presented, DWM shows the previous frame unscaled.
   d.Scaling = DXGI_SCALING_NONE;
-  d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  // Dirty presentation redraws only part of the frame and relies on the
+  // back buffer keeping the previous one, which only sequential flips do.
+  d.SwapEffect = sequential ? DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+                            : DXGI_SWAP_EFFECT_FLIP_DISCARD;
   d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
   if (GetPropW((HWND)hwnd, L"Zenit.CustomFrame")) {
     // Composition swap chains support only stretch; the visual tree sizes them.
@@ -3160,6 +3200,17 @@ extern "C" int zenit_d12_surface_create(ZenitD12Queue *q, void *hwnd,
   *out = s;
   return 0;
 }
+extern "C" int zenit_d12_surface_create(ZenitD12Queue *q, void *hwnd,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t format, uint32_t buffers,
+                                        ZenitD12Surface **out) {
+  return surface_create(q, hwnd, width, height, format, buffers, false, out);
+}
+extern "C" int zenit_d12_surface_create_sequential(
+    ZenitD12Queue *q, void *hwnd, uint32_t width, uint32_t height,
+    uint32_t format, uint32_t buffers, ZenitD12Surface **out) {
+  return surface_create(q, hwnd, width, height, format, buffers, true, out);
+}
 extern "C" int zenit_d12_surface_acquire(ZenitD12Surface *s,
                                          ZenitD12Texture **out) {
   if (!out)
@@ -3190,8 +3241,8 @@ extern "C" int zenit_d12_surface_acquire(ZenitD12Surface *s,
   *out = t;
   return 0;
 }
-extern "C" int zenit_d12_surface_present(ZenitD12Surface *s, ZenitD12Texture *t,
-                                         uint32_t interval, int *occluded) {
+static int surface_present(ZenitD12Surface *s, ZenitD12Texture *t,
+                           uint32_t interval, RECT *dirty, int *occluded) {
   if (!s || !t || s->acquired != t || interval > 4 || !occluded)
     return 1;
   d11_prof_dump();
@@ -3199,8 +3250,16 @@ extern "C" int zenit_d12_surface_present(ZenitD12Surface *s, ZenitD12Texture *t,
   const uint64_t start = trace ? cpu_time_micros() : 0;
   HRESULT hr = surface_update_composition(s);
   const uint64_t composition_end = trace ? cpu_time_micros() : 0;
-  if (SUCCEEDED(hr))
-    hr = s->swap->Present(interval, 0);
+  if (SUCCEEDED(hr)) {
+    if (dirty) {
+      DXGI_PRESENT_PARAMETERS parameters = {};
+      parameters.DirtyRectsCount = 1;
+      parameters.pDirtyRects = dirty;
+      hr = s->swap->Present1(interval, 0, &parameters);
+    } else {
+      hr = s->swap->Present(interval, 0);
+    }
+  }
   if (trace)
     fprintf(stderr, "[d3d11-cpu] composition_us=%llu present_us=%llu interval=%u result=0x%08lx\n",
             (unsigned long long)(composition_end - start),
@@ -3212,6 +3271,27 @@ extern "C" int zenit_d12_surface_present(ZenitD12Surface *s, ZenitD12Texture *t,
   s->acquired = nullptr;
   zenit_d12_texture_release(t);
   return 0;
+}
+extern "C" int zenit_d12_surface_present(ZenitD12Surface *s, ZenitD12Texture *t,
+                                         uint32_t interval, int *occluded) {
+  return surface_present(s, t, interval, nullptr, occluded);
+}
+// Same contract as the D3D12 backend: a dirty rectangle is only valid on a
+// sequential HWND swap chain (not composition) and must lie in the buffer.
+extern "C" int zenit_d12_surface_present_dirty(ZenitD12Surface *s,
+                                               ZenitD12Texture *t,
+                                               uint32_t interval, uint32_t x,
+                                               uint32_t y, uint32_t w,
+                                               uint32_t h, int *occluded) {
+  if (!s || !t || s->acquired != t || !w || !h || s->composition)
+    return 1;
+  DXGI_SWAP_CHAIN_DESC1 desc = {};
+  if (FAILED(s->swap->GetDesc1(&desc)) ||
+      desc.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || x >= desc.Width ||
+      y >= desc.Height || w > desc.Width - x || h > desc.Height - y)
+    return 1;
+  RECT dirty = {(LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h)};
+  return surface_present(s, t, interval, &dirty, occluded);
 }
 extern "C" int zenit_d12_surface_discard(ZenitD12Surface *s,
                                          ZenitD12Texture *t) {
@@ -3262,5 +3342,100 @@ extern "C" int zenit_d12_surface_size(ZenitD12Surface *s, uint32_t *width,
     return 1;
   *width = s->width;
   *height = s->height;
+  return 0;
+}
+
+// Compositor sprite atlas (src/zenit_app/sprite_host.zig): an opaque
+// composition swap chain that native/windows/compositor_sprites.cpp shows
+// through DirectComposition. Its back buffer is rendered once by the regular
+// encoder (the returned texture) and presented once; DWM keeps showing it.
+struct ZenitD12SpriteAtlas {
+  D11Com<IDXGISwapChain1> swap;
+};
+extern "C" int zenit_d12_sprite_atlas_create(ZenitD12Queue *q, uint32_t w,
+                                             uint32_t h, uint32_t format,
+                                             ZenitD12SpriteAtlas **out,
+                                             ZenitD12Texture **texture_out) {
+  if (!out || !texture_out)
+    return 1;
+  *out = nullptr;
+  *texture_out = nullptr;
+  if (!q || !w || !h || w > 16384 || h > 16384 ||
+      (format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+       format != DXGI_FORMAT_B8G8R8A8_UNORM))
+    return 1;
+  D11Com<IDXGIDevice> device;
+  D11Com<IDXGIAdapter> adapter;
+  D11Com<IDXGIFactory2> factory;
+  HRESULT hr =
+      q->owner->raw->QueryInterface(IID_IDXGIDevice, (void **)device.put());
+  if (SUCCEEDED(hr))
+    hr = device->GetAdapter(adapter.put());
+  if (SUCCEEDED(hr))
+    hr = adapter->GetParent(IID_IDXGIFactory2, (void **)factory.put());
+  if (FAILED(hr))
+    return result(hr);
+  auto a = new (std::nothrow) ZenitD12SpriteAtlas;
+  if (!a)
+    return 2;
+  DXGI_SWAP_CHAIN_DESC1 d = {};
+  d.Width = w;
+  d.Height = h;
+  d.Format = (DXGI_FORMAT)format;
+  d.SampleDesc.Count = 1;
+  d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+  // Composition swap chains: sequential flip, at least two buffers.
+  d.BufferCount = 2;
+  d.Scaling = DXGI_SCALING_STRETCH;
+  d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+  d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+  hr = factory->CreateSwapChainForComposition(q->owner->raw, &d, nullptr,
+                                              a->swap.put());
+  auto t = SUCCEEDED(hr) ? new (std::nothrow) ZenitD12Texture : nullptr;
+  if (SUCCEEDED(hr) && !t)
+    hr = E_OUTOFMEMORY;
+  if (SUCCEEDED(hr))
+    hr = a->swap->GetBuffer(0, IID_ID3D11Resource, (void **)t->raw.put());
+  if (FAILED(hr)) {
+    if (t) {
+      t->owner = nullptr;
+      delete t;
+    }
+    delete a;
+    return result(hr);
+  }
+  t->owner = q->owner;
+  zenit_d12_device_retain(t->owner);
+  t->dimension = 2;
+  t->width = w;
+  t->height = h;
+  t->depth = t->mips = t->samples = 1;
+  t->usage = 1 | 2 | 4 | 16;
+  t->format = (DXGI_FORMAT)format;
+  *out = a;
+  *texture_out = t;
+  return 0;
+}
+// After the render commands were submitted to the atlas' queue.
+extern "C" int zenit_d12_sprite_atlas_present(ZenitD12SpriteAtlas *a) {
+  if (!a)
+    return 1;
+  return FAILED(a->swap->Present(0, 0)) ? 2 : 0;
+}
+extern "C" IUnknown *zenit_d12_sprite_atlas_content(ZenitD12SpriteAtlas *a) {
+  return a ? a->swap.p : nullptr;
+}
+extern "C" void zenit_d12_sprite_atlas_release(ZenitD12SpriteAtlas *a) {
+  delete a;
+}
+// The surface's own DirectComposition device and root visual (custom-frame
+// windows), or nulls: compositor sprites join this tree when there is one.
+extern "C" int zenit_d12_surface_composition(ZenitD12Surface *s,
+                                             IDCompositionDevice **device,
+                                             IDCompositionVisual **root) {
+  if (!s || !device || !root)
+    return 1;
+  *device = s->composition.p;
+  *root = s->composition_root.p;
   return 0;
 }

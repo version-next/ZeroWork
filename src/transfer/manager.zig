@@ -31,6 +31,17 @@ pub const JobSpec = struct {
     /// Frozen byte rate for an explicitly paced transport; zero is unlimited.
     pacing_kbps: u32 = 0,
     conflict_context: ?Conflict.Context = null,
+
+    /// Resolve a transfer's remote endpoint using the frozen job and POSIX path separators.
+    /// The engine passes the sentinel-terminated result to SFTP. Task details show the same path.
+    pub fn allocRemotePath(self: JobSpec, allocator: std.mem.Allocator, source: []const u8) ![:0]u8 {
+        const leaf = switch (self.direction) {
+            .upload => self.rename orelse std.fs.path.basename(source),
+            .download => if (std.fs.path.isAbsolutePosix(source)) return allocator.dupeSentinel(u8, source, 0) else source,
+        };
+        const separator = if (self.remote_dir.len == 0 or std.mem.endsWith(u8, self.remote_dir, "/")) "" else "/";
+        return std.fmt.allocPrintSentinel(allocator, "{s}{s}{s}", .{ self.remote_dir, separator, leaf }, 0);
+    }
 };
 
 pub const EngineState = enum { running, succeeded, failed, paused, cancelled };
@@ -179,10 +190,13 @@ pub const RetryPolicy = struct {
     base_delay_ms: u64 = 1_000,
     max_delay_ms: u64 = 8_000,
 
+    /// 共享 `Backoff`（指数，封顶 `max_delay_ms`）；`failed_attempt` 从 1 起，即第 `failed_attempt - 1` 次重试。
+    pub fn backoff(self: RetryPolicy) @import("../shared/base/retry.zig").Backoff {
+        return .{ .max_retries = self.max_attempts -| 1, .schedule = .{ .exponential = .{ .base_ms = self.base_delay_ms, .max_ms = self.max_delay_ms } } };
+    }
     pub fn delay(self: RetryPolicy, failed_attempt: u8) ?u64 {
         if (failed_attempt >= self.max_attempts) return null;
-        const shift: u6 = @intCast(@min(failed_attempt - 1, 63));
-        return @min(self.base_delay_ms *| (@as(u64, 1) << shift), self.max_delay_ms);
+        return self.backoff().delayMs(failed_attempt - 1);
     }
 };
 
@@ -703,6 +717,12 @@ pub const Manager = struct {
     pub fn progressAt(self: *const Manager, index: usize) ?Progress {
         if (index >= self.jobs.items.len) return null;
         return snapshot(self.jobs.items[index]);
+    }
+
+    /// The frozen specification borrows the job's owned strings.
+    pub fn specAt(self: *const Manager, index: usize) ?JobSpec {
+        if (index >= self.jobs.items.len) return null;
+        return self.jobs.items[index].spec.view();
     }
 
     pub fn sourceName(self: *const Manager, index: usize) ?[]const u8 {

@@ -400,3 +400,92 @@ static void a11y_snapshot_contract() {
     }
     printf("Windows accessibility snapshot: %u checks; 1000 publications, 4 concurrent readers\n", checks-before);
 }
+
+static void a11y_offset_mapping_contract() {
+    using namespace zenit_a11y;
+    unsigned before = checks;
+    InputNode input = {}; input.id = 17; input.parent_index = no_parent; input.role = 12;
+    input.editable = input.uniform_format = input.geometry_ready = input.rows_ready = input.carets_ready = 1;
+    input.value = {"a中🧪e\xcc\x81", 11};
+    input.selection_start = 4; input.selection_end = 11; input.caret = 8;
+    input.visible_start = 1; input.visible_end = 11;
+    uint32_t characters[] = {0,1,4,8,11}, words[] = {0,4,11}, paragraphs[] = {0,11}, lines[] = {0,8,11};
+    input.characters = {characters,5}; input.words = {words,3};
+    input.paragraphs = {paragraphs,2}; input.lines = {lines,3};
+    ZenitA11yGeometrySegment geometry[] = {{8,11,30,20,20,16},{4,8,10,20,20,16},{0,4,0,20,10,16}};
+    ZenitA11yGeometrySegment rows[] = {{0,8,0,20,40,16},{8,11,0,36,20,16},{11,11,0,52,0,16}};
+    ZenitA11yCaretCandidate carets[] = {
+        {8,30,20,30,36,0,0,0,0,0,0}, {4,10,20,10,36,0,0,0,0,0,0},
+        {4,40,20,40,36,0,0,0,0,1,0}, {11,50,20,50,36,0,0,0,0,1,0}
+    };
+    input.geometry = {geometry,3}; input.rows = {rows,3}; input.carets = {carets,4};
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+    offset_mapping_passes = offset_mapping_bytes = 0;
+#endif
+    auto *snapshot = Snapshot::create(&input,1); CHECK(snapshot);
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+    CHECK(offset_mapping_passes == 1);
+    CHECK(offset_mapping_bytes == input.value.length);
+    printf("Windows UIA offset work: passes=%zu scanned_bytes=%zu source_bytes=%zu\n", offset_mapping_passes, offset_mapping_bytes, input.value.length);
+#endif
+    if (snapshot) {
+        const auto *n = snapshot->find(input.id); CHECK(n);
+        if (n) {
+            CHECK(n->text_length == 6 && n->selection_start == 2 && n->selection_end == 6);
+            CHECK(n->caret == 4 && n->visible_start == 1 && n->visible_end == 6);
+            CHECK(n->character_count == 5 && n->characters[2] == 2 && n->characters[3] == 4 && n->characters[4] == 6);
+            CHECK(n->word_count == 3 && n->words[1] == 2 && n->words[2] == 6);
+            CHECK(n->paragraph_count == 2 && n->paragraphs[1] == 6);
+            CHECK(n->line_count == 3 && n->lines[1] == 4 && n->lines[2] == 6);
+            CHECK(n->geometry_count == 3 && n->geometry[0].start == 4 && n->geometry[1].start == 2 && n->geometry[2].end == 2);
+            CHECK(n->row_count == 3 && n->rows[0].end == 4 && n->rows[2].start == 6 && n->rows[2].end == 6);
+            CHECK(n->caret_count == 4 && n->carets[0].offset == 4 && n->carets[1].offset == 2 && n->carets[2].offset == 2 && n->carets[3].offset == 6);
+            CHECK(n->carets[1].downstream == 0 && n->carets[2].downstream == 1 && n->carets[2].first_x == 40);
+        }
+        snapshot->release();
+    }
+    // All consumers reject interior UTF-8 bytes, not just the selection path.
+    InputNode invalid = input;
+    invalid.selection_start = 2; CHECK(!Snapshot::create(&invalid,1)); invalid = input;
+    invalid.selection_end = 5; CHECK(!Snapshot::create(&invalid,1)); invalid = input;
+    invalid.caret = 10; CHECK(!Snapshot::create(&invalid,1)); invalid = input;
+    invalid.visible_start = 2; CHECK(!Snapshot::create(&invalid,1)); invalid = input;
+    invalid.visible_end = 5; CHECK(!Snapshot::create(&invalid,1));
+    characters[1] = 2; CHECK(!Snapshot::create(&input,1)); characters[1] = 1;
+    words[1] = 2; CHECK(!Snapshot::create(&input,1)); words[1] = 4;
+    uint32_t bad_paragraphs[] = {0,2,11}; invalid = input;
+    invalid.paragraphs = {bad_paragraphs,3}; CHECK(!Snapshot::create(&invalid,1));
+    lines[1] = 5; CHECK(!Snapshot::create(&input,1)); lines[1] = 8;
+    geometry[0].start = 5; CHECK(!Snapshot::create(&input,1)); geometry[0].start = 8;
+    geometry[0].end = 10; CHECK(!Snapshot::create(&input,1)); geometry[0].end = 11;
+    rows[1].end = 10; CHECK(!Snapshot::create(&input,1)); rows[1].end = 11;
+    carets[0].offset = 5; CHECK(!Snapshot::create(&input,1)); carets[0].offset = 8;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+    auto *context = new Context; CHECK(context);
+    if (context) {
+        CHECK(context->publish(&input,1));
+        auto *retained = context->acquire(); CHECK(retained);
+        offset_mapping_allocation_fail_after = 0;
+        CHECK(!context->publish(&input,1));
+        auto *same = context->acquire(); CHECK(same == retained); if (same) same->release();
+        InputNode pair[] = {input,input}; pair[1].id = input.id+1;
+        offset_mapping_allocation_fail_after = 1; // First node succeeds, second fails.
+        CHECK(!context->publish(pair,2));
+        same = context->acquire(); CHECK(same == retained); if (same) same->release();
+        CHECK(retained && retained->find(input.id)->text_length == 6 && retained->find(input.id)->caret == 4);
+        offset_mapping_allocation_fail_after = 0;
+        InputNode empty = {}; empty.id = 1; empty.parent_index = no_parent; empty.editable = 1; empty.visible_end = UINT32_MAX;
+        auto *blank = Snapshot::create(&empty,1); CHECK(blank && blank->find(1)->text_length == 0);
+        if (blank) blank->release(); // Empty values do not need a mapping allocation.
+        InputNode password = input; password.state = secure_state; password.value = {(const char *)1,max_string_bytes};
+        auto *secure = Snapshot::create(&password,1); CHECK(secure && !secure->find(input.id)->editable && !secure->find(input.id)->value[0]);
+        if (secure) secure->release(); // Redacted input must not be inspected or mapped.
+        offset_mapping_allocation_fail_after = -1;
+        context->disconnect(); context->release(); if (retained) retained->release();
+    }
+#endif
+    printf("Windows UIA offset mapping: %u checks; all unit arrays, visual order, repeated affine carets and combining/astral text\n", checks-before);
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+    printf("Windows UIA demand case: single-pass offsets and allocation rollback PASS\n");
+#endif
+}

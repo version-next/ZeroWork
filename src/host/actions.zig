@@ -118,7 +118,7 @@ fn shortcut(id: ActionId, action_id: []const u8, label: []const u8, legacy: keys
 
 pub const descriptors = [_]Descriptor{
     shortcut(.open_session_chooser, "workspace.new_session", "新建会话", .new_tab, .{}),
-    shortcut(.request_close, "workspace.request_close", "断开并关闭", .close_tab, .{ .scope = .tab }),
+    shortcut(.request_close, "workspace.request_close", "关闭页签", .close_tab, .{ .scope = .tab }),
     shortcut(.tab_1, "workspace.tab_1", "第 1 个页签", .tab_1, .{ .scope = .tab }),
     shortcut(.tab_2, "workspace.tab_2", "第 2 个页签", .tab_2, .{ .scope = .tab }),
     shortcut(.tab_3, "workspace.tab_3", "第 3 个页签", .tab_3, .{ .scope = .tab }),
@@ -144,11 +144,11 @@ pub const descriptors = [_]Descriptor{
     shortcut(.toggle_ai, "assistant.toggle", "AI 助手", .ai, .{ .scope = .tab, .capabilities = &.{.ai} }),
     shortcut(.upload, "transfer.upload", "上传", .upload, .{ .scope = .tab, .capabilities = &.{.transfer} }),
     shortcut(.toggle_broadcast, "group.toggle_broadcast", "切换广播", .broadcast, .{ .scope = .terminal, .capabilities = &.{ .terminal, .groups }, .needs_group = true }),
-    .{ .id = .rename_tab, .action_id = "workspace.rename_tab", .label = "重命名页签", .default_chord = .{ .key = .r, .shift = true }, .rule = .{ .scope = .tab } },
+    .{ .id = .rename_tab, .action_id = "workspace.rename_tab", .label = "重命名页签", .default_chord = .{ .key = .f2, .command = false }, .rule = .{ .scope = .tab } },
     .{ .id = .create_sibling_session, .action_id = "session.create_sibling", .label = "新建同类会话", .rule = .{ .scope = .tab, .capabilities = &.{.session_factory} } },
     .{ .id = .duplicate_session, .action_id = "session.duplicate", .label = "镜像复制会话", .rule = .{ .scope = .terminal, .capabilities = &.{ .terminal, .session_factory } } },
     .{ .id = .edit_connection, .action_id = "connection.edit", .label = "编辑主机配置", .rule = .{ .scope = .tab, .capabilities = &.{.saved_connection} }, .unsupported_reason = "当前会话没有可编辑的已保存连接" },
-    .{ .id = .save_connection, .action_id = "connection.save", .label = "保存连接配置", .rule = .{ .scope = .tab, .capabilities = &.{.connection} }, .unsupported_reason = "当前会话没有可保存的连接配置" },
+    .{ .id = .save_connection, .action_id = "connection.save", .label = "保存为主机", .rule = .{ .scope = .tab, .capabilities = &.{.connection} }, .unsupported_reason = "当前会话没有可保存的主机配置" },
     .{ .id = .open_route_details, .action_id = "connection.route_details", .label = "通信链路", .rule = .{ .scope = .tab, .capabilities = &.{.route} }, .unsupported_reason = "当前会话没有 SSH 通信链路" },
     .{ .id = .open_theme_chooser, .action_id = "appearance.choose_theme", .label = "全局主题", .rule = .{ .capabilities = &.{.appearance} } },
     .{ .id = .export_record, .action_id = "record.export", .label = "导出记录", .rule = .{ .scope = .tab, .capabilities = &.{.recording} } },
@@ -178,7 +178,7 @@ pub const factory_shortcuts = blk: {
 };
 
 /// The nine rows of V0.1.1 §5.4, in prototype order.
-pub const tab_menu = [_]ActionId{ .rename_tab, .create_sibling_session, .duplicate_session, .edit_connection, .open_route_details, .open_theme_chooser, .export_record, .close_other_tabs, .request_close };
+pub const tab_menu = [_]ActionId{ .rename_tab, .create_sibling_session, .duplicate_session, .edit_connection, .open_route_details, .export_record, .close_other_tabs, .request_close };
 
 pub const AppCommand = struct { name: []const u8, action: ActionId };
 /// @@ is a literal escape; it deliberately has no business action.
@@ -334,17 +334,18 @@ test "session factories do not require an existing tab" {
 }
 
 test "mirror menu and app command share identity without stealing split keys" {
-    try std.testing.expectEqual(@as(usize, 9), tab_menu.len);
+    try std.testing.expectEqual(@as(usize, 8), tab_menu.len);
     try std.testing.expectEqual(@as(usize, 13), app_commands.len);
     try std.testing.expectEqual(ActionId.duplicate_session, tab_menu[2]);
     try std.testing.expectEqual(ActionId.duplicate_session, fromAppCommand("@dup").?);
     try std.testing.expect(descriptor(.duplicate_session).default_chord == null);
     try std.testing.expectEqual(ActionId.split_vertical, fromShortcut(.{ .key = .d }).?);
     try std.testing.expectEqual(ActionId.split_horizontal, fromShortcut(.{ .key = .d, .shift = true }).?);
-    try std.testing.expectEqual(ActionId.rename_tab, fromShortcut(.{ .key = .r, .shift = true }).?);
-    try std.testing.expectEqual(ActionId.request_close, tab_menu[8]);
-    try std.testing.expectEqual(ActionId.open_theme_chooser, tab_menu[5]);
-    try std.testing.expectEqual(tab_menu[5], fromAppCommand("@THEME").?);
+    try std.testing.expectEqual(ActionId.rename_tab, fromShortcut(.{ .key = .f2, .command = false }).?);
+    try std.testing.expect(fromShortcut(.{ .key = .r, .shift = true }) == null);
+    try std.testing.expectEqual(ActionId.request_close, tab_menu[7]);
+    for (tab_menu) |id| try std.testing.expect(id != .open_theme_chooser);
+    try std.testing.expectEqual(ActionId.open_theme_chooser, fromAppCommand("@THEME").?);
     try std.testing.expect(fromAppCommand("@@") == null);
     try std.testing.expect(fromAppCommand("@missing") == null);
 }

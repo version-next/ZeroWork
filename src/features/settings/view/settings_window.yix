@@ -1,0 +1,67 @@
+//! 设置窗口（Pencil `p6ZVS`，P3 3d）：`.yix` 外壳。宿主在 aux 窗口的 mount 回调里
+//! `ui.view.render(scope, cx, SettingsWindow(.{ .vm = vm, .frame = frame }))`。
+//! 外壳与九个分类的面板正文全部由 view-model 驱动（3f 删除了旧命令式外壳与旧面板）。
+//! 确认对话框（H-save）：窗口级的原生 `W.Modal`，开合与文案来自 view-model（`ViewModel.promptKind`），不随内容页纪元重挂。
+//! “清除全部数据…”的确认（S-12，`data_cleanup.yix`）同样是窗口级原生 `W.Modal`，清除进行中内容页重挂不影响它。
+//! 整窗按键与焦点（S-6）：根上的 `onKeyDownCapture`（Escape / ⌘W / ⌘,）与 `focusRequest`；内容列 `focusRestore`——
+//! 按纪元重挂内容页后，焦点回到同一 `focusId` 的字段（含选区）。卡片 `settings.panel` 不可聚焦。
+//! 宿主要用的三个节点（卡片、内容岛、内容页根）经 `ref()` 交出（`window_frame.zig` 的 `Handles`），不按 test_id 查找。
+const ui = @import("ui");
+const m = @import("../model/view_model.zig");
+const F = @import("window_frame.zig");
+const S = @import("styles.yss");
+const Nav = @import("nav.yix");
+const Page = @import("page.yix");
+const SaveBar = @import("save_bar.yix");
+const DataCleanup = @import("data_cleanup.yix");
+
+fn statusLine(vm: *m.ViewModel) []const u8 {
+    return vm.statusLine();
+}
+fn statusShown(vm: *m.ViewModel) bool {
+    return vm.statusLineShown();
+}
+/// 整窗快捷键（Escape / ⌘W / ⌘,）在捕获阶段先于子控件；窗口没有焦点时按键落到本模板根，同样经过这里。
+fn windowKey(vm: *m.ViewModel, e: ui.view.KeyPress) void {
+    if (vm.windowKey(e.key, e.modifiers)) e.stop();
+}
+fn focusRequest(vm: *m.ViewModel) ui.view.FocusRequest {
+    const ask = vm.focusRequest();
+    return .{ .id = ask.id, .seq = ask.seq };
+}
+fn epochs(vm: *m.ViewModel) []const u64 {
+    return vm.contentEpochs();
+}
+
+/// 把卡片、内容岛、内容页根的 live Ref 交给宿主（`F.Frame.handles`）；窗口卸载时收回。
+fn keep(frame: *F.Frame, panel: *ui.view.Ref(*ui.Node), island: *ui.view.Ref(*ui.Node), content: *ui.view.Ref(*ui.Node)) void {
+    frame.keep(panel, island, content);
+}
+fn forget(frame: *F.Frame, panel: *ui.view.Ref(*ui.Node)) void {
+    frame.forget(panel);
+}
+
+pub fn SettingsWindow(vm: *m.ViewModel, frame: *F.Frame) View {
+    const panel = ref();
+    const island = ref();
+    const content = ref();
+    onMount(keep(frame, panel, island, content));
+    onUnmount(forget(frame, panel));
+    return (
+        <box testId="settings.window" style={S.window_root} onKeyDownCapture={|e| windowKey(vm, e)} focusRequest={focusRequest(vm)}>
+            <box ref={panel} testId="settings.panel" style={S.panel}>
+                <Nav.SettingsNav vm={vm} />
+                <box style={S.stage}>
+                    <box ref={island} testId="settings.island" style={S.island}>
+                        <box style={S.content_column} focusRestore>
+                            {for (epochs(vm)) |epoch| <Page.ContentPage key={epoch} vm={vm} frame={frame} root={content} />}
+                        </box>
+                        <text style={S.status_line} box={S.status_line_box} visible={statusShown(vm)}>{statusLine(vm)}</text>
+                    </box>
+                </box>
+            </box>
+            <SaveBar.Confirmation vm={vm} />
+            <DataCleanup.DataCleanup vm={vm} />
+        </box>
+    );
+}

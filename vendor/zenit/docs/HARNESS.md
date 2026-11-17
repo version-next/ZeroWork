@@ -70,6 +70,52 @@ ZENIT_E2E_FILE_RPC_DIR="$rpc_dir" bun run e2e/record.ts
 The environment variable must be set independently in both terminals. An
 alternative is to use the default `/tmp/zenit_e2e_rpc_<e2e-port>` directory.
 
+## Fast Storybook rebuilds
+
+Story selection is independent of Harness mode. With no `-Dstories`, the full
+showcase, canonical order and story keys stay unchanged. To compile just the
+shell and selected stories, use their existing keys (not display names):
+
+```sh
+zig build storybook -Dstories=button,card
+zig build storybook-exe -Dstories=button
+zig build run-storybook -Dstories=button
+```
+
+`storybook` still packages and ad-hoc signs the macOS `.app`.
+`storybook-exe` compiles the executable and installs it to `zig-out/bin/`
+without bundling, codesigning or starting it; the preview launcher starts it from
+there.
+`run-storybook` already runs that bare executable directly, skipping bundle
+copying, quarantine clearing and `codesign`. On macOS/Linux hosts every example
+target also exposes a `<example>-exe` step (Windows uses the `windows-*` steps). The Mach-O linker still emits the signature required for
+local execution on Apple Silicon.
+
+Selection preserves registry order and navigation sections. Empty, unknown or
+duplicate keys fail compilation. For a Harness-enabled slim build, also pass
+`-Dtest-mode=true` and restrict the E2E runner to tests for the selected keys.
+Harness remains disabled for ordinary preview builds.
+
+Storybook uses platform fonts and compiled-in SVG icons; its bundle currently
+ships no extra fonts, images or app icon. Other applications with custom assets
+must still arrange their development resource paths (`ResourcePath` searches
+ancestor `assets/` directories, then falls back to the current directory).
+
+For reproducible warm-cache Debug measurements, stop competing builds and run:
+
+```sh
+python3 tools/measure_storybook_slim.py --zig /path/to/zig --samples 5 \
+  --output /tmp/storybook-slim-measurement
+```
+
+The output directory must be new. JSON records the revision, commands, exits,
+raw monotonic wall times, nearest-rank p95 and byte-for-byte source restoration.
+With a small sample count the nearest-rank p95 is simply the slowest sample; it is
+not an estimate of tail latency.
+Each iteration changes one Button label to a unique value. Packaged cases also
+use a second edit to time exe compilation and cached-exe packaging separately;
+those phase measurements each include build orchestration overhead.
+
 ## Input isolation on a shared machine
 
 The harness injects input directly into `ui.Cx`, bypassing the OS. Physical
@@ -96,6 +142,47 @@ Programmatic menu actions, mouse-driven window controls and contract injection
 remain available. This does not lock the OS keyboard or suppress system-wide
 shortcuts. Native-message contracts must explicitly seed owned input rather
 than relying on OS keyboard messages while isolation is enabled.
+
+## Run the Storybook suite in parallel
+
+`bash scripts/run_storybook_e2e_parallel.sh` builds once and runs the Storybook
+suite on several app instances at the same time (`ZENIT_E2E_JOBS`, default
+`clamp(cpus / 2, 2, 8)`). Each instance is one ordinary
+`scripts/run_storybook_e2e.sh` unit with its own RPC dir, app log, evidence
+dir, manifest and session dir, so the app-death watchdog (exit 86), the
+exit-time leak gate (exit 87) and the fatal preflight apply per instance. The
+merged `summary.json` and `manifest.json` go to `ZENIT_E2E_OUT`; a dead app
+outranks a leak, which outranks an assertion failure.
+
+Instances run with `ZENIT_E2E_BACKGROUND=1` and pointer and keyboard isolation:
+they never activate, take key focus or order a window front, and every input
+arrives through the harness. Each instance's clipboard is a private named
+pasteboard (`ZENIT_E2E_PASTEBOARD`, which the sequential script sets too), so
+instances cannot read each other's copies and no run overwrites the
+developer's clipboard.
+
+Tests declare how they may be scheduled in `test(name, fn, options)`:
+
+- `fatal: true`: preflight, runs first on every instance; a failure aborts it.
+- `final: true`: checks an invariant accumulated over the whole instance run
+  (the paint invariant), runs last on every instance.
+- `serial: "<reason>"`: measures real time or contention (the GPU frame-time
+  P95 gates). These run in a lane of their own after every parallel instance
+  has exited.
+
+Other tests are spread longest-first using the durations recorded by earlier
+runs (`ZENIT_E2E_DURATIONS`, default `~/Library/Caches/zenit-e2e/`), falling
+back to `e2e/storybook.durations.json`. Tests must not rely on state left by
+earlier tests: `ZENIT_E2E_SHUFFLE_SEED=<n>` shuffles the order, in the
+sequential script and per instance in the parallel one; `schedule.json` and
+each instance's `plan.json` (replay with `ZENIT_E2E_PLAN`) record what ran
+where.
+
+On macOS, `bash scripts/run_storybook_e2e.sh` defaults to background
+rendering for `e2e/storybook.test.ts`. Storybook still submits real Metal
+frames while another app uses the desktop. Set `ZENIT_E2E_BACKGROUND=0` to
+launch the suite in the foreground for inspection. Other test files keep
+their requested window mode.
 
 ## Select a screenshot window
 
@@ -182,6 +269,43 @@ container with a background and children, outside any scroll area, whose
 siblings change). To find the frame and node, rerun with
 `ZENIT_DEBUG_CMDSTREAM=1`.
 
+## Hover state
+
+`/stats` includes `hover`: `test_id` is the nearest test id on the hovered
+path (or `null`), and `reconcile_hit_tests` / `reconcile_changes` count the
+stationary-pointer re-resolutions (hit tests issued, and the ones that moved
+hover). `/scroll` does not move the pointer, so a wheel injected at the
+pointer position exercises hover following content scrolled under a resting
+pointer.
+`pointer_over_content` is the platform presence (false after a
+`pointer_left` until the next pointer event) and `pointer_live` whether
+stationary re-resolution may run (presence, inside the content, no OS drag
+session).
+
+Two routes stand in for platform events, through the same `Cx` entries the
+runtimes use: `POST /pointer_leave` delivers `pointer_left` (the pointer left
+the window, or another window now covers it; `pointerLeave()` in
+`e2e/client.ts`), and `POST /window_active {"active": false}` sets the window's
+activation appearance (`window_focused.appears_active`; test-mode apps
+otherwise always report active; `setWindowActive()`). Real OS input for the
+same behavior runs in the Windows `hover-probe` / `hover-native` batch stages
+and the Linux `hover-native` stage; on macOS,
+`bash scripts/test_native_pointer_presence.sh --live` checks the window server
+and `bash scripts/macos_hover_probe.sh` measures AppKit.
+
+## Inspecting text fields
+
+`POST /input_state {"test_id": …}` (`inputState(testId)` in `e2e/client.ts`) reports the edit
+state of the Input / Textarea / EditableText under that test id: buffer, caret and anchor (UTF-8
+byte offsets, `anchor = -1` without a selection), caret affinity, IME phase and preedit length,
+scroll offsets, and for textareas the wrapped line count, caret and selection rects. The
+executor finds the first `.input` node with an event context under the test id and asks the
+input module which state sits behind it, `ui.widgets.input.editStateOf(node)`, which returns
+`?EditState` (`.input: *TextInputState` or `.textarea: *TextareaState`). Tools that inspect a
+field (harness, DevTools) must go through `editStateOf` rather than comparing `on_event` handler
+pointers and casting the context themselves; a node whose handler the input module did not
+install yields `null` (the endpoint answers with an error).
+
 ## Runtime integration
 
 Applications using `App.runWith` need no application-code changes. A custom
@@ -209,3 +333,53 @@ Requests acknowledge dispatch, not compositor completion: poll status after
 maximize/restore. Minimize has no portable Wayland acknowledgement; verify the
 compositor image. Close uses the native decoration callback and normal teardown.
 Unsupported platforms return an error.
+
+`scripts/run_linux_window_controls.py` uses file RPC plus the GNOME-specific
+`scripts/linux_harness_desktop.py` adapter to exercise actual titlebar pointer
+input and capture compositor frames (including decorations). The adapter owns
+and closes its local Mutter RemoteDesktop/ScreenCast sessions and releases all
+held keys/buttons. It does not synthesize application focus or input serials.
+This VM acceptance adapter is independent of the portable platform backend.
+
+### Linux native scrolling
+
+On a GNOME Wayland acceptance desktop, build Storybook with Harness enabled and
+run `scripts/run_linux_scroll_acceptance.py --binary zig-out/bin/storybook
+--evidence-dir /tmp/zenit-native-scroll-run-1`. The evidence directory must be
+new. The script starts and normally quits its own application; it requires a
+hardware OpenGL renderer and the same Gio/GStreamer/PipeWire dependencies as
+the native window-control adapter.
+
+Harness seeds a scroll position and observes geometry and frame statistics.
+Measured wheel and finger input comes through the compositor, covering both
+directions, fractional wheel detents, finger phases, continuous exact pixel
+movement, and a 125Hz burst without interleaved RPC observations. Returned
+results include the binary hash, input traces, compositor capture, CPU frame
+budget, response/tail times, GPU invariants and exit status.
+
+The VM batch runner's `--stage-group scroll --app-backend opengl` runs this gate
+and the native Wayland scroll protocol contract together. `all` includes both.
+A failed native/pixel prerequisite explicitly skips the long shared Storybook
+suite and leaves the complete batch failed; a skipped suite does not count as
+UI acceptance.
+
+### Linux native pinyin regression
+
+Select GNOME's `libpinyin` input source and Chinese mode, then run against a
+Harness-enabled hardware OpenGL Storybook:
+
+```sh
+python3 scripts/run_linux_native_ime_acceptance.py \
+  --binary zig-out/bin/storybook --evidence-dir /tmp/zenit-native-pinyin
+```
+
+The test uses Mutter's compositor keyboard and pointer events. It checks Input
+preedit/commit, the native clipboard primer, composition cancellation when
+switching to Textarea, and Textarea preedit/commit. JSON and compositor captures
+are saved together. It never injects Harness IME events or changes the selected
+source/mode to force a pass.
+
+Native input priming uses F24. A standalone Shift press toggles libpinyin's
+Chinese/English mode while the GNOME input source still says Chinese, leaving
+subsequent manual acceptance typing ASCII. Window-control and clipboard tests
+must not use standalone Shift for acquiring a keyboard serial.

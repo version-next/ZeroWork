@@ -1,0 +1,85 @@
+old_path	new_path	layer	mixed	note
+src/asset_action_view_tests.zig	src/features/connections/assets/tests/asset_action_view_tests.zig	tests	no	
+src/asset_group_host_tests.zig	src/features/connections/assets/tests/asset_group_host_tests.zig	tests	no	
+src/auth_challenge_native_fixture.zig	src/features/connections/auth/preview/auth_challenge_native_fixture.zig	preview	no	原生夹具
+src/auth_challenge_view_tests.zig	src/features/connections/auth/tests/auth_challenge_view_tests.zig	tests	no	
+src/connection_details_view_tests.zig	src/features/connections/progress/tests/connection_details_view_tests.zig	tests	no	
+src/connection_host_tests.zig	src/features/connections/progress/tests/connection_host_tests.zig	tests	no	也 import host_key_confirmation
+src/connection_logs_view_tests.zig	src/features/connections/progress/tests/connection_logs_view_tests.zig	tests	no	
+src/connection_progress_preview_runner.zig	src/features/connections/progress/preview/connection_progress_preview_runner.zig	preview	no	
+src/connection_progress_view_tests.zig	src/features/connections/progress/tests/connection_progress_view_tests.zig	tests	no	
+src/forward_config_preview_runner.zig	src/features/connections/socks/preview/forward_config_preview_runner.zig	preview	no	import socks_config_view/socks_info_view
+src/quick_connect_view_tests.zig	src/features/connections/quick_connect/tests/quick_connect_view_tests.zig	tests	no	
+src/socks_background_ui_tests.zig	src/features/connections/socks/tests/socks_background_ui_tests.zig	tests	no	
+src/socks_config_view_tests.zig	src/features/connections/socks/tests/socks_config_view_tests.zig	tests	no	
+src/socks_info_preview_runner.zig	src/features/connections/socks/preview/socks_info_preview_runner.zig	preview	no	
+src/socks_info_theme_tests.zig	src/features/connections/socks/tests/socks_info_theme_tests.zig	tests	no	
+src/socks_info_view_tests.zig	src/features/connections/socks/tests/socks_info_view_tests.zig	tests	no	
+src/ssh_connection_details_runner.zig	src/features/connections/wizard/tests/ssh_connection_details_runner.zig	tests	no	验收 runner（非预览），仅 import ui/wizard_probe；也可视为 progress
+src/ssh_probe_loopback_runner.zig	src/features/connections/wizard/tests/ssh_probe_loopback_runner.zig	tests	no	验收 runner，import ui/wizard、wizard_probe
+src/ssh_resource_ledger_tests.zig	src/features/connections/wizard/tests/ssh_resource_ledger_tests.zig	tests	no	import ui/wizard_probe、session_runtime
+src/ssh_status_host_tests.zig	src/features/connections/progress/tests/ssh_status_host_tests.zig	tests	no	测 ssh_status_host，同时 import status_*（shell）
+src/ssh_terminal_status_tests.zig	src/features/connections/progress/tests/ssh_terminal_status_tests.zig	tests	no	测 ssh_status_host，同时 import terminal_view
+src/totp_autofill_tests.zig	src/features/connections/auth/tests/totp_autofill_tests.zig	tests	no	跨 auth_challenge_view/connection_host/probe_connection_host/socks_application_host/wizard_probe 的集成测试
+src/ui/asset_action_styles.zig	src/features/connections/assets/view/asset_action_styles.zig	view	no	
+src/ui/asset_action_view.zig	src/features/connections/assets/view/asset_action_view.zig	view	no	
+src/ui/asset_group_host.zig	src/features/connections/assets/host/asset_group_host.zig	host	yes	ui=1；含视图构建与 workspace/sidebar_view 依赖，整体放 host
+src/ui/asset_group_styles.zig	src/features/connections/assets/view/asset_group_styles.zig	view	no	
+src/ui/auth_challenge_styles.zig	src/features/connections/auth/view/auth_challenge_styles.zig	view	no	被 plugin_challenge_presenter 等 import
+src/ui/auth_challenge_view.zig	src/features/connections/auth/view/auth_challenge_view.zig	view	no	被 background_surface_tests/material_popup_tests 等跨 feature 测试 import
+src/ui/certificate_trust_styles.zig	src/features/connections/auth/view/certificate_trust_styles.zig	view	no	
+src/ui/certificate_trust_view.zig	src/features/connections/auth/view/certificate_trust_view.zig	view	no	被 plugin_challenge_presenter import
+src/ui/challenge_window_host.zig	src/features/connections/auth/host/challenge_window_host.zig	host	no	*_host；被 plugin_window_host 等 import
+src/ui/connection_details_host.zig	src/features/connections/progress/host/connection_details_host.zig	host	no	依赖 workspace/application_host
+src/ui/connection_details_styles.zig	src/features/connections/progress/view/connection_details_styles.zig	view	no	也被 status_connection_*、status_detail_*（shell）与 socks_background_styles import
+src/ui/connection_details_view.zig	src/features/connections/progress/view/connection_details_view.zig	view	no	也被 status_connection_view（shell）、socks_info_view import
+src/ui/connection_host.zig	src/features/connections/progress/host/connection_host.zig	host	no	依赖 workspace/application_host，处理认证挑战与进度
+src/ui/connection_logs_styles.zig	src/features/connections/progress/view/connection_logs_styles.zig	view	no	被 plugins/bmc_ikvm/views.zig import
+src/ui/connection_logs_view.zig	src/features/connections/progress/view/connection_logs_view.zig	view	no	
+src/ui/connection_progress_styles.zig	src/features/connections/progress/view/connection_progress_styles.zig	view	no	
+src/ui/connection_progress_view.zig	src/features/connections/progress/view/connection_progress_view.zig	view	no	1438 行；被 wizard_test_progress 等 import
+src/ui/connection_stepper.zig	src/features/connections/wizard/view/connection_stepper.zig	view	no	被 plugins/remote/editor.zig、plugins/bmc_ikvm/editor.zig import；依赖 wizard_styles
+src/ui/host_key_confirmation.zig	src/host/host_key_confirmation.zig	core	no	被 core import: src/host/socks_background_runtime.zig, src/host/socks_route_host.zig（另被 plugins/remote/challenge_bridge、plugins/sftp/provider_host、plugins/ssh/connect_job、root.zig、ui/session_runtime 等 import）；ui=0，下沉到 host 层
+src/ui/probe_connection_host.zig	src/features/connections/wizard/host/probe_connection_host.zig	host	no	*_host
+src/ui/quick_connect.zig	src/features/connections/quick_connect/model/quick_connect.zig	model	no	ui=0
+src/ui/quick_connect_icon.zig	src/features/connections/quick_connect/model/quick_connect_icon.zig	model	no	ui=0，仅 import icon_ir
+src/ui/quick_connect_styles.zig	src/features/connections/quick_connect/view/quick_connect_styles.zig	view	no	也被 socks_config_styles、notification_history import
+src/ui/quick_connect_view.zig	src/features/connections/quick_connect/view/quick_connect_view.zig	view	no	
+src/ui/socks_application_host.zig	src/features/connections/socks/host/socks_application_host.zig	host	yes	620 行，含视图与 I/O
+src/ui/socks_background_host.zig	src/features/connections/socks/host/socks_background_host.zig	host	no	
+src/ui/socks_background_model.zig	src/host/socks_background_model.zig	core	no	被 core import: src/host/application_task_domain.zig；ui=0 且只依赖 ../host/*，下沉到 host 层
+src/ui/socks_background_styles.zig	src/features/connections/socks/view/socks_background_styles.zig	view	no	被 sidebar_view（shell）import
+src/ui/socks_background_view.zig	src/features/connections/socks/view/socks_background_view.zig	view	no	
+src/ui/socks_config_styles.zig	src/features/connections/socks/view/socks_config_styles.zig	view	no	
+src/ui/socks_config_view.zig	src/features/connections/socks/view/socks_config_view.zig	view	no	
+src/ui/socks_exposure_confirm.zig	src/features/connections/socks/view/socks_exposure_confirm.zig	view	no	ui=1
+src/ui/socks_exposure_confirm_tests.zig	src/features/connections/socks/tests/socks_exposure_confirm_tests.zig	tests	no	位于 src/ui 的测试；由 transfer_panel_tests 聚合
+src/ui/socks_info_styles.zig	src/features/connections/socks/view/socks_info_styles.zig	view	no	被 connection_details_view、status_connection_view（shell）、ssh_status_host 等跨 feature import
+src/ui/socks_info_view.zig	src/features/connections/socks/view/socks_info_view.zig	view	no	
+src/ui/ssh_status_host.zig	src/features/connections/progress/host/ssh_status_host.zig	host	yes	状态条 SSH 状态宿主，依赖 status_*（shell）视图，可能应归 shell（风险）
+src/ui/wizard.zig	src/features/connections/wizard/view/wizard.zig	view	yes	1020 行，含向导视图与 host/plugin 依赖
+src/ui/wizard_probe.zig	src/features/connections/wizard/host/wizard_probe.zig	host	no	ui=0 但开线程做探测（Thread/spawn）且 import wizard.zig、session_lifecycle
+src/ui/wizard_styles.zig	src/features/connections/wizard/view/wizard_styles.zig	view	no	被 plugins/remote、plugins/bmc_ikvm、plugins/fixture_probe import
+src/ui/wizard_test_progress.zig	src/features/connections/wizard/model/wizard_test_progress.zig	model	no	ui=0 但 import connection_progress_view；被 plugins/remote/editor.zig import
+src/wizard_probe_tests.zig	src/features/connections/wizard/tests/wizard_probe_tests.zig	tests	no	
+src/wizard_test_progress_tests.zig	src/features/connections/wizard/tests/wizard_test_progress_tests.zig	tests	no	
+src/wizard_tests.zig	src/features/connections/wizard/tests/wizard_tests.zig	tests	no	
+# CONTESTED src/ui/remote_session_notice.zig workspace 每窗格远程会话提示（重连/断开），被 workspace.zig import，动作回流 workspace 关闭/重试控制器；import local_session_styles
+# CONTESTED src/ui/retained_panel.zig shared-ui 通用窗口持有面板（settings/assistant 共用），main.zig 与 background_surface_tests 使用，与连接无关
+# CONTESTED src/ui/rocky_os_asset.zig shared-ui 由 tools/gen_svg_assets.zig 生成的 OS 图标资源注册表，无任何 import 方
+# CONTESTED src/ui/host_os_assets.zig shared-ui *_assets.zig 资源注册表，被 session_icon/workspace import
+# CONTESTED src/asset_actions_tests.zig root-core 仅测 config/asset_actions + ui/session_lifecycle（后者将下沉 host），无连接视图
+# CONTESTED src/asset_registry_tests.zig root-core 仅 import config/hosts、config/store，不 import src/ui
+# CONTESTED src/ssh_connection_details_tests.zig root-core 仅测 proto/ssh，唯一 ui 依赖是 ui/application_host（归 workspace/app）
+# CONTESTED src/ssh_request_counter_tests.zig root-core 仅 import ui/host_key_confirmation（将下沉 host）与 proto，不触及连接视图
+# CONTESTED src/bmc_editor_capability_tests.zig plugin 测 BMC 编辑器能力，仅 import ui/wizard
+# CONTESTED src/ai_remote_picker_view_tests.zig ai import ui/challenge_window_host 与 host_key_confirmation，但主体是 AI 远程选择器（ai）
+# CONTESTED src/bmc_kvm_preview_runner.zig plugin import connection_details_view、ssh_status_host，但主体是 BMC KVM 预览
+# E2E (无) 在 e2e/、scripts/、docs/（除 docs/ui-revamp）、build.zig、tools/ 中未发现对认领的旧路径（src/ui/*.zig 或 src/*_tests.zig 等）的硬编码引用
+# TESTID wizard
+# TESTID connection
+# TESTID auth
+# TESTID socks
+# TESTID forward
+# TESTID asset
+# TESTID quick

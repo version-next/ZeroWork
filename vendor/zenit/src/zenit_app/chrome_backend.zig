@@ -5,7 +5,7 @@ const platform = @import("platform");
 pub const chrome = @import("system_sdk").window_chrome;
 const Window = platform.Window;
 pub const HitFn = *const fn (?*anyopaque, f32, f32) callconv(.c) c_int;
-extern fn macos_chrome_configure(*anyopaque, c_int, c_int, f32) c_int;
+extern fn macos_chrome_configure(*anyopaque, c_int, c_int, f32, c_int) c_int;
 extern fn macos_chrome_hit(*anyopaque, ?HitFn, ?*anyopaque) void;
 extern fn macos_chrome_state(*anyopaque, *chrome.NativeState) void;
 extern fn macos_chrome_action(*anyopaque, c_int, c_int) c_int;
@@ -64,6 +64,23 @@ pub fn useSystemTitlebar(win: *Window) !void {
 }
 extern fn zenit_win_chrome_minimum(*anyopaque, u32, u32) c_int;
 extern fn zenit_wayland_chrome_minimum(*anyopaque, u32, u32) c_int;
+extern fn macos_chrome_maximizable(*anyopaque, c_int) c_int;
+pub fn setMaximizable(win: *Window, value: bool) !void {
+    if (comptime builtin.os.tag != .macos) {
+        // Loud reject over a silent capability lie; same contract as
+        // configureHeader's visible policies on unsupported backends.
+        if (!value) return error.UnsupportedWindowCapability;
+        return;
+    }
+    if (macos_chrome_maximizable(handle(win), @intFromBool(value)) != 1) return error.NativeChromeConfigurationFailed;
+}
+extern fn macos_chrome_restorable(*anyopaque, c_int) c_int;
+pub fn setRestorable(win: *Window, value: bool) !void {
+    // Only macOS runs a window restore pass; "never restore" is trivially
+    // true on the other backends, so the flag is accepted there.
+    if (comptime builtin.os.tag != .macos) return;
+    if (macos_chrome_restorable(handle(win), @intFromBool(value)) != 1) return error.NativeChromeConfigurationFailed;
+}
 pub fn setMinimumSize(win: *Window, width: u32, height: u32) !void {
     if (width > 16384 or height > 16384) return error.InvalidWindowMinimumSize;
     if (width == 0 and height == 0) return;
@@ -87,10 +104,11 @@ pub fn configure(win: *Window, config: chrome.Config, height: f32) !chrome.State
     if (config == .custom and (!std.math.isFinite(height) or height <= 0)) return error.InvalidTitlebarHeight;
     const mode: c_int = @intCast(@backingInt(std.meta.activeTag(config)));
     const automatic: c_int = if (config == .custom and config.custom.controls == .automatic) 1 else 0;
+    const toolbar: c_int = if (config == .custom and config.custom.titlebar == .toolbar) 1 else 0;
     var supported = true;
     var reason: chrome.FallbackReason = .none;
     switch (builtin.os.tag) {
-        .macos => if (macos_chrome_configure(handle(win), mode, automatic, height) != 1) return error.NativeChromeConfigurationFailed,
+        .macos => if (macos_chrome_configure(handle(win), mode, automatic, height, toolbar) != 1) return error.NativeChromeConfigurationFailed,
         .windows => {
             const result = zenit_win_chrome_configure(handle(win), mode, automatic, height);
             if (result == 0) return error.NativeChromeConfigurationFailed;

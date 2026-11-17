@@ -4,7 +4,7 @@ const host = @import("host_tools.zig");
 const provider = @import("provider.zig");
 const identity = @import("../host/identity.zig");
 fn context() host.Context {
-    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 2, .grant_revision = 3 };
+    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 2, .grant_revision = 3 };
 }
 fn invocation(ctx: host.Context, args: std.json.Value, json: []const u8) !host.Invocation {
     var hash: [32]u8 = undefined;
@@ -413,7 +413,8 @@ test "automatic permission covers host lifecycle network input and group command
     for (cases) |case| {
         var broker: approval.Broker = .{};
         var ctx = context();
-        ctx.binding = .{ .group = 7 };
+        ctx.binding = .{ .tab = 7 };
+        ctx.content = .{ .group = 7 };
         try broker.configure(ctx, 9);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
         defer parsed.deinit();

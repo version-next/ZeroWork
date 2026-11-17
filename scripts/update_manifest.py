@@ -46,8 +46,8 @@ def verify_manifest(archive, envelope):
     version = m['version']
     if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version): raise SystemExit('Automatic updates accept stable X.Y.Z releases only')
     if archive.name != f'ZeroWork-{version}-arm64.zip': raise SystemExit('ZIP filename/version mismatch')
-    expected_url = f'https://github.com/iskylite/ZeroWork/releases/download/v{version}/{archive.name}'
-    if m['url'] != expected_url or m['release_url'] != f'https://github.com/iskylite/ZeroWork/releases/tag/v{version}': raise SystemExit('Update URL/version mismatch')
+    expected_url = f'https://github.com/version-next/ZeroWork/releases/download/v{version}/{archive.name}'
+    if m['url'] != expected_url or m['release_url'] != f'https://github.com/version-next/ZeroWork/releases/tag/v{version}': raise SystemExit('Update URL/version mismatch')
     if type(m['bytes']) is not int or not 0 < m['bytes'] <= 1024**3 or m['bytes'] != archive.stat().st_size: raise SystemExit('Update ZIP size mismatch')
     with archive.open('rb') as source:
         if m['sha256'] != hashlib.file_digest(source, 'sha256').hexdigest(): raise SystemExit('Update ZIP SHA256 mismatch')
@@ -75,7 +75,7 @@ def manifest(args):
         if any(not x.filename.startswith('ZeroWork.app/') or '..' in pathlib.PurePosixPath(x.filename).parts for x in z.infolist()): raise SystemExit('ZIP must contain only ZeroWork.app')
     notes = pathlib.Path(args.notes).read_text() if args.notes else 'ZeroWork ' + args.version
     if len(notes.encode()) > 16384: raise SystemExit('Release notes exceed 16 KiB')
-    payload = encode({'schema':1, 'version':args.version, 'minimum_os':'13.0', 'arch':'arm64', 'url':f'https://github.com/iskylite/ZeroWork/releases/download/v{args.version}/{archive.name}', 'bytes':archive.stat().st_size, 'expanded_bytes':expanded, 'sha256':hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest(), 'notes':notes, 'release_url':f'https://github.com/iskylite/ZeroWork/releases/tag/v{args.version}'})
+    payload = encode({'schema':1, 'version':args.version, 'minimum_os':'13.0', 'arch':'arm64', 'url':f'https://github.com/version-next/ZeroWork/releases/download/v{args.version}/{archive.name}', 'bytes':archive.stat().st_size, 'expanded_bytes':expanded, 'sha256':hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest(), 'notes':notes, 'release_url':f'https://github.com/version-next/ZeroWork/releases/tag/v{args.version}'})
     envelope = {'key_id':trust['key_id'], 'payload_base64':base64.b64encode(payload).decode(), 'signature_base64':base64.b64encode(key.sign(payload)).decode()}
     out = pathlib.Path(args.output or archive.parent/'update.json')
     if out.exists(): raise SystemExit('Refusing to overwrite '+str(out))

@@ -35,6 +35,246 @@ const theme = core.theme;
 const transition = core.transition;
 const world = core.world;
 
+test "frame request consumption paints timer edits without a trailing frame" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    const Edit = struct {
+        node: *Node,
+        calls: usize = 0,
+        fn run(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.node.setBackgroundRaw(Color.rgb(255, 0, 0));
+            self.node.markRenderDirty();
+        }
+    };
+    var edit: Edit = .{ .node = cx.root.? };
+    _ = try cx.setTimer(0, Edit.run, &edit);
+    try t.expect(cx.wantsFrame());
+    cx.advanceFrameClock();
+    cx.layout();
+    const items = cx.render();
+    try t.expectEqual(@as(usize, 1), edit.calls);
+    try t.expect(items.len == 1 and items[0] == .fill_rect);
+    try t.expect(Color.eql(Color.rgb(255, 0, 0), items[0].fill_rect.color));
+    try t.expect(Color.eql(Color.rgb(255, 0, 0), cx.root.?.getBackground()));
+    try t.expect(!cx.hasPendingSceneWork());
+    try t.expect(!cx.wantsFrame());
+}
+
+test "frame request consumption preserves hook continuation and newly due timers" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    const Probe = struct {
+        cx: *Cx,
+        calls: usize = 0,
+        fn timer(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 1) _ = self.cx.setTimer(0, timer, self) catch unreachable;
+        }
+        fn hook(node: *Node) void {
+            node.markRenderDirty();
+        }
+    };
+    var probe: Probe = .{ .cx = cx };
+    _ = try cx.setTimer(0, Probe.timer, &probe);
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 1), probe.calls);
+    try t.expect(cx.wantsFrame()); // The newly created timer still gets a turn.
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 2), probe.calls);
+    try t.expect(!cx.wantsFrame());
+    // An explicit public timer pump, outside painting, still requests paint.
+    _ = try cx.setTimer(0, Probe.timer, &probe);
+    cx.fireDueTimers();
+    try t.expect(cx.needs_redraw);
+    cx.root.?.addBeforeRender(Probe.hook);
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expect(cx.wantsFrame()); // Hooks retain the existing continuation API.
+}
+
+test "frame request consumption runs hooks for timer state without dirty nodes" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    const Probe = struct {
+        var changed = false;
+        fn timer(_: ?*anyopaque) void {
+            changed = true;
+        }
+        fn hook(node: *Node) void {
+            if (changed) node.setBackgroundRaw(Color.rgb(255, 0, 0));
+        }
+    };
+    Probe.changed = false;
+    cx.root.?.addBeforeRender(Probe.hook);
+    cx.layout();
+    _ = cx.render();
+    _ = try cx.setTimer(0, Probe.timer, null);
+    // Deliberately frozen clock, no node dirty bits: consuming the timer's
+    // request must not let the cache bypass its hook on this very frame.
+    cx.layout();
+    const items = cx.render();
+    try t.expect(items.len == 1 and items[0] == .fill_rect);
+    try t.expect(Color.eql(Color.rgb(255, 0, 0), items[0].fill_rect.color));
+    try t.expect(Probe.changed);
+    try t.expect(Color.eql(Color.rgb(255, 0, 0), cx.root.?.getBackground()));
+}
+
+test "frame request consumption runs after-layout hooks on requests raised after an idle clock advance" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    try cx.setTestFrameStep(100);
+    cx.root = try core.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    const Probe = struct {
+        calls: usize = 0,
+        dt_ms: f32 = -1,
+        fn run(raw: *anyopaque, _: u8, _: bool) core.AfterLayoutResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.dt_ms = core.render_engine.saveFrameClock().dt_ms;
+            return .done;
+        }
+    };
+    var probe: Probe = .{};
+    try cx.addAfterLayoutHook(&probe, Probe.run);
+    defer cx.removeAfterLayoutHook(&probe);
+    // Harness loop without layout(): the request comes after the clock found
+    // nothing to do, so the clock stays frozen and frame_count never moves.
+    for (0..6) |_| {
+        cx.advanceFrameClock();
+        cx.requestRedraw();
+        _ = cx.render();
+    }
+    const frozen = cx.frame_time_ms;
+    const before = probe.calls;
+    for (0..3) |i| {
+        cx.advanceFrameClock();
+        cx.requestRedraw();
+        _ = cx.render();
+        try t.expectEqual(before + i + 1, probe.calls);
+        try t.expectEqual(@as(f32, 0), probe.dt_ms); // No time passed: no stale dt.
+    }
+    try t.expectEqual(frozen, cx.frame_time_ms);
+    // An unrequested repaint of the same frame still coalesces.
+    _ = cx.render();
+    try t.expectEqual(before + 3, probe.calls);
+    try t.expect(!cx.wantsFrame());
+}
+
+test "frame request consumption matches the main hook and preserves sibling animations" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
+    const Hooks = struct {
+        var current_calls: usize = 0;
+        var animation_calls: usize = 0;
+        var request_cx: ?*Cx = null;
+        fn current(node: *Node) void {
+            @import("redraw.zig").consumeCurrentFrame(node, @intFromPtr(&current));
+            current_calls += 1;
+            node.markRenderDirty();
+            if (request_cx) |owner| owner.requestRedraw();
+        }
+        fn animation(node: *Node) void {
+            animation_calls += 1;
+            node.setBackgroundRaw(Color.rgb(255, 0, 0));
+            node.markRenderDirty();
+        }
+    };
+    Hooks.current_calls = 0;
+    Hooks.animation_calls = 0;
+    Hooks.request_cx = null;
+    defer Hooks.request_cx = null;
+    cx.root.?.meta.per_frame.hooks.before_render.main = Hooks.current;
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 1), Hooks.current_calls);
+    try t.expect(!cx.wantsFrame());
+    cx.root.?.addBeforeRender(Hooks.animation);
+    cx.requestRedraw();
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 1), Hooks.animation_calls);
+    try t.expect(cx.wantsFrame());
+    cx.root.?.removeBeforeRender(Hooks.animation);
+    cx.root.?.meta.per_frame.hooks.before_render.main = Hooks.animation;
+    cx.requestRedraw();
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 2), Hooks.animation_calls);
+    try t.expect(cx.wantsFrame()); // A replacement does not inherit the opt-out.
+    Hooks.request_cx = cx;
+    cx.root.?.meta.per_frame.hooks.before_render.main = Hooks.current;
+    cx.requestRedraw();
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(@as(usize, 3), Hooks.current_calls);
+    try t.expect(cx.wantsFrame()); // Explicit continuation still wins.
+}
+
+test "frame request consumption restores nested scopes and ignores wrappers and foreign nodes" {
+    const t = std.testing;
+    const tick = @import("render_engine/tick.zig");
+    const redraw = @import("redraw.zig");
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{}, .{});
+    const child = try core.box(cx, .{}, .{});
+    try cx.root.?.appendChild(t.allocator, child);
+    const Hooks = struct {
+        var child_node: *Node = undefined;
+        var inner_continues: bool = true;
+        fn current(node: *Node) void {
+            redraw.consumeCurrentFrame(node, @intFromPtr(&current));
+            node.markRenderDirty();
+        }
+        fn wrapper(node: *Node) void {
+            node.setBackgroundRaw(Color.rgb(1, 2, 3));
+            current(node); // Direct call cannot consume wrapper's request.
+        }
+        fn nested(node: *Node) void {
+            inner_continues = tick.runBeforeRenderHook(child_node, current);
+            node.markRenderDirty();
+        }
+        fn foreign(node: *Node) void {
+            redraw.consumeCurrentFrame(child_node, @intFromPtr(&foreign));
+            node.markRenderDirty();
+        }
+    };
+    Hooks.child_node = child;
+    cx.layout();
+    try t.expect(!tick.runBeforeRenderHook(child, Hooks.current));
+    try t.expect(tick.runBeforeRenderHook(cx.root.?, Hooks.wrapper));
+    try t.expect(tick.runBeforeRenderHook(cx.root.?, Hooks.nested));
+    try t.expect(!Hooks.inner_continues);
+    try t.expect(tick.runBeforeRenderHook(cx.root.?, Hooks.foreign));
+    // Outside a managed call this is ignored, leaving the next hook's default intact.
+    redraw.consumeCurrentFrame(cx.root.?, @intFromPtr(&Hooks.wrapper));
+    try t.expect(tick.runBeforeRenderHook(cx.root.?, Hooks.wrapper));
+}
+
 test "loose interaction memo survives alternating windows and invalidates on mutation" {
     const t = std.testing;
     const a = try Cx.init(t.allocator, t.io);
@@ -186,7 +426,7 @@ test "host frame convergence consumes the final real animation frame and stays i
     const cx = try createConvergenceScene();
     defer cx.deinit();
     const child = cx.root.?.children.items[0];
-    child.applyTransition(cx.allocator, &comptime @import("../recipe.zig").transition("opacity 96ms linear"));
+    try child.applyTransition(cx.allocator, &comptime @import("../recipe.zig").transition("opacity 96ms linear"));
     child.setOpacity(0.25);
     try std.testing.expect(child.frame_state.frame_local.runtime.transitions.?.any_active);
     const frames = try expectSceneConverges(cx);
@@ -391,6 +631,38 @@ test "frame clock freezes across idle frames and resumes without a time jump" {
     try testing.expect(resumed_delta < 100);
 }
 
+test "frame clock keeps flowing while a compositor sprite animates an idle window" {
+    // The compositor animates the sprite on the wall clock meanwhile; the first
+    // frame after the hand-back must paint the picture it shows by then.
+    const testing = std.testing;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const noop = struct {
+        fn draw(_: @import("compositor_sprite.zig").DrawContext, _: ?*anyopaque, _: f64) anyerror!void {}
+        fn repaint(_: ?*anyopaque) void {}
+    };
+    try cx.sprites.register(testing.allocator, 1, 1000, null, noop.draw, noop.repaint);
+    cx.sprites.sources.items[0].active = true;
+
+    cx.needs_redraw = true;
+    try backdateLastFrame(cx, 16 * std.time.ns_per_ms);
+    cx.advanceFrameClock();
+    const before_idle = cx.frame_time_ms;
+    // No root: nothing pending, so these are idle frames.
+    const idle_span_ns: u64 = 1 * std.time.ns_per_s;
+    for (0..5) |_| {
+        cx.needs_redraw = false;
+        try backdateLastFrame(cx, idle_span_ns);
+        cx.clock_epoch.?.timestamp -= idle_span_ns;
+        cx.advanceFrameClock();
+        try testing.expectEqual(before_idle, cx.frame_time_ms);
+    }
+    cx.needs_redraw = true;
+    try backdateLastFrame(cx, 16 * std.time.ns_per_ms);
+    cx.advanceFrameClock();
+    try testing.expect(cx.frame_time_ms - before_idle >= 5000);
+}
+
 test "freeNode disposes attached node scope" {
     const testing = std.testing;
 
@@ -546,6 +818,34 @@ test "image builder mirrors texture_id into World.content" {
     try testing.expectEqual(@as(u32, 42), node.getImage().?.texture_id);
 }
 
+test "setImage replaces and clears a retained image across frames without manual dirtying" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(200, 100, 1);
+    const node = try image(cx, 41, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } });
+    cx.root = try core.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{node});
+    for (0..2) |_| _ = cx.render();
+    for ([_]?u32{ 42, null, 43 }) |texture| {
+        node.setImage(if (texture) |id| .{ .texture_id = id } else null);
+        for (0..2) |_| {
+            _ = cx.render();
+            var seen: ?u32 = null;
+            for (cx.lowerForEncoderPaintTable()) |item| {
+                if (item.kind == .image) {
+                    try t.expect(seen == null);
+                    seen = @intCast(item.resource_handle);
+                }
+            }
+            try t.expectEqual(texture, seen);
+        }
+        const version = node.meta.per_frame.caches.versions.content;
+        node.setImage(node.getImage());
+        try t.expectEqual(version, node.meta.per_frame.caches.versions.content);
+        try t.expect(!node.frame_state.state_bits.dirty.core.layout);
+    }
+}
+
 test "setBackground mirrors into World.paint_state" {
     const testing = std.testing;
 
@@ -595,7 +895,7 @@ test "setBackgroundRaw mirrors World but skips dirty/transition" {
 
     // Configure node background transition: setBackground walks interpolation
     // branch, setBackgroundRaw must **bypass** it, write directly.
-    node.enableImplicitAnimation(cx.allocator, &.{.background}, .{ .duration_ms = 200 });
+    try node.enableImplicitAnimation(cx.allocator, &.{.background}, .{ .duration_ms = 200 });
 
     const blue = Color.rgba(0, 0, 255, 255);
     node.setBackgroundRaw(blue);
@@ -623,7 +923,7 @@ test "setOpacityRaw mirrors World, no transition activation" {
     const node = try builders.box(cx, .{}, .{});
     defer cx.freeNode(node);
 
-    node.enableImplicitAnimation(cx.allocator, &.{.opacity}, .{ .duration_ms = 200 });
+    try node.enableImplicitAnimation(cx.allocator, &.{.opacity}, .{ .duration_ms = 200 });
 
     node.setOpacityRaw(0.3);
 
@@ -724,10 +1024,10 @@ test "主题运行时切换 (dark / light / high_contrast)" {
 
     cx.setTheme(&theme.high_contrast);
     try testing.expectEqualStrings("high_contrast", cx.tokens.name);
-    // high_contrast pure black background.
-    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.r);
-    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.g);
-    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.b);
+    // high_contrast near-black background (neutral.950).
+    try testing.expectEqual(@as(u8, 0x0A), cx.tokens.tokens.color.bg_base.r);
+    try testing.expectEqual(@as(u8, 0x0A), cx.tokens.tokens.color.bg_base.g);
+    try testing.expectEqual(@as(u8, 0x0A), cx.tokens.tokens.color.bg_base.b);
     // Pure white foreground.
     try testing.expectEqual(@as(u8, 255), cx.tokens.tokens.color.fg_primary.r);
 }
@@ -771,94 +1071,94 @@ test "theme Signal 化: themeSignal 惰性创建 + setTheme 驱动 set" {
     var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
-
-    const sig = try cx.themeSignal(scope);
+    const sig = try cx.themeSignal();
     // Repeated calls return same Signal.
-    try testing.expectEqual(sig, try cx.themeSignal(scope));
+    try testing.expectEqual(sig, try cx.themeSignal());
     try testing.expectEqualStrings("dark", sig.get().name);
 
     cx.setTheme(&theme.light);
     try testing.expectEqualStrings("light", sig.get().name);
 }
 
-// Reproduces a failure: **Cx.theme_signal caches a Signal owned by the "first caller's
-// Scope", and the Scope is destroyed with no unbind**, so the cache points to freed memory.
-// The theme signal is global, but the first subscriber is often a component/panel scope
-// (e.g., popover). When that panel closes (scope.dispose) the cache on Cx dangles; the
-// next themeSignal caller gets a wild pointer and setTheme writes through it.
-test "themeSignal 的缓存必须随创建它的 Scope 一起失效（故障复现）" {
+// Window replacement on one Cx (zeditor Global Find / palette): the old window's Input asked
+// for the theme first, the new window's style effects hold the same Signal, then the old
+// window is freed. When the Signal belonged to the first caller's root scope it died with the
+// old window and the new window's next style run read freed memory. The Cx owns it now.
+test "themeSignal 归 Cx 所有：最先请求它的 Scope 释放后，其他持有者读到的仍是活的 Signal" {
     const testing = std.testing;
 
     var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    // Long-lived scope: represents window root.
-    const root_scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer root_scope.dispose();
+    const old_window = try Scope.init(testing.allocator, null, cx.owner);
+    const new_window = try Scope.init(testing.allocator, null, cx.owner);
+    defer new_window.dispose();
 
-    {
-        // Short-lived scope: represents popover/panel, happens first to subscribe
-        // theme.
-        const panel_scope = try Scope.init(testing.allocator, null, cx.owner);
-        const sig = try cx.themeSignal(panel_scope);
-        try testing.expectEqualStrings("dark", sig.get().name);
-        panel_scope.dispose();
-    }
+    // The old window is the current window root when its component asks first.
+    cx.root_scope = old_window;
+    _ = try cx.themeSignal();
+    const Reader = struct {
+        sig: *Signal(*const theme.ThemeTokens),
+        seen: []const u8 = "",
+        fn run(self: *@This()) void {
+            self.seen = self.sig.get().name;
+        }
+    };
+    var reader: Reader = .{ .sig = try cx.themeSignal() };
+    try new_window.createEffect(&reader, Reader.run);
+    try testing.expectEqualStrings("dark", reader.seen);
 
-    // After panel closes: cache must invalidate, themeSignal should rebuild on
-    // root_scope. Before fix returned freed Signal, get()/setTheme both UAF.
-    const sig2 = try cx.themeSignal(root_scope);
-    try testing.expectEqualStrings("dark", sig2.get().name);
+    cx.root_scope = null;
+    old_window.dispose();
+    // Same live Signal for everyone after the first caller is gone.
+    try testing.expectEqual(reader.sig, try cx.themeSignal());
     cx.setTheme(&theme.light);
-    try testing.expectEqualStrings("light", sig2.get().name);
+    try testing.expectEqualStrings("light", reader.seen);
+    try testing.expectEqualStrings("light", reader.sig.get().name);
 }
 
-// There is a **transient window**: disposeNow order is 1 child scope -> 2 cleanups ->
-// 3 effects -> 4 destroy signals -> 5 resources. If unbind were registered as a resource
-// (step 5) it would run after the Signal is freed (step 4), and steps 3/4 run user
-// callbacks, so any themeSignal call hits the uncleaned cache and gets a wild pointer.
-// So unbind must register as cleanup (step 2). This test calls themeSignal in a cleanup to
-// pin this order: it must get a live (rebuilt on another scope) Signal, not one being
-// destroyed.
+// A dispose callback that asks for the theme gets the live Cx Signal, never one being freed.
 test "dispose 期间回调里再取 themeSignal 不得拿到野指针" {
     const testing = std.testing;
 
     var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    const root_scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer root_scope.dispose();
-
-    // Probe registered as resource: resources run at step 5, signals are destroyed at
-    // step 4 already. Reverse execution => later registration runs first, so the probe
-    // ranks before themeSignal's own unbind registration, exactly the worst case. If unbind were
-    // also a resource (bug), the cache would still point at the freed Signal and the probe's
-    // get() is a UAF; with unbind registered as cleanup (correct, step 2) the cache is already
-    // cleared and the probe rebuilds live on root_scope.
     const Probe = struct {
         cx: *Cx,
-        root: *Scope,
         name: []const u8 = "",
 
         fn destroy(ptr: *anyopaque, _: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const sig = self.cx.themeSignal(self.root) catch return;
+            const sig = self.cx.themeSignal() catch return;
             self.name = sig.get().name;
         }
     };
-    var probe = Probe{ .cx = cx, .root = root_scope };
+    var probe = Probe{ .cx = cx };
 
     {
         const panel_scope = try Scope.init(testing.allocator, null, cx.owner);
-        _ = try cx.themeSignal(panel_scope);
+        _ = try cx.themeSignal();
         try panel_scope.registerResource(@ptrCast(&probe), Probe.destroy);
         panel_scope.dispose();
     }
 
-    // Probe must get live Signal content, not wild pointer garbage.
     try testing.expectEqualStrings("dark", probe.name);
+}
+
+test "Cx 服务 Signal（theme / a11y 偏好）在任何 OOM 点都不半建、不泄漏" {
+    const testing = std.testing;
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            const cx = try Cx.init(a, std.testing.io);
+            defer cx.deinit();
+            const sig = try cx.themeSignal();
+            try testing.expect(cx.theme_signal == sig);
+            const prefs = try cx.a11yPreferencesSignal();
+            try testing.expect(cx.a11y_prefs_signal == prefs);
+            try testing.expectEqual(sig, try cx.themeSignal());
+        }
+    }.run, .{});
 }
 
 test "boxStyled/textStyled: setTheme 重放具名样式函数（含 paint_state 背景路径）" {
@@ -1760,7 +2060,7 @@ test "transition setters: writing the current value never starts a transition" {
     const n = try builders.box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 }, .background = Color.hex(0x336699) }, .{});
     defer cx.freeNode(n);
     n.setOpacityRaw(1);
-    n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out, border-color 150ms ease-out, opacity 150ms ease-out"));
+    try n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out, border-color 150ms ease-out, opacity 150ms ease-out"));
     // Slot just built (to_* still default): write same value as current is
     // no-op.
     n.setBackground(Color.hex(0x336699));
@@ -1770,6 +2070,166 @@ test "transition setters: writing the current value never starts a transition" {
     // True change triggers startup.
     n.setOpacity(0);
     try std.testing.expect(n.frame_state.frame_local.runtime.transitions.?.any_active);
+}
+
+test "setTheme and replaySubtreeTheme start theme transitions on this window's clock" {
+    // A publication outside this Cx's frame must not borrow the clock of whichever window rendered
+    // last: a later clock would start the transition in this window's future (it never progresses
+    // until a second publication restarts it), an earlier one would skip it.
+    const recipe_mod = @import("../recipe.zig");
+    const render_engine = @import("render_engine/mod.zig");
+    const saved = render_engine.saveFrameClock();
+    defer render_engine.restoreFrameClock(saved);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    try cx.setTestFrameStep(16);
+    const n = try builders.box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 }, .background = Color.hex(0x336699) }, .{});
+    cx.root = n;
+    defer cx.root = null;
+    defer cx.freeNode(n);
+    try n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out"));
+    n.meta.per_frame.hooks.on_theme = struct {
+        fn paint(node: *Node, t: *const core.ThemeTokens, _: Allocator) void {
+            node.setBackground(t.tokens.color.bg_primary);
+        }
+    }.paint;
+    const slot = n.frame_state.frame_local.runtime.transitions.?.find(.background).?;
+    for ([_]*const core.ThemeTokens{ &core.theme.light, &core.theme.dark }) |t| {
+        render_engine.current_frame_time_ms = cx.frame_time_ms + 10_000;
+        cx.setTheme(t);
+        try std.testing.expect(slot.active);
+        try std.testing.expectEqual(cx.frame_time_ms, slot.start_time_ms);
+        // The outer clock is restored for the caller.
+        try std.testing.expectEqual(cx.frame_time_ms + 10_000, render_engine.current_frame_time_ms);
+    }
+    slot.active = false;
+    n.setBackgroundRaw(Color.hex(0x336699));
+    render_engine.current_frame_time_ms = cx.frame_time_ms + 10_000;
+    cx.replaySubtreeTheme(n);
+    try std.testing.expect(slot.active);
+    try std.testing.expectEqual(cx.frame_time_ms, slot.start_time_ms);
+    try std.testing.expectEqual(cx.frame_time_ms + 10_000, render_engine.current_frame_time_ms);
+}
+
+test "a transition stamped by a later window clock still runs on this window's frames" {
+    // A style write outside this window's frame takes the process-wide clock of the window that
+    // rendered last. A later clock must not freeze the transition at its from-value.
+    const recipe_mod = @import("../recipe.zig");
+    const render_engine = @import("render_engine/mod.zig");
+    const saved = render_engine.saveFrameClock();
+    defer render_engine.restoreFrameClock(saved);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    try cx.setTestFrameStep(100);
+    cx.setViewport(20, 20);
+    const n = try builders.box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 }, .background = Color.hex(0x336699) }, .{});
+    cx.root = n;
+    defer cx.root = null;
+    defer cx.freeNode(n);
+    try n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out"));
+    cx.layout();
+    _ = cx.render();
+    render_engine.current_frame_time_ms = cx.frame_time_ms + 10_000;
+    n.setBackground(Color.hex(0x112233));
+    const slot = n.frame_state.frame_local.runtime.transitions.?.find(.background).?;
+    try std.testing.expect(slot.active);
+    for (0..4) |_| {
+        cx.requestRedraw();
+        cx.advanceFrameClock();
+        cx.layout();
+        _ = cx.render();
+    }
+    try std.testing.expect(!slot.active);
+    try std.testing.expectEqual(Color.hex(0x112233), n.getBackground());
+}
+
+test "a handler after an event-time hit refresh starts its transition on the event clock" {
+    // The host renders nothing while the window is idle, so the frame clock stays at the last
+    // active frame. An event that finds scene work pending refreshes the hit scene with a tick
+    // at that frozen clock; its handler must still stamp transitions with the event's time, or
+    // the first frame after it (a whole idle stretch later) completes them at once.
+    const recipe_mod = @import("../recipe.zig");
+    const render_engine = @import("render_engine/mod.zig");
+    const saved = render_engine.saveFrameClock();
+    defer render_engine.restoreFrameClock(saved);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(40, 40);
+    const n = try builders.box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 }, .background = Color.hex(0x336699) }, .{});
+    cx.root = n;
+    defer cx.root = null;
+    defer cx.freeNode(n);
+    try n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out"));
+    const Press = struct {
+        fn onEvent(event: events_mod.Event, ctx: ?*anyopaque) events_mod.EventResult {
+            if (event == .mouse_down) @as(*Node, @ptrCast(@alignCast(ctx.?))).setBackground(Color.hex(0x112233));
+            return .ignored;
+        }
+    };
+    n.behavior.events.on_event = Press.onEvent;
+    n.behavior.events.event_context = n;
+    n.markInteractionDirty();
+    for (0..2) |_| {
+        cx.requestRedraw();
+        cx.advanceFrameClock();
+        cx.layout();
+        _ = cx.render();
+    }
+    cx.advanceFrameClock(); // idle: the clock freezes
+    // A second passes without a frame; then scene work (a timer's content update) is pending
+    // as the press arrives.
+    cx.clock_epoch.?.timestamp -= std.time.ns_per_s;
+    cx.last_frame_instant.?.timestamp -= std.time.ns_per_s;
+    n.markRenderDirty();
+    cx.handleMouseDown(10, 10, .{});
+    const slot = n.frame_state.frame_local.runtime.transitions.?.find(.background).?;
+    try std.testing.expect(slot.active);
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(slot.active);
+    try std.testing.expect(!Color.eql(Color.hex(0x112233), n.getBackground()));
+}
+
+test "an event-time hit refresh does not pull an event-stamped transition back to the frame clock" {
+    // A pointer move (the harness's automation cursor update after a click, a real pointer
+    // jitter after release) refreshes the hit scene at the frozen frame clock before the next
+    // frame. The click-time start lies ahead of that clock but is no other window's future: it
+    // must not be re-anchored to the stale frame time.
+    const recipe_mod = @import("../recipe.zig");
+    const render_engine = @import("render_engine/mod.zig");
+    const saved = render_engine.saveFrameClock();
+    defer render_engine.restoreFrameClock(saved);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(40, 40);
+    const n = try builders.box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 }, .background = Color.hex(0x336699) }, .{});
+    cx.root = n;
+    defer cx.root = null;
+    defer cx.freeNode(n);
+    try n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out"));
+    for (0..2) |_| {
+        cx.requestRedraw();
+        cx.advanceFrameClock();
+        cx.layout();
+        _ = cx.render();
+    }
+    cx.advanceFrameClock(); // idle: the clock freezes
+    cx.clock_epoch.?.timestamp -= std.time.ns_per_s;
+    cx.last_frame_instant.?.timestamp -= std.time.ns_per_s;
+    // A host entry (the click) starts the transition at the event's time.
+    cx.bindEventClock();
+    n.setBackground(Color.hex(0x112233));
+    const slot = n.frame_state.frame_local.runtime.transitions.?.find(.background).?;
+    const start = slot.start_time_ms;
+    try std.testing.expect(start > cx.frame_time_ms + 500);
+    cx.handleMouseMove(11, 10);
+    try std.testing.expectEqual(start, slot.start_time_ms);
+    cx.advanceFrameClock();
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(slot.active);
+    try std.testing.expect(!Color.eql(Color.hex(0x112233), n.getBackground()));
 }
 
 test "theme replay skips an independent root destroyed by an earlier hook" {
@@ -1822,4 +2282,175 @@ test "caret rectangle admission rejects nonfinite empty and overflow declaration
     for (0..65) |_| cx.addBlinkCaretRect(.{ 10.25, 20.5, 2, 18 });
     try std.testing.expectEqual(@as(usize, 64), cx.caret_rect_count);
     try std.testing.expect(cx.caret_rect_overflow);
+}
+
+test "Cx shutdown keeps timer cancellation storage alive through scope cleanup" {
+    const Resource = struct {
+        cx: *Cx,
+        id: u64,
+        cancelled: *bool,
+        fn callback(_: ?*anyopaque) void {}
+        fn cleanup(self: *@This()) void {
+            self.cx.clearTimer(self.id);
+            // Cleanup may also replace a scheduled task while the owner is
+            // shutting down. It must use live storage and leave no exit leak.
+            const replacement = self.cx.setTimer(0, callback, null) catch unreachable;
+            self.cx.clearTimer(replacement);
+            self.cancelled.* = true;
+        }
+    };
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    cx.root_scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    var cancelled = false;
+    const resource = try cx.root_scope.?.createState(Resource, .{ .cx = cx, .id = try cx.setTimer(0, Resource.callback, null), .cancelled = &cancelled });
+    try cx.root_scope.?.onCleanup(Resource, resource, Resource.cleanup);
+    cx.deinit();
+    try std.testing.expect(cancelled);
+}
+
+test "inactive windows suppress caret paint and wake declarations until activation" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.window_active = false;
+    cx.caret_paint_override = true;
+    try t.expect(!cx.blinkCaretVisible(true));
+    cx.setBlinkCaretPhase(true, 100, 200);
+    cx.addBlinkCaretRect(.{ 0, 0, 1, 10 });
+    try t.expect(!cx.caret_phase_valid);
+    try t.expectEqual(@as(usize, 0), cx.caret_rect_count);
+    cx.window_active = true;
+    try t.expect(cx.blinkCaretVisible(true));
+    cx.setBlinkCaretPhase(true, 100, 200);
+    cx.addBlinkCaretRect(.{ 0, 0, 1, 10 });
+    try t.expect(cx.caret_phase_valid);
+    try t.expectEqual(@as(usize, 1), cx.caret_rect_count);
+}
+
+test "a one-off frame-arena spike is released by the next render instead of pinned" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.setViewport(320, 120);
+    const root = try core.box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 120 } }, .{});
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+    // An application parses a whole document with the frame allocator once.
+    const spike = 4 * cx_render.frame_arena_retain_limit;
+    _ = try cx.frame_arena.allocator().alloc(u8, spike);
+    try t.expect(cx.frame_arena.queryCapacity() >= spike);
+    cx.needs_redraw = true;
+    root.markRenderDirty();
+    cx.layout();
+    _ = cx.render();
+    try t.expect(cx.frame_arena.queryCapacity() <= cx_render.frame_arena_spike_keep);
+    // Ordinary frames below the limit keep their capacity (no malloc churn).
+    _ = try cx.frame_arena.allocator().alloc(u8, cx_render.frame_arena_retain_limit / 4);
+    const steady = cx.frame_arena.queryCapacity();
+    root.markRenderDirty();
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(steady, cx.frame_arena.queryCapacity());
+}
+
+test "structure revision: per-window World serial, global serial and manual invalidation" {
+    const a = try Cx.init(std.testing.allocator, std.testing.io);
+    defer a.deinit();
+    const b = try Cx.init(std.testing.allocator, std.testing.io);
+    defer b.deinit();
+    const root_a = try core.box(a, .{}, .{});
+    a.root = root_a;
+    const root_b = try core.box(b, .{}, .{});
+    b.root = root_b;
+    try std.testing.expect(root_a.world_ref == &a.world);
+    try std.testing.expect(root_b.world_ref == &b.world);
+
+    const global0 = Node.treeStructureRevision();
+    const a0 = root_a.ownedTreeStructureRevision();
+    const b0 = root_b.ownedTreeStructureRevision();
+    try std.testing.expectEqual(a.world.structure_revision, a0);
+
+    // Append / reorder / detach in window A leave window B's serial alone.
+    const c1 = try core.box(a, .{}, .{});
+    const c2 = try core.box(a, .{}, .{});
+    try root_a.appendChild(a.allocator, c1);
+    try root_a.appendChild(a.allocator, c2);
+    try root_a.replaceChildOrder(a.allocator, &.{ c2, c1 });
+    a.detachChild(root_a, c1);
+    a.destroyDetached(c1);
+    try std.testing.expect(root_a.ownedTreeStructureRevision() >= a0 + 4);
+    try std.testing.expectEqual(c2.ownedTreeStructureRevision(), root_a.ownedTreeStructureRevision());
+    try std.testing.expectEqual(b0, root_b.ownedTreeStructureRevision());
+    try std.testing.expect(Node.treeStructureRevision() >= global0 + 4);
+
+    // Window B's change does not move A.
+    const a1 = root_a.ownedTreeStructureRevision();
+    const d = try core.box(b, .{}, .{});
+    try root_b.appendChild(b.allocator, d);
+    try std.testing.expectEqual(a1, root_a.ownedTreeStructureRevision());
+    try std.testing.expect(root_b.ownedTreeStructureRevision() > b0);
+
+    // Manual invalidation moves only the owner window (and the global serial).
+    const b1 = root_b.ownedTreeStructureRevision();
+    const global1 = Node.treeStructureRevision();
+    c2.invalidateTreeStructure();
+    try std.testing.expectEqual(a1 + 1, root_a.ownedTreeStructureRevision());
+    try std.testing.expectEqual(b1, root_b.ownedTreeStructureRevision());
+    try std.testing.expectEqual(global1 + 1, Node.treeStructureRevision());
+}
+
+test "NodeScopeBinding: rebinding a bound node shadows the inner binding until the node is freed" {
+    const testing = std.testing;
+    const NodeScopeBinding = @import("cx_node_lifetime.zig").NodeScopeBinding;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const outer_scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer outer_scope.dispose();
+    const inner_scope = try outer_scope.childScope();
+
+    // A native component binds its own root; a component returning that root rebinds it.
+    const node = try Node.create(testing.allocator, cx.nextId(), .box, .{});
+    const inner = try NodeScopeBinding.create(inner_scope);
+    inner.attach(node);
+    const slot = node.meta.ownership.scope.node_slot.?;
+    const outer = try NodeScopeBinding.create(outer_scope);
+    outer.attach(node);
+    // The outer binding owns the node; the inner slot still reads the live node.
+    try testing.expectEqual(outer_scope, node.meta.ownership.scope.scope.?);
+    try testing.expectEqual(&outer.node, node.meta.ownership.scope.node_slot.?);
+    try testing.expectEqual(node, slot.*.?);
+    // Detach + reattach of the outer (a component rebuild) keeps the inner reading freed after
+    // the detach, as before shadowing.
+    outer.detach();
+    try testing.expect(slot.* == null);
+    try testing.expect(node.meta.ownership.scope.scope == null);
+    inner.attach(node);
+    outer.attach(node);
+    try testing.expectEqual(node, slot.*.?);
+    // Freeing the node clears its scopes first (freeNodeNow): every binding reads freed, the
+    // inner slot included. (freeNode would then dispose the bound scope, bindings and all.)
+    core.clearNodeScopes(node);
+    try testing.expect(slot.* == null);
+    try testing.expect(outer.node == null and outer.shadowed == null and inner.shadowed_by == null);
+    cx.freeNode(node);
+}
+
+test "NodeScopeBinding: a shadowed binding disposed first leaves the outer binding intact" {
+    const testing = std.testing;
+    const NodeScopeBinding = @import("cx_node_lifetime.zig").NodeScopeBinding;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const outer_scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer outer_scope.dispose();
+    const inner_scope = try outer_scope.childScope();
+    const node = try Node.create(testing.allocator, cx.nextId(), .box, .{});
+    defer cx.freeNode(node);
+    (try NodeScopeBinding.create(inner_scope)).attach(node);
+    const outer = try NodeScopeBinding.create(outer_scope);
+    outer.attach(node);
+    inner_scope.dispose();
+    try testing.expect(outer.shadowed == null);
+    try testing.expectEqual(outer_scope, node.meta.ownership.scope.scope.?);
+    try testing.expectEqual(&outer.node, node.meta.ownership.scope.node_slot.?);
 }

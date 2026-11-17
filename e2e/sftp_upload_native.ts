@@ -1,13 +1,14 @@
 /** Real main-app local selection -> upload confirmation -> Manager -> remote refresh.
  * Own loopback peer only; public synthetic Harness input, no injected success.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, cp, mkdir, mkdtemp, open, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, clickAt, key, type_, resizeWindow, screenshot, consoleEvents, sleep, mouseMove } from "../zig-out/share/zenit/harness/client.ts";
 const options: Record<string, string> = {};
 for (let i=2; i<process.argv.length; i+=2) { assert(["--binary","--expected-sha","--out","--python","--theme"].includes(process.argv[i])); options[process.argv[i]]=process.argv[i+1]; }
 assert(options["--out"] && options["--binary"] && /^[0-9a-f]{64}$/.test(options["--expected-sha"]));
@@ -21,7 +22,7 @@ await copyFile(sourceBinary,binary); await copyFile(join(dirname(sourceBinary),"
 const sha=createHash("sha256").update(await readFile(binary)).digest("hex"); assert.equal(sha,options["--expected-sha"]); Object.assign(report,{binary,source_binary:sourceBinary,binary_sha256:sha});
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const appLog=await open(join(output,"app.log"),"w"), peerLog=await open(join(output,"peer.log"),"w"), peerOut=join(output,"peer");
-const peer=spawn(options["--python"]??"python3",[resolve("e2e/sftp_upload_loopback.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
+const peer=spawn(options["--python"]??"python3",["-I",resolve("e2e/sftp_upload_loopback.py"),"--out",peerOut],{stdio:["ignore",peerLog.fd,peerLog.fd]});
 const peerEnded=new Promise<void>(done=>peer.once("close",()=>done())); let peerError:Error|undefined; peer.once("error",e=>{peerError=e;});
 let app:ReturnType<typeof spawn>|undefined, appEnded:Promise<void>|undefined, appError:Error|undefined, ready:any, failure:unknown;
 const payload=Buffer.concat([Buffer.from("ZEROWORK_MAIN_APP_UPLOAD_V1\n"),Buffer.from(Array.from({length:70001},(_,i)=>i%251))]);
@@ -135,27 +136,30 @@ try {
   appEnded=new Promise<void>(done=>app!.once("close",()=>done()));app.once("error",e=>{appError=e;});report.pid=app.pid;
   await waitForServerReady(); assert.equal(Number(JSON.parse(await readFile(join(rpc,"owner.json"),"utf8")).pid),app.pid);
   assert((await resizeWindow(1440,900)).ok); await click("workspace.empty.local");await visible("terminal.surface"); const localTab=(await tabs())[0].test_id;
-  await click("sidebar.host");await settleSftp();
+  // design-r3 A2: a row click only selects; the selected row's native “连接” button connects.
+  await click("sidebar.host");await click("sidebar.host.connect_button");await settleSftp();
   const attached=await waitFor(async()=>(await traces()).find(t=>t.trace_prefix==="SFTP_WORKSPACE_TRACE"&&t.event==="attached")??null,10000); report.attachment=attached;
   const fileTab=(await tabs()).find(n=>n.test_id!==localTab).test_id;
   const authenticatedHosts=await readFile(join(data,"hosts.toml"),"utf8");
   report.fixture_credentials_migrated=authenticatedHosts!==fixture;
-  const path=inside(await visible("files.local"),"files.path.edit"); await clickNode(path,"Edit local breadcrumb path");await visible("files.path");assert((await key("a",{cmd:true})).ok);assert((await type_(local)).ok);assert((await key("return")).ok);
+  // Click the free end of the path bar: a crumb itself navigates instead of starting the edit.
+  const path=inside(await visible("files.local"),"files.path.edit"); assert(path); assert((await clickAt(path.rect.x+path.rect.w-8,path.rect.y+path.rect.h/2)).ok);await clickNode(await visible("files.path"),"Focus the local path Input");await sleep(120);assert((await key("a",{cmd:true})).ok);assert((await type_(local)).ok);assert((await key("return")).ok);
   const row=await waitFor(async()=>nodes(await visible("files.local")).find(n=>n.test_id==="files.row"&&inside(n,"files.row.name")?.text===filename)??null,15000);
   assert.equal(text(inside(await visible("files.remote"),"files.breadcrumb")),"fixture");
   for(const [width,height] of [[1440,900],[860,480]]){
     await resizeWindow(width,height);await sleep(180);
     const panes=[await visible("files.local"),await visible("files.remote")];
-    assert(Math.abs(panes[1].rect.x-panes[0].rect.x-panes[0].rect.w-6)<.5,"V3 independent cards with six point gap");
+    // Island B v3 (files/styles.yss, Pencil c0vKlM): panes gap 4, header 26, path bar 28, rows 26.
+    assert(Math.abs(panes[1].rect.x-panes[0].rect.x-panes[0].rect.w-4)<.5,"Island B v3 independent cards with four point gap");
     for(const pane of panes){
-      assert.equal(inside(pane,"files.columns").rect.h,34);assert.equal(inside(pane,"files.footer").rect.h,36);
-      for(const r of nodes(pane).filter(n=>n.test_id==="files.row"))assert.equal(r.rect.h,40);
+      assert.equal(inside(pane,"files.columns").rect.h,26);assert.equal(inside(pane,"files.footer").rect.h,28);
+      for(const r of nodes(pane).filter(n=>n.test_id==="files.row"))assert.equal(r.rect.h,26);
       if(width===860)assert(!inside(pane,"files.sort.modified"),"Compact pane hides the modified column");
     }
     await capture("01-v3-frame-"+width);
   }
   await resizeWindow(1440,900);await sleep(180);
-  report.checks.push("Actual main-app V3 independent cards, 40 point rows, 34 point header, 36 point footer and compact date-column hiding");
+  report.checks.push("Actual main-app Island B v3 independent cards, 26 point rows, 26 point header, 28 point path bar and compact date-column hiding");
   await clickNode(row,"Select actual owned local file for upload");await waitFor(async()=>/已选 1 项/.test(text(await visible("files.local")))||null,10000);
   await capture("02-selected-local-source-before-upload");
   await clickNode(inside(await visible("files.local"),"files.transfer"),"Open actual local-card upload confirmation");
@@ -165,7 +169,8 @@ try {
   const proof=await waitFor(async()=>{const current=await traces();const accepted=current.find(t=>t.trace_prefix==="FILE_TRANSFER_ENQUEUED"&&t.owner_id===attached.owner.session_id);if(!accepted)return null;assert.equal(accepted.md5_check,true);const backend=current.find(t=>t.trace_prefix==="FILE_TRANSFER_VERIFICATION"&&t.binding_id===accepted.binding_id&&t.engine_state==="succeeded"&&t.verification_state==="passed");const manager=current.find(t=>t.trace_prefix==="FILE_TRANSFER_MANAGER_VERIFICATION"&&t.job===accepted.job&&t.state==="succeeded"&&t.verification_state==="passed");return backend&&manager?{enqueued:accepted,backend,manager}:null;},45000);
   const actual=await readFile(join(peerOut,"actual-upload.bin"));assert.deepEqual(actual,payload);const md5=createHash("md5").update(payload).digest("hex");for(const value of [proof.backend,proof.manager]){assert.equal(value.source_md5,md5);assert.equal(value.target_md5,md5);}report.actual_transfer=proof;report.upload={source:join(local,filename),target:destination,bytes:actual.length,sha256:createHash("sha256").update(actual).digest("hex"),md5};
   await click("toolbar.transfers");const completed=await waitFor(async()=>{const current=await visible("transfer.manager");return nodes(current).find(n=>n.test_id==="transfer.task"&&text(n).includes(filename)&&text(n).includes("已完成"))??null;},15000);
-  assert.equal(text(inside(completed,"transfer.task.location")),destination);
+  // The Manager row no longer prints the location line; it names the file and the session (location is in 事件).
+  assert.equal(text(inside(completed,"transfer.task.name")),filename);
   assert(text(inside(completed,"transfer.task.owner")).includes(`#${attached.owner.session_id}`));
   await capture("04-upload-full-md5-manager-completed");
   await clickNode(inside(completed,"transfer.task.events"),"Inspect original upload job events");
@@ -173,7 +178,10 @@ try {
   const eventContent = text(await visible("transfer.events.entries"));
   assert(eventContent.includes("入队") && eventContent.includes("已完成"));
   assert(eventContent.includes(`会话 #${attached.owner.session_id}`));
-  assert.equal(events.rect.w,520); assert(events.rect.h >= 180 && events.rect.h <= 868);
+  // The native Popover fits its content; its height follows the event list once that is laid out (after-layout
+  // sizing of the list viewport), so read the panel after the entries are shown.
+  const settledEvents = await waitFor(async()=>{const d=(await query("transfer.events.dialog")).find((n:any)=>n.rect?.h>=180);return d??null;},5000);
+  assert.equal(events.rect.w,520); assert.equal(settledEvents.rect.w,520); assert(settledEvents.rect.h >= 180 && settledEvents.rect.h <= 868, `events panel height ${settledEvents.rect.h}`);
   report.event_dialog_rect=events.rect;
   await capture("04b-real-task-events");
   await click("transfer.events.dismiss");
@@ -194,14 +202,19 @@ try {
     await sleep(180);
   }
   const refreshTarget=inside(await visible("files.remote"),"files.refresh");
-  report.refresh_hit_debug={target:refreshTarget,notifications:await query("notifications.stack"),dismiss_controls:(await Promise.all([0,1,2].map(i=>query(`notifications.dismiss.${i}`)))).flat(),at:new Date().toISOString()};
+  report.refresh_hit_debug={target:refreshTarget,notifications:await query("notifications.viewport"),dismiss_controls:(await Promise.all([0,1,2].map(i=>query(`notifications.dismiss.${i}`)))).flat(),at:new Date().toISOString()};
   await writeFile(join(output,"remote-refresh-hit-debug.json"),JSON.stringify(report.refresh_hit_debug,null,2));
   report.remote_refresh={automatic:false,method:"actual_remote_card_refresh_button",observation:"build17 only auto-refreshes completed downloads; uploaded file needs actual remote refresh"};
   await clickNode(inside(await visible("files.remote"),"files.refresh"),"Refresh actual remote card after successful upload");
-  const refreshed=await waitFor(async()=>nodes(await visible("files.remote")).find(n=>n.test_id==="files.row"&&inside(n,"files.row.name")?.text===filename)??null,15000);report.remote_refreshed_row=refreshed;assert(text(refreshed).includes(`${(payload.length/1024).toFixed(1)} KiB`));await capture("05-remote-manually-refreshed-upload-row");
+  const refreshed=await waitFor(async()=>nodes(await visible("files.remote")).find(n=>n.test_id==="files.row"&&inside(n,"files.row.name")?.text===filename)??null,15000);report.remote_refreshed_row=refreshed;const uploadTenths=Math.floor((payload.length*10+512)/1024);assert(text(refreshed).includes(`${uploadTenths%10===0?uploadTenths/10:(uploadTenths/10).toFixed(1)} KiB`));await capture("05-remote-manually-refreshed-upload-row");
+  // The tab close button shows on hover: point at the tab first.
+  {const tab=await visible(fileTab);assert((await mouseMove(tab.rect.x+tab.rect.w/2,tab.rect.y+tab.rect.h/2)).ok);await sleep(200);}
   await click(fileTab.replace("tabs.tab.","tabs.close."));await waitFor(async()=>(await tabs()).length===1&&!(await query("files.workspace")).some(shown)||null,20000);await visible("terminal.surface");
   report.peer_before_shutdown=await waitFor(async()=>{const state=JSON.parse(await readFile(join(peerOut,"state.json"),"utf8"));return state.connections.length===2&&state.active_connections===0?state:null;},15000);
-  assert.equal(report.peer_before_shutdown.forbidden_operations.length,0);assert.equal(report.peer_before_shutdown.errors.length,0);assert(report.peer_before_shutdown.calls.some(c=>c.operation==="WRITE"&&c.path===destination));assert.deepEqual([...report.peer_before_shutdown.read_handles_opened].sort(),[...report.peer_before_shutdown.read_handles_closed].sort());
+  // Guardrail: an SFTP-only host receives zero exec and zero shell/PTY requests (OS identification uses SFTP itself).
+  {const forbidden=report.peer_before_shutdown.forbidden_operations;report.exec_requests=forbidden.filter((f:any)=>f.operation==="EXEC").length;report.shell_requests=forbidden.filter((f:any)=>f.operation==="SHELL").length;
+   assert.equal(report.exec_requests,0,"SFTP host: zero exec requests");assert.equal(report.shell_requests,0,"SFTP host: zero shell requests");assert.deepEqual(forbidden,[],"No shell, PTY or exec");}
+  assert.equal(report.peer_before_shutdown.errors.length,0);assert(report.peer_before_shutdown.calls.some(c=>c.operation==="WRITE"&&c.path===destination));assert.deepEqual([...report.peer_before_shutdown.read_handles_opened].sort(),[...report.peer_before_shutdown.read_handles_closed].sort());
   assert.equal(await readFile(join(data,"hosts.toml"),"utf8"),authenticatedHosts);assert.equal(await readFile(join(data,"known_hosts"),"utf8").catch(e=>{if(e.code==="ENOENT")return "";throw e;}),"");
   report.checks.push("Actual local-card selection and upload action open original-owner/path confirmation with zero prior write/job", "Explicit submit uploads exact owned bytes; actual backend/Manager full MD5 pass and visible original job/attempt succeeds", "Actual remote refresh button exposes uploaded filename and size; both SFTP connections/handles close before peer shutdown");report.status="passed";
 } catch (error) {

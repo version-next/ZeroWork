@@ -2,6 +2,7 @@
  * node e2e/kvm_toolbar_native.ts /absolute/bmc-kvm-preview /tmp/evidence
  * No device, credentials, remote input or management writes.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, rm, writeFile} from 'node:fs/promises';
@@ -48,27 +49,46 @@ async function capture(name: string) {
   const nodes = Object.fromEntries(await Promise.all(ids.map(async id => [id, await h.query(id)])));
   await writeFile(join(out, name + '.json'), JSON.stringify(nodes, null, 2));
 }
-async function width(value: number) {
+// The tools are zenit's native Buttons at their own size; the view folds by need (labels -> icons -> the
+// “更多” menu) when the laid-out controls would not fit. The fixture reports the fold level it chose.
+type Fold = {iconOnly: boolean, overflow: boolean};
+async function fold(): Promise<Fold> {
+  const menus: any = await h.request('GET', '/app/bmc-fixture/menus');
+  return {iconOnly: menus.toolbar_icon_only === true, overflow: menus.toolbar_overflow === true};
+}
+async function width(value: number): Promise<Fold> {
   assert((await h.request('POST', '/app/bmc-fixture/content-width', {width: value})).ok);
   await h.waitFor(async () => Math.abs((await visible('bmc.toolbar')).rect.w - value) < .5 || null, 10000);
-  if (value < 264) await visible('bmc.more'); else await hidden('bmc.more');
-  await h.sleep(180);
+  await h.sleep(300);
+  const state = await fold();
+  if (state.overflow) await visible('bmc.more'); else await hidden('bmc.more');
+  return state;
 }
 try {
   await h.waitForServerReady(); await h.resizeWindow(1440, 900);
   assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
   for (const theme of ['reference-light', 'dark']) {
     assert((await h.request('POST', '/app/bmc-fixture/appearance', {theme, transparency: 0, blur: 24})).ok);
-    for (const size of [1000, 520, 336, 280, 240]) {
-      await width(size);
+    // Without a status the icon toolbar holds all five tools down to the fixture's narrowest pane; the AI
+    // status slot (j8WXoF O1) reserves room, so the narrow passes with it reach the “更多” menu.
+    const seen = {labelled: false, icons: false, overflow: false};
+    let last: Fold = {iconOnly: false, overflow: false};
+    for (const [size, withStatus] of [[1000, false], [640, false], [520, false], [336, false], [280, false], [240, false], [336, true], [280, true], [240, true]] as [number, boolean][]) {
+      assert((await h.request('POST', '/app/bmc-fixture/ai', {activity: withStatus ? 'observing' : 'none'})).ok);
+      await h.sleep(250);
+      const state = await width(size);
+      // Narrowing never unfolds: once icons (or the menu) are needed they stay until there is room again.
+      if (!withStatus && size < 1000) assert((!last.iconOnly || state.iconOnly) && (!last.overflow || state.overflow), `fold is monotonic at ${size}`);
+      if (!withStatus) last = state;
+      if (state.overflow) seen.overflow = true; else if (state.iconOnly) seen.icons = true; else seen.labelled = true;
       const bar = (await visible('bmc.toolbar')).rect;
-      assert.equal(bar.h, 44);
+      assert.equal(bar.h, 40); // j8WXoF / uy2Fa: KVM toolbar 40 high
       const icon = (await visible('bmc.title.icon')).rect;
       const status = (await visible('bmc.disconnect')).rect;
       inside(icon, bar, 'host icon inside toolbar');
       inside(status, bar, 'connection action inside toolbar');
       assert(icon.x + icon.w <= status.x, 'host identity precedes status');
-      if (size >= 280) {
+      if (size >= 280 && !withStatus) {
         const title = (await visible('bmc.title')).rect;
         inside(title, bar, 'hostname inside toolbar');
         assert(icon.x + icon.w <= title.x && title.x + title.w <= status.x + .5, 'hostname is between icon and status');
@@ -76,35 +96,33 @@ try {
       for (const menu of ['control', 'keys', 'display']) {
         const button = await visible('bmc.' + menu);
         inside(button.rect, bar, menu + ' button inside toolbar');
-        assert.equal(button.rect.w, size < 480 ? 32 : 64);
+        assert(status.x + status.w <= button.rect.x + .5, menu + ' button follows the connection state');
         await click('bmc.' + menu); await visible('bmc.' + menu + '.popover');
         await h.key('escape'); await hidden('bmc.' + menu + '.popover');
       }
-      assert.equal((await visible('bmc.disconnect')).rect.w, size < 480 ? 32 : 82);
-      if (size >= 264) {
+      if (!state.overflow) {
         await hidden('bmc.more');
         const video = (await visible('bmc.viewport')).rect;
         for (const menu of ['power', 'boot']) {
           const tool = (await visible('bmc.' + menu)).rect;
           inside(tool, bar, menu + ' direct button');
-          assert.equal(tool.w, size < 480 ? 32 : 64);
           await click('bmc.' + menu); await visible('bmc.' + menu + '.popover');
           assert.deepEqual((await visible('bmc.viewport')).rect, video);
           await h.key('escape'); await hidden('bmc.' + menu + '.popover');
-          if (size === 336) {
+          if (state.iconOnly && !withStatus) {
             await h.mouseMove(tool.x + tool.w / 2, tool.y + tool.h / 2);
             await visible('bmc.' + menu + '.tooltip');
             await h.mouseMove(4, 4); await hidden('bmc.' + menu + '.tooltip');
           }
         }
-        if (size === 336) {
-          const state = (await visible('bmc.disconnect')).rect;
-          await h.mouseMove(state.x + state.w / 2, state.y + state.h / 2);
+        if (state.iconOnly && !withStatus) {
+          const connection = (await visible('bmc.disconnect')).rect;
+          await h.mouseMove(connection.x + connection.w / 2, connection.y + connection.h / 2);
           await visible('bmc.disconnect.tooltip');
           await h.mouseMove(4, 4); await hidden('bmc.disconnect.tooltip');
         }
-        await capture(theme + (size >= 480 ? '-wide-' + size : '-icons-' + size));
-        report.checks.push({theme, width: size, allFiveDirect: true, iconStatus: size < 480});
+        await capture(theme + (state.iconOnly ? '-icons-' : '-wide-') + size + (withStatus ? '-status' : ''));
+        report.checks.push({theme, width: size, withStatus, allFiveDirect: true, iconStatus: state.iconOnly});
         continue;
       }
       await hidden('bmc.power'); await hidden('bmc.boot');
@@ -114,7 +132,9 @@ try {
         await click('bmc.more');
         const popup = (await visible('bmc.more.popover')).rect;
         assert(popup.x >= bar.x && popup.x + popup.w <= bar.x + bar.w + .5);
-        assert(popup.y >= bar.y + bar.h, 'more menu opens downwards');
+        // menus 包: native Menu, below its trigger (the “更多” button) at zenit's default offset.
+        const moreButton = (await visible('bmc.more')).rect;
+        assert(popup.y >= moreButton.y + moreButton.h, 'more menu opens downwards');
         assert.deepEqual((await visible('bmc.viewport')).rect, video, 'opening menu preserves video bounds');
         if (menu === 'power') await capture(theme + '-narrow-' + size + '-more');
         await click('bmc.more.' + menu); await hidden('bmc.more.popover');
@@ -129,20 +149,24 @@ try {
       await h.waitFor(async () => (await h.focused()).test_id === 'bmc.more' || null, 5000);
       // A keyboard activation uses the same retained Button and Popover.
       await h.key('return'); await visible('bmc.more.popover');
-      await h.waitFor(async () => (await h.focused()).test_id === 'bmc.more.power' || null, 5000);
+      // menus 包: the native Menu takes focus itself (active descendant, not a row Button); Tab moves the
+      // highlight to the next action (启动) and Return runs it.
+      await h.waitFor(async () => (await h.focused()).test_id !== 'bmc.more' || null, 5000);
       await h.key('tab');
-      const focus = await h.focused();
-      assert.equal(focus.test_id, 'bmc.more.boot', 'Tab reaches the next overflow action');
       await h.key('return'); await visible('bmc.boot.popover');
       await h.key('escape'); await hidden('bmc.boot.popover');
       await click('bmc.more'); await visible('bmc.more.popover');
       await h.clickAt(bar.x + 4, bar.y - 8); await hidden('bmc.more.popover');
       await click('bmc.more'); await visible('bmc.more.popover');
-      await width(520); await hidden('bmc.more.popover');
+      assert((await h.request('POST', '/app/bmc-fixture/ai', {activity: 'none'})).ok);
+      assert.equal((await width(640)).overflow, false, 'room again: the tools are direct');
+      await hidden('bmc.more.popover');
       await visible('bmc.power'); await visible('bmc.boot');
       report.checks.push({theme, width: size, escape: true, keyboard: true, outsideClick: true, resize: true});
     }
-    await width(1000);
+    assert((await h.request('POST', '/app/bmc-fixture/ai', {activity: 'none'})).ok);
+    assert.deepEqual(seen, {labelled: true, icons: true, overflow: true}, 'the sweep reached every fold level');
+    assert.deepEqual(await width(1000), {iconOnly: false, overflow: false});
     assert((await h.request('POST', '/app/bmc-fixture/appearance', {theme, transparency: 100, blur: 24})).ok);
     for (const channel of [0, 255]) {
       assert((await h.request('POST', '/app/bmc-fixture/frame', {red: channel, green: channel, blue: channel})).ok);
@@ -153,7 +177,8 @@ try {
       const fill = ['r', 'g', 'b'].map(k => Math.round(popup.background[k] * opacity + channel * (1 - opacity)));
       for (const role of ['foreground', 'foreground_secondary']) {
         assert.equal(popup[role].a, 255, role + ' remains opaque');
-        assert(contrast(fill, ['r', 'g', 'b'].map(k => popup[role][k])) >= 4.5, role + ' remains readable');
+        const ink = ['r', 'g', 'b'].map(k => popup[role][k]);
+        assert(contrast(fill, ink) >= 4.5, `${role} remains readable: ${theme} channel ${channel} ink ${ink} on ${fill} = ${contrast(fill, ink).toFixed(2)}`);
       }
       await capture(theme + '-t100-keys-' + (channel ? 'white' : 'black'));
       report.checks.push({theme, transparency: 100, channel, popup});

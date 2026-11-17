@@ -1239,6 +1239,16 @@ pub const Session = struct {
         };
     }
 
+    /// The peer's public identification string from the completed handshake
+    /// ("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"). No packet is sent; empty
+    /// when libssh2 has none.
+    pub fn serverBanner(self: *const Session, output: []u8) []const u8 {
+        const handle = self.handle orelse return output[0..0];
+        if (output.len == 0) return output;
+        const rc = c.zw_libssh2_session_server_banner(handle, output.ptr, output.len);
+        return if (rc <= 0) output[0..0] else output[0..@intCast(rc)];
+    }
+
     pub fn sftpRealpath(self: *Session, path: [:0]const u8, output: []u8) ![]const u8 {
         if (self.state != .active or self.sftp == null) return error.SessionNotActive;
         const rc = c.zw_libssh2_sftp_realpath(self.sftp.?, path.ptr, output.ptr, output.len);

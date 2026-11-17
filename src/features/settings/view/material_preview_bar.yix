@@ -1,0 +1,31 @@
+//! 全窗口材质预览的操作条（P3 3e 外观包；`settings.materials.preview.actions`）：预览打开时由宿主挂在**主窗口**底部
+//! （旧 `appearance_view.mountMaterialPreviewActions`）。宿主每次重挂都按当时的状态给参数（位置、透明度 / 模糊、按钮可用性），
+//! 所以这里不读设置窗口的投影信号（预览期间设置窗口可能被关闭），只经 `vm.dispatch` 上行。按钮全部是原生 `W.Button` 默认外观。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const B = @import("material_preview_bar.yss");
+
+pub const Place = B.Place;
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+
+pub fn MaterialPreviewBar(vm: *m.ViewModel, place: Place, status: []const u8, restorable: bool, savable: bool) View {
+    return (
+        <box testId="settings.materials.preview.actions" style={.{ B.bar, ui.view.styleBy(place, B.placed) }}>
+            <icon src={ui.icons.eye} style={B.bar_icon} />
+            <text style={B.bar_label} box={B.bar_cell}>背景预览</text>
+            <text style={B.bar_value} box={B.bar_cell}>{status}</text>
+            <spacer />
+            <W.Tooltip text="恢复已保存的背景" position={.top}>
+                <W.Button testId="settings.materials.preview.restore" variant={.ghost} iconOnly={true} iconAsset={ui.icons.rotate_ccw} iconSize={16} a11yLabel="恢复已保存的背景" disabled={!restorable} onClick={send(vm, m.Intent.appearanceAction(.restore_materials))} />
+            </W.Tooltip>
+            <W.Tooltip text="返回设置" position={.top}>
+                <W.Button testId="settings.materials.preview.return" variant={.ghost} iconOnly={true} iconAsset={ui.icons.arrow_left} iconSize={16} a11yLabel="返回设置" onClick={send(vm, m.Intent.previewMaterial(false))} />
+            </W.Tooltip>
+            <W.Button testId="settings.materials.preview.save" label="保存全部设置" variant={.primary} iconAsset={ui.icons.save} iconSize={14} disabled={!savable} onClick={send(vm, m.Intent.runCommand(.save))} />
+        </box>
+    );
+}

@@ -26,10 +26,18 @@ pub const Placement = enum {
 };
 
 pub const WindowConfig = struct {
+    /// Stable logical identity for restart snapshots; null uses creation order.
+    persist_key: ?[]const u8 = null,
     min_width: u32 = 0,
     min_height: u32 = 0,
-    /// macOS custom tool windows may supply their own caption controls.
-    hide_native_controls: bool = false,
+    /// Zoom/maximize affordance (green button, title-bar double-click,
+    /// performZoom:). macOS honors this today; other backends reject `false`
+    /// with error.UnsupportedWindowCapability rather than silently maximizing.
+    maximizable: bool = true,
+    /// Window state restoration. Transient windows (panels, dashboards) opt
+    /// out so they never join the platform restore pass. Only macOS has a
+    /// restore pass; elsewhere `false` is trivially true.
+    restorable: bool = true,
     width: if (builtin.os.tag == .windows) u32 else u16 = 800,
     height: if (builtin.os.tag == .windows) u32 else u16 = 600,
     title: [:0]const u8 = if (builtin.os.tag == .windows) "Zenit" else "zenit",
@@ -50,20 +58,9 @@ pub const WindowConfig = struct {
 };
 
 pub fn requestedChrome(config: WindowConfig) WindowChrome {
-    // Legacy hidden-control windows already configure their AppKit host at
-    // creation, including zero-height custom captions used by native fixtures.
-    if (config.chrome) |chrome| return chrome;
-    if (builtin.os.tag == .macos and config.hide_native_controls) return .native;
-    return switch (config.titlebar) {
+    return config.chrome orelse switch (config.titlebar) {
         .default => .native,
         // Legacy custom_inset was a no-op on Linux; opt in through chrome.
         .custom_inset => if (builtin.os.tag == .linux) .native else .{ .custom = .{} },
     };
-}
-
-test "legacy hidden native controls allow a zero height caption and explicit chrome wins" {
-    const std = @import("std");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
-    try std.testing.expectEqual(.native, std.meta.activeTag(requestedChrome(.{ .hide_native_controls = true, .titlebar = .custom_inset, .titlebar_height = 0 })));
-    try std.testing.expectEqual(.frameless, std.meta.activeTag(requestedChrome(.{ .hide_native_controls = true, .titlebar = .custom_inset, .titlebar_height = 0, .chrome = .{ .frameless = .{} } })));
 }

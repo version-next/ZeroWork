@@ -2,6 +2,7 @@
  * Own isolated data/RPC/background Metal process, public synthetic Harness.
  * Remote operations list a nonce /tmp directory and upload/download one owned sentinel.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -9,6 +10,7 @@ import { copyFile, cp, mkdir, mkdtemp, open, readFile, readdir, realpath, writeF
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { request, waitForServerReady, waitFor, query, clickTestId, clickAt, key, type_, focused, resizeWindow, scrollAt, screenshot, consoleEvents, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
 
 const options: Record<string, string> = {}, args = process.argv.slice(2);
 for (let index = 0; index < args.length; index += 2) {
@@ -335,7 +337,7 @@ try {
  await click("toolbar.transfers");await capture("08-roundtrip-completed");
  await key("escape");await key("escape");
  if(sftpAi){
-  await click("toolbar.ai");await visible("ai.prompt");
+  await click(await aiToggleId());await visible("ai.prompt");
   await readonlyAiTurn("list_remote_files",remoteFixture,localFilename);
   await readonlyAiTurn("read_remote_file",remoteFixture+"/"+localFilename,sourceBytes.toString("utf8").trim());
   assert(!(await query("terminal.input")).some(shown));report.sftp_ai.status="passed";

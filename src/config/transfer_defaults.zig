@@ -2,7 +2,7 @@
 //! Existing open panels own their user's selections and do not reapply this.
 const std = @import("std");
 const config = @import("config.zig");
-const confirmation_view = @import("../ui/transfer_panel.zig");
+const confirmation_view = @import("../features/transfer/view/transfer_panel.zig");
 
 pub fn confirmation(policy: config.Transfer, data: confirmation_view.Data) confirmation_view.Data {
     var result = data;

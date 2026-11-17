@@ -1,11 +1,15 @@
 /** Isolated native regression for initial effort and cross-provider inheritance. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,realpath,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleBody,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText} from './provider_fixture.ts';
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);
 await mkdir(out,{recursive:true});
 const base=await realpath(await mkdtemp('/tmp/zw-effort-')),data=join(base,'data'),rpc=join(base,'rpc');
@@ -20,7 +24,7 @@ const server=createServer(async(req,res)=>{
  if(req.method==='GET'){
   res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:models}));return;
  }
- let body='';for await(const chunk of req)body+=chunk;
+ const body=await readRequestText(req);if(isTitleBody(body))return skipTitle(res);
  requests.push(JSON.parse(body));
  res.writeHead(200,{'content-type':'text/event-stream'});
  res.end('data: '+JSON.stringify({choices:[{index:0,delta:{content:'已收到。'},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');
@@ -37,6 +41,7 @@ const app=spawn(binary,[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZEROWORK_A
 const ended=new Promise(r=>app.once('close',r));
 const shown=(n:any)=>n&&n.visible!==false&&!n.hidden&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const flat=(n:any):any[]=>n?[n,...(n.children??[]).flatMap(flat)]:[];
+const chipShows=(chip:any,name:string)=>{const t=String(flat(chip).map((n:any)=>n.text??'').join('')).trim();const base=t.split(' · ')[0];if(base===name)return true;if(!base.endsWith('…'))return false;const p=base.slice(0,-1);return p.length>=3&&name.startsWith(p);};/* ai-redesign-a: the model chip is “model · effort”, ellipsized to the room left (Pencil ⑤). */
 const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);
 const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok,id);};
 const menu=async()=>{if(!(await h.query('ai.model.menu')).some(shown))await click('ai.composer.model');await visible('ai.model.menu');};
@@ -45,11 +50,14 @@ async function select(model:string){
  await menu();
  const row=await h.waitFor(async()=>(await h.query('ai.model.option')).find(n=>shown(n)&&flat(n).some(c=>c.text===model))??null,15000);
  assert((await h.clickAt(row.rect.x+row.rect.w/2,row.rect.y+row.rect.h/2)).ok);
- await h.waitFor(async()=>flat(await visible('ai.composer.model')).some(n=>shown(n)&&n.text===model)||null);
+ // 浮动面板按 #52 变窄（≤420）后，输入区模型芯片在推理档位文案较长时会把模型名截成省略号（宽度可能为 0），
+ // 因此按芯片里的模型名文本 + 菜单里选中标记判断切换结果，而不要求模型名可见。
+ await h.waitFor(async()=>chipShows(await visible('ai.composer.model'),model)&&(await h.query('ai.model.option')).some(n=>shown(n)&&flat(n).some(c=>c.text===model)&&flat(n).some(c=>c.test_id==='ai.model.selected'))||null);
  await menu();
 }
 async function send(model:string,effort:string){
- if((await h.query('ai.model.menu')).some(shown))await h.key('escape');
+ // ai-redesign-a：模型弹层是原生 Popover，没有自带关闭钮（Pencil O4）；再点一次模型按钮收起，再回到输入框。
+ if((await h.query('ai.model.menu')).some(shown)){await click('ai.composer.model');await h.waitFor(async()=>!(await h.query('ai.model.menu')).some(shown)||null,10000);}
  const count=requests.length;
  await click('ai.prompt');await h.type_('验证推理强度 '+count);await click('ai.send');
  await h.waitFor(()=>requests.length>count||null,15000);
@@ -59,7 +67,7 @@ async function send(model:string,effort:string){
 const report:any={status:'running',checks:[]};
 try{
  await h.waitForServerReady(60000);await h.resizeWindow(1440,900);
- await click('workspace.empty.local');await visible('terminal.surface');await click('ai.strip');await menu();
+ await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await menu();
  await value('中');assert((await h.screenshot(join(out,'01-lowest-medium.png'))).ok);
  await send('model-a','medium');report.checks.push('Unselected model starts at its lowest declared level (medium), and sends medium');
  await select('model-b');await value('档位不支持');

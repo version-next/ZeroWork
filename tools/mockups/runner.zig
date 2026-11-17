@@ -15,8 +15,14 @@ const App = @import("zenit_app").App;
 
 const M = @import("mockup_view");
 
+/// A mockup paints the whole window, title bar included, as a static picture. The window uses
+/// zenit's window chrome, so what drags it is declared here: the mockup's surface is one drag
+/// region (zenit `W.DragRegion`). Interactive nodes inside stay controls, and a mockup that
+/// declares its own regions (yix_spike's `windowRegion` header) is read as written, because the
+/// nearest declared region wins.
 fn mountMock(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    return M.mount(cx, scope);
+    const view = try M.mount(cx, scope);
+    return ui.widgets.DragRegion(.{ .style = .{ .width = .fill, .height = .fill } }, .{view}).mount(scope, cx);
 }
 
 pub fn main() !void {
@@ -29,11 +35,17 @@ pub fn main() !void {
             .width = M.window_size.width,
             .height = M.window_size.height,
             .title = M.title,
-            .titlebar = .custom_inset,
+            .chrome = .{ .custom = .{} },
             .titlebar_height = 40,
-            .titlebar_drag_right_inset = 220,
         },
     });
     defer app.deinit();
     try app.runWith(mountMock);
 }
+
+comptime {
+    // -Dtest-mode=true builds carry the e2e launch-guard marker (same bytes as
+    // src/platform/build_mode_marker.zig, outside this root's import tree).
+    if (@import("build_options").test_mode) @export(&build_mode_marker, .{ .name = "zerowork_build_mode_marker" });
+}
+const build_mode_marker: [29:0]u8 = "ZEROWORK_BUILD_MODE=test-mode".*;

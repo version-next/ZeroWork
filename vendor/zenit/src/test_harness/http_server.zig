@@ -28,6 +28,7 @@ fn ownerPid() OwnerPid {
 const RequestResult = struct {
     status: u16,
     body: []const u8,
+    finish_quit_reply: bool = false,
 };
 
 fn readFileCompat(dir: std.Io.Dir, io: std.Io, path: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -35,7 +36,7 @@ fn readFileCompat(dir: std.Io.Dir, io: std.Io, path: []const u8, allocator: std.
 }
 
 fn fileRpcDirFromEnv() []const u8 {
-    const raw = std.c.getenv("ZENIT_E2E_FILE_RPC_DIR") orelse return "";
+    const raw = @import("zenit_environment").getRaw("ZENIT_E2E_FILE_RPC_DIR") orelse return "";
     return std.mem.span(raw);
 }
 
@@ -166,6 +167,9 @@ fn handleFileRpcRequest(queue: *CommandQueue, rpc_dir: []const u8, entry_name: [
     const body = if (body_heap) |b| b else "";
 
     const result = dispatchRequest(queue, method, path, body);
+    // Release the main loop after the atomic publish or on I/O error. An I/O
+    // error still fails the request; it must not strand the app in shutdown.
+    defer if (result.finish_quit_reply) queue.finishQuitReply();
     var res_name_buf: [128]u8 = undefined;
     const res_name = try std.fmt.bufPrint(&res_name_buf, "res-{s}.json", .{id});
     var res_tmp_name_buf: [128]u8 = undefined;
@@ -228,6 +232,16 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             }
             return .{ .status = 400, .body = "{\"error\":\"invalid payload\"}" };
         }
+        if (std.mem.eql(u8, path, "/pointer_leave")) {
+            const result = queue.submitAndWait(.{ .pointer_leave = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/window_active")) {
+            const active = findJsonBool(body, "active") orelse
+                return .{ .status = 400, .body = "{\"error\":\"invalid window_active payload\"}" };
+            const result = queue.submitAndWait(.{ .window_active = active });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/mouse_up")) {
             if (parseMousePoint(body, .mouse_up)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -270,6 +284,15 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             }
             return .{ .status = 400, .body = "{\"error\":\"invalid ime_commit payload\"}" };
         }
+        if (std.mem.eql(u8, path, "/tree")) {
+            // {"root": "<test_id>"?, "visible_only": bool?}: a subtree / visible-only read for
+            // windows whose whole tree outgrows RESULT_BUF_SIZE.
+            var payload = command_queue.TreeQueryPayload{};
+            if (findJsonString(body, "root")) |id| copyTestId(id, &payload.root);
+            payload.visible_only = findJsonBool(body, "visible_only") orelse false;
+            const result = queue.submitAndWait(.{ .query_tree_scoped = payload });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/query")) {
             if (parseQuery(body, std.heap.page_allocator)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -308,6 +331,18 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             const result = queue.submitAndWait(.{ .track_stop = {} });
             return .{ .status = 200, .body = result.getData() };
         }
+        if (std.mem.eql(u8, path, "/scroll_stream")) {
+            const result = queue.submitAndWait(.{ .scroll_stream = .{
+                .x = @floatCast(findJsonNumber(body, "x") orelse return .{ .status = 400, .body = "{\"error\":\"x required\"}" }),
+                .y = @floatCast(findJsonNumber(body, "y") orelse return .{ .status = 400, .body = "{\"error\":\"y required\"}" }),
+                .step = @floatCast(findJsonNumber(body, "step") orelse 12),
+                .span = @intFromFloat(@max(1, findJsonNumber(body, "span") orelse 30)),
+                .count = @intFromFloat(@max(0, findJsonNumber(body, "count") orelse 0)),
+                .interval_ms = @floatCast(findJsonNumber(body, "interval_ms") orelse 8.33),
+                .phased = (findJsonNumber(body, "phased") orelse 0) != 0,
+            } });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/scroll")) {
             if (parseScroll(body)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -335,8 +370,8 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             return .{ .status = 200, .body = result.getData() };
         }
         if (std.mem.eql(u8, path, "/quit")) {
-            const result = queue.submitAndWait(.{ .quit_app = {} });
-            return .{ .status = 200, .body = result.getData() };
+            const result = queue.submitAndWait(.{ .quit_app_after_reply = {} });
+            return .{ .status = 200, .body = result.getData(), .finish_quit_reply = true };
         }
         if (std.mem.eql(u8, path, "/magnify")) {
             if (parseMagnify(body)) |cmd| {
@@ -435,9 +470,9 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             return .{ .status = 200, .body = result.getData() };
         }
         if (std.mem.eql(u8, path, "/clock/advance")) {
-            const ms = findJsonNumber(body, "ms") orelse return .{ .status = 400, .body = "{\"error\":\"ms required\"}" };
+            const ms = findJsonNumber64(body, "ms") orelse return .{ .status = 400, .body = "{\"error\":\"ms required\"}" };
             if (!std.math.isFinite(ms) or ms < 0 or ms > 60_000) return .{ .status = 400, .body = "{\"error\":\"invalid ms\"}" };
-            const result = queue.submitAndWait(.{ .clock_advance = @floatCast(ms) });
+            const result = queue.submitAndWait(.{ .clock_advance = ms });
             return .{ .status = 200, .body = result.getData() };
         }
         if (std.mem.eql(u8, path, "/frames/read")) {
@@ -475,6 +510,22 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             const mode = std.meta.stringToEnum(@import("command_queue.zig").VisualQualityCommand, value) orelse
                 return .{ .status = 400, .body = "{\"error\":\"invalid visual quality\"}" };
             const result = queue.submitAndWait(.{ .visual_quality = mode });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/sprites")) {
+            const command: @import("command_queue.zig").SpritesCommand = if (findJsonBool(body, "debug") orelse false) .debug else if (findJsonBool(body, "enabled")) |on| (if (on) .enable else .disable) else .query;
+            const result = queue.submitAndWait(.{ .sprites = command });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/cpu_patches")) {
+            const command: @import("command_queue.zig").SpritesCommand = if (findJsonBool(body, "enabled")) |on| (if (on) .enable else .disable) else .query;
+            const result = queue.submitAndWait(.{ .cpu_patches = command });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/screenshot/composited")) {
+            const command = parseRecordingStart(body) orelse
+                return .{ .status = 400, .body = "{\"error\":\"path required\"}" };
+            const result = queue.submitAndWait(.{ .composited_screenshot = command.recording_start });
             return .{ .status = 200, .body = result.getData() };
         }
         if (std.mem.eql(u8, path, "/recording/start")) {
@@ -525,10 +576,15 @@ fn parseMousePayload(body: []const u8) ?MousePayload {
     const y = findJsonNumber(body, "y") orelse return null;
     // Modifiers use key_down convention: field presence = true (value irrelevant).
     // Omitted -> all false -> identical to old `{x, y}` request behavior.
+    // Optional "button": "left" | "middle" | "right"; anything else is rejected.
+    const button: @import("ui").events.MouseButton = if (findJsonString(body, "button")) |value|
+        std.meta.stringToEnum(@import("ui").events.MouseButton, value) orelse return null
+    else
+        .left;
     return .{
+        .button = button,
         .x = x,
         .y = y,
-        .button = if (findJsonString(body, "button")) |value| std.meta.stringToEnum(@import("ui").events.MouseButton, value) orelse return null else .left,
         .shift = std.mem.indexOf(u8, body, "\"shift\"") != null,
         .ctrl = std.mem.indexOf(u8, body, "\"ctrl\"") != null,
         .alt = std.mem.indexOf(u8, body, "\"alt\"") != null,
@@ -767,6 +823,10 @@ fn findJsonBool(body: []const u8, key: []const u8) ?bool {
 }
 
 fn findJsonNumber(body: []const u8, key: []const u8) ?f32 {
+    return if (findJsonNumber64(body, key)) |v| @floatCast(v) else null;
+}
+
+fn findJsonNumber64(body: []const u8, key: []const u8) ?f64 {
     var search_buf: [64]u8 = undefined;
     const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
     const start = (std.mem.indexOf(u8, body, pattern) orelse return null) + pattern.len;
@@ -779,7 +839,7 @@ fn findJsonNumber(body: []const u8, key: []const u8) ?f32 {
     while (end < body.len and (body[end] >= '0' and body[end] <= '9' or body[end] == '.')) end += 1;
     if (end == pos) return null;
 
-    return std.fmt.parseFloat(f32, body[pos..end]) catch null;
+    return std.fmt.parseFloat(f64, body[pos..end]) catch null;
 }
 
 test "recording start parser validates path and target fps" {
@@ -801,6 +861,42 @@ test "recording start parser validates path and target fps" {
 fn testTmpRpcDir(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buf);
     return buf[0..len];
+}
+
+test "file RPC quit publishes its acknowledgement before the app loop returns" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try testTmpRpcDir(&tmp, &path_buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "req-quit.json", .data = "{\"method\":\"POST\",\"path\":\"/quit\"}" });
+
+    const Producer = struct {
+        queue: *CommandQueue,
+        path: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            handleFileRpcRequest(self.queue, self.path, "req-quit.json") catch return;
+        }
+    };
+
+    var queue: CommandQueue = .{ .io = io };
+    var producer: Producer = .{ .queue = &queue, .path = path };
+    const worker = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    defer worker.join();
+    while (!queue.hasCommand() and !producer.done.load(.acquire)) std.Thread.yield() catch {};
+    try std.testing.expect(queue.hasCommand());
+
+    _ = @import("command_executor.zig").drainCommandsRequestFrame(&queue);
+    // The main loop may exit as soon as drain returns. Do not join the worker
+    // first: the response must already be published at this point.
+    const response = try readFileCompat(tmp.dir, io, "res-quit.json", std.testing.allocator);
+    defer std.testing.allocator.free(response);
+    // This fixture has no native quit callback. The command's actual result
+    // still has to be delivered, including errors.
+    try std.testing.expectEqualStrings("{\"error\":\"quit callback unavailable\"}", response);
 }
 
 test "file-RPC owner: 空目录首次 claim 成功并写入自身 pid" {
@@ -896,6 +992,15 @@ fn parseScreenshot(body: []const u8) error{ InvalidPayload, InvalidWindowId }!@i
         copyTestId(id, &payload.window_id.?);
     }
     return payload;
+}
+
+test "mouse parsers select the requested button and reject unknown buttons" {
+    try std.testing.expectEqual(@import("ui").events.MouseButton.left, parseMousePayload("{\"x\":1,\"y\":2}").?.button);
+    try std.testing.expectEqual(@import("ui").events.MouseButton.right, parseMousePayload("{\"x\":1,\"y\":2,\"button\":\"right\"}").?.button);
+    const down = parseMousePoint("{\"x\":1,\"y\":2,\"button\":\"middle\",\"shift\":true}", .mouse_down).?;
+    try std.testing.expectEqual(@import("ui").events.MouseButton.middle, down.mouse_down.button);
+    try std.testing.expect(down.mouse_down.shift);
+    try std.testing.expect(parseMousePayload("{\"x\":1,\"y\":2,\"button\":\"back\"}") == null);
 }
 
 test "screenshot parser preserves window identity and rejects native or malformed ids" {

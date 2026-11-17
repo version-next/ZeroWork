@@ -1,9 +1,13 @@
 /** Native Markdown table clipping regression, using an isolated local provider. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,writeFile,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleBody,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const out=resolve(process.argv[2]??'/tmp/zw-ai-table-evidence');
@@ -19,8 +23,9 @@ const answer='目录里大致是：\n\n| 文件 | 看起来是什么 |\n| --- | 
  '| `x.py` | 一个 Python 脚本，用途从文件名看不出来 |\n\nTABLE_COMPLETE：核对安装材料。';
 let requests=0;
 const server=createServer(async(req,res)=>{
- for await(const _ of req){}
+ const raw=await readRequestText(req);
  if(req.method!=='POST')return res.end('{"data":[{"id":"table-fixture"}]}');
+ if(isTitleBody(raw))return skipTitle(res);
  requests++;
  res.writeHead(200,{'content-type':'text/event-stream'});
  res.end('data: '+JSON.stringify({choices:[{index:0,delta:{content:answer}}]})+'\n\ndata: [DONE]\n\n');
@@ -37,22 +42,26 @@ const text=(n:any):string=>n?[n.text??'',...(n.children??[]).map(text)].join(' '
 const report:any={status:'running',checks:[]};
 try{
  await h.waitForServerReady();await h.resizeWindow(1440,1000);
- await click('workspace.empty.local');await click('toolbar.ai');await click('ai.prompt');
+ await click('workspace.empty.local');await click(await aiToggleId());await click('ai.prompt');
  await h.type_('检查目录文件');await click('ai.send');
  await h.waitFor(async()=>text((await h.query('ai.conversation')).find(shown)).includes('TABLE_COMPLETE')||null,20000);
  await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,15000);
  for(const [width,height] of [[1440,1000],[860,700]]){
   await h.resizeWindow(width,height);
+  // Native W.Markdown `.rules` table (Pencil Kaf7E A3): rows are the table's children (header + 5),
+  // cells pad 6 0, and the table stays inside the message column (no horizontal viewport).
   const table=await visible('ai.message.table');
-  const content=table.children[0];assert.equal(content.children.length,6);
+  const content=table;assert.equal(content.children.length,6);
   for(const row of content.children){
    for(const cell of row.children){
-    for(const paragraph of cell.children[0].children??[]){
-     assert(paragraph.rect.y+paragraph.rect.h<=cell.rect.y+cell.rect.h-6+.2,'wrapped text must fit inside cell padding');
+    for(const paragraph of [cell.children[0],...(cell.children[0].children??[])]){
+     assert(paragraph.rect.y+paragraph.rect.h<=row.rect.y+row.rect.h-6+.6,'wrapped text must fit inside cell padding');
     }
    }
   }
-  assert(Math.abs(content.rect.h-table.rect.h)<.2,'horizontal viewport must contain full table height');
+  const column=await visible('ai.response');
+  assert(table.rect.x>=column.rect.x-.5&&table.rect.x+table.rect.w<=column.rect.x+column.rect.w+.5,'the table stays inside the message column');
+  assert(Math.abs(content.rect.h-content.children.reduce((h:number,r:any)=>h+r.rect.h,0))<1,'the table is as tall as its rows');
   await writeFile(join(out,`table-${width}.json`),JSON.stringify(table,null,2));
   await h.mouseMove(1,1);assert((await h.screenshot(join(out,`table-${width}.png`))).ok);
   report.checks.push({width,height,table:table.rect,rows:content.children.map((n:any)=>n.rect.h)});

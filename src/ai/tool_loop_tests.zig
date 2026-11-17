@@ -6,7 +6,7 @@ const retry = @import("retry.zig");
 const scope_mod = @import("tool_scope.zig");
 const http = @import("provider_http.zig");
 const a = std.testing.allocator;
-const scope: scope_mod.Scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+const scope: scope_mod.Scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
 const definitions = [_]provider.ToolDefinition{ .{ .tool = .run_command, .session_ids = &.{101} }, .{ .tool = .read_terminal, .session_ids = &.{101} } };
 const df: provider.ToolCall = .{ .id = "call-local-df", .name = "run_command", .arguments = "{\"session_ids\":[101],\"command\":\"df -h\"}" };
 
@@ -33,7 +33,7 @@ test "new offline turn retains two host tool turns without inheriting their auth
     defer history.deinit();
     const conversation = identity.ConversationId.generate();
     for (0..2) |index| {
-        const context: tools.host.Context = .{ .conversation_id = conversation, .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+        const context: tools.host.Context = .{ .conversation_id = conversation, .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
         var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &.{.{ .authority = .conversation_context, .definition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" } }});
         defer table.deinit();
         const wire = try tools.providerDefinitions(&table, table.arena.allocator());
@@ -81,12 +81,13 @@ test "new offline turn retains two host tool turns without inheriting their auth
 test "round authority handoff preserves old tool pairs and refreshes only the next batch" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
     const contribution: tools.host.Contribution = .{ .authority = .lifecycle, .definition = .{ .id = "host.create_group", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}", .effect = .resource_write } };
     var original = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &.{contribution});
     defer original.deinit();
     var next_context = context;
-    next_context.binding = .{ .group = 7 };
+    next_context.binding = .{ .tab = 7 };
+    next_context.content = .{ .group = 7 };
     next_context.binding_revision = 2;
     var successor = try tools.RequestTable.initWithHost(a, .{ .owner = next_context.binding, .members = .{} }, &.{}, &.{}, next_context, &.{.{ .authority = .conversation_context, .definition = .{ .id = "host.get_current_context", .schema = contribution.definition.schema } }});
     defer successor.deinit();
@@ -151,7 +152,7 @@ test "round authority handoff preserves old tool pairs and refreshes only the ne
 test "tool deadline cancelled authority refresh releases the candidate and keeps the old snapshot" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
     var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &.{.{ .authority = .conversation_context, .definition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\"}" } }});
     defer table.deinit();
     const Fixture = struct {
@@ -189,7 +190,7 @@ test "tool deadline cancelled authority refresh releases the candidate and keeps
 test "tool deadline Stop after accepted result skips later notifications without dropping facts" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
     var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &.{.{ .authority = .conversation_context, .definition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\"}" } }});
     defer table.deinit();
     const Fixture = struct {
@@ -225,7 +226,7 @@ test "tool deadline Stop after accepted result skips later notifications without
 test "host tools retain real call pairs and conversation receipts without session targets" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const authority: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
+    const authority: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
     const definition: tools.ToolDefinition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" };
     const empty: scope_mod.Scope = .{ .owner = authority.binding, .members = .{} };
     var table = try tools.RequestTable.initWithHost(a, empty, &.{}, &.{}, authority, &.{.{ .definition = definition, .authority = .conversation_context }});
@@ -807,7 +808,8 @@ test "answer retry of unknown tools rejects new calls and preserves owner and bu
     manager.cooldown_deadline_ms = std.math.maxInt(u64);
     try std.testing.expectError(error.ProviderCoolingDown, manager.resumeAnswer(script.interface(), null));
     manager.cooldown_deadline_ms = 0;
-    manager.scope.?.owner = .{ .session = 102 };
+    manager.scope.?.owner = .{ .tab = 102 };
+    manager.scope.?.content = .{ .session = 102 };
     try std.testing.expectError(error.ToolOwnerChanged, manager.resumeAnswer(script.interface(), null));
     manager.scope = scope;
     run.compaction_failure = error.ProviderFailure;
@@ -969,7 +971,7 @@ test "failed request snapshot construction leaves no resumable uninitialized led
 test "host uncertain execution blocks a fresh command while preserving exact read and stop receipts" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
     var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &@import("host_execution.zig").contributions);
     defer table.deinit();
     const wire = try tools.providerDefinitions(&table, table.arena.allocator());
@@ -1100,7 +1102,7 @@ test "plugin dispatch remains available after a large completed operation histor
 test "execution deadline known unsent timeout never becomes an unknown side effect" {
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = scope.owner, .content = scope.content, .binding_revision = 1, .grant_revision = 1 };
     var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, context, &.{.{ .authority = .execution_control, .definition = .{ .id = "host.run_in_terminal", .effect = .resource_write, .schema = "{\"type\":\"object\"}" } }});
     defer table.deinit();
     const Fixture = struct {

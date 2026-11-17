@@ -25,7 +25,7 @@ test "text publication: NumberStepper resizes after digit count change" {
     const scope = try ui.Scope.init(cx.allocator, null, cx.owner);
     defer scope.dispose();
     const stepper = try @import("../components/number_stepper/mod.zig").NumberStepper(.{ .value = 9 }).mount(scope, cx);
-    const value_node: *ui.Node = @as(*@import("../components/number_stepper/mod.zig").NumberStepperRuntime, @ptrCast(@alignCast(stepper.wrapper.behavior.events.key_context.?))).value_node;
+    const value_node: *ui.Node = stepper.field.text_display_node.?;
     try root.appendChild(cx.allocator, stepper.wrapper);
     cx.layout();
     _ = cx.render();
@@ -181,4 +181,26 @@ test "text publication: setContent 长文本经节点替换 / 销毁不泄漏、
         node.setText(t);
         try std.testing.expectEqualStrings(s, node.getText().?.content);
     }
+}
+
+test "getText lifetime: a write-back keeps the borrowed slice; the node's own text may feed setTextContent" {
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const label = try ui.text(cx, "initial", .{ .font_size = 14 });
+    cx.root = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 40 } }, .{label});
+    try label.setTextContent(cx.allocator, "owned label text");
+    // Read -> change a style field -> write the same content back: the node keeps its (owned)
+    // bytes, so the slice read before the write is still the node's text.
+    const before = label.getText().?;
+    var restyled = before;
+    restyled.font_size = 18;
+    label.setText(restyled);
+    try std.testing.expect(label.getTextRaw().?.owned);
+    try std.testing.expect(label.getText().?.content.ptr == before.content.ptr);
+    try std.testing.expectEqualStrings("owned label text", before.content);
+    // The node's own text as the input of a write that replaces it: copied before the write
+    // releases the old bytes.
+    try label.setTextContent(cx.allocator, label.getText().?.content[6..11]);
+    try std.testing.expectEqualStrings("label", label.getText().?.content);
+    try std.testing.expectEqual(@as(f32, 18), label.getText().?.font_size);
 }

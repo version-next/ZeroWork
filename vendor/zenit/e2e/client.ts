@@ -145,7 +145,7 @@ export async function request(
 ): Promise<any> {
   const httpJob = process.env.ZENIT_E2E_HTTP_JOB_ID;
   if (httpJob) {
-    const base = process.env.ZENIT_E2E_HTTP_BASE ?? "http://127.0.0.1:19817";
+    const base = process.env.ZENIT_E2E_HTTP_BASE ?? "http://192.168.232.1:19817";
     const token = process.env.ZENIT_E2E_HTTP_TOKEN;
     if (!token) throw new Error("ZENIT_E2E_HTTP_TOKEN is required for Windows HTTP RPC");
     const response = await fetch(`${base}/rpc/${httpJob}`, {
@@ -228,8 +228,21 @@ export async function health(): Promise<{ status: "ok" }> {
   return result;
 }
 
-export async function tree(): Promise<QueryNode> {
-  return request("GET", "/tree");
+export interface TreeOptions {
+  /** Start at the first node with this test id (a visible one when `visibleOnly`). */
+  root?: string;
+  /** Leave out subtrees that cannot show: display none, opacity 0, suspended overlay layers,
+   *  collapsed clips, empty leaves and boxes wholly outside their clip (scrolled-away rows). */
+  visibleOnly?: boolean;
+}
+
+/** The window's node tree. With options, a subtree and / or only what can show (POST /tree), for
+ *  windows whose whole tree outgrows the 256 KB result buffer ("tree too large"). */
+export async function tree(options?: TreeOptions): Promise<QueryNode> {
+  if (!options || (options.root === undefined && !options.visibleOnly)) return request("GET", "/tree");
+  const body: Record<string, unknown> = { visible_only: options.visibleOnly === true };
+  if (options.root !== undefined) body.root = options.root;
+  return request("POST", "/tree", body);
 }
 
 export async function focused(): Promise<FocusedResult> {
@@ -240,7 +253,35 @@ export async function query(testId: string): Promise<QueryNode[]> {
   return request("POST", "/query", { test_id: testId });
 }
 
+/** One value per work counter (docs/design/streaming-content.md §5.8). */
+export interface WorkCounts {
+  text_layouts: number;
+  text_layout_bytes: number;
+  text_shape_bytes: number;
+  nodes_created: number;
+  nodes_destroyed: number;
+  layout_passes: number;
+  after_layout_rounds: number;
+  md_scanned_bytes: number;
+  /** Reserved for the scroll settle phase; always 0 until it exists. */
+  scroll_settle_rounds: number;
+}
+
+/** `/stats` `work`: per-frame work counters of the bound window since the last /stats/reset. */
+export interface WorkStats {
+  frames: number;
+  /** Frames in the percentile window (most recent <= 120). */
+  window: number;
+  totals: WorkCounts;
+  last: WorkCounts;
+  p50: WorkCounts;
+  p95: WorkCounts;
+  max: WorkCounts;
+}
+
 export interface FrameStats {
+  /** null when the host does not publish work counters. */
+  work?: WorkStats | null;
   renderer_backend?: "d3d12" | "d3d11" | "metal" | "null_backend" | "opengl" | "vulkan" | "legacy" | null;
   window_scale?: number | null;
   retained_hits: number;
@@ -250,6 +291,16 @@ export interface FrameStats {
   frame_count: number;
   backdrop_luminance_milli: number;
   /** Paint invariant: cumulative duplicate solid-rect count (same node, frame, identical fill emitted twice). Must be 0 */
+  /** Hovered path's nearest test_id and stationary-pointer hover re-resolution counters. */
+  hover: {
+    test_id: string | null;
+    reconcile_hit_tests: number;
+    reconcile_changes: number;
+    /** Platform presence: false after `pointer_left` until the next pointer event. */
+    pointer_over_content: boolean;
+    /** Stationary re-resolution may run: presence, inside the content, no OS drag session. */
+    pointer_live: boolean;
+  } | null;
   paint_duplicate_fills: number;
   /** Most recent double-emit node id (debug; 0 = never) */
   paint_duplicate_node: number;
@@ -350,10 +401,16 @@ export async function waitForConsole(
   throw new Error(`console event timeout: ${JSON.stringify(predicate)}; recent=${JSON.stringify(recent.slice(-10))}`);
 }
 
+/** Matches ui.events.MouseButton. Omit = left. */
+export type MouseButton = "left" | "middle" | "right";
+
 /** count > 1 injects consecutive clicks inside the app in one request, so a
  *  double-click never depends on the driver's round-trip time. */
-export async function clickAt(x: number, y: number, count = 1): Promise<ClickResult> {
-  return request("POST", "/click", count === 1 ? { x, y } : { x, y, count });
+export async function clickAt(x: number, y: number, count = 1, button?: MouseButton): Promise<ClickResult> {
+  const body: Record<string, unknown> = { x, y };
+  if (count !== 1) body.count = count;
+  if (button) body.button = button;
+  return request("POST", "/click", body);
 }
 
 /** Matches ui.events.ScrollPhase. Omit = mouse wheel. */
@@ -424,16 +481,26 @@ export async function clickTestId(testId: string): Promise<ClickResult> {
   return request("POST", "/click", { test_id: testId });
 }
 
-export async function mouseDown(x: number, y: number): Promise<{ ok: boolean }> {
-  return request("POST", "/mouse_down", { x, y });
+export async function mouseDown(x: number, y: number, button?: MouseButton): Promise<{ ok: boolean }> {
+  return request("POST", "/mouse_down", button ? { x, y, button } : { x, y });
 }
 
 export async function mouseMove(x: number, y: number): Promise<{ ok: boolean }> {
   return request("POST", "/mouse_move", { x, y });
 }
 
-export async function mouseUp(x: number, y: number): Promise<{ ok: boolean }> {
-  return request("POST", "/mouse_up", { x, y });
+export async function mouseUp(x: number, y: number, button?: MouseButton): Promise<{ ok: boolean }> {
+  return request("POST", "/mouse_up", button ? { x, y, button } : { x, y });
+}
+
+/** The platform's `pointer_left` (the pointer left the window or another window covers it). */
+export async function pointerLeave(): Promise<{ ok: boolean }> {
+  return request("POST", "/pointer_leave", {});
+}
+
+/** The platform's window activation appearance (test-mode apps otherwise stay active). */
+export async function setWindowActive(active: boolean): Promise<{ ok: boolean }> {
+  return request("POST", "/window_active", { active });
 }
 
 export async function key(name: string, mods?: { shift?: boolean; ctrl?: boolean; alt?: boolean; cmd?: boolean }): Promise<{ ok: boolean }> {
@@ -484,6 +551,9 @@ export interface InputState {
   cursor_affinity?: "upstream" | "downstream";
   /** Textarea-only visual geometry, populated after a render pass. */
   display_line_count?: number;
+  line_height?: number;
+  padding_h?: number;
+  padding_v?: number;
   cursor_rect?: { x: number; y: number; w: number; h: number } | null;
   selection_rects?: Array<{ x: number; y: number; w: number; h: number }>;
   ime_preedit_len: number;

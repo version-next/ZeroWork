@@ -1,8 +1,7 @@
 #pragma once
 // DirectWrite alpha correction coefficients from Microsoft Windows Terminal.
-// Source: https://github.com/microsoft/terminal/blob/e90f9a534cae047fccddacc1ee813a82929662d5/src/renderer/atlas/dwrite_helpers.cpp
 // Copyright (c) Microsoft Corporation. Licensed under the MIT license.
-// See dwrite_alpha_correction.LICENSE for attribution and license terms.
+// See dwrite_alpha_correction.LICENSE and docs/TEXT_NATIVE_FIDELITY.md.
 static void dwrite_gamma_ratios(float gamma, float out[4]) {
     static const float ratios[13][4] = {
         {0,0,0,0}, {.0166f,-.0807f,.2227f,-.0751f},

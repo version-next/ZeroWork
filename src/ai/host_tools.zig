@@ -13,7 +13,11 @@ pub const ChildOrigin = struct {
 pub const Context = struct {
     conversation_id: identity.ConversationId,
     task_id: identity.TaskId,
+    /// 对话绑定的 tab（M10）。旧日志里的 `session` / `group` 归属只读。
     binding: scope.Owner,
+    /// 授权捕获时绑定 tab 的内容（会话或会话组），见 `tool_scope.Content`。`.tab` 绑定必须给出；
+    /// 旧的 `session` / `group` 绑定由归属本身派生，旧记录里没有这个字段。
+    content: ?scope.Content = null,
     binding_revision: u64,
     grant_revision: u64,
     child_origin: ?ChildOrigin = null,
@@ -21,7 +25,7 @@ pub const Context = struct {
     pub fn jsonStringify(self: Context, writer: *std.json.Stringify) !void {
         try writer.beginObject();
         inline for (@typeInfo(Context).@"struct".field_names) |name| {
-            const emit = if (comptime std.mem.eql(u8, name, "child_origin")) self.child_origin != null else true;
+            const emit = if (comptime std.mem.eql(u8, name, "child_origin")) self.child_origin != null else if (comptime std.mem.eql(u8, name, "content")) self.content != null else true;
             if (emit) {
                 try writer.objectField(name);
                 try writer.write(@field(self, name));
@@ -34,13 +38,20 @@ pub const Context = struct {
         if (self.child_origin) |origin| {
             if (!origin.agent.valid() or !origin.parent.agent.valid() or !origin.parent.conversation.valid() or origin.parent.binding == 0 or origin.parent.environment == 0 or origin.worker_generation == 0 or origin.scope_revision == 0 or origin.parent.conversation.eql(self.conversation_id)) return error.InvalidHostAuthority;
         }
+        if (self.binding.raw() == 0) return error.InvalidHostAuthority;
         switch (self.binding) {
-            .session => |id| if (id == 0) return error.InvalidHostAuthority,
-            .group => |id| if (id == 0) return error.InvalidHostAuthority,
+            // 运行期在捕获作用域之前先用归属配置审批通道，此时还没有内容；内容未解析时 `contentOf`
+            // 是不含任何成员的空会话，所有成员与会话组判断都失败关闭。
+            .tab => if (self.content) |value| if (value.raw() == 0) return error.InvalidHostAuthority,
+            .session, .group => if (self.content) |value| if (!value.eql(scope.Content.ofLegacy(self.binding).?)) return error.InvalidHostAuthority,
         }
     }
+    /// 绑定 tab 的内容：`.tab` 绑定取捕获的 `content`，旧绑定由归属派生；都没有时是空会话（失败关闭）。
+    pub fn contentOf(self: Context) scope.Content {
+        return self.content orelse scope.Content.ofLegacy(self.binding) orelse .{ .session = 0 };
+    }
     pub fn eql(self: Context, other: Context) bool {
-        return self.conversation_id.eql(other.conversation_id) and self.task_id.eql(other.task_id) and self.binding.eql(other.binding) and self.binding_revision == other.binding_revision and self.grant_revision == other.grant_revision and std.meta.eql(self.child_origin, other.child_origin);
+        return self.conversation_id.eql(other.conversation_id) and self.task_id.eql(other.task_id) and self.binding.eql(other.binding) and std.meta.eql(self.content, other.content) and self.binding_revision == other.binding_revision and self.grant_revision == other.grant_revision and std.meta.eql(self.child_origin, other.child_origin);
     }
 };
 /// Contributed by the trusted host, never by a provider manifest.

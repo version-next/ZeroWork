@@ -10,16 +10,17 @@ const Shadow = core.Shadow;
 
 /// Panel corner radius, border.radius and hit/clip shape share same scalar
 pub fn popoverRadius(t: *const theme.ThemeTokens) f32 {
-    return t.tokens.radius.md;
+    return t.tokens.radius.panel;
 }
 
 pub fn popoverContentBackground(t: *const theme.ThemeTokens) Color {
-    return t.tokens.color.bg_secondary;
+    return t.tokens.color.bg_primary;
 }
 
 pub fn popoverContentBorder(t: *const theme.ThemeTokens) Border {
     return .{
         .width = 1,
+        .overlay = true,
         .color = t.tokens.color.border,
         .radius = popoverRadius(t),
     };
@@ -30,11 +31,19 @@ pub fn popoverKeyShadow(t: *const theme.ThemeTokens) Shadow {
     return t.tokens.shadow.md;
 }
 
-/// Ambient light shadow layer: large-extent soft shadow simulates elevation (MD3 double-shadow
-/// style)
-pub const popover_ambient_shadow: Shadow = .{
-    .color = Color.rgba(0, 0, 0, 18),
-    .blur = 40,
-    .offset_x = 0,
-    .offset_y = 16,
-};
+/// Recolor the default chrome, preserving explicit caller overrides and all
+/// dimensions managed by the positioner.
+pub fn updateChromeTheme(node: *core.Node, before: *const theme.ThemeTokens, after: *const theme.ThemeTokens) void {
+    if (Color.eql(node.getBackground(), popoverContentBackground(before))) {
+        node.setBackground(popoverContentBackground(after));
+    }
+    if (Color.eql(node.style.border.color, before.tokens.color.border)) {
+        node.setBorderColor(after.tokens.color.border);
+    }
+    if (node.style.ext) |ext| {
+        if (ext.shadow_count == 1 and @import("std").meta.eql(ext.shadows[0], popoverKeyShadow(before))) {
+            ext.setShadow(popoverKeyShadow(after));
+            node.markRenderDirty();
+        }
+    }
+}

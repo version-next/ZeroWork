@@ -1,0 +1,12 @@
+//! Grabber styling: a capsule in the tertiary ink at rest and the accent ink while its surface is
+//! held (follows tokens, the same in every theme mode). View in grabber.yix.
+const ui = @import("../../ui.zig");
+
+/// Capsule 4 high (radius = half the height), `width` from the view (36 at rest, 48 held); never
+/// shrinks, never hit.
+style capsule($width: f32) { width: $width; height: 4; corner-radius: 2; flex-shrink: 0; hit-behavior: pass-through; }
+/// Ink: `fg-tertiary` at rest, `accent` while the host's drag region is pressed (`active`).
+recipe Ink {
+  base { }
+  flag active { background: accent; } else { background: fg-tertiary; }
+}

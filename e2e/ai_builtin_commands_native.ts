@@ -1,9 +1,13 @@
 /** Local built-ins through the actual AI tool catalog; isolated data and PTY. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,writeFile,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const out=resolve(process.argv[2]??'/tmp/zw-ai-builtin-commands');await mkdir(out,{recursive:true});
 const isolated=await mkdtemp('/private/tmp/zw-ai-builtins-'),data=join(isolated,'data'),rpc=join(isolated,'rpc');await mkdir(data);await mkdir(rpc);
@@ -13,7 +17,7 @@ const payload=(envelope:any)=>{for(const b of envelope.content??[])try{return JS
 let failure:any=null;const checks:string[]=[];
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"builtin-fixture"}]}');
- let raw='';for await(const b of req)raw+=b;const body=JSON.parse(raw);
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
  res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length)return res.end(frame({content:'Built-in display'})+'data: [DONE]\n\n');
  const builtin=body.tools.find((t:any)=>t.function.name===wire('host.run_builtin'));assert(builtin);
@@ -46,7 +50,7 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok);};
 const report:any={status:'running',checks};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  for(const [command,key]of [['@dots','dots'],['@help','help']]){
   await click('ai.prompt');await h.type_('请在当前终端执行 '+command);await click('ai.send');
   await h.waitFor(async()=>{if(failure)throw Error(failure);return text(await h.query('ai.panel')).includes('BUILTIN_DISPLAYED_'+key)||null;},30000);

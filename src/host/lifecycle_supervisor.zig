@@ -138,7 +138,7 @@ pub const Supervisor = struct {
     }
     pub fn enqueue(self: *Supervisor, request: OpenRequest) !Snapshot {
         try request.context.validate();
-        if (!request.operation_ref.valid() or request.context.binding != .group or request.context.binding.group != @backingInt(request.group.id) or request.group.revision == 0 or (request.source == null) == (request.saved_source == null)) return error.InvalidHostAuthority;
+        if (!request.operation_ref.valid() or request.context.contentOf() != .group or request.context.contentOf().group != @backingInt(request.group.id) or request.group.revision == 0 or (request.source == null) == (request.saved_source == null)) return error.InvalidHostAuthority;
         if (request.source) |source| if (@backingInt(source.session_id) == 0 or source.generation == 0) return error.InvalidHostAuthority;
         if (request.saved_source) |source| if (@backingInt(source.id) == 0 or source.revision == 0) return error.InvalidHostAuthority;
         if (self.find(request.operation_ref)) |entry| {
@@ -236,7 +236,7 @@ test "owned lifecycle completion requires host evidence and takeover invalidates
     var supervisor = Supervisor.init(std.testing.allocator);
     defer supervisor.deinit();
     const task = identity.TaskId.generate();
-    const request: OpenRequest = .{ .operation_ref = identity.HostOperationId.generate(), .context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = task, .binding = .{ .group = 3 }, .binding_revision = 1, .grant_revision = 1 }, .group = .{ .id = @fromBackingInt(3) }, .source = .{ .session_id = @fromBackingInt(5) }, .connection_policy = .new_only, .retention = .auto_idle };
+    const request: OpenRequest = .{ .operation_ref = identity.HostOperationId.generate(), .context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = task, .binding = .{ .tab = 3 }, .content = .{ .group = 3 }, .binding_revision = 1, .grant_revision = 1 }, .group = .{ .id = @fromBackingInt(3) }, .source = .{ .session_id = @fromBackingInt(5) }, .connection_policy = .new_only, .retention = .auto_idle };
     _ = try supervisor.enqueue(request);
     _ = try supervisor.enqueue(request);
     try std.testing.expectEqual(@as(usize, 1), supervisor.entries.items.len);

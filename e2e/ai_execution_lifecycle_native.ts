@@ -9,14 +9,18 @@
  * ZW_AI_TEST_TAKEOVER_ONLY=1 checks one precise input handoff while the same
  * provider Task and a second real Local execution keep running.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
-import {spawn,execFile} from 'node:child_process';
-import {promisify} from 'node:util';
+import {spawn} from 'node:child_process';
+import {readPasteboardText} from './private_pasteboard.ts';
 import {createHash,randomBytes} from 'node:crypto';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,open,realpath,rm,access} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-patch-integrated');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
 const closeOnly=process.env.ZW_AI_TEST_CLOSE_ONLY==='1';
@@ -101,6 +105,8 @@ const holdTakeover=(body:any,res:any,kind:string)=>{
 };
 const releaseTakeover=(kind:string,calls:any[])=>{assert(takeoverHeld&&takeoverHeld.kind===kind);const held=takeoverHeld;takeoverHeld=null;emitMany(held.body,held.res,calls)};
 const finish=(res:any,stage:string)=>{activeCall=null;finalEmitted=true;res.end(frame({content:`[E-${stage}] 已核验真实终端、执行回执与本次任务边界。`})+'data: [DONE]\n\n')};
+// 早于本 Task 的历史消息在发送前加「[历史环境，仅作记录]\n」前缀（src/ai/session_runtime.zig 历史投影），去掉前缀后仍须是完整 JSON 结果。
+const historyPrefix='[历史环境，仅作记录]\n',historical=(content:string)=>content.startsWith(historyPrefix)?content.slice(historyPrefix.length):content;
 const validateWire=(body:any)=>{
  const system=body.messages.find((m:any)=>m.role==='system')?.content??'';
  assert(!/assistant_session_id=|provider=.*session_id=/.test(system),'ambient identity must be discovered through tools');
@@ -113,7 +119,7 @@ const validateWire=(body:any)=>{
     const expected=emitted.get(call.id);assert.equal(call.function.name,expected.wire);
     assert.deepEqual(JSON.parse(call.function.arguments),expected.arguments,'assistant wire changed original arguments');
    }
-   JSON.parse(message.content);pending.delete(message.tool_call_id);
+   JSON.parse(historical(message.content));pending.delete(message.tool_call_id);
   }
  }
  assert.equal(pending.size,0,'provider followup must contain a result for every original call');
@@ -139,7 +145,7 @@ const assertRunning=(body:any,label:string)=>{
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'execution-lifecycle-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);validateWire(body);
+  const raw=await readRequestText(req);const body=JSON.parse(raw);if(isTitleRequest(body))return skipTitle(res);validateWire(body);
   for(const line of(await readFile(join(out,'app.log'),'utf8')).split('\n')){const start=line.indexOf('AI_TOOL_TRACE ');if(start<0)continue;try{const event=JSON.parse(line.slice(start+14));if(event.event==='host_result')fullHostResults.set(event.call_id,event.result)}catch{}}
   // A real single-to-group handoff adds a host-authored user notice. Keep the
   // fixture's explicit task marker as the boundary across that genuine notice.
@@ -170,10 +176,10 @@ const server=createServer(async(req,res)=>{
    const openedB=result(results,'takeover-open-b');if(!openedB)return emit(body,res,'takeover-open-b','host.open_session',{group_ref:groupContext.binding_ref,source_ref:initialSession.session_ref,connection_policy:'new_only',retention:'keep',request_key:key+'-takeover-open-b'});
    let readyA=result(results,'takeover-ready-a'),readyB=result(results,'takeover-ready-b');
    if(!readyA||!readyB)return emitMany(body,res,[{id:'takeover-ready-a',name:'host.wait_session_ready',arguments:{operation_ref:openedA.operation_ref,after_revision:openedA.source_revision,wait_ms:30000}},{id:'takeover-ready-b',name:'host.wait_session_ready',arguments:{operation_ref:openedB.operation_ref,after_revision:openedB.source_revision,wait_ms:30000}}]);
-   for(let i=1;(readyA.state!=='ready'||readyB.state!=='ready')&&i<=3;i++){
+   for(let i=1;readyA.state!=='ready'||readyB.state!=='ready';i++){
     for(const value of[readyA,readyB])assert(['queued','prepared','opening','ready'].includes(value.state),JSON.stringify(value));
     const nextA=result(results,'takeover-ready-a-'+i),nextB=result(results,'takeover-ready-b-'+i);
-    if(!nextA||!nextB)return emitMany(body,res,[{id:'takeover-ready-a-'+i,name:'host.wait_session_ready',arguments:{operation_ref:openedA.operation_ref,after_revision:readyA.source_revision,wait_ms:30000}},{id:'takeover-ready-b-'+i,name:'host.wait_session_ready',arguments:{operation_ref:openedB.operation_ref,after_revision:readyB.source_revision,wait_ms:30000}}]);readyA=nextA;readyB=nextB;
+    if(!nextA||!nextB){if(!pollWithin('takeover-ready',90000))break;return emitMany(body,res,[{id:'takeover-ready-a-'+i,name:'host.wait_session_ready',arguments:{operation_ref:openedA.operation_ref,after_revision:readyA.source_revision,wait_ms:30000}},{id:'takeover-ready-b-'+i,name:'host.wait_session_ready',arguments:{operation_ref:openedB.operation_ref,after_revision:readyB.source_revision,wait_ms:30000}}])}readyA=nextA;readyB=nextB;
    }
    for(const ready of[readyA,readyB]){assert.equal(ready.state,'ready');assert.equal(ready.ownership,'created_task');assert.equal(ready.membership_committed,true)}
    // Lifecycle attached/ready precedes the private shell hello and recording
@@ -181,11 +187,11 @@ const server=createServer(async(req,res)=>{
    // sending either command; failed/unavailable never become execution retries.
    takeoverState.pty_observation_started_at??=performance.now();takeoverState.pty_observations??=[];
    let sessionA:any,sessionB:any;
-   for(let attempt=0;attempt<3;attempt++){
+   for(let attempt=0;;attempt++){
     const suffix=attempt?'-'+attempt:'',idA='takeover-session-a'+suffix,idB='takeover-session-b'+suffix;
     const observationA=result(results,idA),observationB=result(results,idB);
     if(!observationA||!observationB){
-     assert(performance.now()-takeoverState.pty_observation_started_at<6000,'private PTY readiness exceeded the bounded read-only deadline');
+     assert(performance.now()-takeoverState.pty_observation_started_at<6000,'private PTY capability did not become ready within six seconds of read-only observations');
      if(attempt)await h.sleep(attempt===1?1500:3000);
      return emitMany(body,res,[{id:idA,name:'host.get_session',arguments:{session_ref:readyA.session_ref}},{id:idB,name:'host.get_session',arguments:{session_ref:readyB.session_ref}}]);
     }
@@ -199,7 +205,8 @@ const server=createServer(async(req,res)=>{
      assert(caps.trusted_pty_failure===null||(caps.trusted_pty_state==='busy'&&caps.trusted_pty_failure==='WorkerBusy'),`private PTY failure: ${JSON.stringify(caps)}`);
     }
     if([sessionA,sessionB].every(session=>session.capabilities.trusted_pty_execution===true))break;
-    assert(attempt<2&&performance.now()-takeoverState.pty_observation_started_at<6000,'private PTY capability did not become ready within three read-only observations / six seconds');
+    // Not ready yet: observe again. The six-second deadline is checked where the next observation is issued (above), not
+    // here — this point is replayed with every later request of the turn, long after the wait is over.
    }
    for(const session of[sessionA,sessionB])assert.equal(session.capabilities.trusted_pty_execution,true);
    Object.assign(takeoverState,{session_a:sessionA,session_b:sessionB});
@@ -219,9 +226,9 @@ const server=createServer(async(req,res)=>{
    const notice=notices.find((item:any)=>item.text?.includes('你已接管终端')&&(item.conversation_id??item.context?.conversation_id)===initialContext.conversation_id);
    assert(notice,'the same provider Task must receive the real host handoff notice');assert.equal(notice.task_id??notice.context?.task_id,initialContext.task_id);assert(notice.revision??notice.notice_revision);assert(notice.text.includes(sessionA.title));takeoverState.notices=notices;
    let doneA=result(results,'takeover-finished-a');if(!doneA)return holdTakeover(body,res,'before_user_input');
-   for(let i=1;doneA.state!=='interval_recorded'&&i<=3;i++){
+   for(let i=1;doneA.state!=='interval_recorded';i++){
     assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(doneA.state),JSON.stringify(doneA));
-    const id='takeover-finished-a-'+i,next=result(results,id);if(!next)return emit(body,res,id,'host.wait_execution',{execution_ref:runA.execution_ref,after_revision:doneA.source_revision,wait_ms:30000,max_bytes:8192});doneA=next;
+    const id='takeover-finished-a-'+i,next=result(results,id);if(!next){if(!pollWithin('takeover-finished-a',90000))break;return emit(body,res,id,'host.wait_execution',{execution_ref:runA.execution_ref,after_revision:doneA.source_revision,wait_ms:30000,max_bytes:8192})}doneA=next;
    }
    assertIntervalRecorded(doneA,takeoverCommands.a,takeoverMarkerA);assert.equal(doneA.snapshot.input_handed_off,true);assert.equal(await readFile(takeoverFiles.doneA,'utf8'),takeoverInput+'\n');takeoverState.finished_original_a=doneA;
    const fresh=result(results,'takeover-fresh-a');if(!fresh)return emit(body,res,'takeover-fresh-a','host.run_in_terminal',{session_ref:readyA.session_ref,command:takeoverCommands.fresh,request_key:key+'-takeover-fresh-a'});
@@ -229,10 +236,10 @@ const server=createServer(async(req,res)=>{
    let finalA=result(results,'takeover-final-a-0'),finalB=result(results,'takeover-final-b-0'),originalA=result(results,'takeover-original-a-again');
    if(!finalA||!finalB||!originalA)return holdTakeover(body,res,'fresh_output');
    assert.equal(originalA.execution_ref,runA.execution_ref);assert.equal(originalA.snapshot.execution_id,doneA.snapshot.execution_id);assert.equal(originalA.snapshot.input_handed_off,true);assert.equal(originalA.state,'interval_recorded');assert.deepEqual(originalA.snapshot.owner,doneA.snapshot.owner);assert.equal(originalA.snapshot.execution_fence,doneA.snapshot.execution_fence);assert.equal(originalA.snapshot.execution_input_epoch,doneA.snapshot.execution_input_epoch);assert.equal(originalA.snapshot.grant,null);assert.deepEqual(originalA.snapshot.start,doneA.snapshot.start);assert.deepEqual(originalA.snapshot.end,doneA.snapshot.end);assert.equal(originalA.snapshot.interval_saved,true);
-   for(let i=1;(finalA.state!=='interval_recorded'||finalB.state!=='interval_recorded')&&i<=3;i++){
+   for(let i=1;finalA.state!=='interval_recorded'||finalB.state!=='interval_recorded';i++){
     for(const value of[finalA,finalB])assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(value.state),JSON.stringify(value));
     const nextA=result(results,'takeover-final-a-'+i),nextB=result(results,'takeover-final-b-'+i);
-    if(!nextA||!nextB)return emitMany(body,res,[{id:'takeover-final-a-'+i,name:'host.wait_execution',arguments:{execution_ref:fresh.execution_ref,after_revision:finalA.source_revision,wait_ms:30000,max_bytes:8192}},{id:'takeover-final-b-'+i,name:'host.wait_execution',arguments:{execution_ref:runB.execution_ref,after_revision:finalB.source_revision,wait_ms:30000,max_bytes:8192}}]);finalA=nextA;finalB=nextB;
+    if(!nextA||!nextB){if(!pollWithin('takeover-final',90000))break;return emitMany(body,res,[{id:'takeover-final-a-'+i,name:'host.wait_execution',arguments:{execution_ref:fresh.execution_ref,after_revision:finalA.source_revision,wait_ms:30000,max_bytes:8192}},{id:'takeover-final-b-'+i,name:'host.wait_execution',arguments:{execution_ref:runB.execution_ref,after_revision:finalB.source_revision,wait_ms:30000,max_bytes:8192}}])}finalA=nextA;finalB=nextB;
    }
    assertIntervalRecorded(finalA,takeoverCommands.fresh,takeoverFreshMarker);assert(finalA.snapshot.execution_fence>doneA.snapshot.execution_fence);assert(finalA.snapshot.execution_input_epoch>=doneA.snapshot.input_epoch);assert.equal(finalA.snapshot.input_handed_off,false);assertIntervalRecorded(finalB,takeoverCommands.b,takeoverMarkerB);assert.equal(finalB.snapshot.input_handed_off,false);
    Object.assign(takeoverState,{finished_fresh_a:finalA,finished_b:finalB});return finish(res,stage);
@@ -273,9 +280,9 @@ const server=createServer(async(req,res)=>{
    const run=result(results,'life-run');if(!run)return emit(body,res,'life-run','host.run_in_terminal',{session_ref:ownedSession.session_ref,command,request_key:key+'-run',wait_ms:2000});
    assert(run.execution_ref);executionRef=run.execution_ref;
    let state=run.state==='interval_recorded'?run:result(results,'life-wait');if(!state)return emit(body,res,'life-wait','host.wait_execution',{execution_ref:executionRef,until:'terminal',wait_ms:30000,max_bytes:8192});
-   for(let i=1;state.state!=='interval_recorded'&&i<30;i++){
+   for(let i=1;state.state!=='interval_recorded';i++){
     assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(state.state),JSON.stringify(state));
-    const id='life-wait-'+i,next=result(results,id);if(!next)return emit(body,res,id,'host.wait_execution',{execution_ref:executionRef,until:'terminal',wait_ms:30000,max_bytes:8192});state=next;
+    const id='life-wait-'+i,next=result(results,id);if(!next){if(!pollWithin('life-wait',120000))break;return emit(body,res,id,'host.wait_execution',{execution_ref:executionRef,until:'terminal',wait_ms:30000,max_bytes:8192})}state=next;
    }
    assertIntervalRecorded(state);recorded=state;assert.equal(await readFile(markerFile,'utf8'),marker+'\n','one native write only');
    return finish(res,stage);
@@ -341,7 +348,7 @@ const revealCardAction=async(id:string,action:string)=>{
 const copyNative=async(node:any,label:string)=>{
  if(!node)throw new AcceptanceFailure('query_contract','native-copy',`missing visible ${label} action`);
  assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,label);
- return(await promisify(execFile)('/usr/bin/pbpaste',[],{encoding:'utf8'})).stdout;
+ return(await readPasteboardText());
 };
 const assertIntervalCardScope=(facts:any,snapshot?:any)=>{
  assert(facts.output_scope.startsWith('本次终端输出 · '),'card must identify its observed PTY interval');
@@ -365,9 +372,15 @@ const traceEvents=async()=>{
 const report:any={status:'running',binary,binary_sha256:binarySha256,started_at:new Date().toISOString(),checks:[],limits:['The local HTTP fixture supplies deterministic provider tool calls; all session, terminal, approval, lifecycle and recording results come from the real application.','Local uses its supported new_only policy. Real SSH reuse is a separate acceptance.','Initial discovery is batched; intermediate wait revisions require another genuine provider round and remain subject to the production tool-round budget.','Harness input, the normal owned-window close route and Metal screenshots cover the native window; physical keyboard, IME, VoiceOver and SSH are outside this case.']};
 report.mode=takeoverOnly?'precise_takeover_only':negativeOnly?'execution_rejections_only':closeOnly?'normal_close_only':'full_execution_lifecycle';
 async function normalClose(){
- await click(takeoverOnly?'ai.collapse':'ai.close');const windows=await h.request('POST','/zerowork/windows',{action:'snapshot'});assert.equal(windows.windows.length,1);
- const closingAt=performance.now(),route=takeoverOnly?'POST /quit':'POST /zerowork/windows close';
- assert((takeoverOnly?await h.request('POST','/quit'):await h.request('POST','/zerowork/windows',{action:'close',window:windows.windows[0].window})).ok);
+ // Stop 发布的「AI 操作未完成」通知 toast 叠在最大化助手右上角（ai_notification_conversation_native 断言的设计），会盖住 ai.close；先逐个关掉。
+ for(let i=0;i<8;i++){const toast=(await h.query('notifications.toast.0')).find(shown);if(!toast)break;await h.mouseMove(toast.rect.x+toast.rect.w/2,toast.rect.y+toast.rect.h/2);await click('notifications.dismiss.0');await h.sleep(400)}
+ await click(takeoverOnly?'ai.collapse':'ai.close');
+ // 关闭助手现在先确认「结束当前会话?」（ai_close_confirmation_view.zig：结束并解绑）；按确认完成关闭后再关窗口。
+ if(!takeoverOnly){await h.sleep(200);if((await h.query('ai.close.confirmation.confirm')).some(shown)){await click('ai.close.confirmation.confirm');await absent('ai.close.confirmation')}}
+ const windows=await h.request('POST','/zerowork/windows',{action:'snapshot'});assert.equal(windows.windows.length,1);
+ // 关窗口现在只隐藏窗口、进程常驻（e1372d88，multiwindow_test_routes.zig「Same as the window close button」）；正常退出走应用 Quit 路由。
+ const closingAt=performance.now(),route='POST /quit';
+ assert((await h.request('POST','/quit')).ok);
  report.close_confirmations=[];let closingRpcUnavailable=false;
  while(app.exitCode===null&&app.signalCode===null&&performance.now()-closingAt<15000){
   // The final native window can unbind before its process exit notification.
@@ -391,25 +404,25 @@ async function normalClose(){
 }
 try{acceptance:{
  await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  if(takeoverOnly){
   await send('TAKEOVER');const approved=new Set<string>(),startedAt=performance.now();
   const allowed=['takeover-group','takeover-open-a','takeover-open-b','takeover-run-a','takeover-run-b','takeover-fresh-a'];
   while(!finalEmitted&&performance.now()-startedAt<120000){
    assert.equal(fixtureFailure,null);assert.equal(takeoverUnexpectedProviderClose,false,'taking one Session must not cancel the provider');
    const recovery=(await h.query('ai.recovery')).find(shown);if(recovery)throw new AcceptanceFailure('product','provider-continuity',`provider failed: ${text(recovery)}`);
-   if((await h.query('ai.host_approval')).some(shown)&&activeCall&&allowed.includes(activeCall.id)){
+   if((await h.query('ai.interaction.panel')).some(shown)&&activeCall&&allowed.includes(activeCall.id)){
     if(!approved.has(activeCall.id)){
      if(activeCall.name==='host.run_in_terminal'){
       const expected=activeCall.arguments.command.replaceAll('\r\n','\n');
-      const preview=text(await visible('ai.host_approval.summary'));if(preview!==queryText(expected))throw new AcceptanceFailure('query_contract','approval-preview','approval preview differs from its documented 200-byte query representation',{preview,expected:queryText(expected)});
-      assert.equal(text(await visible('ai.host_approval.target')),activeCall.arguments.session_ref);
-      await click('ai.host_approval.copy');const complete=(await promisify(execFile)('/usr/bin/pbpaste',[],{encoding:'utf8'})).stdout;
+      const preview=text(await visible('ai.interaction.command'));if(preview!==queryText(expected))throw new AcceptanceFailure('query_contract','approval-preview','approval preview differs from its documented 200-byte query representation',{preview,expected:queryText(expected)});
+      /* 交互卡把 s1: 引用解析成「tab 标题 · #会话号」（ai_host.zig updateComposerInteraction），不再显示原始引用 */{const shownTarget=text(await visible('ai.interaction.target'));assert(!shownTarget.includes('s1:')&&/ · #\d+$/.test(shownTarget),shownTarget);}
+      await click('ai.interaction.copy');const complete=(await readPasteboardText());
       if(complete!==expected)throw new AcceptanceFailure('product','approval-copy','the real pending approval copy must preserve the complete normalized command',{complete,expected});
       takeoverState.approval_commands??=[];takeoverState.approval_commands.push({call_id:activeCall.id,session_ref:activeCall.arguments.session_ref,preview:queryText(expected),complete});
      }
      if(activeCall.id==='takeover-fresh-a'){assert(takeoverState.user_input_sent);assert.equal(await exists(takeoverFiles.freshA),false);await capture('takeover-05-fresh-same-session-approval')}
-     approved.add(activeCall.id);await click('ai.host_approval.accept');
+     approved.add(activeCall.id);await click('ai.interaction.approve');
     }
    }
    if(takeoverHeld?.kind==='before_handoff'){
@@ -426,7 +439,7 @@ try{acceptance:{
      const a=takeoverState.session_a.session_id,b=takeoverState.session_b.session_id;assert.notEqual(a,b);
      const paneA=await controlledPane(a),paneB=await controlledPane(b);takeoverState.control_tags_before=[];
      for(const[id,pane]of[[a,paneA],[b,paneB]]as const){const right=pane.surface.rect.x+pane.surface.rect.w-pane.tag.rect.x-pane.tag.rect.w,bottom=pane.surface.rect.y+pane.surface.rect.h-pane.tag.rect.y-pane.tag.rect.h;assert(Math.abs(pane.tag.rect.h-28)<=.5);assert(Math.abs(right-12)<=.5);assert(Math.abs(bottom-10)<=.5);assert.equal(text(pane.title),'AI 控制 • 只读');takeoverState.control_tags_before.push({session_id:id,surface:pane.surface.rect,tag:pane.tag.rect,right,bottom,title:text(pane.title),button:pane.button.rect})}
-     await capture('takeover-01-two-real-executions-active');await click('toolbar.ai');await visible('ai.stop');
+     await capture('takeover-01-two-real-executions-active');await click(await aiToggleId());await visible('ai.stop');
      await click('ai.task_finish.takeover');await visible('ai.task_finish.takeover.target.'+a);await visible('ai.task_finish.takeover.target.'+b);takeoverState.target_menu=[a,b];await capture('takeover-02-exact-target-menu');await click('ai.task_finish.takeover.target.'+a);
      const notice=text(await visible('ai.host_notice.body'));assert(notice.includes('你已接管终端'));assert(notice.includes(takeoverState.session_a.title));assert(notice.includes('命令')&&notice.includes('AI')&&notice.includes('重新申请权限'));takeoverState.native_notice=notice;
      await visible('ai.stop');takeoverState.provider_active_after_handoff=true;await capture('takeover-03-original-task-host-notice');
@@ -440,7 +453,7 @@ try{acceptance:{
     assert(surface.rect.x>=pane.rect.x-.5&&surface.rect.y>=pane.rect.y-.5&&surface.rect.x+surface.rect.w<=pane.rect.x+pane.rect.w+.5&&surface.rect.y+surface.rect.h<=pane.rect.y+pane.rect.h+.5);
     assert((await h.clickAt(surface.rect.x+surface.rect.w/2,surface.rect.y+surface.rect.h/2)).ok);assert((await h.type_(takeoverInput)).ok);assert((await h.key('return')).ok);takeoverState.user_input_sent=true;
     await h.waitFor(async()=>{try{return await readFile(takeoverFiles.doneA,'utf8')===takeoverInput+'\n'||null}catch{return null}},15000);
-    await click('toolbar.ai');await visible('ai.stop');assert(text(await visible('ai.host_notice.body')).includes(takeoverState.native_notice));await capture('takeover-04-read-ended-by-normal-user-input');
+    await click(await aiToggleId());await visible('ai.stop');assert(text(await visible('ai.host_notice.body')).includes(takeoverState.native_notice));await capture('takeover-04-read-ended-by-normal-user-input');
     releaseTakeover('before_user_input',[{id:'takeover-finished-a',name:'host.get_execution',arguments:{execution_ref:takeoverState.execution_a,max_bytes:8192}}]);
    }
    if(takeoverHeld?.kind==='fresh_output'){
@@ -455,10 +468,10 @@ try{acceptance:{
   }
   assert(finalEmitted,'takeover acceptance timed out without a final provider answer');assert.equal(fixtureFailure,null);assert.equal(takeoverUnexpectedProviderClose,false);assert.deepEqual([...approved],allowed);await absent('ai.stop');await visible('ai.turn.complete');
   assert.equal(await readFile(takeoverFiles.doneA,'utf8'),takeoverInput+'\n');assert.equal(await readFile(takeoverFiles.freshA,'utf8'),takeoverFreshMarker+'\n');assert(takeoverState.b_released);assert(takeoverState.notices.some((notice:any)=>takeoverState.native_notice.includes(notice.text)||notice.text.includes(takeoverState.native_notice)));
-  const events=await traceEvents(),identities=events.filter((event:any)=>event.event==='request_identity');assert.equal(identities.length,1,'handoff keeps the same original provider Task');assert(!events.some((event:any)=>event.event==='conversation_rollback'));
+  /* request_identity 追踪事件已在 fcec7cb4 移除；改用宿主结果回执里的 task_id */const events=await traceEvents();assert.equal(new Set([...observations.values()].map((o:any)=>o.envelope.receipt.task_id)).size,1,'handoff keeps the same original provider Task');assert(!events.some((event:any)=>event.event==='conversation_rollback'));
   for(const call of emitted.values())assert.equal(events.filter((event:any)=>event.event==='tool_feedback'&&event.call_id===call.id).length,1,call.id);
   for(const observation of observations.values()){const receipt=observation.envelope.receipt;assert.equal(receipt.conversation_id,initialContext.conversation_id);assert.equal(receipt.task_id,initialContext.task_id)}
-  const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));const runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal');assert.equal(runs.length,3);for(const run of runs){assert.equal(run.stage,'succeeded');assert.equal(run.execution_receipt.sealed,false);assert.equal(run.execution_receipt.interval_saved,true);assert.equal(run.execution_receipt.output_scope,'session_interval');assert.equal(run.remote_effect_unknown,false)}assert.equal(runs.find((run:any)=>run.original_call==='takeover-run-a').execution_receipt.input_handed_off,true);
+  const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));const runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal');assert.equal(runs.length,3);for(const run of runs){assert.equal(run.stage,'succeeded');assert.equal(run.execution_receipt.sealed,false);assert.equal(run.execution_receipt.interval_saved,true);assert.equal(run.execution_receipt.output_scope,'session_interval');assert.equal(run.remote_effect_unknown,false)}assert.equal(runs.find((run:any)=>run.original_call==='takeover-run-a').execution_receipt.input_handed_off,true);
   await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));const manifests:any[]=[];
   for(const path of await readdir(data,{recursive:true}))if(String(path).endsWith('.json'))try{const document=JSON.parse(await readFile(join(data,String(path)),'utf8'));if(document.execution_ranges?.some((range:any)=>['x1:'+range.execution_id].some(ref=>[takeoverState.execution_a,takeoverState.execution_b,takeoverState.fresh_execution_a].includes(ref))))manifests.push({path:String(path),document})}catch{}
   for(const snapshot of[takeoverState.finished_original_a.snapshot,takeoverState.finished_b.snapshot,takeoverState.finished_fresh_a.snapshot]){
@@ -479,7 +492,7 @@ try{acceptance:{
   await h.waitFor(async()=>{
    if(fixtureFailure||finalEmitted)return true;
    const recovery=(await h.query('ai.recovery')).find(shown);if(recovery){report.native_failure=text(recovery);return true}
-   for(const id of ['ai.approval','ai.host_approval'])if((await h.query(id)).some(shown)){report.unexpected_approval=id;return true}
+   for(const id of ['ai.interaction.panel'])if((await h.query(id)).some(shown)){report.unexpected_approval=id;return true}
    return null;
   },30000);
   assert.equal(fixtureFailure,null);assert.equal(report.unexpected_approval,undefined,'fixed-mode denial must not request approval');assert(finalEmitted,report.native_failure);await absent('ai.stop');await visible('ai.turn.complete');
@@ -495,11 +508,11 @@ try{acceptance:{
   await h.waitFor(async()=>{
    if(fixtureFailure||finalEmitted)return true;
    const recovery=(await h.query('ai.recovery')).find(shown);if(recovery){report.native_failure=text(recovery);return true}
-   if(!approved&&(await h.query('ai.host_approval')).some(shown)){assert.equal(activeCall?.id,'close-create-group');approved=true;await click('ai.host_approval.accept')}
+   if(!approved&&(await h.query('ai.interaction.panel')).some(shown)){assert.equal(activeCall?.id,'close-create-group');approved=true;await click('ai.interaction.approve')}
    return null;
   },30000);
   assert.equal(fixtureFailure,null);assert(finalEmitted);assert(approved);await absent('ai.stop');await visible('ai.turn.complete');
-  const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));const record=journal.records.find((r:any)=>r.original_call==='close-create-group');assert(record);assert.equal(record.stage,'succeeded');assert.equal(record.wire_notice_revision,record.notice_revision);assert.equal(record.local_released,true);assert.equal(record.remote_effect_unknown,false);assert.equal(record.context.conversation_id,initialContext.conversation_id);
+  const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));const record=journal.records.find((r:any)=>r.original_call==='close-create-group');assert(record);assert.equal(record.stage,'succeeded');assert.equal(record.wire_notice_revision,record.notice_revision);assert.equal(record.local_released,true);assert.equal(record.remote_effect_unknown,false);assert.equal(record.context.conversation_id,initialContext.conversation_id);
   assert(![...emitted.values()].some(call=>call.name==='host.run_in_terminal'));
   await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));await capture('close-only-ai-task-settled');
   report.checks.push('A real Local and completed AI lifecycle Task start the production Driver, advertise its execution catalog and persist a committed group operation in the real Journal','The close-only acceptance does not invoke terminal execution or weaken any execution/recording assertion');
@@ -510,15 +523,15 @@ try{acceptance:{
  await h.waitFor(async()=>{
   if(fixtureFailure||finalEmitted)return true;
   const recovery=(await h.query('ai.recovery')).find(shown);if(recovery){report.native_failure=text(recovery);return true}
-  if((await h.query('ai.host_approval')).some(shown)){
+  if((await h.query('ai.interaction.panel')).some(shown)){
    assert(activeCall);if(approved.has(activeCall.id))return null;
-   const summary=text(await visible('ai.host_approval.summary'));
+   const summary=text(await visible('ai.interaction.command'));
    assert.equal(await exists(markerFile),false,'command must have zero writes before its approval');
    if(activeCall.name==='host.run_in_terminal'){
-    assert.equal(activeCall.id,'life-run');assert.equal(summary,normalizedCommand,'approval must show normalized command');
-    assert.equal(text(await visible('ai.host_approval.title')),'请求执行命令');await capture('03-command-pending-zero-write');
+    assert.equal(activeCall.id,'life-run');/* harness query 文本按 200 字节截断（queryText，同 takeover 分支）；隔离 TMPDIR 下命令路径更长会超过 200 字节 */assert.equal(summary,queryText(normalizedCommand),'approval must show normalized command');
+    /* 交互卡标题按审批种类（ai_host.zig updateComposerInteraction：terminal_command →「确认执行命令」） */assert.equal(text(await visible('ai.interaction.title')),'确认执行命令');await capture('03-command-pending-zero-write');
    }else{assert(['life-create-group','life-open'].includes(activeCall.id),activeCall.id);await capture(activeCall.id==='life-create-group'?'01-group-pending':'02-owned-session-pending')}
-   approved.add(activeCall.id);await click('ai.host_approval.accept');
+   approved.add(activeCall.id);await click('ai.interaction.approve');
   }return null;
  },90000);
  assert.equal(fixtureFailure,null);assert(finalEmitted,`native task failed before final text: ${report.native_failure??'unknown'}`);assert.deepEqual([...approved],['life-create-group','life-open','life-run']);await absent('ai.stop');await visible('ai.turn.complete');await visible('ai.task_finish.close');
@@ -532,14 +545,15 @@ try{acceptance:{
  await h.waitFor(async()=>(await h.query('groups.pane.title')).filter(shown).length===1||null,10000);await capture('05-owned-closed-borrowed-retained');
  report.checks.push('Production discovery returns real scoped s1 refs; single-to-group handoff keeps ConversationId/TaskId and advances binding revision','Supported Local new_only creates a task-owned ready terminal in the group','Exact normalized CRLF command approval precedes all native writes, with original provider wire arguments and call IDs preserved','Actual Local private protocol confirms accepted/native-written/submit-ack/END/foreground exit and a durably saved same-PTY interval','TaskFinish ask closes only the owned terminal; the original borrowed terminal and group remain');
  // Persist independent disk evidence before the temporary application data is removed.
- const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));
+ const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));
  const runRecord=journal.records.find((r:any)=>r.original_call==='life-run');assert(runRecord);assert.equal(runRecord.stage,'succeeded');assert.equal(runRecord.execution_receipt.sealed,false);assert.equal(runRecord.execution_receipt.interval_saved,true);assert.equal(runRecord.execution_receipt.output_scope,'session_interval');assert.equal(runRecord.execution_receipt.recording_settled,true);assert.equal(journal.records.filter((r:any)=>r.tool_id==='host.run_in_terminal'&&r.execution).length,1);
  const files=await readdir(data,{recursive:true});let matchingManifest:any=null;
  for(const file of files){if(!String(file).endsWith('.json'))continue;try{const doc=JSON.parse(await readFile(join(data,String(file)),'utf8'));if(doc.execution_ranges?.some((r:any)=>'x1:'+r.execution_id===executionRef)){matchingManifest={path:String(file),document:doc};break}}catch{}}
  assert(matchingManifest,'the execution must have its real recording manifest');
  const range=matchingManifest.document.execution_ranges.find((r:any)=>'x1:'+r.execution_id===executionRef);assert.equal(range.sealed,false);assert.equal(range.interval_saved,true);assert.equal(range.output_scope,'session_interval');assert.equal(range.completion_evidence,'foreground_finished');assert(range.end&&range.end.raw_offset>=range.start.raw_offset);await writeFile(join(out,'execution-recording-manifest.json'),JSON.stringify(matchingManifest,null,2));
- await send('STOP');await visible('ai.host_approval');assert.equal(activeCall?.id,'stop-run');assert.equal(text(await visible('ai.host_approval.summary')),stopCommand);assert.equal(await exists(stopFile),false);await capture('06-stop-before-dispatch');
- const stopStart=performance.now();await click('ai.stop');await absent('ai.host_approval');await absent('ai.stop');
+ await send('STOP');await visible('ai.interaction.panel');assert.equal(activeCall?.id,'stop-run');assert.equal(text(await visible('ai.interaction.command')),stopCommand);assert.equal(await exists(stopFile),false);await capture('06-stop-before-dispatch');
+ /* 交互卡展开时输入区尾部（含 Stop）隐藏（ai_composer_controls_view.zig setInteraction）；先「稍后处理」收成待办胶囊，审批仍挂起，再按 Stop */await click('ai.interaction.postpone');await visible('ai.interaction.pending');assert.equal(activeCall?.id,'stop-run');
+ const stopStart=performance.now();await click('ai.stop');await absent('ai.interaction.panel');await absent('ai.interaction.pending');await absent('ai.stop');
  const cancelled=await h.waitFor(async()=>(await traceEvents()).find((event:any)=>event.event==='tool_feedback'&&event.call_id==='stop-run')??null,15000);
  const envelope=JSON.parse(cancelled.content);assert.equal(envelope.error_code,'CancelledBeforeDispatch');assert.equal(envelope.receipt?.side_effect_started??envelope.side_effect_started,false);assert.equal(envelope.receipt?.local_released??envelope.local_released,true);assert.equal(envelope.receipt?.remote_effect_unknown??envelope.remote_effect_unknown,false);
  assert(!requests.some(r=>r.stage==='STOP'&&r.results.some((r:any)=>r.id==='stop-run')),'Stop must not request another provider round');report.stop={elapsed_ms:performance.now()-stopStart,envelope};
@@ -558,13 +572,13 @@ try{acceptance:{
  report.primary_execution_lifecycle_passed=true;report.marker=marker;report.execution=recorded;report.disk_execution_range=range;report.approved_calls=[...approved];
  await normalClose();
  report.status='passed';
-}}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;if(takeoverOnly){if(error instanceof AcceptanceFailure)recordFailure(error.category,error.phase,error.message,error.evidence);else recordFailure('verification','native-acceptance',String(error),{last_action:report.last_action});report.primary_failure=takeoverState.primary_failure}process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{})}
+}}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;if(takeoverOnly){if(error instanceof AcceptanceFailure)recordFailure(error.category,error.phase,error.message,error.evidence);else recordFailure('verification','native-acceptance',String(error),{last_action:report.last_action});report.primary_failure=takeoverState.primary_failure}process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{})}
 finally{
  takeoverTeardown=true;if(takeoverHeld){takeoverHeld.res.destroy();takeoverHeld=null}
  report.requests=requests;report.emitted=[...emitted.values()];report.observations=Object.fromEntries(observations);
  if(takeoverOnly){await writeFile(join(out,'raw-execution-snapshots.json'),JSON.stringify({observations:Object.fromEntries(observations),diagnostic:takeoverState.failure_snapshots??null},null,2));await writeFile(join(out,'provider-wire.json'),JSON.stringify(requests,null,2));takeoverState.provider_stream_aborted=takeoverUnexpectedProviderClose;takeoverState.files={};for(const[name,path]of Object.entries(takeoverFiles))try{takeoverState.files[name]=await readFile(path,'utf8')}catch{takeoverState.files[name]=null}report.takeover=takeoverState}
  const rawLog=await readFile(join(out,'app.log'),'utf8');report.native_errors=rawLog.split('\n').filter(line=>line.includes('ai worker turn failed:'));
- if(!report.status.startsWith('passed'))try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.json')))}catch{}
+ if(!report.status.startsWith('passed'))try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.v4.json')))}catch{}
  let forced=false;if(app.exitCode===null&&app.signalCode===null){forced=true;app.kill('SIGTERM')}await Promise.race([ended,h.sleep(2000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended}report.cleanup={exit_code:app.exitCode,signal:app.signalCode,forced};if(forced&&report.status.startsWith('passed')){report.status='failed';report.error='normal app close was not achieved; signal fallback is cleanup only';process.exitCode=1}server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));await log.close();
  const preserveIsolation=takeoverOnly||!report.status.startsWith('passed');report.isolation={directory:iso,preserved:preserveIsolation,data,rpc,zdot};
  await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));if(!preserveIsolation)await rm(iso,{recursive:true,force:true});

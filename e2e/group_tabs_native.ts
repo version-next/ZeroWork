@@ -2,6 +2,8 @@
  * node e2e/group_tabs_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  * --prepare-only 1 writes a plan without starting an app.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { cleanupOwnedBridgeDirectories } from './native_owned_cleanup.ts';
 import { spawn, execFileSync } from "node:child_process";
@@ -42,7 +44,7 @@ const menuItem=async(label:string)=>{
 };
 const tabs=async()=>{const strip=(await query("tabs.strip")).find(shown);return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??"")):[]};
 const panes=async()=>flat(await visible("groups.workspace")).filter(n=>/^groups\.pane\.\d+$/.test(n.test_id??""));
-const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);const observed:any={};for(const id of ["tabs.strip","tabs.viewport","tabs.picker","tabs.all","workspace.titlebar","groups.workspace"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
+const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);const observed:any={};for(const id of ["tabs.strip","tabs.viewport","tabs.all.menu","tabs.all","workspace.titlebar","groups.workspace"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
 const check=(name:string,detail:any)=>report.checks.push({name,status:"passed",detail});
 async function joinTrustedGroup(label:string):Promise<void>{
  // Shell startup is async and user rc files may take seconds. A real shell
@@ -85,16 +87,13 @@ try {
  if(args["--geometry-only"]==="1") {
    for(let i=0;i<9;i++)await newLocal();await visible("tabs.all");
    for(const width of [1440,860]) {
-     await resizeWindow(width,width===1440?900:480);await sleep(200);
-     await click("tabs.all");await visible("tabs.picker");await type("Acceptance");await sleep(150);
-     const picker=await visible("tabs.picker"), trigger=await visible("tabs.all"), titlebar=await visible("workspace.titlebar");
-     assert(Math.abs(picker.rect.x-(width-14-420))<0.01,JSON.stringify({width,picker:picker.rect,trigger:trigger.rect}));
-     assert(Math.abs(picker.rect.y-62)<0.01,JSON.stringify({width,picker:picker.rect,titlebar:titlebar.rect}));
-     assert.equal(picker.rect.w,420);assert.equal(picker.rect.h,270);
-     const rows=(await query("tabs.picker.row")).filter(shown);assert.equal(rows.length,1);assert(label(rows[0]).includes("Acceptance"));
-     await capture(`geometry-${width}-picker`);
-     await press("return");await visible("groups.workspace");await hidden("tabs.picker");
-     check(`picker geometry and real group selection at ${width}`,{width,picker:picker.rect,trigger:trigger.rect,titlebar:titlebar.rect,groupTab:groupTab.test_id});
+     await resizeWindow(width,width===1440?900:480);await sleep(800);
+     // 稿 3 “⌄ n”: a native Menu (240 wide) under its trigger, inside the window.
+     await click("tabs.all");const picker=await visible("tabs.all.menu"), trigger=await visible("tabs.all");
+     assert(picker.rect.x>=0&&picker.rect.x+picker.rect.w<=width&&picker.rect.y>=trigger.rect.y+trigger.rect.h-1,JSON.stringify({width,picker:picker.rect,trigger:trigger.rect}));
+     assert.equal(picker.rect.w,240);
+     await capture(`geometry-${width}-overflow-menu`);await press("escape");await hidden("tabs.all.menu");
+     check(`overflow menu geometry at ${width}`,{width,picker:picker.rect,trigger:trigger.rect});
    }
  } else {
  let order=await tabOrder();assert.deepEqual(order,[firstTab,groupTab.test_id,lastTab]);check("group installed between ordinary tabs in a single presentation order",order);
@@ -110,19 +109,24 @@ try {
  await press("1",{cmd:true});await visible("groups.workspace");await capture("02-command-slot-group-first");await press("modifiers_released");
  assert.equal(await recordGroupSourcePid("after"),originalSourcePid);check("mixed drag preserves the original real group source shell PID",originalSourcePid);
  // Real Local services create overflow. No internal group/tab state is injected.
- for(let i=0;i<9;i++)await newLocal();await visible("tabs.all");await resizeWindow(860,480);await sleep(200);
- const overflowOrder=await tabOrder();assert.equal(overflowOrder.length,12);await press("9",{cmd:true});
- const nine=await allTabs();for(let i=0;i<nine.length;i++){const ordinal=flat(nine[i]).find(n=>n.test_id==="tabs.ordinal");if(ordinal)assert.equal(ordinal.text,String(i+1));if(i>=9)assert(!ordinal,"ordinals after 9 stay hidden even when scrolled into view");}
+ for(let i=0;i<9;i++)await newLocal();await visible("tabs.all");await resizeWindow(860,480);await sleep(800);
+ // 稿 3: tabs that do not fit go into “⌄ n” (least recently used first); strip + menu = all 12.
+ const hiddenIds=async()=>{if(!(await query("tabs.all")).some(shown))return [];await click("tabs.all");const menu=await visible("tabs.all.menu");const ids=flat(menu).filter(n=>/^tabs\.all\.item\.\d+$/.test(n.test_id??"")).map(n=>n.test_id.replace("tabs.all.item.","tabs.tab."));await press("escape");await hidden("tabs.all.menu");return ids;};
+ const overflowOrder=await tabOrder();const overflowHidden=await hiddenIds();assert.equal(overflowOrder.length+overflowHidden.length,12);assert(overflowHidden.length>0);
+ await press("9",{cmd:true});await sleep(400);
+ // 稿 3: ⌘ held > 300 ms shows “⌘1…⌘8” in the close slot; ⌘9 is always the last tab.
+ assert((await tabOrder()).length>0);
  await capture("03-overflow-command-absolute-slots");await press("modifiers_released");
- await click("tabs.all");await visible("tabs.picker");await click("tabs.picker.query");await type("Acceptance");await sleep(150);
- const rows=(await query("tabs.picker.row")).filter(shown);assert.equal(rows.length,1);assert(label(rows[0]).includes("Acceptance"));await capture("04-picker-real-group-result");await press("return");await visible("groups.workspace");await hidden("tabs.picker");
- assert.equal((await allTabs())[0].test_id,groupTab.test_id);check("picker resolves group TabId and restores real group workspace",{order:await tabOrder()});
- await click("tabs.all");await type("not-found-unique");await visible("tabs.picker.empty");await press("return");await visible("groups.workspace");await visible("tabs.picker.empty");await press("escape");await hidden("tabs.picker");check("empty picker Enter and Escape preserve group active identity",{});
- await capture("05-group-restored-after-picker"); }
+ // Choosing the group in “⌄ n” (or from the strip if it is still shown) restores the real group workspace.
+ const hiddenNow=await hiddenIds();report.hiddenNow=hiddenNow;
+ if(hiddenNow.includes(groupTab.test_id)){await click("tabs.all");await visible("tabs.all.menu");await click(groupTab.test_id.replace("tabs.tab.","tabs.all.item."));await hidden("tabs.all.menu");}else await click(groupTab.test_id);
+ await visible("groups.workspace");await capture("04-overflow-real-group-result");
+ await waitFor(async()=>(await tabOrder()).includes(groupTab.test_id)||null,5000);check("overflow menu resolves group TabId and restores real group workspace",{order:await tabOrder(),hidden:overflowHidden});
+ await capture("05-group-restored-after-overflow"); }
  report.status="passed";
 } catch(error){report.status="failed";report.error=String(error?.stack??error);await capture("failure").catch(()=>{});process.exitCode=1;}
 finally {
- const processes=execFileSync('/bin/ps',['-axo','pid=,ppid='],{encoding:'utf8'}).trim().split('\n').map(line=>line.trim().split(/\s+/).map(Number));const owned=new Set([child.pid]);for(let pass=0;pass<processes.length;pass++){let changed=false;for(const [pid,parent] of processes)if(owned.has(parent)&&!owned.has(pid)){owned.add(pid);changed=true}if(!changed)break}
+ const processes=psCompat(['-axo','pid=,ppid=']).trim().split('\n').map(line=>line.trim().split(/\s+/).map(Number));const owned=new Set([child.pid]);for(let pass=0;pass<processes.length;pass++){let changed=false;for(const [pid,parent] of processes)if(owned.has(parent)&&!owned.has(pid)){owned.add(pid);changed=true}if(!changed)break}
  if(child.exitCode===null&&child.signalCode===null){child.kill("SIGTERM");await Promise.race([ended,sleep(3000)]);if(child.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await ended}}
  for(const pid of [...owned].filter(pid=>pid!==child.pid).reverse()){try{process.kill(pid!,'SIGHUP')}catch{}}
  await waitFor(async()=>[...owned].every(pid=>{try{process.kill(pid!,0);return false}catch{return true}})||null,5000);

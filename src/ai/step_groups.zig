@@ -49,7 +49,21 @@ pub const Summary = struct {
     phase: events.Phase = .succeeded,
     live: bool = false,
     thinking_projection: ?[]const u8 = null,
+    /// 失败与被拒绝分开统计（用户主动拒绝不算失败）。
+    failed: usize = 0,
+    rejected: usize = 0,
 };
+
+/// 步骤组的状态文案：失败、被拒绝分开写；两者都有时并列。
+pub fn statusLabel(buffer: []u8, phase: events.Phase, failed: usize, rejected: usize) ?[]const u8 {
+    if (failed > 0 and rejected > 0) return std.fmt.bufPrint(buffer, "{d} 个步骤失败 · {d} 个被拒绝", .{ failed, rejected }) catch "有步骤失败";
+    return switch (phase) {
+        .failed => "有步骤失败",
+        .rejected => "有步骤被拒绝",
+        .cancelled => "有步骤取消",
+        else => null,
+    };
+}
 /// Shared with the thinking card: project the latest line of the streamed
 /// content. Completed thinking never overrides the group's normal summary.
 pub fn thinkingProjection(text: []const u8) []const u8 {
@@ -80,6 +94,8 @@ pub fn summarize(turn: *const turns.Turn, first: usize, end: usize, now: u64) Su
         result.count += 1;
         result.latest = item;
         if (phase == .running or phase == .approved) result.live = true;
+        if (phase == .failed) result.failed += 1;
+        if (phase == .rejected) result.rejected += 1;
         // A later cancellation or completed step must not hide an earlier failure.
         if (phase == .failed or (phase == .rejected and result.phase != .failed) or (phase == .cancelled and result.phase != .failed and result.phase != .rejected)) result.phase = phase;
     }
@@ -106,4 +122,12 @@ pub fn sync(a: std.mem.Allocator, turn: *turns.Turn, expanded: bool) !void {
         }
         first = end;
     }
+}
+
+test "step group status keeps failures and user rejections apart" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("有步骤被拒绝", statusLabel(&buffer, .rejected, 0, 1).?);
+    try std.testing.expectEqualStrings("有步骤失败", statusLabel(&buffer, .failed, 1, 0).?);
+    try std.testing.expectEqualStrings("1 个步骤失败 · 2 个被拒绝", statusLabel(&buffer, .failed, 1, 2).?);
+    try std.testing.expect(statusLabel(&buffer, .succeeded, 0, 0) == null);
 }

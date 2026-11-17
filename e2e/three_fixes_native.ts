@@ -1,6 +1,7 @@
 /** Isolated main-entry regression: real loopback HTTP/SSE, Local exec and native UI.
  * No external AI/SSH traffic. Writes only the runner's own temporary marker.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
@@ -9,16 +10,23 @@ import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {waitForServerReady,waitFor,query,clickTestId,key,type_,inputState,resizeWindow,screenshot,sleep,scrollAt} from '../zig-out/share/zenit/harness/client.ts';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText} from './provider_fixture.ts';
 const out=resolve(process.argv[2]??'dist/ui-acceptance/fix-three-20261022/native-dark'),theme=process.argv[3]??'dark';
 await mkdir(out,{recursive:true});
 const iso=await mkdtemp(join(tmpdir(),'zw-three-fixes-')),rpc=join(iso,'rpc'),data=join(iso,'data'),marker=join(iso,'executions.txt');
 await mkdir(rpc);await mkdir(data);
 const requests:any[]=[],report:any={status:'running',theme,checks:[],screenshots:[],provider:'controlled loopback OpenAI-compatible HTTP/SSE, production transport',input:'synthetic public Harness, real isolated main-entry Metal window',limits:['No external model behavior or physical IME claim','SIGTERM cleanup is not normal-close evidence']};
 let next='tool',call=0,forceFailure=true;
-const server=createServer(async(req,res)=>{try{let body='';for await(const chunk of req)body+=chunk;const parsed=JSON.parse(body);requests.push(parsed);res.writeHead(200,{'content-type':'text/event-stream'});
+const server=createServer(async(req,res)=>{try{const body=await readRequestText(req);
+ // 模型目录刷新（GET …/models，src/ai/model_discovery.zig）不是对话请求：回空目录，不计入 requests。
+ if(req.method==='GET'){res.writeHead(200,{'content-type':'application/json'});res.end('{"data":[]}');return;}
+ const parsed=JSON.parse(body);if(isTitleRequest(parsed))return skipTitle(res);requests.push(parsed);res.writeHead(200,{'content-type':'text/event-stream'});
  const frame=(delta:any)=>res.write('data: '+JSON.stringify({choices:[{index:0,delta}]})+'\n\n');
  if(next==='tool'){
-  const sys=parsed.messages.find((m:any)=>m.role==='system')?.content??'';const id=Number(sys.match(/assistant_session_id=(\d+)/)?.[1]);assert(id>0);
+  // 系统提示不再有 assistant_session_id=N；当前会话由 <host_session_facts> 的 targets[].session_id 给出（src/ai/session_prompt.zig）。
+  const sys=parsed.messages.find((m:any)=>m.role==='system')?.content??'';const facts=JSON.parse(sys.match(/<host_session_facts>\s*(\{[\s\S]*?\})\s*<\/host_session_facts>/)?.[1]??'{}');const id=Number(facts.targets?.find((t:any)=>t.batch_execution)?.session_id);assert(id>0);
   call++;const command=`printf 'x\\n' >> '${marker}'`;
   frame({tool_calls:[{index:0,id:'fix-call-'+call,type:'function',function:{name:'run_command',arguments:JSON.stringify({session_ids:[id],command})}}]});
   res.end('data: [DONE]\n\n');next='feedback';
@@ -43,25 +51,27 @@ const txt=(n:any)=>flat(n).map(x=>x.text??'').join('');
 async function visible(id:string){return waitFor(async()=>(await query(id)).find(shown)??null,15000)}
 async function click(id:string){report.last_action=id;await visible(id);assert((await clickTestId(id)).ok);await sleep(100)}
 async function edit(id:string,text:string){await click(id);await key('a',{cmd:true});await type_(text)}
-async function cap(name:string){await sleep(100);const path=join(out,name+'.png');assert((await screenshot(path)).ok);report.screenshots.push(path);const nodes:any={};for(const id of ['ai.panel','quick.connect','wizard.panel','wizard.encoding'])nodes[id]=await query(id);await writeFile(join(out,name+'.queries.json'),JSON.stringify(nodes,null,2));}
+async function cap(name:string){await sleep(100);const path=join(out,name+'.png');assert((await screenshot(path)).ok);report.screenshots.push(path);const nodes:any={};for(const id of ['ai.panel','quick.connect','wizard.dialog','wizard.encoding'])nodes[id]=await query(id);await writeFile(join(out,name+'.queries.json'),JSON.stringify(nodes,null,2));}
 async function count(){return (await readFile(marker,'utf8').catch(()=>'' )).trim().split('\n').filter(Boolean).length}
 async function submit(question:string){await edit('ai.prompt',question);await click('ai.send')}
-async function approve(expected:number){await visible('ai.approval');assert.equal(await count(),expected,'No execution before explicit approval');await click('ai.approval.accept');}
+// 审批卡已移入输入区交互卡：ai.approval / ai.approval.accept → ai.interaction.approve（src/features/ai/composer/view/ai_composer_interaction_view.zig）。
+async function approve(expected:number){await visible('ai.interaction.approve');assert.equal(await count(),expected,'No execution before explicit approval');await click('ai.interaction.approve');}
 async function recovery(){await visible('ai.recovery');assert(txt((await query('ai.panel')).find(shown)).includes('PARTIAL_REPLY_KEPT'));}
 try{
  await waitForServerReady();await resizeWindow(1440,900);
- await click('toolbar.quick_connect');await cap('00-quick-icon');await key('escape');
+ await key('k',{cmd:true});await sleep(300);await cap('00-quick-icon');await key('escape');
  // The wizard is opened through the normal new-profile entry; no host saved.
  await key('t',{cmd:true});await click('session.menu.new_profile');
  await edit('wizard.name','encoding-test');await edit('wizard.host','127.0.0.1');await edit('wizard.user','tester');
- await click('wizard.identity.toggle');await click('wizard.advanced.toggle');
+ // 连接信息卡常驻展开，已无 wizard.identity.toggle（src/plugins/remote/editor.zig wizard.identity.card）；只需展开高级选项。
+ await click('wizard.advanced.toggle');
  const before=await inputState('wizard.encoding');await edit('wizard.encoding','GB18030');
  assert.equal((await inputState('wizard.encoding')).buffer,'UTF-8');report.checks.push('UTF-8 readonly capability prevents unsupported edit');await cap('01-encoding-readonly');await resizeWindow(860,480);await cap('01b-encoding-compact');await resizeWindow(1440,900);await key('escape');
- await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await submit('controlled first question');await approve(0);await recovery();assert.equal(await count(),1);await cap('02-recovery-original');
  // Retain a separate next draft and prove editing does not request or execute.
  await edit('ai.prompt','next draft');const requestCount=requests.length;await click('ai.recovery.edit');assert.equal(requests.length,requestCount);assert.equal(await count(),1);assert((await inputState('ai.prompt')).buffer.includes('next draft'));assert((await inputState('ai.prompt')).buffer.includes('controlled first question'));const edited=(await inputState('ai.prompt')).buffer;await click('ai.recovery.edit');assert.equal((await inputState('ai.prompt')).buffer,edited);
- await resizeWindow(860,480);await cap('02b-recovery-compact');const bounds=await visible('ai.panel');for(const id of ['ai.recovery.answer','ai.recovery.edit','ai.recovery.regenerate']){const n=await visible(id);assert.equal(n.rect.h,28);assert.equal(n.rect.w,id==='ai.recovery.edit'?104:140);assert(n.rect.x>=bounds.rect.x&&n.rect.x+n.rect.w<=bounds.rect.x+bounds.rect.w);assert(n.rect.y>=bounds.rect.y&&n.rect.y+n.rect.h<=bounds.rect.y+bounds.rect.h-90)}await click('ai.recovery.answer');await waitFor(async()=>txt((await query('ai.panel')).find(shown)).includes('ANSWER_RETRY_DONE')||null,15000);assert.equal(await count(),1);assert.equal(requests.length,requestCount+1);assert.equal((await inputState('ai.prompt')).buffer,'next draft\ncontrolled first question');assert(txt((await query('ai.panel')).find(shown)).includes('PARTIAL_REPLY_KEPT'));await resizeWindow(1440,900);await cap('03-answer-only-no-replay');report.checks.push('same ledger answer-only retry: one original execution, no tools advertised, partial retained separately, next draft unchanged');
+ await resizeWindow(860,480);await cap('02b-recovery-compact');const bounds=await visible('ai.panel');for(const id of ['ai.recovery.answer','ai.recovery.edit','ai.recovery.regenerate']){const n=await visible(id);/* 恢复操作改为 zenit 原生 Button size=.sm（高 24、宽随文字），提交 672a9a90 / src/features/ai/cards/view/ai_recovery_view.zig:102 */assert.equal(n.rect.h,24);assert(n.rect.w>0);assert(n.rect.x>=bounds.rect.x&&n.rect.x+n.rect.w<=bounds.rect.x+bounds.rect.w);assert(n.rect.y>=bounds.rect.y&&n.rect.y+n.rect.h<=bounds.rect.y+bounds.rect.h-90)}await click('ai.recovery.answer');await waitFor(async()=>txt((await query('ai.panel')).find(shown)).includes('ANSWER_RETRY_DONE')||null,15000);assert.equal(await count(),1);assert.equal(requests.length,requestCount+1);assert.equal((await inputState('ai.prompt')).buffer,'next draft\ncontrolled first question');assert(txt((await query('ai.panel')).find(shown)).includes('PARTIAL_REPLY_KEPT'));await resizeWindow(1440,900);await cap('03-answer-only-no-replay');report.checks.push('same ledger answer-only retry: one original execution, no tools advertised, partial retained separately, next draft unchanged');
  forceFailure=true;await submit('controlled second question');await approve(1);await recovery();assert.equal(await count(),2);await cap('04-before-new-plan');
  // Switching owners must not expose the failed owner's recovery actions.
  await key('t',{cmd:true});await click('session.menu.local');await sleep(250);assert(!(await query('ai.recovery')).some(shown));await click('tabs.tab.1');await recovery();

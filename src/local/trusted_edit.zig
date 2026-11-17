@@ -5,7 +5,31 @@ const identity = @import("../host/identity.zig");
 pub const edit = @import("../host/trusted_edit.zig");
 pub const Native = opaque {};
 extern fn zw_local_edit_poll_fd(*Native) c_int;
-extern fn zw_local_edit_create(u64, u64, [*]const u8, usize) ?*Native;
+extern fn zw_local_edit_create(u64, u64, [*]const u8, usize, ?[*:0]const u8) ?*Native;
+pub extern fn zw_local_edit_template(?[*:0]const u8, [*]u8, usize) c_int;
+pub extern fn zw_local_edit_sweep(?[*:0]const u8) c_int;
+pub extern fn zw_local_edit_sweep_dir([*:0]const u8, [*:0]const u8) c_int;
+pub extern fn zw_local_edit_root_tag([*:0]const u8) u32;
+const user_dirs = @import("../platform/user_dirs.zig");
+
+/// Where the private ZLE directory lives. Formal builds return null, which the
+/// native layer maps to the historic /tmp/zw-edit-<uid>-XXXXXX. Isolated builds
+/// (unit tests, -Dtest-mode=true, previews) use the private TMPDIR, else the
+/// private HOME from user_dirs; never the shared /tmp root itself.
+pub fn TempRoot(comptime isolated_build: bool) type {
+    return struct {
+        pub fn resolve(buffer: *[std.c.PATH_MAX]u8) ?[*:0]const u8 {
+            if (comptime !isolated_build) return null;
+            if (std.c.getenv("TMPDIR")) |value| if (value[0] == '/') if (std.c.realpath(value, buffer)) |path| return path;
+            const home = user_dirs.home(std.heap.c_allocator) catch return null;
+            defer std.heap.c_allocator.free(home);
+            if (home.len >= buffer.len) return null;
+            @memcpy(buffer[0..home.len], home);
+            buffer[home.len] = 0;
+            return buffer[0..home.len :0].ptr;
+        }
+    };
+}
 extern fn zw_local_edit_destroy(*Native) void;
 extern fn zw_local_edit_directory(*Native) [*:0]const u8;
 extern fn zw_local_edit_nonce(*Native) [*:0]const u8;
@@ -33,7 +57,11 @@ pub const Bridge = struct {
     tx: std.ArrayList(u8) = .empty,
     tx_offset: usize = 0,
     pub fn init(allocator: std.mem.Allocator, owner: identity.SessionHandle) !Bridge {
-        const native = zw_local_edit_create(@backingInt(owner.session_id), owner.generation, script.ptr, script.len) orelse return error.IntegrationUnavailable;
+        var root_buffer: [std.c.PATH_MAX]u8 = undefined;
+        const root = TempRoot(user_dirs.isolated).resolve(&root_buffer);
+        // An isolated build without a private root must not fall back to /tmp.
+        if (comptime user_dirs.isolated) if (root == null) return error.IntegrationUnavailable;
+        const native = zw_local_edit_create(@backingInt(owner.session_id), owner.generation, script.ptr, script.len, root) orelse return error.IntegrationUnavailable;
         return .{ .allocator = allocator, .owner = owner, .native = native };
     }
     pub fn deinit(self: *Bridge) void {

@@ -1,0 +1,15 @@
+//! AI composer area layout (Pencil Kaf7E ③ / ⑤; view: ai_composer.yix). The field, the controls
+//! and the decision panel are native; these styles only place them.
+const ui = @import("ui");
+
+/// The area: queue, decision panel and field 8 apart; margins by width (⑤, decided by the host);
+/// pinned to its content height once measured (0 = fit).
+style area($pad: ui.Padding, $h: f32) { position: relative; width: fill; height: {if ($h > 0) ui.Sizing{ .px = $h } else ui.Sizing{ .fit = .{} }}; flex-shrink: 0; direction: column; gap: 8; padding: {$pad}; }
+/// A slot the host fills (the request queue view).
+style slot { width: fill; height: fit; direction: column; flex-shrink: 0; }
+/// The header row's chip slot (attachment views).
+style chips { width: fill; height: fit; direction: column; }
+/// Send / Stop side by side at the end of the tool row.
+style actions { width: fit; height: fit; direction: row; align-items: center; gap: 4; flex-shrink: 0; }
+/// “稍后处理” capsule: right above the composer area, aligned to its right margin.
+style capsule($side: f32) { position: absolute; inset: {ui.Inset{ .right = .{ .px = $side }, .bottom = .{ .percent = 100 } }}; margin: 0 0 8 0; z-index: 2; }

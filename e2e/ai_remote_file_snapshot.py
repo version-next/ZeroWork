@@ -18,6 +18,11 @@ import time
 
 import paramiko
 import sftp_readonly as fixture
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 original_data = fixture.data
@@ -120,6 +125,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--close-pending-only", action="store_true", help="Run only the two pending picker-close lifecycle regressions")
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     binary = directory / "ai-remote-file-frozen"

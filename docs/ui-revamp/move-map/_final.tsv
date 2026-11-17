@@ -1,0 +1,766 @@
+old_path	new_path	layer	package	note
+src/ai_attached_service_tests.zig	src/features/ai/tools/tests/ai_attached_service_tests.zig	tests	ai	
+src/ai_attachments_view_tests.zig	src/features/ai/attachments/tests/ai_attachments_view_tests.zig	tests	ai	
+src/ai_child_agent_tests.zig	src/ai/tests/ai_child_agent_tests.zig	core	root-core	依据 import 分布 ai:15 host:1 config:4; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_values.zig
+src/ai_children_view_tests.zig	src/features/ai/sessions/tests/ai_children_view_tests.zig	tests	ai	
+src/ai_close_confirmation_preview_runner.zig	src/features/ai/pane/preview/ai_close_confirmation_preview_runner.zig	preview	ai	
+src/ai_close_confirmation_view_tests.zig	src/features/ai/pane/tests/ai_close_confirmation_view_tests.zig	tests	ai	
+src/ai_composer_controls_view_tests.zig	src/features/ai/composer/tests/ai_composer_controls_view_tests.zig	tests	ai	
+src/ai_composer_input_tests.zig	src/features/ai/composer/tests/ai_composer_input_tests.zig	tests	ai	
+src/ai_composer_interaction_view_tests.zig	src/features/ai/composer/tests/ai_composer_interaction_view_tests.zig	tests	ai	
+src/ai_conversation_commands_tests.zig	src/ai/tests/ai_conversation_commands_tests.zig	core	root-core	依据 import 分布 ai:3 host:1 config:2; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_values.zig
+src/ai_conversation_input_view_tests.zig	src/features/ai/pane/tests/ai_conversation_input_view_tests.zig	tests	ai	import ai_pending_view(approvals)+ai_sessions_view(sessions)，按会话输入区整体归 pane
+src/ai_conversation_tests.zig	src/features/ai/pane/tests/ai_conversation_tests.zig	tests	ai	
+src/ai_empty_recent_preview_runner.zig	src/features/ai/sessions/preview/ai_empty_recent_preview_runner.zig	preview	ai	
+src/ai_empty_recent_view_tests.zig	src/features/ai/sessions/tests/ai_empty_recent_view_tests.zig	tests	ai	
+src/ai_extensions_tests.zig	src/ai/tests/ai_extensions_tests.zig	core	root-core	依据 import 分布 ai:13 host:1 config:5; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_schema.zig
+src/ai_feedback_view_tests.zig	src/features/ai/pane/tests/ai_feedback_view_tests.zig	tests	ai	
+src/ai_file_tool_result_tests.zig	src/features/ai/cards/tests/ai_file_tool_result_tests.zig	tests	ai	
+src/ai_float_gestures_tests.zig	src/features/ai/pane/tests/ai_float_gestures_tests.zig	tests	ai	
+src/ai_gateway_runner.zig	src/ai/acceptance/ai_gateway_runner.zig	core	root-core	依据 import 分布 ai:1 config:1; 构建根(build.zig:945)，搬进子目录后须经根目录多路复用根引入
+src/ai_host_catalog_tests.zig	src/ai/tests/ai_host_catalog_tests.zig	core	root-core	依据 import 分布 ai:10 config:2
+src/ai_image_attachment_tests.zig	src/ai/tests/ai_image_attachment_tests.zig	core	root-core	依据 import 分布 ai:7 host:1
+src/ai_image_attachment_view_tests.zig	src/features/ai/attachments/tests/ai_image_attachment_view_tests.zig	tests	ai	
+src/ai_inventory_grant_tests.zig	src/ai/tests/ai_inventory_grant_tests.zig	core	root-core	依据 import 分布 ai:2
+src/ai_inventory_grant_view_tests.zig	src/features/ai/approvals/tests/ai_inventory_grant_view_tests.zig	tests	ai	
+src/ai_lifecycle_backend_tests.zig	src/ai/tests/ai_lifecycle_backend_tests.zig	core	root-core	依据 import 分布 ai:2
+src/ai_limits_tests.zig	src/ai/tests/ai_limits_tests.zig	core	root-core	依据 import 分布 ai:11 host:2
+src/ai_local_text_attachment_tests.zig	src/ai/tests/ai_local_text_attachment_tests.zig	core	root-core	依据 import 分布 ai:3 host:1 platform:1; platform:4 为出现次数(同一 platform/realtime 重复)，唯一模块 ai 多，归 ai
+src/ai_local_tools_tests.zig	src/features/ai/tools/tests/ai_local_tools_tests.zig	tests	ai	
+src/ai_message_alignment_tests.zig	src/features/ai/pane/tests/ai_message_alignment_tests.zig	tests	ai	
+src/ai_panel_visibility_tests.zig	src/features/ai/pane/tests/ai_panel_visibility_tests.zig	tests	ai	
+src/ai_provider_settings_tests.zig	src/features/settings/tests/ai_provider_settings_tests.zig	tests	settings	21 个测试; import ui 与 config/ai_provider_settings
+src/ai_recovery_preview_runner.zig	src/features/ai/cards/preview/ai_recovery_preview_runner.zig	preview	ai	
+src/ai_recovery_view_tests.zig	src/features/ai/cards/tests/ai_recovery_view_tests.zig	tests	ai	
+src/ai_remote_file_snapshot_runner.zig	src/features/ai/attachments/preview/ai_remote_file_snapshot_runner.zig	preview	ai	非 UI 的 loopback 验收 runner，仅 import ui/ai_file_tool_result；P6 可能转 acceptance
+src/ai_remote_file_snapshot_tests.zig	src/features/ai/attachments/tests/ai_remote_file_snapshot_tests.zig	tests	ai	
+src/ai_remote_picker_view_tests.zig	src/features/ai/attachments/tests/ai_remote_picker_view_tests.zig	tests	ai	同时 import challenge_window_host、host_key_confirmation（connections）
+src/ai_request_budget_tests.zig	src/ai/tests/ai_request_budget_tests.zig	core	root-core	依据 import 分布 ai:10
+src/ai_session_patch_tests.zig	src/ai/tests/ai_session_patch_tests.zig	core	root-core	依据 import 分布 ai:13 host:1 platform:1 config:1
+src/ai_ssh_tools_tests.zig	src/features/ai/tools/tests/ai_ssh_tools_tests.zig	tests	ai	
+src/ai_tail_follow_tests.zig	src/features/ai/pane/tests/ai_tail_follow_tests.zig	tests	ai	
+src/ai_task_gateway_tests.zig	src/ai/tests/ai_task_gateway_tests.zig	core	root-core	依据 import 分布 ai:11 host:1
+src/ai_terminal_selection_tests.zig	src/host/tests/ai_terminal_selection_tests.zig	core	root-core	依据 import 分布 host:4 vt:4; host/vt 各 4 个 import 并列，被测对象 host/ai_terminal_selection → 归 host
+src/ai_terminal_text_attachment_tests.zig	src/ai/tests/ai_terminal_text_attachment_tests.zig	core	root-core	依据 import 分布 ai:5 host:1; 兄弟根文件 import: ai_local_text_attachment_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/ai_tool_approval_view_tests.zig	src/features/ai/approvals/tests/ai_tool_approval_view_tests.zig	tests	ai	
+src/ai_tool_results_view_tests.zig	src/features/ai/cards/tests/ai_tool_results_view_tests.zig	tests	ai	
+src/ai_vt_attachment_view_tests.zig	src/features/ai/attachments/tests/ai_vt_attachment_view_tests.zig	tests	ai	
+src/ai_wire_history_tests.zig	src/ai/tests/ai_wire_history_tests.zig	core	root-core	依据 import 分布 ai:3
+src/appearance_apply_tests.zig	src/features/settings/tests/appearance_apply_tests.zig	tests	settings	依赖随 settings 搬走的 settings_controller
+src/appearance_font_tests.zig	src/tests_font.zig	root	settings	test-font 构建根
+src/appearance_tests.zig	src/tests_appearance.zig	root	settings	test-appearance 构建根（build.zig:679），改名 src/tests_appearance.zig; 自身 1 个 test 块，聚合 startup_transition/theme_registry/background_asset/background_geometry/background_asset_tests(17)/theme_installation_tests(3)/appearance_apply_tests(8)/appearance_ui_worker_tests(6)/settings_controller，聚合内相对路径需随搬迁更新
+src/appearance_ui_worker_tests.zig	src/features/settings/tests/appearance_ui_worker_tests.zig	tests	settings	6 个测试; 测 appearance_ui_worker
+src/application_data_cleanup_ui_tests.zig	src/features/settings/tests/application_data_cleanup_ui_tests.zig	tests	settings	3 个测试; 另被 settings_content_tests import
+src/application_environment_contract.zig	src/platform/acceptance/application_environment_contract.zig	core	root-core	建议：作为 platform 验收 runner 迁到 src/platform/acceptance/；它是 build.zig:961 的 exe 根，step test-app-environment，仅检查正式默认值忽略进程环境变量，与 UI 无关；也可留根改名 acceptance.zig 多路复用，但需 T1 决定；依据 import platform:2 config:2 ai:1 formal_environment(模块); 构建根(build.zig:961)，搬进子目录后须经根目录多路复用根引入
+src/application_task_domain_tests.zig	src/host/tests/application_task_domain_tests.zig	core	root-core	依据 import 分布 host:5 transfer:1 config:1
+src/applog_tests.zig	src/platform/tests/applog_tests.zig	core	root-core	依据 import 分布 platform:1
+src/asset_action_view_tests.zig	src/features/connections/assets/tests/asset_action_view_tests.zig	tests	connections	
+src/asset_actions_tests.zig	src/config/tests/asset_actions_tests.zig	core	root-core	只依赖 config 与已下沉的 session_lifecycle
+src/asset_group_host_tests.zig	src/features/connections/assets/tests/asset_group_host_tests.zig	tests	connections	
+src/asset_registry_tests.zig	src/config/tests/asset_registry_tests.zig	core	root-core	依据 import 分布 config:2
+src/auth_challenge_native_fixture.zig	src/features/connections/auth/preview/auth_challenge_native_fixture.zig	preview	connections	原生夹具
+src/auth_challenge_view_tests.zig	src/features/connections/auth/tests/auth_challenge_view_tests.zig	tests	connections	
+src/auxiliary_appearance_tests.zig	src/shared/ui/tests/auxiliary_appearance_tests.zig	tests	shared-ui	只 import auxiliary_appearance；目标目录 shared/ui/tests/ 不在 §5.1，需主 agent 确认
+src/background_asset_tests.zig	src/config/tests/background_asset_tests.zig	core	root-core	只测 config
+src/background_surface_tests.zig	src/features/shell/tests/background_surface_tests.zig	tests	shell	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/bmc_ai_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_input_tests.zig	plugin	root-core	依据 import 分布 host:3 platform:1 plugins:4
+src/bmc_ai_observation_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_observation_tests.zig	plugin	root-core	依据 import 分布 ai:1 host:3 platform:1 plugins:4
+src/bmc_ai_tool_tests.zig	src/plugins/bmc_ikvm/tests/bmc_ai_tool_tests.zig	plugin	root-core	依据 import 分布 ai:6 host:5 platform:1 plugins:6
+src/bmc_bootstrap_tests.zig	src/plugins/bmc_ikvm/tests/bmc_bootstrap_tests.zig	plugin	root-core	依据 import 分布 proto:1 host:5 plugins:9
+src/bmc_composition_tests.zig	src/plugins/bmc_ikvm/tests/bmc_composition_tests.zig	plugin	root-core	依据 import 分布 host:6 ui:1 plugins:6 ui(模块); 另 import ui/: plugin_content_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_connection_progress_tests.zig	src/plugins/bmc_ikvm/tests/bmc_connection_progress_tests.zig	plugin	root-core	依据 import 分布 host:1 plugins:3
+src/bmc_controller_tests.zig	src/plugins/bmc_ikvm/tests/bmc_controller_tests.zig	plugin	root-core	依据 import 分布 host:2 plugins:8
+src/bmc_credential_gc_tests.zig	src/plugins/bmc_ikvm/tests/bmc_credential_gc_tests.zig	plugin	root-core	依据 import 分布 config:4
+src/bmc_editor_capability_tests.zig	src/plugins/bmc_ikvm/tests/bmc_editor_capability_tests.zig	plugin	root-core	依据 import 分布 host:9 config:5 ui:1 ui(模块); 另 import ui/: wizard.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_editor_tests.zig	src/plugins/bmc_ikvm/tests/bmc_editor_tests.zig	plugin	root-core	依据 import 分布 host:7 config:5 ui:2 plugins:5 ui(模块); 另 import ui/: app_theme.zig shell_styles.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_explicit_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_explicit_input_tests.zig	plugin	root-core	依据 import 分布 host:2 plugins:3
+src/bmc_frame_input_tests.zig	src/plugins/bmc_ikvm/tests/bmc_frame_input_tests.zig	plugin	root-core	依据 import 分布 host:3 plugins:2
+src/bmc_journal_concurrency_tests.zig	src/plugins/bmc_ikvm/tests/bmc_journal_concurrency_tests.zig	plugin	root-core	依据 import 分布 plugins:2
+src/bmc_kvm_preview_runner.zig	src/plugins/bmc_ikvm/preview/bmc_kvm_preview_runner.zig	plugin	root-core	依据 import 分布 host:5 platform:2 config:2 ui:7 plugins:5 ui(模块) zenit_app(模块); 另 import ui/: app_theme.zig connection_details_view.zig layer_materials.zig local_session_styles.zig shell_styles.zig ssh_status_host.zig workspace_chrome.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:619)，搬进子目录后须经根目录多路复用根引入
+src/bmc_live_backend_tests.zig	src/plugins/bmc_ikvm/tests/bmc_live_backend_tests.zig	plugin	root-core	依据 import 分布 proto:1 host:3 platform:1 plugins:3; 兄弟根文件 import: bmc_native_driver_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/bmc_live_readonly_runner.zig	src/plugins/bmc_ikvm/acceptance/bmc_live_readonly_runner.zig	plugin	root-core	依据 import 分布 proto:2 ai:3 host:15 platform:1 config:2 ui:1 plugins:12 ui(模块) zenit_app(模块); 另 import ui/: app_theme.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:632)，搬进子目录后须经根目录多路复用根引入
+src/bmc_management_tests.zig	src/plugins/bmc_ikvm/tests/bmc_management_tests.zig	plugin	root-core	依据 import 分布 plugins:9
+src/bmc_native_driver_tests.zig	src/plugins/bmc_ikvm/tests/bmc_native_driver_tests.zig	plugin	root-core	依据 import 分布 proto:1 host:5 config:1 plugins:13
+src/bmc_plugin_probe_tests.zig	src/plugins/bmc_ikvm/tests/bmc_plugin_probe_tests.zig	plugin	root-core	依据 import 分布 proto:1 host:4 config:1 plugins:7
+src/bmc_plugin_runtime_tests.zig	src/plugins/bmc_ikvm/tests/bmc_plugin_runtime_tests.zig	plugin	root-core	依据 import 分布 ai:1 host:5 config:1 plugins:8
+src/bmc_probe_access_tests.zig	src/plugins/bmc_ikvm/tests/bmc_probe_access_tests.zig	plugin	root-core	依据 import 分布 host:9 config:1
+src/bmc_production_management_tests.zig	src/plugins/bmc_ikvm/tests/bmc_production_management_tests.zig	plugin	root-core	依据 import 分布 proto:1 host:6 plugins:6; 兄弟根文件 import: bmc_native_driver_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/bmc_redfish_compatibility_tests.zig	src/plugins/bmc_ikvm/tests/bmc_redfish_compatibility_tests.zig	plugin	root-core	依据 import 分布 plugins:4
+src/bmc_rfb_tests.zig	src/plugins/bmc_ikvm/tests/bmc_rfb_tests.zig	plugin	root-core	依据 import 分布 plugins:1
+src/bmc_security_tests.zig	src/plugins/bmc_ikvm/tests/bmc_security_tests.zig	plugin	root-core	依据 import 分布 host:4 config:1
+src/bmc_snapshot_copy_tests.zig	src/plugins/bmc_ikvm/tests/bmc_snapshot_copy_tests.zig	plugin	root-core	依据 import 分布 plugins:4
+src/bmc_tests.zig	src/tests_bmc.zig	root	root-core	按 §5.1 改名为 tests_bmc.zig 留根；是 test-bmc 构建根(build.zig:454)；自身含 0 个 test 块，仅 comptime 聚合 ~30 个 import；唯一 ui 依赖 ui/plugin_window_host.zig；聚合 bmc_*_tests 搬走后要改成 plugins/bmc_ikvm/tests/ 路径; 另 import ui/: plugin_window_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 兄弟根文件 import: bmc_ai_input_tests.zig bmc_ai_observation_tests.zig bmc_ai_tool_tests.zig bmc_bootstrap_tests.zig bmc_composition_tests.zig bmc_connection_progress_tests.zig bmc_controller_tests.zig bmc_credential_gc_tests.zig bmc_editor_capability_tests.zig bmc_editor_tests.zig bmc_explicit_input_tests.zig bmc_frame_input_tests.zig bmc_journal_concurrency_tests.zig bmc_live_backend_tests.zig bmc_management_tests.zig bmc_native_driver_tests.zig bmc_plugin_probe_tests.zig bmc_plugin_runtime_tests.zig bmc_probe_access_tests.zig bmc_production_management_tests.zig bmc_redfish_compatibility_tests.zig bmc_rfb_tests.zig bmc_security_tests.zig bmc_snapshot_copy_tests.zig bmc_view_tests.zig bmc_wire_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 构建根(build.zig:454)，搬进子目录后须经根目录多路复用根引入
+src/bmc_view_tests.zig	src/plugins/bmc_ikvm/tests/bmc_view_tests.zig	plugin	root-core	依据 import 分布 host:5 config:2 ui:4 plugins:8 ui(模块); 另 import ui/: app_theme.zig layer_materials.zig shell_styles.zig theme_states.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径)
+src/bmc_wire_tests.zig	src/plugins/bmc_ikvm/tests/bmc_wire_tests.zig	plugin	root-core	依据 import 分布 plugins:4
+src/broadcast_view_tests.zig	src/features/workspace/tests/broadcast_view_tests.zig	tests	workspace	
+src/builtin_records_tests.zig	src/features/terminal/tests/builtin_records_tests.zig	tests	terminal	import ui/terminal_document + history_cast + history_reading(history 包); e2e/builtin_records_test.sh 硬编码路径
+src/button_policy_preview_runner.zig	src/shared/ui/preview/button_policy_preview_runner.zig	preview	shared-ui	跨 feature 按钮策略；构建根
+src/button_policy_tests.zig	src/shared/ui/tests/button_policy_tests.zig	tests	shared-ui	
+src/chrome_policy_tests.zig	src/shared/ui/tests/chrome_policy_tests.zig	tests	shared-ui	
+src/command_error_hint_tests.zig	src/features/terminal/tests/command_error_hint_tests.zig	tests	terminal	测 command_error_hint_view/terminal_view
+src/command_metadata_tests.zig	src/vt/tests/command_metadata_tests.zig	core	root-core	依据 import 分布 host:1 vt:2; 被 terminal_controller_tests 兄弟 import
+src/compaction_e2e_tests.zig	src/ai/tests/compaction_e2e_tests.zig	core	root-core	依据 import 分布 ai:9 config:1
+src/composer_interaction_preview_runner.zig	src/features/ai/composer/preview/composer_interaction_preview_runner.zig	preview	ai	
+src/config/ai_extensions_settings.zig	src/features/settings/view/ai_extensions_settings.zig	view	settings	import ui; AI 扩展(MCP/Skills)设置面板; 内含 std.Thread.spawn 导入 job 与 mcp/local_skills 调用，混合; 仅 main.zig 引用
+src/config/ai_model_editor.zig	src/features/settings/view/ai_model_editor.zig	view	settings	import ui; 模型编辑弹窗; 仅被 ai_provider_settings 引用
+src/config/ai_provider_settings.zig	src/features/settings/view/ai_provider_settings.zig	view	settings	import ui; Provider 设置面板，含 model_discovery / provider_config 调用; 被 main.zig 与 ai_provider_settings_tests 引用
+src/config/appearance_ui_context.zig	src/features/settings/view/appearance_ui_context.zig	view	settings	import ui（只用 ui.Cx/Node 作为 hook 类型）; 被 settings_content_view/appearance_view/main/settings_content_tests 引用，必须留在 host 之下
+src/config/appearance_ui_picker.zig	src/features/settings/host/appearance_ui_picker.zig	host	settings	import ui; 系统文件面板 + 驱动 appearance_ui_worker，非节点构建; 仅 main.zig 引用
+src/config/appearance_ui_worker.zig	src/features/settings/host/appearance_ui_worker.zig	host	settings	无 ui import; std.Thread.spawn 且读写主题/背景文件，按规则归 host; 被 appearance_ui_picker/main/appearance_ui_worker_tests 引用
+src/config/keybinding_picker.zig	src/features/settings/view/keybinding_picker.zig	view	settings	import ui; 快捷键录入弹层; 被 main.zig 及 keybinding_tests/keybinding_recorder_tests/settings_picker_tests/material_popup_tests(非本包) 引用
+src/config/provider_delete_dialog.zig	src/features/settings/view/provider_delete_dialog.zig	view	settings	import ui; 仅被 ai_provider_settings 引用
+src/config/settings_accordion.zig	src/features/settings/view/settings_accordion.zig	view	settings	import ui
+src/config/settings_ai_draft.zig	src/features/settings/model/settings_ai_draft.zig	model	settings	无 ui; 注意被 ai feature 的 src/ui/ai_composer_controls_view.zig 跨 feature import（需在 ai 包的迁移里更新路径）
+src/config/settings_content_view.zig	src/features/settings/view/settings_content_view.zig	view	settings	import ui; 838 行，Hooks/Action/Navigation 与控件混合; 计划 P3 拆
+src/config/settings_controller.zig	src/features/settings/model/settings_controller.zig	model	settings	无 ui; 含 save/completeSave 的 io+dir 参数式 I/O 但无线程，按计划 §4.5 进 model/controller; 被 root.zig 与大量测试 import
+src/config/settings_history.zig	src/features/settings/model/settings_history.zig	model	settings	无 ui; 仅 std
+src/config/settings_mcp_styles.zig	src/features/settings/view/settings_mcp_styles.zig	view	settings	import ui
+src/config/settings_model.zig	src/features/settings/model/settings_model.zig	model	settings	无 ui; root.zig 引用
+src/config/settings_parts/INTEGRATION.md	src/features/settings/view/panes/INTEGRATION.md	view	settings	非 zig 文档，随 settings_parts 目录走
+src/config/settings_parts/appearance_styles.zig	src/features/settings/view/panes/appearance_styles.zig	view	settings	import ui
+src/config/settings_parts/appearance_view.zig	src/features/settings/view/panes/appearance_view.zig	view	settings	import ui; 1532 行外观页
+src/config/settings_parts/settings.zig	src/features/settings/view/panes/settings.zig	view	settings	无 ui 但仅重导出 appearance_view.mountContent，放 model 会造成 model→view 反向依赖，故归 view
+src/config/settings_parts/settings_ai.zig	src/features/settings/view/panes/settings_ai.zig	view	settings	import ui
+src/config/settings_parts/settings_controls.zig	src/features/settings/view/panes/settings_controls.zig	view	settings	import ui; 699 行公共控件（被 provider_delete_dialog/ai_* 等 import，计划里归 view/components）
+src/config/settings_parts/settings_data.zig	src/features/settings/view/panes/settings_data.zig	view	settings	import ui
+src/config/settings_parts/settings_keys.zig	src/features/settings/view/panes/settings_keys.zig	view	settings	import ui
+src/config/settings_parts/settings_notify.zig	src/features/settings/view/panes/settings_notify.zig	view	settings	import ui
+src/config/settings_parts/settings_plugins.zig	src/features/settings/view/panes/settings_plugins.zig	view	settings	import ui
+src/config/settings_parts/settings_ssh.zig	src/features/settings/view/panes/settings_ssh.zig	view	settings	import ui
+src/config/settings_parts/settings_transfer.zig	src/features/settings/view/panes/settings_transfer.zig	view	settings	import ui
+src/config/settings_parts/settings_updates.zig	src/features/settings/view/panes/settings_updates.zig	view	settings	import ui
+src/config/settings_parts/settings_updates_styles.zig	src/features/settings/view/panes/settings_updates_styles.zig	view	settings	import ui
+src/config/settings_picker.zig	src/features/settings/view/settings_picker.zig	view	settings	import ui; 锚定 chip 编辑器
+src/config/settings_search.zig	src/features/settings/model/settings_search.zig	model	settings	无 ui; 当前没有任何文件 import 它（疑似死代码或仅文档引用），P1 照搬
+src/config/settings_shell.zig	src/features/settings/view/settings_shell.zig	view	settings	import ui; 偏好窗口外壳，含 aux_window Spec 与内联测试宿主; main.zig 引用 window_spec
+src/config/settings_styles.zig	src/features/settings/view/settings_styles.zig	view	settings	import ui; 另被 connections 的 src/ui/socks_config_view.zig 跨 feature import
+src/config/settings_subpages.zig	src/features/settings/view/settings_subpages.zig	view	settings	import ui（仅为图标）; 本质是数据表，计划 P3 拆成 model/catalog + view 图标映射; 仅 main.zig 引用
+src/config/settings_values.zig	src/features/settings/model/settings_values.zig	model	settings	无 ui; 被 root.zig 与多个测试 import
+src/config/settings_view.zig	src/features/settings/model/settings_view.zig	model	settings	无 ui; 被 root.zig 与 config_transaction_tests import
+src/config_transaction_tests.zig	src/features/settings/tests/config_transaction_tests.zig	tests	settings	1 个测试; 只 import settings_controller/settings_schema/settings_view/plugin_page 等，测设置事务，不只是 core config
+src/connection_details_view_tests.zig	src/features/connections/progress/tests/connection_details_view_tests.zig	tests	connections	
+src/connection_host_tests.zig	src/features/connections/progress/tests/connection_host_tests.zig	tests	connections	也 import host_key_confirmation
+src/connection_logs_view_tests.zig	src/features/connections/progress/tests/connection_logs_view_tests.zig	tests	connections	
+src/connection_progress_preview_runner.zig	src/features/connections/progress/preview/connection_progress_preview_runner.zig	preview	connections	
+src/connection_progress_view_tests.zig	src/features/connections/progress/tests/connection_progress_view_tests.zig	tests	connections	
+src/connection_transport_runner.zig	src/host/acceptance/connection_transport_runner.zig	core	root-core	依据 import 分布 proto:1 host:2 platform:1 config:1 plugins:1; 构建根(build.zig:814)，搬进子目录后须经根目录多路复用根引入; 被测 host/connection_config_resolver+transport_factory 归 host（runner 与 tests 成对）
+src/connection_transport_tests.zig	src/host/tests/connection_transport_tests.zig	core	root-core	依据 import 分布 host:2 config:1; 兄弟根文件 import: connection_transport_runner.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 被测 host/connection_config_resolver+transport_factory 归 host（runner 与 tests 成对）
+src/credential_store_tests.zig	src/config/tests/credential_store_tests.zig	core	root-core	依据 import 分布 config:5; 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig; 同时 import config/settings_controller(将进 settings)，被测对象为 config 其他文件，仍归 config
+src/data_lifecycle_tests.zig	src/config/tests/data_lifecycle_tests.zig	core	root-core	依据 import 分布 platform:1 config:2
+src/diagnostic_export_tests.zig	src/host/tests/diagnostic_export_tests.zig	core	root-core	依据 import 分布 host:1
+src/engine_dispatch_tests.zig	src/transfer/tests/engine_dispatch_tests.zig	core	root-core	依据 import 分布 host:2 transfer:3
+src/execution_result_preview_runner.zig	src/features/ai/cards/preview/execution_result_preview_runner.zig	preview	ai	
+src/fetch_url_tests.zig	src/ai/tests/fetch_url_tests.zig	core	root-core	依据 import 分布 ai:3
+src/file_application_host_tests.zig	src/features/files/tests/file_application_host_tests.zig	tests	files	import ui
+src/file_authentication_tests.zig	src/features/files/tests/file_authentication_tests.zig	tests	files	不 import ui；测 file_authentication（该文件建议下沉 core）
+src/file_binding_host_runner.zig	src/host/acceptance/file_binding_host_runner.zig	core	root-core	依据 import 分布 proto:1 host:4 platform:1
+src/file_binding_host_tests.zig	src/host/tests/file_binding_host_tests.zig	core	root-core	依据 import 分布 proto:1 host:5 platform:1 config:1
+src/file_binding_startup_tests.zig	src/host/tests/file_binding_startup_tests.zig	core	root-core	依据 import 分布 proto:1 host:5 platform:1; 兄弟根文件 import: file_binding_host_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制)
+src/file_mkdir_view_tests.zig	src/features/files/tests/file_mkdir_view_tests.zig	tests	files	import ui
+src/file_route_factory_runner.zig	src/host/acceptance/file_route_factory_runner.zig	core	root-core	依据 import 分布 proto:3 host:5 platform:1
+src/file_route_factory_tests.zig	src/host/tests/file_route_factory_tests.zig	core	root-core	依据 import 分布 host:1
+src/file_transfer_active_fin_native_tests.zig	src/host/tests/file_transfer_active_fin_native_tests.zig	core	root-core	依据 import 分布 proto:1 host:5 transfer:2 platform:1
+src/file_transfer_fault_native_tests.zig	src/host/tests/file_transfer_fault_native_tests.zig	core	root-core	依据 import 分布 proto:1 host:8 transfer:3 platform:1
+src/file_transfer_fault_tests.zig	src/transfer/tests/file_transfer_fault_tests.zig	core	root-core	依据 import 分布 proto:1 transfer:2 platform:1
+src/file_transfer_host_tests.zig	src/host/tests/file_transfer_host_tests.zig	core	root-core	依据 import 分布 proto:1 host:7 transfer:1 platform:1
+src/file_transfer_runtime_tests.zig	src/host/tests/file_transfer_runtime_tests.zig	core	root-core	依据 import 分布 proto:1 host:6 transfer:2 platform:1
+src/file_workspace_controller_tests.zig	src/host/tests/file_workspace_controller_tests.zig	core	root-core	被测对象是 host/file_workspace_controller
+src/file_workspace_native_fixture.zig	src/features/files/preview/file_workspace_native_fixture.zig	preview	files	build.zig:357 file-workspace-preview 硬编码此路径；import ui、zenit_app
+src/file_workspace_presentation_tests.zig	src/features/files/tests/file_workspace_presentation_tests.zig	tests	files	import ui
+src/file_workspace_view_tests.zig	src/features/files/tests/file_workspace_view_tests.zig	tests	files	import ui；依赖根目录 ui_theme_test_support.zig
+src/fixed_forward_runner.zig	src/proto/ssh/acceptance/fixed_forward_runner.zig	core	root-core	依据 import 分布 proto:4 host:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:875)，搬进子目录后须经根目录多路复用根引入
+src/floating_input_tests.zig	src/shared/ui/tests/floating_input_tests.zig	tests	shared-ui	
+src/forward_config_preview_runner.zig	src/features/connections/socks/preview/forward_config_preview_runner.zig	preview	connections	import socks_config_view/socks_info_view
+src/forward_load_runner.zig	src/proto/ssh/acceptance/forward_load_runner.zig	core	root-core	依据 import 分布 proto:4 host:2 platform:1 vt:3; 构建根(build.zig:877)，搬进子目录后须经根目录多路复用根引入; 混合 host/proto/vt
+src/fullscreen_titlebar_tests.zig	src/features/shell/tests/fullscreen_titlebar_tests.zig	tests	shell	
+src/group_close_controller_tests.zig	src/features/workspace/tests/group_close_controller_tests.zig	tests	workspace	
+src/host_approval_preview_runner.zig	src/features/ai/approvals/preview/host_approval_preview_runner.zig	preview	ai	
+src/host_context_tests.zig	src/host/tests/host_context_tests.zig	core	root-core	依据 import 分布 host:6 config:1
+src/host_recording_queries_tests.zig	src/features/ai/tools/tests/host_recording_queries_tests.zig	tests	ai	import ui/ai_host_recording_queries
+src/host_secret_store_tests.zig	src/features/ai/approvals/tests/host_secret_store_tests.zig	tests	ai	import ui/ai_host_secret_controller
+src/host_terminal_queries_tests.zig	src/features/ai/tools/tests/host_terminal_queries_tests.zig	tests	ai	import ui/ai_host_terminal_queries
+src/incremental_ui_tests.zig	src/features/ai/pane/tests/incremental_ui_tests.zig	tests	ai	
+src/inventory_grant_preview_runner.zig	src/features/ai/approvals/preview/inventory_grant_preview_runner.zig	preview	ai	
+src/keybinding_recorder_tests.zig	src/features/settings/tests/keybinding_recorder_tests.zig	tests	settings	3 个测试; 只 import keybinding_picker/keybindings，picker 归 settings
+src/keybinding_tests.zig	src/features/settings/tests/keybinding_tests.zig	tests	settings	4 个测试; 同上
+src/local_adapter_tests.zig	src/local/tests/local_adapter_tests.zig	core	root-core	依据 import 分布 host:4 platform:2 config:3 local:3 vt:6 generated_ghostty_vt(模块); 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/local_fs_service_tests.zig	src/local/tests/local_fs_service_tests.zig	core	root-core	依据 import 分布 host:2 platform:1 local:1
+src/local_process_tests.zig	src/local/tests/local_process_tests.zig	core	root-core	依据 import 分布 host:2 local:4; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/local_trusted_edit_tests.zig	src/local/tests/local_trusted_edit_tests.zig	core	root-core	依据 import 分布 host:3 local:4 vt:1; 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/main.zig	src/main.zig	root	root-core	固定留根(AGENTS/§5.1)；导入大量 ui/ 文件，路径随各 feature 搬迁在 P1 后续任务中改写；见 BUILDROOT; 另 import ui/: ai_assistant_header.zig ai_assistant_styles.zig ai_attachments_styles.zig ai_attachments_view.zig ai_card_scroll.zig ai_children_styles.zig ai_children_view.zig ai_close_confirmation_view.zig ai_composer_controls_view.zig ai_composer_interaction_view.zig ai_composer_keys.zig ai_composer_sizing.zig ai_empty_view.zig ai_execution_backend.zig ai_execution_result_view.zig ai_feedback_view.zig ai_float_gestures.zig ai_history_view.zig ai_host_approval_view.zig ai_host_catalog_controller.zig ai_host_notice_view.zig ai_host_queries.zig ai_host_secret_controller.zig ai_host_secret_view.zig ai_host_terminal_queries.zig ai_image_attachments_view.zig ai_inventory_grant_view.zig ai_lifecycle_controller.zig ai_message_view.zig ai_pane_layout.zig ai_pending_styles.zig ai_pending_view.zig ai_recording_query_access.zig ai_recovery_view.zig ai_remote_picker.zig ai_return_focus.zig ai_sessions_view.zig ai_step_group_view.zig ai_step_view.zig ai_strip_styles.zig ai_strip_view.zig ai_tail_follow.zig ai_task_finish.zig ai_text_selection.zig ai_timeline_view.zig ai_tool_approval_view.zig ai_tool_header_projection.zig ai_tool_results_styles.zig ai_tool_results_view.zig ai_tool_titles.zig ai_tools.zig ai_transcript_images.zig ai_turn_status_view.zig ai_verification_view.zig app_theme.zig application_data_cleanup_view.zig application_host.zig asset_action_view.zig asset_group_host.zig aux_window.zig background_layers.zig background_texture.zig broadcast_controller.zig broadcast_event.zig broadcast_view.zig builtin_commands.zig builtin_dispatch.zig command_help_view.zig command_history_view.zig connection_details_host.zig connection_details_view.zig connection_host.zig connection_progress_view.zig context_menu_state.zig context_menus.zig control_hint.zig copy_button.zig design.zig donation_qr.zig feedback_message.zig file_application_host.zig file_copy_view.zig file_workspace_presentation.zig file_workspace_view.zig floating_input.zig group_close_controller.zig group_model.zig history_host.zig history_styles.zig host_os_assets.zig layer_materials.zig local_close_view.zig local_status_view.zig multiwindow_test_routes.zig notification_history.zig notification_presenter.zig plugin_editor_host.zig plugin_window_host.zig probe_connection_host.zig quick_connect.zig quick_connect_icon.zig quick_connect_view.zig record_cleanup_view.zig retained_panel.zig session_export.zig session_export_jobs.zig session_icon.zig session_menu.zig session_os_cache.zig shell_styles.zig sidebar_collapsed_view.zig sidebar_model.zig sidebar_view.zig socks_application_host.zig socks_background_host.zig socks_config_view.zig socks_exposure_confirm.zig socks_info_view.zig ssh_status_host.zig startup_view.zig status_connection_extras.zig status_connection_view.zig status_controller.zig status_detail_view.zig status_hover_preview.zig status_theme_view.zig status_transfer_view.zig terminal_view.zig transfer_conflict_view.zig transfer_manager_view.zig transfer_panel.zig transfer_toolbar_view.zig wizard.zig wizard_probe.zig workspace.zig workspace_chrome.zig workspace_tab_styles.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 依赖将被 §5.2 搬进 feature 的 core 文件: ai_extensions_settings.zig ai_provider_settings.zig appearance_ui_context.zig appearance_ui_picker.zig appearance_ui_worker.zig keybinding_picker.zig settings_ai_draft.zig settings_content_view.zig settings_controller.zig settings_history.zig settings_pages.zig settings_picker.zig settings_schema.zig settings_shell.zig settings_subpages.zig settings_values.zig update/app_host.zig; 构建根(build.zig:167)，搬进子目录后须经根目录多路复用根引入
+src/material_performance_tests.zig	src/features/shell/tests/material_performance_tests.zig	tests	shell	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/material_popup_tests.zig	src/features/shell/tests/material_popup_tests.zig	tests	shell	跨 feature import(ai/connections/terminal/notification 等)，按名称认领
+src/model_catalog_tests.zig	src/ai/tests/model_catalog_tests.zig	core	root-core	依据 import 分布 ai:1
+src/network_socks_runner.zig	src/proto/ssh/acceptance/network_socks_runner.zig	core	root-core	依据 import 分布 proto:3 platform:1
+src/notification_coordinator_tests.zig	src/host/tests/notification_coordinator_tests.zig	core	root-core	
+src/notification_platform_tests.zig	src/host/tests/notification_platform_tests.zig	core	root-core	
+src/notification_presenter_controls_tests.zig	src/features/notifications/tests/notification_presenter_controls_tests.zig	tests	notifications	import ui、notification_history、notification_presenter、ai_assistant_styles、layer_materials、app_theme
+src/notification_preview_runner.zig	src/features/notifications/preview/notification_preview_runner.zig	preview	notifications	import zenit_app、ui、notification_history/presenter、command_error_hint_view；build.zig:610 硬编码路径（step test-notification-preview）
+src/notification_read_view_tests.zig	src/features/terminal/tests/notification_read_view_tests.zig	tests	terminal	实际测 TerminalView
+src/plugin_fixture_tests.zig	src/tests_plugin_fixture.zig	root	root-core	按 §5.1 改名为 tests_plugin_fixture.zig 留根；是 test-plugin-fixture 构建根(build.zig:782)；自身含 7 个具名 test 加 1 个匿名 test{}（共 8 个测试体）；import 仅 plugins/fixture_probe、host、ai、config 与 ui(zenit) 模块，无 ui/ 视图; 另 import ui/: plugin_window_host.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 构建根(build.zig:782)，搬进子目录后须经根目录多路复用根引入
+src/plugin_settings_v3_tests.zig	src/features/settings/tests/plugin_settings_v3_tests.zig	tests	settings	1 个测试; 测 settings_parts/settings_plugins
+src/provider_protocol_tools_tests.zig	src/ai/tests/provider_protocol_tools_tests.zig	core	root-core	依据 import 分布 ai:5
+src/quick_connect_view_tests.zig	src/features/connections/quick_connect/tests/quick_connect_view_tests.zig	tests	connections	
+src/real_jump_validation_runner.zig	src/proto/ssh/acceptance/real_jump_validation_runner.zig	core	root-core	依据 import 分布 proto:3 host:1 platform:1 generated_ssh_session(模块) generated_ssh_channel(模块)
+src/record_cleanup_tests.zig	src/host/tests/record_cleanup_tests.zig	core	root-core	
+src/record_cleanup_ui_tests.zig	src/features/history/tests/record_cleanup_ui_tests.zig	tests	history	import ui/record_cleanup_view、app_theme、shell_styles、record_cleanup_tests
+src/recording_access_tests.zig	src/features/ai/tools/tests/recording_access_tests.zig	tests	ai	import ui/ai_recording_query_access
+src/remaining_ui_tests.zig	src/features/ai/pane/tests/remaining_ui_tests.zig	tests	ai	仅测 ai_history_view（虚拟历史行），文件名泛化但内容全属 ai
+src/retained_transfer_store_tests.zig	src/host/tests/retained_transfer_store_tests.zig	core	root-core	依据 import 分布 host:6 transfer:3 platform:1
+src/root.zig	src/root.zig	root	root-core	固定留根(AGENTS/§5.1)；导入大量 ui/ 文件，路径随各 feature 搬迁在 P1 后续任务中改写；见 BUILDROOT; 另 import ui/: ai_execution_backend.zig ai_host_queries.zig ai_lifecycle_controller.zig ai_recording_query_access.zig ai_tools.zig application_host.zig broadcast_controller.zig builtin_commands.zig builtin_dispatch.zig command_bar.zig completion.zig completion_controller.zig completion_state.zig context_menu_effects.zig context_menu_state.zig context_menu_view.zig context_menus.zig copy_button.zig glyph_atlas.zig group_context.zig group_dispatch.zig group_model.zig history_cast.zig history_list.zig history_replay.zig host_key_confirmation.zig local_command_state.zig overlay_anchor.zig overlay_model.zig pane_manager.zig pane_worker_registry.zig paste_policy.zig quick_connect.zig reconnect_bridge.zig session_reconnect_policy.zig session_tombstone.zig session_tombstone_view.zig shortcut_dispatch.zig shortcut_router.zig sidebar_model.zig status_controller.zig tab_strip_layout.zig terminal_export.zig terminal_selection.zig theme.zig timestamp_gutter.zig workspace_model.zig(BMC 归本包；这些 ui 文件由对应 feature 搬迁，需随之改路径); 兄弟根文件 import: ai_attached_service_tests.zig ai_child_agent_tests.zig ai_conversation_commands_tests.zig ai_extensions_tests.zig ai_host_catalog_tests.zig ai_inventory_grant_tests.zig ai_limits_tests.zig ai_local_text_attachment_tests.zig ai_request_budget_tests.zig ai_session_patch_tests.zig ai_task_gateway_tests.zig asset_actions_tests.zig bmc_ai_tool_tests.zig bmc_tests.zig connection_transport_tests.zig credential_store_tests.zig data_lifecycle_tests.zig diagnostic_export_tests.zig file_transfer_active_fin_native_tests.zig file_transfer_fault_native_tests.zig file_transfer_fault_tests.zig host_context_tests.zig host_recording_queries_tests.zig host_secret_store_tests.zig host_terminal_queries_tests.zig notification_coordinator_tests.zig notification_platform_tests.zig retained_transfer_store_tests.zig session_export_tests.zig session_host_auxiliary_tests.zig session_host_background_tests.zig session_host_retained_tests.zig settings_quiet_hours_tests.zig sftp_directory_recovery_tests.zig socks_route_host_tests.zig ssh_totp_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 依赖将被 §5.2 搬进 feature 的 core 文件: settings_controller.zig settings_model.zig settings_pages.zig settings_schema.zig settings_values.zig settings_view.zig; 构建根(build.zig:41)，搬进子目录后须经根目录多路复用根引入
+src/service_model_catalog_tests.zig	src/ai/tests/service_model_catalog_tests.zig	core	root-core	依据 import 分布 ai:1
+src/session_export_tests.zig	src/features/workspace/tests/session_export_tests.zig	tests	workspace	还 import ui/terminal_export.zig 与 vt
+src/session_host_auxiliary_tests.zig	src/host/tests/session_host_auxiliary_tests.zig	core	root-core	依据 import 分布 host:3
+src/session_host_background_tests.zig	src/host/tests/session_host_background_tests.zig	core	root-core	依据 import 分布 host:4
+src/session_host_retained_tests.zig	src/host/tests/session_host_retained_tests.zig	core	root-core	依据 import 分布 host:2
+src/session_menu_tests.zig	src/features/workspace/tests/session_menu_tests.zig	tests	workspace	
+src/settings_content_tests.zig	src/features/settings/tests/settings_content_tests.zig	tests	settings	45 个测试; 聚合 application_data_cleanup_ui_tests
+src/settings_field_lifecycle_tests.zig	src/features/settings/tests/settings_field_lifecycle_tests.zig	tests	settings	1 个测试; 无 ui，测 settings_controller/values
+src/settings_notification_permission_view_tests.zig	src/features/settings/tests/settings_notification_permission_view_tests.zig	tests	settings	3 个测试
+src/settings_picker_tests.zig	src/features/settings/tests/settings_picker_tests.zig	tests	settings	6 个测试
+src/settings_preview_runner.zig	src/features/settings/preview/settings_preview_runner.zig	preview	settings	settings-preview 构建根（build.zig:345），e2e/settings_previews.ts 引用; import ui/zenit_app
+src/settings_quiet_hours_tests.zig	src/features/settings/tests/settings_quiet_hours_tests.zig	tests	settings	1 个测试
+src/settings_runtime_consumer_tests.zig	src/features/terminal/tests/settings_runtime_consumer_tests.zig	tests	terminal	
+src/settings_search_alias_tests.zig	src/features/settings/tests/settings_search_alias_tests.zig	tests	settings	3 个测试; 被 transfer_panel_tests.zig:58 聚合
+src/settings_transfer_budget_tests.zig	src/features/settings/tests/settings_transfer_budget_tests.zig	tests	settings	5 个测试
+src/settings_transfer_defaults_tests.zig	src/features/transfer/tests/settings_transfer_defaults_tests.zig	tests	transfer	
+src/sftp_adapter_tests.zig	src/host/tests/sftp_adapter_tests.zig	core	root-core	
+src/sftp_directory_recovery_tests.zig	src/host/tests/sftp_directory_recovery_tests.zig	core	root-core	依据 import 分布 proto:1 host:6 platform:1
+src/sftp_engine_worker_tests.zig	src/transfer/tests/sftp_engine_worker_tests.zig	core	root-core	依据 import 分布 transfer:1
+src/sftp_readonly_runner.zig	src/proto/ssh/acceptance/sftp_readonly_runner.zig	core	root-core	依据 import 分布 proto:2 host:1 platform:1 generated_ssh_session(模块)
+src/sftp_readonly_tests.zig	src/proto/ssh/tests/sftp_readonly_tests.zig	core	root-core	依据 import 分布 proto:1
+src/sftp_resume_native_tests.zig	src/transfer/tests/sftp_resume_native_tests.zig	core	root-core	依据 import 分布 proto:1 transfer:2 platform:1
+src/shared/testing/ui_kit.zig	src/shared/testing/ui_kit.zig	shared_testing	shared-ui	已在目标位置，old=new；import ui/app_theme、ui/shell_styles、config/theme_registry(这些 import 路径在 P1 需随搬迁改写)
+src/shared_forward_runner.zig	src/proto/ssh/acceptance/shared_forward_runner.zig	core	root-core	依据 import 分布 proto:3 host:2 platform:1 generated_ssh_session(模块)
+src/shared_readonly_native_tests.zig	src/proto/ssh/tests/shared_readonly_native_tests.zig	core	root-core	依据 import 分布 proto:4 host:1 transfer:1 platform:1 vt:3
+src/shared_transfer_native_tests.zig	src/proto/ssh/tests/shared_transfer_native_tests.zig	core	root-core	依据 import 分布 proto:2 host:1 transfer:1 platform:1 vt:3
+src/sidebar_view_tests.zig	src/features/shell/tests/sidebar_view_tests.zig	tests	shell	
+src/socks_background_runtime_runner.zig	src/host/acceptance/socks_background_runtime_runner.zig	core	root-core	依据 import 分布 proto:1 host:4 platform:1
+src/socks_background_ui_tests.zig	src/features/connections/socks/tests/socks_background_ui_tests.zig	tests	connections	
+src/socks_config_view_tests.zig	src/features/connections/socks/tests/socks_config_view_tests.zig	tests	connections	
+src/socks_info_preview_runner.zig	src/features/connections/socks/preview/socks_info_preview_runner.zig	preview	connections	
+src/socks_info_theme_tests.zig	src/features/connections/socks/tests/socks_info_theme_tests.zig	tests	connections	
+src/socks_info_view_tests.zig	src/features/connections/socks/tests/socks_info_view_tests.zig	tests	connections	
+src/socks_route_host_runner.zig	src/host/acceptance/socks_route_host_runner.zig	core	root-core	依据 import 分布 proto:1 host:3 platform:1
+src/socks_route_host_tests.zig	src/host/tests/socks_route_host_tests.zig	core	root-core	依据 import 分布 proto:2 host:3 config:1
+src/socks_worker_host_runner.zig	src/host/acceptance/socks_worker_host_runner.zig	core	root-core	依据 import 分布 proto:3 host:3 transfer:1 platform:1 vt:3; 构建根(build.zig:876)，搬进子目录后须经根目录多路复用根引入; 混合 host/proto/vt
+src/ssh_auth_challenge_tests.zig	src/proto/ssh/tests/ssh_auth_challenge_tests.zig	core	root-core	依据 import 分布 proto:2 platform:1
+src/ssh_auth_flow_tests.zig	src/proto/ssh/tests/ssh_auth_flow_tests.zig	core	root-core	依据 import 分布 proto:3
+src/ssh_auth_loopback_runner.zig	src/proto/ssh/acceptance/ssh_auth_loopback_runner.zig	core	root-core	依据 import 分布 proto:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:838)，搬进子目录后须经根目录多路复用根引入
+src/ssh_auth_native_tests.zig	src/proto/ssh/tests/ssh_auth_native_tests.zig	core	root-core	依据 import 分布 proto:1
+src/ssh_bootstrap_protocol_tests.zig	src/host/tests/ssh_bootstrap_protocol_tests.zig	core	root-core	依据 import 分布 host:2 local:1; 被测 host/trusted_edit + local/execution，归 host
+src/ssh_bootstrap_runner.zig	src/host/acceptance/ssh_bootstrap_runner.zig	core	root-core	依据 import 分布 proto:2 host:3 platform:1 vt:2; 构建根(build.zig:873)，搬进子目录后须经根目录多路复用根引入
+src/ssh_connection_details_runner.zig	src/features/connections/wizard/tests/ssh_connection_details_runner.zig	tests	connections	验收 runner（非预览），仅 import ui/wizard_probe；也可视为 progress
+src/ssh_connection_details_tests.zig	src/features/connections/progress/tests/ssh_connection_details_tests.zig	tests	connections	import application_host
+src/ssh_connection_wait_runner.zig	src/proto/ssh/acceptance/ssh_connection_wait_runner.zig	core	root-core	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块); 构建根(build.zig:836)，搬进子目录后须经根目录多路复用根引入
+src/ssh_connection_wait_tests.zig	src/proto/ssh/tests/ssh_connection_wait_tests.zig	core	root-core	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块)
+src/ssh_disconnect_runner.zig	src/features/workspace/tests/acceptance/ssh_disconnect_runner.zig	tests	workspace	依赖 UI 宿主的验收 runner；构建根
+src/ssh_exec_service_runner.zig	src/proto/ssh/acceptance/ssh_exec_service_runner.zig	core	root-core	依据 import 分布 proto:2 ai:1 host:3 platform:2 generated_ssh_session(模块); 构建根(build.zig:839)，搬进子目录后须经根目录多路复用根引入; 被测核心 proto/ssh/exec_bridge，故归 proto/ssh
+src/ssh_exec_service_tests.zig	src/proto/ssh/tests/ssh_exec_service_tests.zig	core	root-core	依据 import 分布 proto:2 ai:1 host:3 transfer:1; 被测核心 proto/ssh/exec_bridge，故归 proto/ssh
+src/ssh_execution_recording_tests.zig	src/vt/tests/ssh_execution_recording_tests.zig	core	root-core	依据 import 分布 host:1 vt:5
+src/ssh_hardening_runner.zig	src/proto/ssh/acceptance/ssh_hardening_runner.zig	core	root-core	依据 import 分布 proto:2 platform:1 generated_ssh_session(模块); 构建根(build.zig:837)，搬进子目录后须经根目录多路复用根引入
+src/ssh_known_hosts_tests.zig	src/proto/ssh/tests/ssh_known_hosts_tests.zig	core	root-core	依据 import 分布 proto:1
+src/ssh_probe_loopback_runner.zig	src/features/connections/wizard/tests/ssh_probe_loopback_runner.zig	tests	connections	验收 runner，import ui/wizard、wizard_probe
+src/ssh_reconnect_loopback_runner.zig	src/features/workspace/tests/acceptance/ssh_reconnect_loopback_runner.zig	tests	workspace	同上
+src/ssh_reconnect_tests.zig	src/features/workspace/tests/ssh_reconnect_tests.zig	tests	workspace	
+src/ssh_release_receipt_runner.zig	src/proto/ssh/acceptance/ssh_release_receipt_runner.zig	core	root-core	依据 import 分布 proto:1 platform:1 generated_ssh_session(模块)
+src/ssh_release_receipt_tests.zig	src/proto/ssh/tests/ssh_release_receipt_tests.zig	core	root-core	依据 import 分布 proto:1 generated_ssh_session(模块)
+src/ssh_request_counter_tests.zig	src/proto/ssh/tests/ssh_request_counter_tests.zig	core	root-core	只依赖 core 与已下沉的 host_key_confirmation
+src/ssh_resource_ledger_tests.zig	src/features/connections/wizard/tests/ssh_resource_ledger_tests.zig	tests	connections	import ui/wizard_probe、session_runtime
+src/ssh_session_smoke.zig	src/proto/ssh/acceptance/ssh_session_smoke.zig	core	root-core	依据 import 分布 proto:1
+src/ssh_shared_connection_runner.zig	src/features/workspace/tests/acceptance/ssh_shared_connection_runner.zig	tests	workspace	同上
+src/ssh_shell_end_runner.zig	src/vt/acceptance/ssh_shell_end_runner.zig	core	root-core	依据 import 分布 proto:1 host:1 platform:1 vt:4
+src/ssh_shell_end_tests.zig	src/vt/tests/ssh_shell_end_tests.zig	core	root-core	依据 import 分布 vt:2
+src/ssh_shell_execution_runner.zig	src/features/workspace/tests/acceptance/ssh_shell_execution_runner.zig	tests	workspace	同上
+src/ssh_status_host_tests.zig	src/features/connections/progress/tests/ssh_status_host_tests.zig	tests	connections	测 ssh_status_host，同时 import status_*（shell）
+src/ssh_terminal_service_tests.zig	src/features/terminal/tests/ssh_terminal_service_tests.zig	tests	terminal	
+src/ssh_terminal_status_tests.zig	src/features/connections/progress/tests/ssh_terminal_status_tests.zig	tests	connections	测 ssh_status_host，同时 import terminal_view
+src/ssh_totp_tests.zig	src/proto/ssh/tests/ssh_totp_tests.zig	core	root-core	依据 import 分布 proto:1
+src/ssh_vm_smoke_runner.zig	src/proto/ssh/acceptance/ssh_vm_smoke_runner.zig	core	root-core	依据 import 分布 proto:3 host:1 platform:1 generated_ssh_session(模块)
+src/status_connection_view_tests.zig	src/features/shell/tests/status_connection_view_tests.zig	tests	shell	
+src/status_controller_tests.zig	src/features/shell/tests/status_controller_tests.zig	tests	shell	
+src/status_detail_tests.zig	src/features/shell/tests/status_detail_tests.zig	tests	shell	
+src/task_finish_preview_runner.zig	src/features/ai/cards/preview/task_finish_preview_runner.zig	preview	ai	
+src/terminal_controller_tests.zig	src/vt/tests/terminal_controller_tests.zig	core	root-core	依据 import 分布 proto:1 host:2 vt:10 generated_ghostty_vt(模块); 兄弟根文件 import: command_metadata_tests.zig(搬迁后路径需改为跨目录引用，注意 Zig 模块根限制); 构建根(build.zig:546)，搬进子目录后须经根目录多路复用根引入
+src/terminal_execution_tests.zig	src/features/terminal/tests/terminal_execution_tests.zig	tests	terminal	构建根（test-terminal-execution）
+src/terminal_focus_local_tests.zig	src/features/terminal/tests/terminal_focus_local_tests.zig	tests	terminal	import ui/terminal_view 与 ai_return_focus
+src/terminal_overlay_theme_tests.zig	src/features/terminal/tests/terminal_overlay_theme_tests.zig	tests	terminal	导入 terminal_view
+src/terminal_search_service_tests.zig	src/vt/tests/terminal_search_service_tests.zig	core	root-core	依据 import 分布 host:1 vt:5
+src/terminal_search_tests.zig	src/features/terminal/tests/terminal_search_tests.zig	tests	terminal	导入 terminal_search
+src/terminal_search_theme_tests.zig	src/features/terminal/tests/terminal_search_theme_tests.zig	tests	terminal	导入 terminal_search, app_theme, shell_styles
+src/terminal_surface_tests.zig	src/features/terminal/tests/terminal_surface_tests.zig	tests	terminal	包装文件, 导入 terminal_focus_local_tests 与 ui/terminal_surface_tests
+src/testing/data_directory.zig	src/shared/testing/data_directory.zig	shared_testing	shared-ui	被 core import: src/config/paths.zig(tools/arch/baseline.txt 已记 core->shared_testing)；import platform/runtime_mode；共 1 个 importer
+src/theme_installation_tests.zig	src/config/tests/theme_installation_tests.zig	core	root-core	依据 import 分布 config:3
+src/theme_layer_tests.zig	src/shared/ui/tests/theme_layer_tests.zig	tests	shared-ui	跨 feature 主题测试
+src/totp_autofill_tests.zig	src/features/connections/auth/tests/totp_autofill_tests.zig	tests	connections	跨 auth_challenge_view/connection_host/probe_connection_host/socks_application_host/wizard_probe 的集成测试
+src/transfer_confirmation_view_tests.zig	src/features/transfer/tests/transfer_confirmation_view_tests.zig	tests	transfer	import ui; 测 ui/transfer_panel.zig（该文件将下沉 config，P1 需同步改 import）
+src/transfer_conflict_native_fixture.zig	src/features/transfer/preview/transfer_conflict_native_fixture.zig	preview	transfer	build.zig:392 transfer-conflict-preview 的根文件；若 V-1 不成立需留 src 根或经 preview.zig 多路复用
+src/transfer_conflict_tests.zig	src/transfer/tests/transfer_conflict_tests.zig	core	root-core	
+src/transfer_conflict_view_tests.zig	src/features/transfer/tests/transfer_conflict_view_tests.zig	tests	transfer	import ui; 测 ui/transfer_conflict_view.zig
+src/transfer_controls_preview_runner.zig	src/features/transfer/preview/transfer_controls_preview_runner.zig	preview	transfer	build.zig:400 transfer-controls-preview 的根文件；同时 import ui/status_transfer_view.zig（CONTESTED）与 ui/ai_sessions_view.zig（ai 包）
+src/transfer_engine_mux_tests.zig	src/transfer/tests/transfer_engine_mux_tests.zig	core	root-core	依据 import 分布 proto:1 host:2 transfer:4 platform:1
+src/transfer_events_native_fixture.zig	src/features/transfer/preview/transfer_events_native_fixture.zig	preview	transfer	build.zig:384 transfer-events-preview 的根文件
+src/transfer_manager_view_tests.zig	src/features/transfer/tests/transfer_manager_view_tests.zig	tests	transfer	import ui; 46 个 test 块，1883 行
+src/transfer_panel_tests.zig	src/tests_ui.zig	root	transfer	test-ui 聚合根（build.zig:735），按 §5.1 改名 tests_ui.zig 留 src 根；自身 6 个 test 块全是聚合 import，含 0 条传输面板自有用例（仅 import transfer_manager_view_tests/transfer_confirmation_view_tests/transfer_conflict_tests/transfer_conflict_view_tests/ui/transfer_panel.zig 等）；文件头注释描述已过时
+src/trusted_completion_ui_tests.zig	src/features/terminal/tests/trusted_completion_ui_tests.zig	tests	terminal	导入 terminal_view
+src/ui/ai_assistant_header.zig	src/features/ai/pane/view/ai_assistant_header.zig	view	ai	
+src/ui/ai_assistant_styles.zig	src/features/ai/pane/view/ai_assistant_styles.zig	view	ai	
+src/ui/ai_attachments_styles.zig	src/features/ai/attachments/view/ai_attachments_styles.zig	view	ai	
+src/ui/ai_attachments_view.zig	src/features/ai/attachments/view/ai_attachments_view.zig	view	ai	
+src/ui/ai_brand.zig	src/features/ai/shared/view/ai_brand.zig	view	ai	被 core import: src/config/ai_provider_settings.zig（后者归 settings）；ai 与 settings 共用的品牌标记，建议主 agent 评估放 shared/ui
+src/ui/ai_brand_assets.zig	src/shared/ui/assets/ai_brand_assets.zig	shared_ui	shared-ui	
+src/ui/ai_card_scroll.zig	src/features/ai/cards/view/ai_card_scroll.zig	view	ai	
+src/ui/ai_child_logo.zig	src/features/ai/sessions/view/ai_child_logo.zig	view	ai	
+src/ui/ai_children_styles.zig	src/features/ai/sessions/view/ai_children_styles.zig	view	ai	
+src/ui/ai_children_view.zig	src/features/ai/sessions/view/ai_children_view.zig	view	ai	
+src/ui/ai_close_confirmation_styles.zig	src/features/ai/pane/view/ai_close_confirmation_styles.zig	view	ai	
+src/ui/ai_close_confirmation_view.zig	src/features/ai/pane/view/ai_close_confirmation_view.zig	view	ai	
+src/ui/ai_composer_controls_styles.zig	src/features/ai/composer/view/ai_composer_controls_styles.zig	view	ai	
+src/ui/ai_composer_controls_view.zig	src/features/ai/composer/view/ai_composer_controls_view.zig	view	ai	
+src/ui/ai_composer_interaction_styles.zig	src/features/ai/composer/view/ai_composer_interaction_styles.zig	view	ai	
+src/ui/ai_composer_interaction_view.zig	src/features/ai/composer/view/ai_composer_interaction_view.zig	view	ai	
+src/ui/ai_composer_keys.zig	src/features/ai/composer/view/ai_composer_keys.zig	view	ai	
+src/ui/ai_composer_sizing.zig	src/features/ai/composer/view/ai_composer_sizing.zig	view	ai	
+src/ui/ai_disconnect_backend.zig	src/features/ai/tools/host/ai_disconnect_backend.zig	host	ai	
+src/ui/ai_empty_styles.zig	src/features/ai/sessions/view/ai_empty_styles.zig	view	ai	
+src/ui/ai_empty_view.zig	src/features/ai/sessions/view/ai_empty_view.zig	view	ai	
+src/ui/ai_execution_backend.zig	src/features/ai/tools/host/ai_execution_backend.zig	host	ai	
+src/ui/ai_execution_backend_tests.zig	src/features/ai/tools/tests/ai_execution_backend_tests.zig	tests	ai	src/ui 下的 Zig 测试；import ui
+src/ui/ai_execution_result_styles.zig	src/features/ai/cards/view/ai_execution_result_styles.zig	view	ai	
+src/ui/ai_execution_result_view.zig	src/features/ai/cards/view/ai_execution_result_view.zig	view	ai	
+src/ui/ai_feedback_view.zig	src/features/ai/pane/view/ai_feedback_view.zig	view	ai	
+src/ui/ai_file_tool_result.zig	src/features/ai/cards/model/ai_file_tool_result.zig	model	ai	
+src/ui/ai_file_tools.zig	src/features/ai/tools/host/ai_file_tools.zig	host	ai	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_float_gesture_styles.zig	src/features/ai/pane/view/ai_float_gesture_styles.zig	view	ai	
+src/ui/ai_float_gestures.zig	src/features/ai/pane/view/ai_float_gestures.zig	view	ai	
+src/ui/ai_group_context.zig	src/features/ai/tools/host/ai_group_context.zig	host	ai	
+src/ui/ai_group_tools.zig	src/features/ai/tools/host/ai_group_tools.zig	host	ai	
+src/ui/ai_history_view.zig	src/features/ai/pane/view/ai_history_view.zig	view	ai	
+src/ui/ai_host_approval_route_styles.zig	src/features/ai/approvals/view/ai_host_approval_route_styles.zig	view	ai	
+src/ui/ai_host_approval_view.zig	src/features/ai/approvals/view/ai_host_approval_view.zig	view	ai	
+src/ui/ai_host_catalog_controller.zig	src/features/ai/tools/host/ai_host_catalog_controller.zig	host	ai	
+src/ui/ai_host_notice_view.zig	src/features/ai/cards/view/ai_host_notice_view.zig	view	ai	
+src/ui/ai_host_queries.zig	src/features/ai/tools/host/ai_host_queries.zig	host	ai	含线程/I/O 相关代码
+src/ui/ai_host_recording_queries.zig	src/features/ai/tools/model/ai_host_recording_queries.zig	model	ai	
+src/ui/ai_host_secret_controller.zig	src/features/ai/approvals/host/ai_host_secret_controller.zig	host	ai	含线程/I/O 相关代码
+src/ui/ai_host_secret_view.zig	src/features/ai/approvals/view/ai_host_secret_view.zig	view	ai	
+src/ui/ai_host_terminal_queries.zig	src/features/ai/tools/host/ai_host_terminal_queries.zig	host	ai	
+src/ui/ai_image_attachments_styles.zig	src/features/ai/attachments/view/ai_image_attachments_styles.zig	view	ai	
+src/ui/ai_image_attachments_view.zig	src/features/ai/attachments/view/ai_image_attachments_view.zig	view	ai	
+src/ui/ai_inventory_context.zig	src/features/ai/tools/host/ai_inventory_context.zig	host	ai	
+src/ui/ai_inventory_grant_styles.zig	src/features/ai/approvals/view/ai_inventory_grant_styles.zig	view	ai	
+src/ui/ai_inventory_grant_view.zig	src/features/ai/approvals/view/ai_inventory_grant_view.zig	view	ai	
+src/ui/ai_lifecycle_controller.zig	src/features/ai/tools/host/ai_lifecycle_controller.zig	host	ai	import ui + application_host + 线程；生命周期控制器
+src/ui/ai_local_tools.zig	src/features/ai/tools/host/ai_local_tools.zig	host	ai	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_message_view.zig	src/features/ai/pane/view/ai_message_view.zig	view	ai	
+src/ui/ai_pane_layout.zig	src/features/ai/pane/view/ai_pane_layout.zig	view	ai	
+src/ui/ai_pending_styles.zig	src/features/ai/approvals/view/ai_pending_styles.zig	view	ai	
+src/ui/ai_pending_view.zig	src/features/ai/approvals/view/ai_pending_view.zig	view	ai	
+src/ui/ai_preview_geometry.zig	src/features/ai/attachments/view/ai_preview_geometry.zig	view	ai	
+src/ui/ai_recording_query_access.zig	src/features/ai/tools/host/ai_recording_query_access.zig	host	ai	含线程/I/O 相关代码
+src/ui/ai_recovery_styles.zig	src/features/ai/cards/view/ai_recovery_styles.zig	view	ai	
+src/ui/ai_recovery_view.zig	src/features/ai/cards/view/ai_recovery_view.zig	view	ai	
+src/ui/ai_remote_picker.zig	src/features/ai/attachments/view/ai_remote_picker.zig	view	ai	
+src/ui/ai_remote_picker_styles.zig	src/features/ai/attachments/view/ai_remote_picker_styles.zig	view	ai	
+src/ui/ai_return_focus.zig	src/features/ai/pane/view/ai_return_focus.zig	view	ai	
+src/ui/ai_session_context.zig	src/features/ai/tools/host/ai_session_context.zig	host	ai	
+src/ui/ai_session_row.zig	src/features/ai/sessions/view/ai_session_row.zig	view	ai	
+src/ui/ai_sessions_styles.zig	src/features/ai/sessions/view/ai_sessions_styles.zig	view	ai	
+src/ui/ai_sessions_view.zig	src/features/ai/sessions/view/ai_sessions_view.zig	view	ai	
+src/ui/ai_ssh_tools.zig	src/features/ai/tools/host/ai_ssh_tools.zig	host	ai	被 src/plugins/linked_plugins.zig import createAdapter（plugins 非 core 清单；feature->plugins 依赖方向需主 agent 裁决）；依赖 application_host
+src/ui/ai_step_disclosure.zig	src/features/ai/cards/view/ai_step_disclosure.zig	view	ai	
+src/ui/ai_step_group_styles.zig	src/features/ai/cards/view/ai_step_group_styles.zig	view	ai	
+src/ui/ai_step_group_view.zig	src/features/ai/cards/view/ai_step_group_view.zig	view	ai	
+src/ui/ai_step_view.zig	src/features/ai/cards/view/ai_step_view.zig	view	ai	
+src/ui/ai_strip_styles.zig	src/features/ai/cards/view/ai_strip_styles.zig	view	ai	
+src/ui/ai_strip_view.zig	src/features/ai/cards/view/ai_strip_view.zig	view	ai	
+src/ui/ai_tail_follow.zig	src/features/ai/pane/view/ai_tail_follow.zig	view	ai	
+src/ui/ai_task_finish.zig	src/features/ai/cards/view/ai_task_finish.zig	view	ai	view 同时依赖 application_host/lifecycle_supervisor/terminal_execution
+src/ui/ai_task_finish_styles.zig	src/features/ai/cards/view/ai_task_finish_styles.zig	view	ai	
+src/ui/ai_text_selection.zig	src/features/ai/pane/view/ai_text_selection.zig	view	ai	
+src/ui/ai_timeline_view.zig	src/features/ai/pane/view/ai_timeline_view.zig	view	ai	
+src/ui/ai_token_count.zig	src/features/ai/shared/model/ai_token_count.zig	model	ai	助手用量与模型上下文标签共用的纯函数
+src/ui/ai_tool_approval_styles.zig	src/features/ai/approvals/view/ai_tool_approval_styles.zig	view	ai	
+src/ui/ai_tool_approval_view.zig	src/features/ai/approvals/view/ai_tool_approval_view.zig	view	ai	
+src/ui/ai_tool_header_projection.zig	src/features/ai/cards/model/ai_tool_header_projection.zig	model	ai	
+src/ui/ai_tool_results_styles.zig	src/features/ai/cards/view/ai_tool_results_styles.zig	view	ai	
+src/ui/ai_tool_results_view.zig	src/features/ai/cards/view/ai_tool_results_view.zig	view	ai	
+src/ui/ai_tool_titles.zig	src/features/ai/cards/model/ai_tool_titles.zig	model	ai	
+src/ui/ai_tools.zig	src/features/ai/tools/host/ai_tools.zig	host	ai	依赖 application_host/workspace，不下沉；ai/turn_manager 对 Bridge 的 import 留在基线；mixed
+src/ui/ai_transcript_images.zig	src/features/ai/attachments/view/ai_transcript_images.zig	view	ai	
+src/ui/ai_transcript_images_styles.zig	src/features/ai/attachments/view/ai_transcript_images_styles.zig	view	ai	
+src/ui/ai_turn_status_view.zig	src/features/ai/pane/view/ai_turn_status_view.zig	view	ai	
+src/ui/ai_verification_view.zig	src/features/ai/cards/view/ai_verification_view.zig	view	ai	
+src/ui/app_theme.zig	src/shared/ui/theme/app_theme.zig	shared_ui	shared-ui	被约 227 个文件 import(ai/terminal/connection/transfer/socks/notification 等 77 个前缀，另有 config/settings_* 10 个、plugins 2 个、update/app_host 1 个，后三者随各自 feature 搬迁)；违反 shared/ui 不依赖 core/feature：import config/theme_presets、config/theme_registry(core) 及 ai_tool_approval_styles/notification_history_styles/notification_styles/shell_styles(feature 样式)，已在 baseline；core 目录无人 import；tools/arch/baseline.txt 记作 legacy_shared_ui
+src/ui/app_update_styles.zig	src/features/update/view/app_update_styles.zig	view	update	import ui；跟随 app_update_view
+src/ui/app_update_view.zig	src/features/update/view/app_update_view.zig	view	update	import ui、control_hint、shell_styles（shell）；被 core 目录 src/update/app_host.zig import，但 app_host 本包一并搬入 feature/host，故不下沉
+src/ui/application_data_cleanup_styles.zig	src/features/settings/view/application_data_cleanup_styles.zig	view	settings	import ui; 引用 history 的 record_cleanup_styles.zig（跨 feature 依赖，P1 先保留）
+src/ui/application_data_cleanup_view.zig	src/features/settings/view/application_data_cleanup_view.zig	view	settings	import ui; 偏好设置「数据」页的清理确认弹层; main.zig 与 application_data_cleanup_ui_tests 引用
+src/ui/application_host.zig	src/features/shell/host/application_host.zig	host	shell	混合型巨型文件(4456行)，主线程到 SSH/Local runtime 的桥，P5 再拆。被 plugins import: src/plugins/sftp/provider_host.zig
+src/ui/asset_action_styles.zig	src/features/connections/assets/view/asset_action_styles.zig	view	connections	
+src/ui/asset_action_view.zig	src/features/connections/assets/view/asset_action_view.zig	view	connections	
+src/ui/asset_group_host.zig	src/features/connections/assets/host/asset_group_host.zig	host	connections	ui=1；含视图构建与 workspace/sidebar_view 依赖，整体放 host
+src/ui/asset_group_styles.zig	src/features/connections/assets/view/asset_group_styles.zig	view	connections	
+src/ui/assets/ai-brands/LICENSE	src/shared/ui/assets/ai-brands/LICENSE	shared_ui	shared-ui	
+src/ui/assets/ai-brands/README.md	src/shared/ui/assets/ai-brands/README.md	shared_ui	shared-ui	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/ai-brands/anthropic.svg	src/shared/ui/assets/ai-brands/anthropic.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/deepseek.svg	src/shared/ui/assets/ai-brands/deepseek.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/gemini.svg	src/shared/ui/assets/ai-brands/gemini.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/grok.svg	src/shared/ui/assets/ai-brands/grok.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/kimi.svg	src/shared/ui/assets/ai-brands/kimi.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/meta.svg	src/shared/ui/assets/ai-brands/meta.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/minimax.svg	src/shared/ui/assets/ai-brands/minimax.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/mistral.svg	src/shared/ui/assets/ai-brands/mistral.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/moonshot.svg	src/shared/ui/assets/ai-brands/moonshot.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/ollama.svg	src/shared/ui/assets/ai-brands/ollama.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/openai.svg	src/shared/ui/assets/ai-brands/openai.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/qwen.svg	src/shared/ui/assets/ai-brands/qwen.svg	shared_ui	shared-ui	
+src/ui/assets/ai-brands/zhipu.svg	src/shared/ui/assets/ai-brands/zhipu.svg	shared_ui	shared-ui	
+src/ui/assets/donation-qr.txt	src/shared/ui/assets/donation-qr.txt	shared_ui	shared-ui	
+src/ui/assets/host-os/LICENSE	src/shared/ui/assets/host-os/LICENSE	shared_ui	shared-ui	
+src/ui/assets/host-os/LICENSE-DISTRIBUTION-LOGOS	src/shared/ui/assets/host-os/LICENSE-DISTRIBUTION-LOGOS	shared_ui	shared-ui	
+src/ui/assets/host-os/LICENSE-UKUI	src/shared/ui/assets/host-os/LICENSE-UKUI	shared_ui	shared-ui	
+src/ui/assets/host-os/README.md	src/shared/ui/assets/host-os/README.md	shared_ui	shared-ui	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/host-os/SOURCES.md	src/shared/ui/assets/host-os/SOURCES.md	shared_ui	shared-ui	
+src/ui/assets/host-os/alinux.rgba	src/shared/ui/assets/host-os/alinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/alinux.svg	src/shared/ui/assets/host-os/alinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/almalinux.rgba	src/shared/ui/assets/host-os/almalinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/almalinux.svg	src/shared/ui/assets/host-os/almalinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/alpine-contrast.rgba	src/shared/ui/assets/host-os/alpine-contrast.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/alpine.rgba	src/shared/ui/assets/host-os/alpine.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/alpine.svg	src/shared/ui/assets/host-os/alpine.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/amazonlinux.rgba	src/shared/ui/assets/host-os/amazonlinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/amazonlinux.svg	src/shared/ui/assets/host-os/amazonlinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/anolis.rgba	src/shared/ui/assets/host-os/anolis.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/anolis.svg	src/shared/ui/assets/host-os/anolis.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/aosc.rgba	src/shared/ui/assets/host-os/aosc.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/aosc.svg	src/shared/ui/assets/host-os/aosc.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/archlinux.rgba	src/shared/ui/assets/host-os/archlinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/archlinux.svg	src/shared/ui/assets/host-os/archlinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/bclinux-contrast.rgba	src/shared/ui/assets/host-os/bclinux-contrast.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/bclinux.rgba	src/shared/ui/assets/host-os/bclinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/bclinux.svg	src/shared/ui/assets/host-os/bclinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/centos.rgba	src/shared/ui/assets/host-os/centos.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/centos.svg	src/shared/ui/assets/host-os/centos.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/debian.rgba	src/shared/ui/assets/host-os/debian.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/debian.svg	src/shared/ui/assets/host-os/debian.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/deepin-status.rgba	src/shared/ui/assets/host-os/deepin-status.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/deepin.rgba	src/shared/ui/assets/host-os/deepin.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/deepin.svg	src/shared/ui/assets/host-os/deepin.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/euleros.rgba	src/shared/ui/assets/host-os/euleros.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/euleros.svg	src/shared/ui/assets/host-os/euleros.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/fedora.rgba	src/shared/ui/assets/host-os/fedora.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/fedora.svg	src/shared/ui/assets/host-os/fedora.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/freebsd.rgba	src/shared/ui/assets/host-os/freebsd.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/freebsd.svg	src/shared/ui/assets/host-os/freebsd.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/gentoo.rgba	src/shared/ui/assets/host-os/gentoo.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/gentoo.svg	src/shared/ui/assets/host-os/gentoo.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/isoft.rgba	src/shared/ui/assets/host-os/isoft.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/isoft.svg	src/shared/ui/assets/host-os/isoft.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/kali.rgba	src/shared/ui/assets/host-os/kali.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/kali.svg	src/shared/ui/assets/host-os/kali.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/kylin.rgba	src/shared/ui/assets/host-os/kylin.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/kylin.svg	src/shared/ui/assets/host-os/kylin.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/kylinsec.rgba	src/shared/ui/assets/host-os/kylinsec.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/kylinsec.svg	src/shared/ui/assets/host-os/kylinsec.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/linux.rgba	src/shared/ui/assets/host-os/linux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/linux.svg	src/shared/ui/assets/host-os/linux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/linuxmint.rgba	src/shared/ui/assets/host-os/linuxmint.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/linuxmint.svg	src/shared/ui/assets/host-os/linuxmint.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/linx.rgba	src/shared/ui/assets/host-os/linx.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/linx.svg	src/shared/ui/assets/host-os/linx.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/loongnix.rgba	src/shared/ui/assets/host-os/loongnix.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/loongnix.svg	src/shared/ui/assets/host-os/loongnix.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/manjaro.rgba	src/shared/ui/assets/host-os/manjaro.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/manjaro.svg	src/shared/ui/assets/host-os/manjaro.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/neokylin.rgba	src/shared/ui/assets/host-os/neokylin.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/neokylin.svg	src/shared/ui/assets/host-os/neokylin.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/netbsd.rgba	src/shared/ui/assets/host-os/netbsd.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/netbsd.svg	src/shared/ui/assets/host-os/netbsd.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/nfs.rgba	src/shared/ui/assets/host-os/nfs.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/nfs.svg	src/shared/ui/assets/host-os/nfs.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/nixos.rgba	src/shared/ui/assets/host-os/nixos.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/nixos.svg	src/shared/ui/assets/host-os/nixos.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/openbsd.rgba	src/shared/ui/assets/host-os/openbsd.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/openbsd.svg	src/shared/ui/assets/host-os/openbsd.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/opencloudos.rgba	src/shared/ui/assets/host-os/opencloudos.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/opencloudos.svg	src/shared/ui/assets/host-os/opencloudos.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/openeuler.rgba	src/shared/ui/assets/host-os/openeuler.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/openeuler.svg	src/shared/ui/assets/host-os/openeuler.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/openkylin.rgba	src/shared/ui/assets/host-os/openkylin.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/openkylin.svg	src/shared/ui/assets/host-os/openkylin.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/opensuse.rgba	src/shared/ui/assets/host-os/opensuse.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/opensuse.svg	src/shared/ui/assets/host-os/opensuse.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/oraclelinux.rgba	src/shared/ui/assets/host-os/oraclelinux.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/oraclelinux.svg	src/shared/ui/assets/host-os/oraclelinux.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/redflag-contrast.rgba	src/shared/ui/assets/host-os/redflag-contrast.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/redflag.rgba	src/shared/ui/assets/host-os/redflag.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/redflag.svg	src/shared/ui/assets/host-os/redflag.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/rhel.rgba	src/shared/ui/assets/host-os/rhel.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/rhel.svg	src/shared/ui/assets/host-os/rhel.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/rocky.rgba	src/shared/ui/assets/host-os/rocky.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/rocky.svg	src/shared/ui/assets/host-os/rocky.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/sles.rgba	src/shared/ui/assets/host-os/sles.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/sles.svg	src/shared/ui/assets/host-os/sles.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/sugon-status.rgba	src/shared/ui/assets/host-os/sugon-status.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/sugon.rgba	src/shared/ui/assets/host-os/sugon.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/sugon.svg	src/shared/ui/assets/host-os/sugon.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/tencentos.rgba	src/shared/ui/assets/host-os/tencentos.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/tencentos.svg	src/shared/ui/assets/host-os/tencentos.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/ubuntu-status.rgba	src/shared/ui/assets/host-os/ubuntu-status.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/ubuntu.rgba	src/shared/ui/assets/host-os/ubuntu.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/ubuntu.svg	src/shared/ui/assets/host-os/ubuntu.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/ubuntukylin.rgba	src/shared/ui/assets/host-os/ubuntukylin.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/ubuntukylin.svg	src/shared/ui/assets/host-os/ubuntukylin.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/uos.rgba	src/shared/ui/assets/host-os/uos.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/uos.svg	src/shared/ui/assets/host-os/uos.svg	shared_ui	shared-ui	
+src/ui/assets/host-os/windows.rgba	src/shared/ui/assets/host-os/windows.rgba	shared_ui	shared-ui	
+src/ui/assets/host-os/windows.svg	src/shared/ui/assets/host-os/windows.svg	shared_ui	shared-ui	
+src/ui/assets/local_apple.svg	src/shared/ui/assets/local_apple.svg	shared_ui	shared-ui	
+src/ui/assets/os/linux.svg	src/shared/ui/assets/os/linux.svg	shared_ui	shared-ui	
+src/ui/assets/os/rocky.svg	src/shared/ui/assets/os/rocky.svg	shared_ui	shared-ui	
+src/ui/assets/os/ubuntu.svg	src/shared/ui/assets/os/ubuntu.svg	shared_ui	shared-ui	
+src/ui/assets/os/windows.svg	src/shared/ui/assets/os/windows.svg	shared_ui	shared-ui	
+src/ui/assets/shell/README.md	src/shared/ui/assets/shell/README.md	shared_ui	shared-ui	随资源目录搬迁；文中含旧路径需同步改文字
+src/ui/assets/shell/tab-ear-left.svg	src/shared/ui/assets/shell/tab-ear-left.svg	shared_ui	shared-ui	
+src/ui/assets/shell/tab-ear-right.svg	src/shared/ui/assets/shell/tab-ear-right.svg	shared_ui	shared-ui	
+src/ui/assets/sidebar_footer_frame.svg	src/shared/ui/assets/sidebar_footer_frame.svg	shared_ui	shared-ui	
+src/ui/assets_generated.zig	src/shared/ui/assets/assets_generated.zig	shared_ui	shared-ui	生成物(gen_svg_assets)；仅 session_icon.zig 使用；含 @embedFile("assets/local_apple.svg") 与 sidebar_footer_frame.svg，搬到 shared/ui/assets/ 后相对路径需改为同目录
+src/ui/auth_challenge_styles.zig	src/features/connections/auth/view/auth_challenge_styles.zig	view	connections	被 plugin_challenge_presenter 等 import
+src/ui/auth_challenge_view.zig	src/features/connections/auth/view/auth_challenge_view.zig	view	connections	被 background_surface_tests/material_popup_tests 等跨 feature 测试 import
+src/ui/aux_window.zig	src/shared/ui/window/aux_window.zig	shared_ui	shared-ui	被 wizard_*、main.zig、config/settings_shell 共 3 个文件 import；窗口外壳辅助
+src/ui/auxiliary_appearance.zig	src/shared/ui/theme/auxiliary_appearance.zig	shared_ui	shared-ui	仅 src/auxiliary_appearance_tests.zig import；import config/background_asset(core)、background_layers/shell_styles(shell feature)；辅助窗口外观
+src/ui/background_layers.zig	src/features/shell/view/background_layers.zig	view	shell	
+src/ui/background_repeat.zig	src/features/shell/model/background_repeat.zig	model	shell	e2e/material_geometry.ts 文本引用旧路径
+src/ui/background_texture.zig	src/features/shell/model/background_texture.zig	model	shell	另被 src/main.zig 与 src/ui/auxiliary_appearance.zig 使用
+src/ui/broadcast_controller.zig	src/features/workspace/model/broadcast_controller.zig	model	workspace	不 import ui
+src/ui/broadcast_event.zig	src/features/workspace/model/broadcast_event.zig	model	workspace	
+src/ui/broadcast_styles.zig	src/features/workspace/view/broadcast_styles.zig	view	workspace	跟随 broadcast_view
+src/ui/broadcast_view.zig	src/features/workspace/view/broadcast_view.zig	view	workspace	
+src/ui/builtin_commands.zig	src/vt/builtin_commands.zig	core	terminal	被 core import 间接: command_palette(->vt/ssh_shell_execution) 依赖它; 依赖 command_catalog(->ai); 建议随 command_palette 下沉到 vt (不 import ui)
+src/ui/builtin_completion.zig	src/host/builtin_completion.zig	core	terminal	被 core import: src/host/runtime_service.zig, src/plugins/ssh/runtime_binding.zig; 依赖 ai/execbridge 与 platform/account; 不 import ui; 超出 §5.2 已知名单
+src/ui/builtin_dispatch.zig	src/features/terminal/model/builtin_dispatch.zig	model	terminal	不 import ui
+src/ui/builtin_records_styles.zig	src/features/terminal/view/builtin_records_styles.zig	view	terminal	import ui; 样式跟随 terminal_document/视图
+src/ui/certificate_trust_styles.zig	src/features/connections/auth/view/certificate_trust_styles.zig	view	connections	
+src/ui/certificate_trust_view.zig	src/features/connections/auth/view/certificate_trust_view.zig	view	connections	被 plugin_challenge_presenter import
+src/ui/challenge_window_host.zig	src/features/connections/auth/host/challenge_window_host.zig	host	connections	*_host；被 plugin_window_host 等 import
+src/ui/color_palette.zig	src/shared/ui/components/color_palette/color_palette.zig	shared_ui	shared-ui	被 tab_color_picker(shell/workspace)与 asset_* (connections)import；预设色按钮通用件，不是设置页界面；import app_theme+color_palette_styles
+src/ui/color_palette_styles.zig	src/shared/ui/components/color_palette/color_palette_styles.zig	shared_ui	shared-ui	color_palette 的样式，被 color_palette 与 asset_* import；跟随 color_palette
+src/ui/command_annotation_styles.zig	src/features/terminal/view/command_annotation_styles.zig	view	terminal	import ui
+src/ui/command_annotations.zig	src/features/terminal/model/command_annotations.zig	model	terminal	不 import ui
+src/ui/command_bar.zig	src/features/terminal/model/command_bar.zig	model	terminal	不 import ui; 依赖 host/runtime_service
+src/ui/command_catalog.zig	src/ai/command_catalog.zig	core	terminal	被 core import: src/ai/session_prompt.zig (§5.2 已知)
+src/ui/command_error_hint_styles.zig	src/features/terminal/view/command_error_hint_styles.zig	view	terminal	import ui
+src/ui/command_error_hint_view.zig	src/features/terminal/view/command_error_hint_view.zig	view	terminal	import ui; src/notification_preview_runner.zig 也引用它
+src/ui/command_help_view.zig	src/features/terminal/view/command_help_view.zig	view	terminal	import ui
+src/ui/command_history_styles.zig	src/features/terminal/view/command_history_styles.zig	view	terminal	import ui
+src/ui/command_history_view.zig	src/features/terminal/view/command_history_view.zig	view	terminal	import ui
+src/ui/command_palette.zig	src/vt/command_palette.zig	core	terminal	被 core import: src/vt/ssh_shell_execution.zig (LineTracker); 依赖 builtin_commands; 不 import ui; 超出 §5.2 已知名单
+src/ui/compact_overlay_layout.zig	src/shared/ui/components/compact_overlay_layout/compact_overlay_layout.zig	shared_ui	shared-ui	
+src/ui/completion.zig	src/features/terminal/model/completion.zig	model	terminal	不 import ui
+src/ui/completion_controller.zig	src/features/terminal/model/completion_controller.zig	model	terminal	不 import ui 故归 model (无 ui 依赖的 controller)
+src/ui/completion_input.zig	src/features/terminal/model/completion_input.zig	model	terminal	不 import ui
+src/ui/completion_state.zig	src/features/terminal/model/completion_state.zig	model	terminal	不 import ui
+src/ui/connection_details_host.zig	src/features/connections/progress/host/connection_details_host.zig	host	connections	依赖 workspace/application_host
+src/ui/connection_details_styles.zig	src/features/connections/progress/view/connection_details_styles.zig	view	connections	也被 status_connection_*、status_detail_*（shell）与 socks_background_styles import
+src/ui/connection_details_view.zig	src/features/connections/progress/view/connection_details_view.zig	view	connections	也被 status_connection_view（shell）、socks_info_view import
+src/ui/connection_host.zig	src/features/connections/progress/host/connection_host.zig	host	connections	依赖 workspace/application_host，处理认证挑战与进度
+src/ui/connection_logs_styles.zig	src/features/connections/progress/view/connection_logs_styles.zig	view	connections	被 plugins/bmc_ikvm/views.zig import
+src/ui/connection_logs_view.zig	src/features/connections/progress/view/connection_logs_view.zig	view	connections	
+src/ui/connection_progress_styles.zig	src/features/connections/progress/view/connection_progress_styles.zig	view	connections	
+src/ui/connection_progress_view.zig	src/features/connections/progress/view/connection_progress_view.zig	view	connections	1438 行；被 wizard_test_progress 等 import
+src/ui/connection_stepper.zig	src/features/connections/wizard/view/connection_stepper.zig	view	connections	被 plugins/remote/editor.zig、plugins/bmc_ikvm/editor.zig import；依赖 wizard_styles
+src/ui/context_menu_effects.zig	src/features/workspace/model/context_menu_effects.zig	model	workspace	
+src/ui/context_menu_state.zig	src/features/workspace/model/context_menu_state.zig	model	workspace	
+src/ui/context_menu_view.zig	src/features/workspace/model/context_menu_view.zig	model	workspace	名为 view 但不 import ui，仅生成 snapshot 数据
+src/ui/context_menus.zig	src/features/workspace/model/context_menus.zig	model	workspace	
+src/ui/control_hint.zig	src/shared/ui/components/control_hint/control_hint.zig	shared_ui	shared-ui	被约 25 个文件 import(ai 8、transfer 2、connection、status、tab、file、history、broadcast、quick_connect、local、config/settings、plugins/bmc_ikvm 等)
+src/ui/copy_button.zig	src/shared/ui/components/copy_button/copy_button.zig	shared_ui	shared-ui	被 18 个文件 import(ai 6、connection 3、socks、status、transfer、plugins/bmc、根测试)；import shell_styles(feature)+config/theme_registry(core) 已在 baseline
+src/ui/design.zig	src/shared/ui/theme/design.zig	shared_ui	shared-ui	被 terminal_view/workspace/main 共 3 个文件 import；按 design* 规则归 theme；import ui+app_theme
+src/ui/design_tokens.zig	src/shared/ui/theme/design_tokens.zig	shared_ui	shared-ui	被 config/settings_content_view(随 settings 搬)、command_* 以及 build.zig:311 作为独立 module 根引用；build.zig 硬编码
+src/ui/donation_qr.zig	src/shared/base/donation_qr.zig	shared_base	shared-ui	不 import ui；使下沉到 vt 的 terminal_record_geometry 不反向依赖 feature
+src/ui/donation_qr_view.zig	src/features/terminal/view/donation_qr_view.zig	view	terminal	
+src/ui/empty_saved_connections.zig	src/features/workspace/view/empty_saved_connections.zig	view	workspace	空工作区已保存连接列表；import sidebar_styles.zig（shell）；被 workspace.zig 使用
+src/ui/feedback_message.zig	src/shared/base/feedback_message.zig	shared_base	shared-ui	不 import ui；被 main、workspace、status、file×3 共 6 个文件 import(3 个 feature)；用户可见错误文案
+src/ui/file_actions_styles.zig	src/features/files/view/file_actions_styles.zig	view	files	import ui；跟随 file_actions_view
+src/ui/file_actions_view.zig	src/features/files/view/file_actions_view.zig	view	files	import ui；未被 core import
+src/ui/file_application_host.zig	src/features/files/host/file_application_host.zig	host	files	不 import ui，7 行兼容 shim 转发 plugins/sftp/provider_host；被 main.zig、ai_local_tools_tests、totp_autofill_tests、ui/ai_{file,group,ssh}_tools、ui/ai_tools import（ai 包需改路径）；未被 core import
+src/ui/file_authentication.zig	src/host/file_authentication.zig	core	files	不 import ui；被 core import: src/host/application_task_domain.zig、src/plugins/sftp/provider_host.zig；自身依赖 ui/host_key_confirmation.zig 与 ui/session_lifecycle.zig（后者按 §5.2 下沉 host/；host_key_confirmation 属 connections 包，需主 agent 确认）
+src/ui/file_copy_styles.zig	src/features/files/view/file_copy_styles.zig	view	files	import ui；跟随 file_copy_view
+src/ui/file_copy_view.zig	src/features/files/view/file_copy_view.zig	view	files	import ui；被 plugin import: src/plugins/sftp/provider_host.zig（Options 类型，2 处）；建议主 agent 裁决
+src/ui/file_mkdir_styles.zig	src/features/files/view/file_mkdir_styles.zig	view	files	import ui；跟随 file_mkdir_view
+src/ui/file_mkdir_view.zig	src/features/files/view/file_mkdir_view.zig	view	files	import ui；未被 core import
+src/ui/file_workspace_icons.zig	src/features/files/view/file_workspace_icons.zig	view	files	import ui；未被 core import
+src/ui/file_workspace_icons_assets.zig	src/features/files/model/file_workspace_icons_assets.zig	model	files	只被 files 使用
+src/ui/file_workspace_presentation.zig	src/features/files/view/file_workspace_presentation.zig	view	files	import ui；625 行含宿主逻辑（file_promises 等）；被 plugin import: src/plugins/sftp/provider_host.zig；建议主 agent 裁决是否下沉
+src/ui/file_workspace_styles.zig	src/features/files/view/file_workspace_styles.zig	view	files	import ui；import files/_styles.yss.zig，搬后改为同目录 _styles.yss.zig
+src/ui/file_workspace_title_icons.zig	src/features/files/model/file_workspace_title_icons.zig	model	files	不 import ui（仅 icon_ir）图标数据
+src/ui/file_workspace_view.zig	src/features/files/view/file_workspace_view.zig	view	files	import ui；1712 行；被 core import: src/host/file_workspace_controller.zig:10（pub const View，已知）；严格下沉会连带 styles/icons，建议主 agent 裁决
+src/ui/files/_styles.yss.zig	src/features/files/view/_styles.yss.zig	view	files	styles.yss 生成孪生，须与 styles.yss 同目录；被 file_workspace_styles import
+src/ui/files/styles.yss	src/features/files/view/styles.yss	view	files	yss 源；仅 files 使用
+src/ui/floating_input.zig	src/shared/ui/components/floating_input/floating_input.zig	shared_ui	shared-ui	
+src/ui/focus_fill.zig	src/shared/ui/zenit_ext/focus_fill.zig	shared_ui	shared-ui	zenit 公开扩展点 Cx.setFocusIndicator 的适配；被 shell_styles(ThemePublication)、chrome_policy_tests 等 import；vendor/DEPENDENCIES.md 引用
+src/ui/formatted_output.zig	src/features/ai/cards/model/formatted_output.zig	model	ai	只被 AI 工具结果视图使用
+src/ui/glyph_atlas.zig	src/features/terminal/model/glyph_atlas.zig	model	terminal	不 import ui; 仅被 root.zig 引用
+src/ui/group_close_controller.zig	src/host/group_close_controller.zig	core	workspace	只依赖 host/identity；被 ai/legacy_adapter 使用
+src/ui/group_close_styles.zig	src/features/workspace/view/group_close_styles.zig	view	workspace	
+src/ui/group_close_view.zig	src/features/workspace/view/group_close_view.zig	view	workspace	
+src/ui/group_context.zig	src/features/workspace/model/group_context.zig	model	workspace	
+src/ui/group_dispatch.zig	src/features/workspace/model/group_dispatch.zig	model	workspace	
+src/ui/group_join_view.zig	src/features/workspace/view/group_join_view.zig	view	workspace	
+src/ui/group_layout.zig	src/features/workspace/model/group_layout.zig	model	workspace	
+src/ui/group_model.zig	src/features/workspace/model/group_model.zig	model	workspace	
+src/ui/group_workspace_model.zig	src/features/workspace/view/group_workspace_model.zig	view	workspace	名为 model 但 import ui 且持有 *ui.Node，按规则放 view
+src/ui/group_workspace_styles.zig	src/features/workspace/view/group_workspace_styles.zig	view	workspace	
+src/ui/history_archive.zig	src/features/history/model/history_archive.zig	model	history	无 ui import；依赖 platform/presentation_wakeup、vt/session_archive；被 ssh_shell_execution_runner、terminal_execution_tests、workspace 引用（跨 feature）
+src/ui/history_cast.zig	src/features/history/model/history_cast.zig	model	history	依赖 history_replay→history_colors(import ui)，不满足下沉条件；local/recording、vt/ssh_worker 对它的 import 留在基线
+src/ui/history_colors.zig	src/features/history/view/history_colors.zig	view	history	import ui（仅 test 块用 ui.Cx）、app_theme、terminal_view、builtin_records_styles；被 history_replay（model 层）与 terminal_view 引用，存在 model->view 与跨 feature 依赖
+src/ui/history_host.zig	src/features/history/host/history_host.zig	host	history	747 行；import ui、workspace、session_export*、floating_input；被 main.zig 引用
+src/ui/history_list.zig	src/features/history/model/history_list.zig	model	history	无 ui import；仅 vt/session_archive；被 root.zig、transfer_panel_tests 引用
+src/ui/history_reading.zig	src/features/history/model/history_reading.zig	model	history	无 ui import；被 history_archive、terminal_view、workspace、builtin_records_tests 引用
+src/ui/history_replay.zig	src/features/history/model/history_replay.zig	model	history	无 ui import；但 import history_colors（view 层）与 terminal_record_geometry（归 terminal/vt）；被 terminal_view、workspace、root.zig 等引用
+src/ui/history_row.zig	src/features/history/view/history_row.zig	view	history	import ui；含 1 个就地 test
+src/ui/history_styles.zig	src/features/history/view/history_styles.zig	view	history	import ui；跟随 history_row/history_host；自身 import ai_close_confirmation_styles、notification_styles（跨 feature）；被 terminal_view、command_history_view、ai_transcript_images、main.zig 引用
+src/ui/host_key_confirmation.zig	src/host/host_key_confirmation.zig	core	connections	被 core import: src/host/socks_background_runtime.zig, src/host/socks_route_host.zig（另被 plugins/remote/challenge_bridge、plugins/sftp/provider_host、plugins/ssh/connect_job、root.zig、ui/session_runtime 等 import）；ui=0，下沉到 host 层
+src/ui/host_os_assets.zig	src/shared/ui/assets/host_os_assets.zig	shared_ui	shared-ui	import ui+session_os_assets；@embedFile("assets/host-os/...") 搬后需改为 host-os/...；被 main、workspace、session_icon 使用；e2e/domestic_os_native.ts、e2e/tab_icon_states_native.ts 硬编码读取此路径
+src/ui/icon_button_feedback.zig	src/shared/ui/components/icon_button_feedback/icon_button_feedback.zig	shared_ui	shared-ui	被 workspace/sidebar/file_workspace/transfer 测试 共 4 个 feature 前缀文件 import
+src/ui/layer_materials.zig	src/shared/ui/styles/layer_materials.zig	shared_ui	shared-ui	
+src/ui/layout_motion.zig	src/shared/ui/styles/layout_motion.zig	shared_ui	shared-ui	被 ai×4、connection、sidebar、transfer 测试、config/settings_accordion、plugins/remote/editor 共 9 个文件 import；tools/arch/baseline.txt 有 legacy_plugin 条目
+src/ui/local_close_styles.zig	src/features/terminal/view/local_close_styles.zig	view	terminal	import ui
+src/ui/local_close_view.zig	src/features/terminal/view/local_close_view.zig	view	terminal	import ui; status_detail_tests/theme_layer_tests 引用
+src/ui/local_command_state.zig	src/features/terminal/model/local_command_state.zig	model	terminal	不 import ui; 被 terminal_view/root.zig 引用
+src/ui/local_session_styles.zig	src/features/terminal/view/local_session_styles.zig	view	terminal	import ui
+src/ui/local_status_styles.zig	src/features/terminal/view/local_status_styles.zig	view	terminal	import ui
+src/ui/local_status_view.zig	src/features/terminal/view/local_status_view.zig	view	terminal	import ui
+src/ui/log_typography.zig	src/shared/ui/styles/log_typography.zig	shared_ui	shared-ui	
+src/ui/material_geometry.zig	src/shared/ui/styles/material_geometry.zig	shared_ui	shared-ui	
+src/ui/multiwindow_test_routes.zig	src/features/workspace/host/multiwindow_test_routes.zig	host	workspace	import zenit_app/application_host/plugin_window_host；仅 test 路由，被 main.zig 引用；归属有风险
+src/ui/notification_card.zig	src/features/notifications/model/notification_card.zig	model	notifications	无 ui import；仅 host/notification_coordinator（core）
+src/ui/notification_countdown.zig	src/features/notifications/view/notification_countdown.zig	view	notifications	import ui；被 command_error_hint_view 引用（跨 feature）
+src/ui/notification_history.zig	src/features/notifications/view/notification_history.zig	view	notifications	import ui、host/notification_host、layer_materials、quick_connect_styles（connections）；被 main.zig 引用
+src/ui/notification_history_styles.zig	src/features/notifications/view/notification_history_styles.zig	view	notifications	import ui；被 app_theme、ai_recovery_view、button_policy_*、material_popup_tests 引用（跨 feature）
+src/ui/notification_placement.zig	src/features/notifications/model/notification_placement.zig	model	notifications	无 ui import；含 1 个就地 test
+src/ui/notification_presenter.zig	src/features/notifications/view/notification_presenter.zig	view	notifications	import ui、host/notification_host、floating_input、layer_materials；被 file_actions_view、file_workspace_view、plugin_window_host、transfer_manager_view、main.zig 引用（跨 feature）；Presenter 含挂载与窗口交互，无线程/IO，故归 view
+src/ui/notification_styles.zig	src/features/notifications/view/notification_styles.zig	view	notifications	import ui；被 app_theme、history_styles、command_error_hint_* 引用（跨 feature）
+src/ui/overlay_anchor.zig	src/shared/base/overlay_anchor.zig	shared_base	shell	ui=0 纯模型；被 context_menu_view/group_context(workspace)与 status_controller/status_detail_view(shell)共用
+src/ui/overlay_model.zig	src/features/shell/model/overlay_model.zig	model	shell	被 application_host.zig 与 src/root.zig 引用
+src/ui/pane_manager.zig	src/features/workspace/model/pane_manager.zig	model	workspace	
+src/ui/pane_worker_registry.zig	src/features/workspace/model/pane_worker_registry.zig	model	workspace	import host/runtime_service（core）
+src/ui/paste_policy.zig	src/host/paste_policy.zig	core	terminal	被 core import: src/host/terminal_service.zig (§5.2 已知)
+src/ui/plugin_challenge_presenter.zig	src/features/connections/auth/host/plugin_challenge_presenter.zig	host	connections	
+src/ui/plugin_content_host.zig	src/features/shell/host/plugin_content_host.zig	host	shell	插件窗口承载基础设施
+src/ui/plugin_editor_host.zig	src/features/connections/wizard/host/plugin_editor_host.zig	host	connections	被向导使用
+src/ui/plugin_window_host.zig	src/features/shell/host/plugin_window_host.zig	host	shell	同上
+src/ui/probe_connection_host.zig	src/features/connections/wizard/host/probe_connection_host.zig	host	connections	*_host
+src/ui/quick_connect.zig	src/features/connections/quick_connect/model/quick_connect.zig	model	connections	ui=0
+src/ui/quick_connect_icon.zig	src/features/connections/quick_connect/model/quick_connect_icon.zig	model	connections	ui=0，仅 import icon_ir
+src/ui/quick_connect_styles.zig	src/features/connections/quick_connect/view/quick_connect_styles.zig	view	connections	也被 socks_config_styles、notification_history import
+src/ui/quick_connect_view.zig	src/features/connections/quick_connect/view/quick_connect_view.zig	view	connections	
+src/ui/reconnect_bridge.zig	src/features/terminal/host/reconnect_bridge.zig	host	terminal	不 import ui, 但按 §5.2 *_bridge 归 host; 依赖 vt/reconnect 与 session_tombstone(workspace 包)
+src/ui/record_cleanup_styles.zig	src/features/history/view/record_cleanup_styles.zig	view	history	import ui；被 application_data_cleanup_styles、ui_constraint_tests 引用
+src/ui/record_cleanup_view.zig	src/features/history/view/record_cleanup_view.zig	view	history	import ui、host/record_cleanup；test_id 前缀为 settings.record_cleanup.*（见 TESTID）；被 main.zig 引用
+src/ui/remote_session_notice.zig	src/features/workspace/view/remote_session_notice.zig	view	workspace	
+src/ui/retained_panel.zig	src/features/shell/view/retained_panel.zig	view	shell	
+src/ui/rocky_os_asset.zig	src/shared/ui/assets/rocky_os_asset.zig	shared_ui	shared-ui	生成物，无 import 者(仅 assets/host-os/README.md 提及)；@embedFile 路径需同步改
+src/ui/session_export.zig	src/features/workspace/host/session_export.zig	host	workspace	不 import ui，但含 writeArchive 文件 I/O，放 host
+src/ui/session_export_jobs.zig	src/features/workspace/host/session_export_jobs.zig	host	workspace	import ui；开线程做导出
+src/ui/session_icon.zig	src/shared/ui/components/session_icon/session_icon.zig	shared_ui	shared-ui	shell/connections/workspace 共用
+src/ui/session_lifecycle.zig	src/host/session_lifecycle.zig	core	workspace	被 core import: src/ai/{assistant_store,attached_service,child_gateway,child_projection,conversation_commands,session_journal,session_runtime}.zig src/config/hosts.zig src/host/{command,file_binding_host,file_route_factory,plugin_registry,session_host,sftp_adapter,socks_background_runtime,socks_route_host}.zig src/vt/reconnect.zig；§5.2 下沉 host/
+src/ui/session_menu.zig	src/features/workspace/view/session_menu.zig	view	workspace	
+src/ui/session_menu_styles.zig	src/features/workspace/view/session_menu_styles.zig	view	workspace	
+src/ui/session_os_assets.zig	src/shared/ui/assets/session_os_assets.zig	shared_ui	shared-ui	生成物，仅被 host_os_assets 与 session_icon 使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；有 session_ 前缀，可能与 workspace 包撞车，请去重
+src/ui/session_os_cache.zig	src/features/workspace/host/session_os_cache.zig	host	workspace	读写磁盘缓存 OS 标签；不 import ui；被 main.zig/workspace.zig 使用
+src/ui/session_reconnect_policy.zig	src/features/workspace/model/session_reconnect_policy.zig	model	workspace	
+src/ui/session_runtime.zig	src/features/workspace/host/session_runtime.zig	host	workspace	不 import ui，但 1092 行，起线程/做日志 I/O；src/ai/session_runtime.zig 是 ai 自己的同名文件，非此文件；无 core import
+src/ui/session_tombstone.zig	src/features/workspace/model/session_tombstone.zig	model	workspace	
+src/ui/session_tombstone_view.zig	src/features/workspace/model/session_tombstone_view.zig	model	workspace	不 import ui，仅 snapshot
+src/ui/settings/_styles.yss.zig	src/features/settings/view/_styles.yss.zig	view	settings	yss 孪生，跟 styles.yss 同目录; 内含 previewCss("src/ui/settings/styles.yss") 路径字面量，搬迁后需重新生成; 被 config/settings_shell.zig 与 settings_styles.zig import
+src/ui/settings/styles.yss	src/features/settings/view/styles.yss	view	settings	设置窗口样式源文件; 计划 §5.1 目标 view/styles.yss
+src/ui/shell/_styles.yss.zig	src/features/shell/view/shell/_styles.yss.zig	view	shell	yss 生成孪生，随 styles.yss；shell_styles.zig 以 shell/_styles.yss.zig 引用，搬迁时需同步相对路径
+src/ui/shell/styles.yss	src/features/shell/view/shell/styles.yss	view	shell	目录 shell/ 保留以免与 view/ 内文件混淆，孪生同目录
+src/ui/shell_assets.zig	src/shared/ui/assets/shell_assets.zig	shared_ui	shared-ui	生成物，仅被 workspace 系列使用(单 feature，按 *_assets.zig 规则仍归 shared-ui)；有 shell_ 前缀，可能与 shell 包撞车；@embedFile("assets/shell/...") 需改；assets/shell/README.md 含 zig fmt src/ui/shell_assets.zig
+src/ui/shell_styles.zig	src/features/shell/view/shell_styles.zig	view	shell	其中 ThemePublication 之后会单独拆到 shared/ui/theme，P1 仍整体归 shell view/。被 plugins import: src/plugins/bmc_ikvm/styles.zig
+src/ui/shortcut_dispatch.zig	src/features/shell/model/shortcut_dispatch.zig	model	shell	全局快捷键
+src/ui/shortcut_router.zig	src/features/shell/model/shortcut_router.zig	model	shell	同上
+src/ui/sidebar_collapsed_view.zig	src/features/shell/view/sidebar_collapsed_view.zig	view	shell	
+src/ui/sidebar_model.zig	src/features/shell/model/sidebar_model.zig	model	shell	
+src/ui/sidebar_new_button.zig	src/features/shell/view/sidebar_new_button.zig	view	shell	
+src/ui/sidebar_styles.zig	src/features/shell/view/sidebar_styles.zig	view	shell	
+src/ui/sidebar_view.zig	src/features/shell/view/sidebar_view.zig	view	shell	
+src/ui/socks_application_host.zig	src/features/connections/socks/host/socks_application_host.zig	host	connections	620 行，含视图与 I/O
+src/ui/socks_background_host.zig	src/features/connections/socks/host/socks_background_host.zig	host	connections	
+src/ui/socks_background_model.zig	src/host/socks_background_model.zig	core	connections	被 core import: src/host/application_task_domain.zig；ui=0 且只依赖 ../host/*，下沉到 host 层
+src/ui/socks_background_styles.zig	src/features/connections/socks/view/socks_background_styles.zig	view	connections	被 sidebar_view（shell）import
+src/ui/socks_background_view.zig	src/features/connections/socks/view/socks_background_view.zig	view	connections	
+src/ui/socks_config_styles.zig	src/features/connections/socks/view/socks_config_styles.zig	view	connections	
+src/ui/socks_config_view.zig	src/features/connections/socks/view/socks_config_view.zig	view	connections	
+src/ui/socks_exposure_confirm.zig	src/features/connections/socks/view/socks_exposure_confirm.zig	view	connections	ui=1
+src/ui/socks_exposure_confirm_tests.zig	src/features/connections/socks/tests/socks_exposure_confirm_tests.zig	tests	connections	位于 src/ui 的测试；由 transfer_panel_tests 聚合
+src/ui/socks_info_styles.zig	src/features/connections/socks/view/socks_info_styles.zig	view	connections	被 connection_details_view、status_connection_view（shell）、ssh_status_host 等跨 feature import
+src/ui/socks_info_view.zig	src/features/connections/socks/view/socks_info_view.zig	view	connections	
+src/ui/ssh_status_host.zig	src/features/connections/progress/host/ssh_status_host.zig	host	connections	状态条 SSH 状态宿主，依赖 status_*（shell）视图，可能应归 shell（风险）
+src/ui/startup_styles.zig	src/features/shell/view/startup_styles.zig	view	shell	
+src/ui/startup_transition.zig	src/features/shell/model/startup_transition.zig	model	shell	
+src/ui/startup_view.zig	src/features/shell/view/startup_view.zig	view	shell	
+src/ui/status_connection_extras.zig	src/features/shell/model/status_connection_extras.zig	model	shell	ui=0 但 import workspace.zig
+src/ui/status_connection_styles.zig	src/features/shell/view/status_connection_styles.zig	view	shell	
+src/ui/status_connection_view.zig	src/features/shell/view/status_connection_view.zig	view	shell	
+src/ui/status_controller.zig	src/features/shell/model/status_controller.zig	model	shell	ui=0；被 src/main.zig 使用
+src/ui/status_detail_styles.zig	src/features/shell/view/status_detail_styles.zig	view	shell	
+src/ui/status_detail_view.zig	src/features/shell/view/status_detail_view.zig	view	shell	
+src/ui/status_hover_preview.zig	src/features/shell/view/status_hover_preview.zig	view	shell	
+src/ui/status_theme_styles.zig	src/features/shell/view/status_theme_styles.zig	view	shell	
+src/ui/status_theme_view.zig	src/features/shell/view/status_theme_view.zig	view	shell	
+src/ui/status_transfer_styles.zig	src/features/shell/view/status_transfer_styles.zig	view	shell	
+src/ui/status_transfer_view.zig	src/features/shell/view/status_transfer_view.zig	view	shell	
+src/ui/tab_color_picker.zig	src/features/shell/view/tab_color_picker.zig	view	shell	
+src/ui/tab_picker.zig	src/features/shell/view/tab_picker.zig	view	shell	
+src/ui/tab_rename.zig	src/features/shell/view/tab_rename.zig	view	shell	
+src/ui/tab_strip_layout.zig	src/features/shell/model/tab_strip_layout.zig	model	shell	被 workspace.zig/workspace_chrome.zig 使用
+src/ui/terminal_cell_graphics.zig	src/features/terminal/view/terminal_cell_graphics.zig	view	terminal	import ui
+src/ui/terminal_document.zig	src/features/terminal/model/terminal_document.zig	model	terminal	没有被 core 直接 import，不下沉
+src/ui/terminal_document_source.zig	src/host/terminal_document_source.zig	core	terminal	被 core import: src/plugins/ssh/terminal_service.zig; 也被 history_cast(->vt) 依赖; 不 import ui; 超出 §5.2 已知名单
+src/ui/terminal_export.zig	src/features/terminal/host/terminal_export.zig	host	terminal	不 import ui; 做文件写入 I/O 故归 host; session_export(workspace) 与 terminal_view 引用
+src/ui/terminal_file_bridge.zig	src/features/terminal/host/terminal_file_bridge.zig	host	terminal	bridge + 线程原子量; 依赖 application_host 与 ai/plugin_tools
+src/ui/terminal_file_job.zig	src/features/terminal/host/terminal_file_job.zig	host	terminal	文件任务 + mutex; 依赖 application_host 与 ai; ai_local_tools_tests 引用
+src/ui/terminal_overlay_styles.zig	src/features/terminal/view/terminal_overlay_styles.zig	view	terminal	import ui
+src/ui/terminal_record_geometry.zig	src/vt/terminal_record_geometry.zig	core	terminal	被 core import: src/vt/search_snapshot.zig, src/vt/snapshot.zig (§5.2 已知); 引用 donation_qr.zig(非本包) 的 Slice 类型, 需一并下沉或解耦
+src/ui/terminal_scrollbar.zig	src/features/terminal/view/terminal_scrollbar.zig	view	terminal	import ui
+src/ui/terminal_search.zig	src/features/terminal/view/terminal_search.zig	view	terminal	import ui
+src/ui/terminal_search_styles.zig	src/features/terminal/view/terminal_search_styles.zig	view	terminal	import ui
+src/ui/terminal_selection.zig	src/features/terminal/model/terminal_selection.zig	model	terminal	不 import ui
+src/ui/terminal_status_snapshot.zig	src/features/terminal/model/terminal_status_snapshot.zig	model	terminal	不 import ui; ssh_status_host(connections 包) 也引用
+src/ui/terminal_styles.zig	src/features/terminal/view/terminal_styles.zig	view	terminal	import ui
+src/ui/terminal_surface.zig	src/features/terminal/view/terminal_surface.zig	view	terminal	1525 行; 视图+输入+合成文档状态混合
+src/ui/terminal_surface_input.zig	src/features/terminal/view/terminal_surface_input.zig	view	terminal	import ui; 输入事件处理
+src/ui/terminal_surface_tests.zig	src/features/terminal/tests/terminal_surface_view_tests.zig	tests	terminal	2914 行; 与根目录 src/terminal_surface_tests.zig 同名冲突故改名 (被 root 包装文件及 background_surface_tests/settings_runtime_consumer_tests 以 ui/terminal_surface_tests.zig 路径 import)
+src/ui/terminal_view.zig	src/features/terminal/view/terminal_view.zig	view	terminal	8469 行混合巨型文件(§5.2); 被 core import: src/host/runtime_service.zig (TerminalViewNode 类型/mountTerminal), 属 check-arch 基线违规, 留待 P5
+src/ui/theme.zig	src/shared/ui/theme/theme.zig	shared_ui	shared-ui	旧版终端主题结构(Theme.sauber)，仅 src/root.zig:91 以 zerowork.theme 导出，无其它使用者；与 src/vt/theme.zig 不是同一文件(host/vt import 的是后者)；无 ui import，也可视为纯数据
+src/ui/theme/zerowork.tokens.json	src/shared/ui/theme/zerowork.tokens.json	shared_ui	shared-ui	build.zig:33/37 generateThemeLayers 硬编码此路径；另 vendor/DEPENDENCIES.md 引用
+src/ui/theme_states.zig	src/shared/ui/theme/theme_states.zig	shared_ui	shared-ui	被 app_theme/layer_materials/sidebar/settings/bmc 等 8 个文件 import；只依赖 ui
+src/ui/timestamp_gutter.zig	src/vt/timestamp_gutter.zig	core	terminal	被 core import: src/vt/text_projection.zig (§5.2 已知)
+src/ui/transfer_conflict_styles.zig	src/features/transfer/view/transfer_conflict_styles.zig	view	transfer	import ui; 跟随 transfer_conflict_view；core 未 import
+src/ui/transfer_conflict_view.zig	src/features/transfer/view/transfer_conflict_view.zig	view	transfer	import ui; core 未 import；836 行；依赖 file_workspace_icons（files/shared）
+src/ui/transfer_events_styles.zig	src/features/transfer/view/transfer_events_styles.zig	view	transfer	import ui; 跟随 transfer_events_view；core 未 import
+src/ui/transfer_events_view.zig	src/features/transfer/view/transfer_events_view.zig	view	transfer	import ui; core 未 import
+src/ui/transfer_manager_view.zig	src/features/transfer/view/transfer_manager_view.zig	view	transfer	1842 行，含虚拟列表/行/任务逻辑；import ui；core 未 import（被 ui/workspace.zig、main.zig 使用）；依赖 status_transfer_view（CONTESTED）
+src/ui/transfer_panel.zig	src/features/transfer/view/transfer_panel.zig	view	transfer	import ui，不下沉；config/transfer_defaults 对它的 import 留在基线；mixed
+src/ui/transfer_styles.zig	src/features/transfer/view/transfer_styles.zig	view	transfer	import ui; core 未 import；被 transfer_events_view/transfer_panel/transfer_manager_view/status_transfer_view 共用
+src/ui/transfer_toolbar_view.zig	src/features/transfer/view/transfer_toolbar_view.zig	view	transfer	import ui; core 未 import；test_id 为 toolbar.transfers.*（前缀属 shell），挂载点在 main.zig 工具栏
+src/ui/v3_geometry.zig	src/shared/ui/styles/v3_geometry.zig	shared_ui	shell	使用者都是界面文件（settings 随迁），不进 core
+src/ui/wizard.zig	src/features/connections/wizard/view/wizard.zig	view	connections	1020 行，含向导视图与 host/plugin 依赖
+src/ui/wizard_probe.zig	src/features/connections/wizard/host/wizard_probe.zig	host	connections	ui=0 但开线程做探测（Thread/spawn）且 import wizard.zig、session_lifecycle
+src/ui/wizard_styles.zig	src/features/connections/wizard/view/wizard_styles.zig	view	connections	被 plugins/remote、plugins/bmc_ikvm、plugins/fixture_probe import
+src/ui/wizard_test_progress.zig	src/features/connections/wizard/model/wizard_test_progress.zig	model	connections	ui=0 但 import connection_progress_view；被 plugins/remote/editor.zig import
+src/ui/workspace.zig	src/features/workspace/view/workspace.zig	view	workspace	8780 行混合巨型文件（模型/视图/宿主）；整体放 view
+src/ui/workspace_chrome.zig	src/features/workspace/view/workspace_chrome.zig	view	workspace	
+src/ui/workspace_model.zig	src/features/workspace/model/workspace_model.zig	model	workspace	
+src/ui/workspace_tab_styles.zig	src/features/workspace/view/workspace_tab_styles.zig	view	workspace	被 main.zig 引用；与 shell 页签样式可能重叠
+src/ui_constraint_tests.zig	src/shared/ui/tests/ui_constraint_tests.zig	tests	shared-ui	跨 feature 约束测试
+src/ui_theme_test_support.zig	src/shared/testing/ui_theme_test_support.zig	shared_testing	shared-ui	被 8 个根测试 import；import ui+ui/shell_styles+ui/app_theme
+src/update/app_host.zig	src/features/update/host/app_host.zig	host	update	§5.2 点名；import ui、ui/app_theme、ui/app_update_view、host/session_host、platform/realtime、update/{admission,client,close_coordinator}（core，搬后需改为跨目录相对路径）；被 src/main.zig:17,17443 引用
+src/update_tests.zig	src/tests_update.zig	root	update	test-update 构建根
+src/vt_conformance_runner.zig	src/vt/acceptance/vt_conformance_runner.zig	core	root-core	依据 import 分布 vt:1; 构建根(build.zig:106)，搬进子目录后须经根目录多路复用根引入
+src/wizard_probe_tests.zig	src/features/connections/wizard/tests/wizard_probe_tests.zig	tests	connections	
+src/wizard_test_progress_tests.zig	src/features/connections/wizard/tests/wizard_test_progress_tests.zig	tests	connections	
+src/wizard_tests.zig	src/features/connections/wizard/tests/wizard_tests.zig	tests	connections	

@@ -8,11 +8,111 @@
 //! setStructureNotifyCallback).
 
 const std = @import("std");
+const node_interaction_untrusted = @import("node_interaction.zig");
 const world_mod = @import("world.zig");
 const node_mod = @import("node.zig");
 
 const Node = node_mod.Node;
 const Allocator = std.mem.Allocator;
+
+/// Diagnostic renderer seam. Production builds erase the fields and every call.
+/// Subscribe before creating nodes; callbacks may copy patches but MUST NOT mutate
+/// nodes or subscriptions. This is a forest protocol, independent of Cx.root:
+/// detached retained nodes and rootless overlays stay alive until destroy.
+pub const host_enabled = @import("builtin").is_test or @import("zenit_environment").dev_preview or @import("zenit_environment").web_host;
+pub const HostId = u64;
+pub const HostPatch = union(enum) {
+    create: struct { id: HostId, world: u16, element: u32, tag: @import("types.zig").ElementTag, node: *const Node },
+    /// Move an existing child, inserting before anchor (null means append).
+    /// Covers first insert, reparent and reorder without changing identity.
+    place: struct { id: HostId, parent: HostId, before: ?HostId },
+    retained_remove: HostId,
+    destroy: HostId,
+    dirty: HostId,
+};
+pub const Host = struct {
+    context: *anyopaque,
+    patch: *const fn (*anyopaque, HostPatch) void,
+    next: ?*Host = null,
+
+    pub fn attach(self: *Host) void {
+        if (comptime !host_enabled) return;
+        if (host_notifying) @panic("renderer host callback reentry");
+        var current = hosts;
+        while (current) |h| : (current = h.next) {
+            if (h == self) @panic("renderer host already attached");
+        }
+        self.next = hosts;
+        hosts = self;
+    }
+    pub fn detach(self: *Host) void {
+        if (comptime !host_enabled) return;
+        if (host_notifying) @panic("renderer host callback reentry");
+        var link = &hosts;
+        while (link.*) |h| {
+            if (h == self) {
+                link.* = h.next;
+                self.next = null;
+                return;
+            }
+            link = &h.next;
+        }
+    }
+};
+var hosts: ?*Host = null;
+var host_notifying = false;
+var host_generation: HostId = 0;
+
+fn publishHost(patch: HostPatch) void {
+    if (comptime !host_enabled) return;
+    if (host_notifying) @panic("renderer host callback reentry");
+    host_notifying = true;
+    defer host_notifying = false;
+    var current = hosts;
+    while (current) |h| : (current = h.next) h.patch(h.context, patch);
+}
+
+pub inline fn hostCreated(node: *Node) void {
+    if (comptime !host_enabled) return;
+    // A process-lifetime generation, independent of pointer/ElementId/u8 reuse.
+    // Never wrap: a stale patch must never address a new node, even after 256 frees.
+    host_generation = std.math.add(HostId, host_generation, 1) catch @panic("renderer host identity exhausted");
+    node.host_id = host_generation;
+    publishHost(.{ .create = .{ .id = node.host_id, .world = node.world_id, .element = node.element_id_raw, .tag = node.tag, .node = node } });
+}
+/// Advances on every node mutation that reaches the host channel: every dirty mark (all
+/// node_dirty mark functions start with hostDirty), placement and retained removal. Event-time
+/// hit refreshes compare it with its value at the last before-render tick: with no mutation since,
+/// re-running the tick at the same frame time cannot change the scene (cx_render.ensureHitTestSceneFresh).
+pub var g_scene_mutation_gen: u64 = 0;
+
+/// Advances whenever a node starts retiring (Node.pending_free_cx set) or
+/// freeing (Node.freeing set). A traversal that saw no advance since it began
+/// knows every node on its stack still passes the check it made on entry
+/// (render_engine/tick.zig isRetiring).
+pub var g_retire_gen: u64 = 0;
+
+pub inline fn hostDestroyed(node: *const Node) void {
+    g_scene_mutation_gen +%= 1;
+    if (comptime !host_enabled) return;
+    publishHost(.{ .destroy = node.host_id });
+}
+pub inline fn hostDirty(node: *const Node) void {
+    g_scene_mutation_gen +%= 1;
+    if (comptime !host_enabled) return;
+    if (node.freeing) return;
+    publishHost(.{ .dirty = node.host_id });
+}
+fn hostPlaced(parent: *const Node, child: *const Node, before: ?*const Node) void {
+    g_scene_mutation_gen +%= 1;
+    if (comptime !host_enabled) return;
+    publishHost(.{ .place = .{ .id = child.host_id, .parent = parent.host_id, .before = if (before) |b| b.host_id else null } });
+}
+fn hostRetained(child: *const Node) void {
+    g_scene_mutation_gen +%= 1;
+    if (comptime !host_enabled) return;
+    publishHost(.{ .retained_remove = child.host_id });
+}
 
 // ---------------------------------------------------------------------------
 // Structure callback unit (moved wholesale from node.zig)
@@ -31,10 +131,26 @@ pub fn structureRevision() u64 {
     return g_structure_revision;
 }
 
-/// Invalidates retained topology consumers without coupling independent windows.
+/// Advance the global serial and the serial of `node`'s owner World, so retained topology
+/// consumers in one window are not invalidated by another window's tree changes.
 pub fn recordStructureChange(node: *Node) void {
     g_structure_revision +%= 1;
     if (node.world_ref) |world| world.structure_revision +%= 1;
+}
+
+/// `NodeRuntime.hidden.settle_pending` up from `parent` (whose children just changed) until an
+/// ancestor already has it. Not stopped by layout isolation (layout-dirty marks are) nor by
+/// display: none (hidden roots nest): the hidden settlement above must learn about every shape
+/// change below it. A set bit implies set ancestors, except where a settlement has since cleared
+/// the whole set part of a subtree, so stopping at the first set ancestor misses no hidden root;
+/// amortized O(1). Called at the tree mutations themselves (append / insert / reorder / remove),
+/// not from `recordStructureChange`, which also serves metadata-only invalidation.
+fn markHiddenSettlePending(parent: *Node) void {
+    var cur: ?*Node = parent;
+    while (cur) |n| : (cur = n.parent) {
+        if (n.frame_state.frame_local.runtime.hidden.settle_pending) return;
+        n.frame_state.frame_local.runtime.hidden.settle_pending = true;
+    }
 }
 
 /// Sync one parent-child chain change to the node's owner World's elements table.
@@ -105,6 +221,7 @@ pub fn appendChild(self: *Node, allocator: Allocator, child: *Node) !void {
     if (child.parent) |old_parent| old_parent.removeChildRetained(child);
     self.children.appendAssumeCapacity(child);
     recordStructureChange(self);
+    markHiddenSettlePending(self);
     child.parent = self;
     // Child has custom_draw -> bubble mark.
     if (child.frame_state.state_bits.flags.has_custom_draw_subtree) {
@@ -114,6 +231,10 @@ pub fn appendChild(self: *Node, allocator: Allocator, child: *Node) !void {
     // has_custom_draw_subtree).
     if (child.frame_state.state_bits.flags.has_text_subtree) self.markSubtreeText();
     if (child.frame_state.state_bits.flags.has_before_render_subtree) self.markSubtreeBeforeRenderHook();
+    if (child.frame_state.state_bits.flags.has_untrusted_before_render_subtree) node_interaction_untrusted.markSubtreeUntrustedBeforeRenderHook(self);
+    // A pending translate-only move inside the attached subtree must stay reachable from the
+    // root (the commit walk follows subtree_translation).
+    if (child.frame_state.state_bits.dirty.hit.subtree_translation) @import("node_dirty.zig").bubbleSubtreeTranslation(self);
     child.frame_state.state_bits.dirty.runtime.dirty = true;
     child.frame_state.state_bits.dirty.runtime.subtree_dirty = true;
     child.frame_state.state_bits.dirty.runtime.full_rebuild = false;
@@ -123,6 +244,7 @@ pub fn appendChild(self: *Node, allocator: Allocator, child: *Node) !void {
     // P0-3 phase 3: sync parent-child chain directly to owner World; no more
     // process-level callback.
     syncWorldStructure(self, child, .append);
+    hostPlaced(self, child, null);
 }
 
 /// Insert child before anchor; null anchor is equivalent to appendChild. Anchor
@@ -145,10 +267,15 @@ pub fn insertChildBefore(self: *Node, allocator: Allocator, child: *Node, before
     const index = std.mem.indexOfScalar(*Node, self.children.items, anchor) orelse unreachable;
     self.children.insertAssumeCapacity(index, child);
     recordStructureChange(self);
+    markHiddenSettlePending(self);
     child.parent = self;
     if (child.frame_state.state_bits.flags.has_custom_draw_subtree) self.markCustomDrawSubtree();
     if (child.frame_state.state_bits.flags.has_text_subtree) self.markSubtreeText();
     if (child.frame_state.state_bits.flags.has_before_render_subtree) self.markSubtreeBeforeRenderHook();
+    if (child.frame_state.state_bits.flags.has_untrusted_before_render_subtree) node_interaction_untrusted.markSubtreeUntrustedBeforeRenderHook(self);
+    // A pending translate-only move inside the attached subtree must stay reachable from the
+    // root (the commit walk follows subtree_translation).
+    if (child.frame_state.state_bits.dirty.hit.subtree_translation) @import("node_dirty.zig").bubbleSubtreeTranslation(self);
     child.frame_state.state_bits.dirty.runtime.dirty = true;
     child.frame_state.state_bits.dirty.runtime.subtree_dirty = true;
     child.frame_state.state_bits.dirty.runtime.full_rebuild = false;
@@ -157,6 +284,7 @@ pub fn insertChildBefore(self: *Node, allocator: Allocator, child: *Node, before
     self.markOrderDirty();
     self.markLayoutDirty();
     syncWorldInsertBefore(self, child, anchor, index);
+    hostPlaced(self, child, anchor);
 }
 
 /// World sync for insertChildBefore. O(1) linked-list insert with world_ref;
@@ -214,10 +342,15 @@ pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []
     // Ownership stays with the caller; this operation never runs cleanup.
     for (self.children.items) |child| {
         syncWorldStructure(self, child, .unlink);
+        // Omitted from the new order: it leaves self, like removeChildRetained (raw writes made
+        // to it in a verified hook subtree must not replay where it goes, raw_shadow.onDetached).
+        if (!seen.contains(child)) @import("render_engine/raw_shadow.zig").onDetached(child);
         child.parent = null;
+        hostRetained(child);
     }
     self.children.clearRetainingCapacity();
     recordStructureChange(self);
+    markHiddenSettlePending(self);
     for (order) |child| {
         if (child.parent) |old_parent| old_parent.removeChildRetained(child);
         self.children.appendAssumeCapacity(child);
@@ -225,11 +358,16 @@ pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []
         if (child.frame_state.state_bits.flags.has_custom_draw_subtree) self.markCustomDrawSubtree();
         if (child.frame_state.state_bits.flags.has_text_subtree) self.markSubtreeText();
         if (child.frame_state.state_bits.flags.has_before_render_subtree) self.markSubtreeBeforeRenderHook();
+        if (child.frame_state.state_bits.flags.has_untrusted_before_render_subtree) node_interaction_untrusted.markSubtreeUntrustedBeforeRenderHook(self);
+        // A pending translate-only move inside the attached subtree must stay reachable from the
+        // root (the commit walk follows subtree_translation).
+        if (child.frame_state.state_bits.dirty.hit.subtree_translation) @import("node_dirty.zig").bubbleSubtreeTranslation(self);
         if (membership_changed) {
             child.frame_state.state_bits.dirty.runtime.dirty = true;
             child.frame_state.state_bits.dirty.runtime.subtree_dirty = true;
         }
         syncWorldStructure(self, child, .append);
+        hostPlaced(self, child, null);
     }
     if (membership_changed) self.markRuntimeIndexDirty();
     self.markOrderDirty();
@@ -263,6 +401,10 @@ fn removeChildRetainedInternal(self: *Node, child: *Node, full_runtime_rebuild: 
     const index = std.mem.indexOfScalar(*Node, self.children.items, child) orelse return;
     _ = self.children.orderedRemove(index);
     recordStructureChange(self);
+    markHiddenSettlePending(self);
+    // A subtree leaving (or moving within) a verified hook subtree may carry raw writes its new
+    // place never verifies: its caches go, it re-records once (render_engine/raw_shadow.zig).
+    @import("render_engine/raw_shadow.zig").onDetached(child);
     if (full_runtime_rebuild) {
         self.markRuntimeIndexFullRebuild();
     }
@@ -270,6 +412,7 @@ fn removeChildRetainedInternal(self: *Node, child: *Node, full_runtime_rebuild: 
     self.markLayoutDirty();
     // P0-3 phase 3: same as above, direct owner World.
     syncWorldStructure(self, child, .unlink);
+    hostRetained(child);
 }
 
 /// Remove all children, recursively fire onCleanup. Note: doesn't free memory;

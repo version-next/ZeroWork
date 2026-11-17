@@ -91,7 +91,7 @@ pub const State = struct {
         const batch = startsAny(instruction, &.{ "这次批处理执行", "这次批量执行", "run as batch" });
         if (@as(u8, @intFromBool(current)) + @as(u8, @intFromBool(fresh)) + @as(u8, @intFromBool(batch)) != 1) return;
         const handle = selected orelse return; // groups never infer active/pin
-        if (context.binding == .session and context.binding.session != @backingInt(handle.session_id)) return error.TargetOutsideScope;
+        if (context.contentOf() == .session and context.contentOf().session != @backingInt(handle.session_id)) return error.TargetOutsideScope;
         const route: Route = if (current) .current_terminal else if (fresh and !containsAny(instruction, &.{ "批量", "批处理", "batch" })) .new_terminal else .batch;
         self.grant = .{ .context = context, .choice = .{ .route = route, .create_new = fresh, .source = .{ .session = handle }, .retention = if (containsAny(submitted, &.{ "后保留", "并保留", "and keep" })) .keep else retention } };
     }
@@ -174,9 +174,60 @@ pub const State = struct {
         self.lock();
         defer self.mutex.unlock();
         const grant = if (self.grant) |*value| value else return error.RouteGrantNotFound;
-        if (!grant.context.eql(prior) or prior.binding != .session or next.binding != .group or prior.binding.session != @backingInt(initial.session_id) or !prior.conversation_id.eql(next.conversation_id) or !prior.task_id.eql(next.task_id) or prior.grant_revision != next.grant_revision or next.binding_revision != prior.binding_revision +| 1 or !(grant.choice.route == .new_terminal or grant.choice.create_new) or !grant.choice.source.eql(.{ .session = initial })) return error.RouteGrantChanged;
+        try handoffAllowed(grant.*, prior, next, initial);
         self.context = next;
         grant.context = next;
+    }
+    /// A route choice held across the handoff commit (`hold` / `handoffHeld`).
+    pub const Held = struct { grant: Grant };
+    /// Committing the session -> group handoff supersedes the worker's pending approvals, and
+    /// superseding revokes the route choice (as it must for steering). The lifecycle commit holds
+    /// the choice just before and hands exactly that choice on afterwards.
+    pub fn hold(self: *State, context: host.Context) ?Held {
+        self.lock();
+        defer self.mutex.unlock();
+        const grant = self.grant orelse return null;
+        if (!grant.context.eql(context)) return null;
+        return .{ .grant = grant };
+    }
+    /// `handoff` for a held choice: the same transition checks; the live choice must be the held
+    /// one or gone (revoked by the commit). A failed check leaves the live state unchanged.
+    pub fn handoffHeld(self: *State, held: Held, prior: host.Context, next: host.Context, initial: identity.SessionHandle) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.grant) |current| if (!std.meta.eql(current, held.grant)) return error.RouteGrantChanged;
+        try handoffAllowed(held.grant, prior, next, initial);
+        var grant = held.grant;
+        grant.context = next;
+        self.grant = grant;
+        self.context = next;
+    }
+    /// The live choice, held across an environment refresh that supersedes approvals (`restore`):
+    /// after a committed lifecycle transition (`transition`), or while the choice waits for the
+    /// session its own bound create makes (that session joining the group changes the
+    /// environment). Such a choice still runs only its exact command on the identity `created`
+    /// proves.
+    pub fn holdLive(self: *State, transition: bool) ?Held {
+        self.lock();
+        defer self.mutex.unlock();
+        const grant = self.grant orelse return null;
+        const context = self.context orelse return null;
+        if (!grant.context.eql(context)) return null;
+        if (!transition and !(grant.create != null and grant.created == null)) return null;
+        return .{ .grant = grant };
+    }
+    /// Put a held choice back after a refresh revoked it: only into the same context, and only
+    /// when no other choice was made meanwhile.
+    pub fn restore(self: *State, held: Held) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.grant != null) return;
+        const context = self.context orelse return;
+        if (!held.grant.context.eql(context)) return;
+        self.grant = held.grant;
+    }
+    fn handoffAllowed(grant: Grant, prior: host.Context, next: host.Context, initial: identity.SessionHandle) !void {
+        if (!grant.context.eql(prior) or prior.contentOf() != .session or next.contentOf() != .group or prior.contentOf().session != @backingInt(initial.session_id) or !prior.conversation_id.eql(next.conversation_id) or !prior.task_id.eql(next.task_id) or prior.grant_revision != next.grant_revision or next.binding_revision != prior.binding_revision +| 1 or !(grant.choice.route == .new_terminal or grant.choice.create_new) or !grant.choice.source.eql(.{ .session = initial })) return error.RouteGrantChanged;
     }
     pub fn consume(self: *State, context: host.Context, target: identity.SessionHandle, command: []const u8) void {
         self.lock();

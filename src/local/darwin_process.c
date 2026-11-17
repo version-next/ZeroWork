@@ -5,7 +5,6 @@
 #include <libproc.h>
 #include <limits.h>
 #include <poll.h>
-#include <pwd.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdlib.h>
@@ -144,19 +143,11 @@ static int signal_groups(ZW_LOCAL_PROCESS *p, int signal_number) {
     return 0;
 }
 
+/* The Zig caller always supplies the directory (the user's home comes from
+ * platform/user_dirs.zig); this layer never looks up the account itself. */
 static char *resolve_cwd(const char *cwd) {
-    if (cwd) return realpath(cwd, NULL);
-    long needed = sysconf(_SC_GETPW_R_SIZE_MAX);
-    size_t size = needed > 0 ? (size_t)needed : 16384;
-    if (size > 1024 * 1024) { errno = ERANGE; return NULL; }
-    char *buffer = malloc(size);
-    if (!buffer) return NULL;
-    struct passwd record, *result = NULL;
-    int rc = getpwuid_r(getuid(), &record, buffer, size, &result);
-    char *resolved = rc == 0 && result ? realpath(result->pw_dir, NULL) : NULL;
-    if (!resolved && rc) errno = rc;
-    free(buffer);
-    return resolved;
+    if (!cwd) { errno = EINVAL; return NULL; }
+    return realpath(cwd, NULL);
 }
 
 static void child_failed(int fd, int stage) {

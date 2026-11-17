@@ -1118,7 +1118,7 @@ test "wizard host options persist through registry serialization and snapshot" {
     try std.testing.expectEqual(@as(u16, 9090), host.socks_port);
     try std.testing.expectEqualStrings("0.0.0.0", host.socks_bind);
     try std.testing.expectEqual(@as(?usize, 0), host.socks_exit);
-    var snapshot = try @import("../ui/session_lifecycle.zig").Snapshot(HostConfig).init(std.testing.allocator, host);
+    var snapshot = try @import("../host/session_lifecycle.zig").Snapshot(HostConfig).init(std.testing.allocator, host);
     defer snapshot.deinit();
     try std.testing.expect(snapshot.value.terminal_type.ptr != host.terminal_type.ptr);
     try std.testing.expect(snapshot.value.socks_bind.ptr != host.socks_bind.ptr);
@@ -1216,4 +1216,24 @@ test "command info host tri state survives canonical host storage" {
     try std.testing.expectEqual(@as(?bool, false), reloaded.hosts[2].command_info);
     try std.testing.expect(reloaded.hosts[0].auto_shell_integration == null);
     try std.testing.expectError(error.InvalidValue, Registry.parse(std.testing.allocator, "[[hosts]] name=\"bad\";host=\"h\";user=\"u\";command_info=7\n"));
+}
+
+test "protocol values the connection editor never implemented still load as unknown, non-connectable hosts" {
+    // The editor's `Protocol` enum dropped scp / mosh / telnet / serial / ftps / vnc / rdp / kvm
+    // (PLUGIN_ARCH_PLAN 6.2.1 Q1). That enum is never persisted: a saved host with any of these
+    // values keeps it as `protocol_id`, is listed as an unknown plugin and round-trips unchanged.
+    inline for (.{ "scp", "mosh", "telnet", "serial", "ftps", "vnc", "rdp", "kvm" }) |value| {
+        const source = "[registry]\nschema_version=2\nrevision=1\n[[hosts]]\nconnection_id=1\nname=\"old\"\nprotocol=\"" ++ value ++ "\"\nhost=\"10.0.0.1\"\nport=5900\nuser=\"admin\"\n";
+        var first = try Registry.parse(std.testing.allocator, source);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 1), first.hosts.len);
+        try std.testing.expectEqualStrings(value, first.hosts[0].protocolId());
+        try std.testing.expect(!first.hosts[0].isLegacy());
+        try first.hosts[0].validate();
+        const encoded = try first.encode(std.testing.allocator);
+        defer std.testing.allocator.free(encoded);
+        var second = try Registry.parse(std.testing.allocator, encoded);
+        defer second.deinit();
+        try std.testing.expectEqualStrings(value, second.hosts[0].protocolId());
+    }
 }

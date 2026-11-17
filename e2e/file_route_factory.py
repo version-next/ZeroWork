@@ -19,6 +19,11 @@ import time
 
 import paramiko
 from sftp_readonly import Files, State
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
@@ -212,6 +217,7 @@ def main():
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("dist/ssh-acceptance/20261020/file-route-factory"))
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     frozen_runner = args.output_dir / "file-route-factory-frozen"

@@ -1,5 +1,8 @@
 //! Durable cursor for committed directory backgrounds, separate from settings.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
+/// 只认 version 1；其他版本视同没有进度（不报错）。
+const schema = persist.SchemaRange.exactly(1);
 const Playlist = @import("background_playlist.zig").Playlist;
 
 pub const filename = "background-rotation.json";
@@ -17,14 +20,7 @@ pub fn save(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, directory
     const bytes = try std.json.Stringify.valueAlloc(allocator, Snapshot{ .directory = directory, .random = list.random, .index = list.index, .paths = list.paths.items }, .{});
     defer allocator.free(bytes);
     if (bytes.len > max_bytes) return error.BackgroundProgressTooLarge;
-    var atomic = try dir.createFileAtomic(io, filename, .{ .permissions = @fromBackingInt(0o600), .replace = true });
-    defer atomic.deinit(io);
-    var buffer: [4096]u8 = undefined;
-    var writer = atomic.file.writer(io, &buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
-    try atomic.file.sync(io);
-    try atomic.replace(io);
+    try persist.writeAtomic(io, dir, filename, bytes, .{});
 }
 
 /// Reconcile against the freshly scanned paths. Never open paths supplied by
@@ -35,7 +31,7 @@ pub fn restore(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, direct
     const parsed = try std.json.parseFromSlice(Snapshot, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const saved = parsed.value;
-    if (saved.version != 1 or saved.index >= saved.paths.len or saved.random != list.random or !std.mem.eql(u8, directory, saved.directory)) return;
+    if (!schema.accepts(saved.version) or saved.index >= saved.paths.len or saved.random != list.random or !std.mem.eql(u8, directory, saved.directory)) return;
     var remaining: std.StringHashMap(void) = .init(allocator);
     defer remaining.deinit();
     for (list.paths.items) |path| try remaining.put(path, {});

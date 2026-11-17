@@ -2,7 +2,7 @@
 """Regenerate source-colour OS artwork (requires Pillow and resvg-py).
 
 Official brand marks are used only to identify the remote operating system.
-Existing host icon IDs are retained; see src/ui/assets/host-os/README.md.
+Existing host icon IDs are retained; see src/shared/ui/assets/host-os/README.md.
 """
 import argparse
 import base64
@@ -15,7 +15,7 @@ import resvg_py
 from os_logo_extract import prepare
 
 ROOT = Path(__file__).resolve().parents[1]
-DEST = ROOT / "src/ui/assets/host-os"
+DEST = ROOT / "src/shared/ui/assets/host-os"
 SOURCES = {
     "kylin": "https://raw.githubusercontent.com/ukui/ukui-themes/master/icons/ukui-classical/scalable/places/start-here.svg",
     "neokylin": "https://p3-sdbk2-media.byteimg.com/tos-cn-i-xv4ileqgde/d9fb1b4ea2554a70baa0ac24db8f2f51~tplv-xv4ileqgde-resize-w:720.image",

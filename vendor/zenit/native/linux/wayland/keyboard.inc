@@ -88,7 +88,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     (void)keyboard; (void)serial; ZenitWaylandWindow *w = data;
     if (surface != w->surface) return;
     cancel_keyboard(w); w->keyboard_focused = 1;
-    if (getenv("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME keyboard enter\n");
+    if (zenitAutomationEnvironment("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME keyboard enter\n");
     if (!keys || keys->size % sizeof(uint32_t)) { w->closed = 1; return; }
     for (size_t i = 0; i < keys->size / sizeof(uint32_t); ++i) {
         uint32_t key; memcpy(&key, (char *)keys->data + i * sizeof(key), sizeof(key));
@@ -98,7 +98,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface) {
     (void)keyboard; (void)serial; (void)surface; ZenitWaylandWindow *w = data;
     cancel_keyboard(w); w->keyboard_focused = 0; clipboard_focus_lost(w);
-    if (getenv("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME keyboard leave\n");
+    if (zenitAutomationEnvironment("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME keyboard leave\n");
 }
 static void emit_keyboard_press(ZenitWaylandWindow *w, uint32_t key, int repeat) {
     uint32_t modifiers = keyboard_modifiers(w);
@@ -120,7 +120,7 @@ static void emit_keyboard_press(ZenitWaylandWindow *w, uint32_t key, int repeat)
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
     (void)keyboard; (void)serial; (void)time; ZenitWaylandWindow *w = data;
-    if (getenv("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME raw key received focused=%d pressed=%u\n", w->keyboard_focused, state);
+    if (zenitAutomationEnvironment("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, "IME raw key received focused=%d pressed=%u\n", w->keyboard_focused, state);
     if (!w->keyboard_focused || !w->xkb_state || key >= 768) return;
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         clipboard_input_serial(w, serial);

@@ -3,6 +3,7 @@ const http = @import("provider_http.zig");
 const provider = @import("provider.zig");
 const provider_config = @import("provider_config.zig");
 const registry = @import("registry.zig");
+const net_connect = @import("../platform/net_connect.zig");
 
 pub const max_response_bytes: usize = 8 * 1024 * 1024;
 /// An owned transport response. `send` allocates `body` with the allocator it
@@ -240,7 +241,10 @@ fn nativeSendUnbounded(raw: *anyopaque, plan: http.RequestPlan, body: []const u8
 
 fn nativeSendStreamUnbounded(raw: *anyopaque, plan: http.RequestPlan, body: []const u8, allocator: std.mem.Allocator, sink: ChunkSink, sink_ctx: *anyopaque) anyerror!ResponseMeta {
     const context: *NativeContext = @ptrCast(@alignCast(raw));
-    var client: std.http.Client = .{ .allocator = allocator, .io = context.io };
+    // Dial through net_connect: a sandbox / firewall EPERM is an ordinary connect
+    // failure here, never std.Io.Threaded's errnoBug abort (REQUESTS #53).
+    var dialer: net_connect.Guarded = .{ .base = context.io };
+    var client: std.http.Client = .{ .allocator = allocator, .io = dialer.io() };
     defer client.deinit();
     const uri = try std.Uri.parse(plan.endpoint);
     var auth_buf: [4096]u8 = undefined;
@@ -1311,4 +1315,8 @@ test "deadline regression send queued expiry and Stop cannot dispatch or allocat
     try std.testing.expectEqual(@as(usize, 0), script.calls);
     try std.testing.expectEqual(@as(usize, 0), counting.allocations);
     try std.testing.expectEqual(@as(usize, 0), counting.deallocations);
+}
+
+test {
+    _ = net_connect;
 }

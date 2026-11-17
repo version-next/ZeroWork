@@ -1,0 +1,1306 @@
+const std = @import("std");
+const ui = @import("ui");
+const LocalTools = @import("../host/ai_local_tools.zig");
+const Application = @import("../../../shell/host/application_host.zig").ApplicationHost;
+const Workspace = @import("../../../workspace/view/workspace.zig").Workspace;
+const Config = @import("../../../../config/config.zig").Config;
+const scope_mod = @import("../../../../ai/tool_scope.zig");
+const Loop = @import("../../../../ai/tool_loop.zig");
+const provider = @import("../../../../ai/provider.zig");
+const clock = @import("../../../../platform/realtime.zig");
+const a = std.testing.allocator;
+extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+extern "c" fn unsetenv([*:0]const u8) c_int;
+test {
+    _ = @import("../host/ai_group_tools.zig");
+    _ = @import("../../../../ai/group_context.zig");
+    _ = @import("../host/ai_tab_context.zig");
+    // host.tab_context 查询参数的卡片类型实现（终端、文件）。
+    _ = @import("../host/ai_local_tools.zig");
+    _ = @import("../host/ai_file_tools.zig");
+    _ = @import("../../../../ai/tool_results.zig");
+    _ = @import("../../cards/tests/ai_tool_results_view_tests.zig");
+    _ = @import("../../attachments/view/ai_transcript_images.zig");
+}
+
+/// PL4a M9 golden（生产请求的工具列表与系统提示规则）：AI 能力从清单字段移到卡片类型前后，
+/// 同一会话准备出的 provider 工具定义（含 schema 与说明）与 session_prompt 生成的规则文本逐字不变。
+/// 摘要是对两者的 SHA-256；数值在改动前的代码上采集。
+fn requestGolden(wire: []const provider.ToolDefinition, prompt: []const u8) [64]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (wire) |tool| {
+        hash.update(@tagName(tool.tool));
+        hash.update(@tagName(tool.authority));
+        hash.update(std.mem.asBytes(&tool.session_ids.len));
+        if (tool.dynamic) |definition| {
+            hash.update(definition.id);
+            hash.update(&.{0});
+            hash.update(definition.name);
+            hash.update(&.{0});
+            hash.update(definition.schema);
+            hash.update(&.{0});
+            hash.update(definition.description);
+        }
+        hash.update(&.{0xff});
+    }
+    hash.update(prompt);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+fn expectRequestGolden(comptime label: []const u8, expected: []const u8, wire: []const provider.ToolDefinition, prompt: []const u8) !void {
+    const actual = requestGolden(wire, prompt);
+    if (!std.mem.eql(u8, expected, &actual)) {
+        std.debug.print("request golden {s}: {s} (tools={d})\n", .{ label, &actual, wire.len });
+        for (wire) |tool| std.debug.print("  tool {s}\n", .{tool.name()});
+        return error.RequestGoldenChanged;
+    }
+}
+
+const FileWorker = struct {
+    host: Loop.Host,
+    invocation: @import("../../../../ai/plugin_tools.zig").DynamicInvocation,
+    done: std.atomic.Value(bool) = .init(false),
+    results: ?[]@import("../../../../ai/plugin_tools.zig").ToolResult = null,
+    failure: ?anyerror = null,
+    fn run(self: *FileWorker) void {
+        self.results = self.host.execute_dynamic.?(self.host.context, self.invocation, a, null) catch |err| blk: {
+            self.failure = err;
+            break :blk null;
+        };
+        self.done.store(true, .release);
+    }
+};
+fn fileCall(f: *Fixture, bridge: *@import("../host/ai_tools.zig").Bridge, name: []const u8, arguments: []const u8, id: u64, confirm: bool) ![]u8 {
+    const table = bridge.requestTable().?;
+    var name_buffer: [64]u8 = undefined;
+    var parsed = try table.parse(a, try @import("../../../../ai/plugin_tools.zig").encodeName(&name_buffer, name), arguments);
+    defer parsed.deinit();
+    const call_id = try std.fmt.allocPrint(a, "file-call-{d}", .{id});
+    defer a.free(call_id);
+    var worker: FileWorker = .{ .host = bridge.interface(), .invocation = .{ .table = table, .parsed = parsed, .operation_id = id, .turn_id = 1, .call_id = call_id, .arguments = arguments } };
+    const thread = try std.Thread.spawn(.{}, FileWorker.run, .{&worker});
+    defer thread.join();
+    defer if (worker.results) |results| {
+        for (results) |*result| result.deinit(a);
+        a.free(results);
+    };
+    const deadline = clock.monotonicNs() + 6 * std.time.ns_per_s;
+    var approved = false;
+    while (!worker.done.load(.acquire) and clock.monotonicNs() < deadline) {
+        try f.tick(null);
+        bridge.pump(f.app);
+        if (bridge.pendingApproval()) |approval| {
+            try std.testing.expect(confirm);
+            try std.testing.expect(!approved);
+            try std.testing.expectEqualStrings(name, approval.tool_id.?);
+            try bridge.decide(approval.sequence, approval.arguments_hash, true);
+            approved = true;
+        }
+    }
+    if (!worker.done.load(.acquire)) {
+        bridge.shutdown(f.app);
+        return error.FileToolTimedOut;
+    }
+    try std.testing.expectEqual(confirm, approved);
+    if (worker.failure) |err| return err;
+    const result = worker.results.?[0];
+    return a.dupe(u8, result.blocks[0].structured);
+}
+
+test "terminal files registered Local tools create read edit and reject stale content through actual approval" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const owner = try f.prepare(&probe);
+    var bridge = @import("../host/ai_tools.zig").Bridge.init(a);
+    defer bridge.deinit();
+    try bridge.prepare(f.app, owner);
+    {
+        const prompt = try @import("../../../../ai/session_prompt.zig").build(a, .auto, bridge.wire);
+        defer a.free(prompt);
+        try expectRequestGolden("local", "a24aaa3632dd835f1b61f8c9b00e077db8d4e38b7203f9b3f657c8b651ed155f", bridge.wire, prompt);
+    }
+    const path = try std.fmt.allocPrint(a, "{s}/工具 'quoted'.txt", .{f.directory});
+    defer a.free(path);
+    const create = try std.json.Stringify.valueAlloc(a, .{ .session_ids = [_]u64{@backingInt(owner.session_id)}, .path = path, .text = "port=80\r\n" }, .{});
+    defer a.free(create);
+    const created = try fileCall(&f, &bridge, "file.write_text", create, 10001, true);
+    defer a.free(created);
+    const parsed_create = try std.json.parseFromSlice(std.json.Value, a, created, .{});
+    defer parsed_create.deinit();
+    try std.testing.expect(parsed_create.value.object.get("committed").?.bool);
+    try std.testing.expect(parsed_create.value.object.get("verified").?.bool);
+    const read_args = try std.json.Stringify.valueAlloc(a, .{ .session_ids = [_]u64{@backingInt(owner.session_id)}, .path = path }, .{});
+    defer a.free(read_args);
+    const read = try fileCall(&f, &bridge, "file.read_text", read_args, 10002, false);
+    defer a.free(read);
+    const parsed_read = try std.json.parseFromSlice(std.json.Value, a, read, .{});
+    defer parsed_read.deinit();
+    try std.testing.expectEqualStrings("port=80\r\n", parsed_read.value.object.get("text").?.string);
+    const edit_args = try std.json.Stringify.valueAlloc(a, .{ .session_ids = [_]u64{@backingInt(owner.session_id)}, .path = path, .expected_version = parsed_read.value.object.get("version").?.string, .edits = [_]@import("../../../../host/terminal_files.zig").Edit{.{ .old_text = "80", .new_text = "90" }} }, .{});
+    defer a.free(edit_args);
+    const edited = try fileCall(&f, &bridge, "file.edit_text", edit_args, 10003, true);
+    defer a.free(edited);
+    const parsed_edit = try std.json.parseFromSlice(std.json.Value, a, edited, .{});
+    defer parsed_edit.deinit();
+    try std.testing.expect(parsed_edit.value.object.get("committed").?.bool);
+    bridge.setPermissionMode(.auto);
+    const stale = try fileCall(&f, &bridge, "file.edit_text", edit_args, 10004, false);
+    defer a.free(stale);
+    const parsed_stale = try std.json.parseFromSlice(std.json.Value, a, stale, .{});
+    defer parsed_stale.deinit();
+    try std.testing.expectEqualStrings("SourceChanged", parsed_stale.value.object.get("error_code").?.string);
+    try std.testing.expect(!parsed_stale.value.object.get("committed").?.bool);
+    const actual = try f.tmp.dir.readFileAlloc(std.testing.io, std.fs.path.basename(path), a, .limited(1024));
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("port=90\r\n", actual);
+    const large = try a.alloc(u8, 65536);
+    defer a.free(large);
+    @memset(large, 'x');
+    const large_path = try std.fmt.allocPrint(a, "{s}/large.txt", .{f.directory});
+    defer a.free(large_path);
+    const large_args = try std.json.Stringify.valueAlloc(a, .{ .session_ids = [_]u64{@backingInt(owner.session_id)}, .path = large_path, .text = large }, .{});
+    defer a.free(large_args);
+    try std.testing.expect(large_args.len > 65536);
+    const large_result = try fileCall(&f, &bridge, "file.write_text", large_args, 10005, false);
+    defer a.free(large_result);
+    const large_json = try std.json.parseFromSlice(std.json.Value, a, large_result, .{});
+    defer large_json.deinit();
+    try std.testing.expect(large_json.value.object.get("committed").?.bool and large_json.value.object.get("verified").?.bool);
+    try std.testing.expectEqual(@as(i64, 65536), large_json.value.object.get("size").?.integer);
+}
+
+test "transcript image native read cache and rendering never change the provider request" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var bridge = LocalTools.Bridge.init(a);
+    defer bridge.deinit();
+    const owner = try f.prepare(&bridge);
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0dIDAT\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\x00\x00\x00\x00IEND\xae\x42\x60\x82";
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "preview.png", .data = png });
+    const preview = @import("../../attachments/view/ai_transcript_images.zig");
+    var store: preview.Store = .{ .allocator = a };
+    defer store.deinit();
+    const source: @import("../../../../ai/terminal_file_source.zig").Source = .{ .owner = owner, .cwd = f.directory };
+    const entry = try store.entry(source, 1, 1, "preview.png");
+    try std.testing.expect(entry == try store.entry(source, 1, 1, "preview.png"));
+    const messages = [_]provider.Message{.{ .role = .assistant, .content = "结果：![预览](preview.png)" }};
+    const request: provider.ChatRequest = .{ .model = "text-only", .system = "", .messages = &messages };
+    const before = try @import("../../../../ai/provider_http.zig").requestBody(a, .openai_compat, request, 1024);
+    defer a.free(before);
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (store.busy() and clock.monotonicNs() < deadline) {
+        try f.tick(null);
+        _ = store.tick(f.app);
+    }
+    try std.testing.expect(!store.busy());
+    try std.testing.expectEqualStrings(png, entry.image.content().?.bytes);
+    const Callback = struct {
+        fn open(_: *anyopaque, _: @import("../../../../ai/image_attachments.zig").ContentRef) !void {}
+    };
+    const scope = try f.scope.childScope();
+    defer scope.dispose();
+    const node = try @import("../../pane/view/ai_message_view.zig").mountWithImages(f.cx, scope, messages[0].content, 572, .{ .store = &store, .source = source, .conversation = 1, .turn = 1, .app = null, .preview_context = &store, .preview = Callback.open });
+    try f.cx.root.?.appendChild(a, node);
+    try f.tick(null);
+    const after = try @import("../../../../ai/provider_http.zig").requestBody(a, .openai_compat, request, 1024);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "data:image") == null);
+    try std.testing.expectEqual(@as(usize, 0), messages[0].images.len);
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "preview.png", .data = "changed" });
+    try std.testing.expectEqualStrings(png, entry.image.content().?.bytes);
+    const image_ref = try @import("../../../../ai/image_offload.zig").reference(a, entry.image);
+    defer a.free(image_ref);
+    try std.testing.expectError(error.ImageReferenceNotFound, @import("../../../../ai/image_offload.zig").find(&messages, image_ref, owner));
+    for ([_]@import("../../../../ai/registry.zig").Kind{ .anthropic, .ollama }) |kind| {
+        const body = try @import("../../../../ai/provider_http.zig").requestBody(a, kind, request, 1024);
+        defer a.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "base64") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "image/png") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "preview.png") != null);
+    }
+}
+
+const FileLifecyclePeer = struct {
+    key: @import("../../../../host/session_host.zig").OperationKey,
+    binding: @import("../../../../host/session_host.zig").ServiceHandle,
+    cleanup: @import("../../../../host/operation.zig").Cleanup = .unknown,
+    stdout: []const u8 = "",
+    snapshot_failure: bool = false,
+    wrong_binding: bool = false,
+    cancel_calls: usize = 0,
+    close_pending: bool = false,
+    retired: bool = false,
+    const Exec = @import("../../../../ai/execbridge.zig");
+    fn facade(self: *@This()) Exec.ExecBridge {
+        return .{ .ctx = self, .exec_fn = start, .abort_fn = abort, .poll_fn = poll, .close_fn = close, .snapshot_fn = snapshot, .close_call_fn = retire };
+    }
+    fn start(_: *anyopaque, _: []const u8, _: Exec.ExecOpts) !Exec.ExecHandle {
+        return error.UnexpectedDispatch;
+    }
+    fn abort(handle: Exec.ExecHandle) void {
+        const self: *@This() = @ptrCast(@alignCast(handle.ptr));
+        self.cancel_calls += 1;
+    }
+    fn poll(_: Exec.ExecHandle) ?Exec.ExecResult {
+        return null;
+    }
+    fn close(_: *anyopaque) void {}
+    fn snapshot(handle: Exec.ExecHandle, allocator: std.mem.Allocator) !Exec.OwnedResult {
+        const self: *@This() = @ptrCast(@alignCast(handle.ptr));
+        if (self.snapshot_failure) return error.SnapshotUnavailable;
+        var binding = self.binding;
+        if (self.wrong_binding) binding.binding_generation += 1;
+        return .{ .arena = .init(allocator), .value = .{ .key = self.key, .service_binding = binding, .stdout = self.stdout, .stderr = "", .elapsed_ms = 0, .status = .cancelled, .exit_code = 1, .cleanup = self.cleanup, .diagnostics = .{ .request_started = true } } };
+    }
+    fn retire(handle: Exec.ExecHandle) !@import("../../../../host/operation.zig").Cleanup {
+        const self: *@This() = @ptrCast(@alignCast(handle.ptr));
+        if (self.close_pending) return .releasing;
+        self.retired = true;
+        return self.cleanup;
+    }
+};
+
+test "terminal files cancellation preserves SSH facts and retains the original handle until actual retirement" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const owner = try f.prepare(&probe);
+    const binding = f.app.sessions.queryService(owner, .exec).available;
+    const Job = @import("../../../terminal/host/terminal_file_job.zig").Job;
+    for (0..4) |index| {
+        const key = try f.app.sessions.journal.begin(.{ .session = owner }, null);
+        var peer: FileLifecyclePeer = .{ .key = key, .binding = binding, .stdout = if (index == 1) "ZWCOMMIT1\n" else "", .snapshot_failure = index == 2, .wrong_binding = index == 3 };
+        const job = try a.create(Job);
+        job.* = .{ .allocator = a, .arena = .init(a), .owner = owner, .binding = binding, .request = .{ .kind = .write_text, .path = "/not-dispatched" }, .local = false, .started_ns = clock.monotonicNs(), .stage = .write, .after = "committed bytes", .active = .{ .facade = peer.facade(), .handle = .{ .ptr = &peer }, .key = key } };
+        var bridge: @import("../../../terminal/host/terminal_file_bridge.zig").Bridge = .{ .allocator = a, .job = job };
+        defer {
+            peer.snapshot_failure = false;
+            peer.wrong_binding = false;
+            peer.cleanup = .released;
+            peer.close_pending = false;
+            bridge.pump(f.app);
+        }
+        bridge.pump(f.app);
+        try std.testing.expect(job.reportable and !job.done and !peer.retired);
+        if (index >= 2) try std.testing.expectEqual(@as(usize, 0), peer.cancel_calls);
+        try std.testing.expectEqual(index == 1, job.result.committed);
+        try std.testing.expectEqual(index != 1, job.result.outcome_unknown);
+        try std.testing.expectEqual(@import("../../../../host/session_host.zig").CloseReceipt.unknown, bridge.stop());
+        try std.testing.expectError(error.ToolCleanupPending, bridge.clear());
+        peer.snapshot_failure = false;
+        peer.wrong_binding = false;
+        peer.cleanup = .released;
+        peer.close_pending = true;
+        bridge.pump(f.app);
+        try std.testing.expect(bridge.job != null and !peer.retired);
+        peer.close_pending = false;
+        bridge.pump(f.app);
+        try std.testing.expect(bridge.job == null and peer.retired);
+        try bridge.clear();
+    }
+}
+
+test "transcript image unknown SSH cleanup reports failure and retains its original job" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const owner = try f.prepare(&probe);
+    const binding = f.app.sessions.queryService(owner, .exec).available;
+    const key = try f.app.sessions.journal.begin(.{ .session = owner }, null);
+    var peer: FileLifecyclePeer = .{ .key = key, .binding = binding };
+    const Job = @import("../../../terminal/host/terminal_file_job.zig").Job;
+    const job = try a.create(Job);
+    job.* = .{ .allocator = a, .arena = .init(a), .owner = owner, .binding = binding, .request = .{ .kind = .read_image, .path = "/not-dispatched.png" }, .local = false, .started_ns = clock.monotonicNs(), .active = .{ .facade = peer.facade(), .handle = .{ .ptr = &peer }, .key = key } };
+    var store: @import("../../attachments/view/ai_transcript_images.zig").Store = .{ .allocator = a };
+    defer store.deinit();
+    const entry = try store.entry(.{ .owner = owner }, 1, 1, "/not-dispatched.png");
+    entry.job = job;
+    entry.phase = .loading;
+    defer {
+        peer.cleanup = .released;
+        store.cancel();
+        _ = store.tick(f.app);
+    }
+    try std.testing.expect(store.tick(f.app));
+    try std.testing.expectEqualStrings("SshCleanupUnknown", @errorName(entry.failure.?));
+    try std.testing.expect(entry.phase == .failed and entry.job == job and store.busy() and !peer.retired);
+    try std.testing.expectEqual(@import("../../../../host/session_host.zig").CloseReceipt.unknown, store.stopOwner(owner, f.app));
+    peer.cleanup = .released;
+    _ = store.tick(f.app);
+    try std.testing.expect(!store.busy() and peer.retired and entry.job == null);
+    _ = try store.entry(.{ .owner = owner }, 1, 2, "/queued.png");
+    store.cancel();
+    try std.testing.expect(store.tick(f.app));
+    try std.testing.expect(!store.busy());
+}
+
+const Fixture = struct {
+    cx: *ui.Cx,
+    scope: *ui.Scope,
+    workspace: *Workspace,
+    app: *Application,
+    config: Config = .{},
+    tmp: @TypeOf(std.testing.tmpDir(.{})),
+    path: [:0]u8,
+    directory: [:0]u8,
+    previous_zdotdir: ?[:0]u8 = null,
+    fn init(self: *Fixture) !void {
+        return self.initWithFilePlugin(null);
+    }
+    fn initWithFilePlugin(self: *Fixture, file_plugin: ?@import("../../../shell/host/application_host.zig").FilePlugin) !void {
+        self.* = .{ .cx = try ui.Cx.init(a, std.testing.io), .scope = undefined, .workspace = undefined, .app = undefined, .tmp = std.testing.tmpDir(.{}), .path = undefined, .directory = undefined };
+        self.cx.setViewport(1100, 720);
+        self.cx.root = try ui.box(self.cx, .{ .width = .fill(), .height = .fill(), .direction = .column }, .{});
+        self.scope = try ui.Scope.init(a, null, self.cx.owner);
+        var nodes: [4]*ui.Node = undefined;
+        for (&nodes) |*node| {
+            node.* = try ui.box(self.cx, .{ .width = .fill(), .height = .{ .px = 100 } }, .{});
+            try self.cx.root.?.appendChild(a, node.*);
+        }
+        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hosts.toml", .data = "" });
+        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "probe.txt", .data = "LOCAL_AI_TOOL_OK" });
+        self.path = try self.tmp.dir.realPathFileAlloc(std.testing.io, "hosts.toml", a);
+        self.directory = try self.tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        // Both the interactive PTY and exec children must use fixture-owned
+        // shell startup, rather than inherit the user's login configuration.
+        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".zshenv", .data = "setopt NO_RCS\nPROMPT=''\nRPROMPT=''\n" });
+        self.previous_zdotdir = if (std.c.getenv("ZDOTDIR")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+        if (setenv("ZDOTDIR", self.directory.ptr, 1) != 0) {
+            if (self.previous_zdotdir) |value| a.free(value);
+            return error.EnvironmentFailed;
+        }
+        errdefer self.restoreShellEnvironment();
+        self.workspace = try Workspace.init(a, self.cx, self.scope, std.testing.io, &self.config, self.path, nodes[0], nodes[1], nodes[2], nodes[3]);
+        self.app = if (file_plugin) |plugin| try Application.initWithFilePlugin(a, self.workspace, plugin) else try Application.init(a, self.workspace);
+        try self.scope.onCleanup(Application, self.app, Application.deinit);
+        self.app.install();
+    }
+    fn tick(self: *Fixture, bridge: ?*LocalTools.Bridge) !void {
+        _ = try self.app.safeTick();
+        if (bridge) |value| value.pump(self.app);
+        self.cx.advanceFrameClock();
+        self.cx.layout();
+        _ = self.cx.render();
+        var unused: [1]std.c.pollfd = undefined;
+        _ = std.c.poll(&unused, 0, 2);
+    }
+    fn prepare(self: *Fixture, bridge: *LocalTools.Bridge) !@import("../../../../host/identity.zig").SessionHandle {
+        const created = try self.app.createLocal(self.directory);
+        const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            try self.tick(null);
+            if (bridge.prepare(self.app, created.handle)) |_| return created.handle else |err| switch (err) {
+                error.ServiceUnavailable, error.WorkerBusy, error.StaleSession => {},
+                else => return err,
+            }
+        }
+        return error.LocalServiceNotReady;
+    }
+    fn deinit(self: *Fixture) void {
+        var ids: [16]u64 = undefined;
+        const count = @min(ids.len, self.workspace.tabs.items.len);
+        for (self.workspace.tabs.items[0..count], ids[0..count]) |tab, *id| id.* = tab.id;
+        for (ids[0..count]) |id| _ = self.app.requestCloseLegacy(id) catch |err| std.debug.panic("Local AI fixture close request failed: {s}", .{@errorName(err)});
+        const deadline = clock.monotonicNs() + 8 * std.time.ns_per_s;
+        // Content can detach one controller tick before the original Local
+        // worker joins. Drain its real receipt before disposing this fixture.
+        while (self.workspace.tabs.items.len != 0 or self.app.local_adapter.shutdownStep() != .released) {
+            self.tick(null) catch |err| std.debug.panic("Local AI fixture cleanup tick failed: {s}", .{@errorName(err)});
+            if (clock.monotonicNs() >= deadline) @panic("Local AI fixture did not release its real sessions");
+        }
+        self.cx.clearFocus();
+        self.scope.dispose();
+        self.cx.deinit();
+        self.restoreShellEnvironment();
+        a.free(self.directory);
+        a.free(self.path);
+        self.tmp.cleanup();
+    }
+    fn restoreShellEnvironment(self: *Fixture) void {
+        if (self.previous_zdotdir) |value| {
+            if (setenv("ZDOTDIR", value.ptr, 1) != 0) @panic("Local AI fixture could not restore ZDOTDIR");
+            a.free(value);
+        } else if (unsetenv("ZDOTDIR") != 0) @panic("Local AI fixture could not restore ZDOTDIR");
+    }
+};
+const Worker = struct {
+    host: Loop.Host,
+    invocation: Loop.Invocation,
+    token: provider.CancelToken = .{},
+    done: std.atomic.Value(bool) = .init(false),
+    outcome: ?Loop.Outcome = null,
+    failure: ?anyerror = null,
+    fn run(self: *Worker) void {
+        self.outcome = self.host.execute(self.host.context, self.invocation, a, &self.token) catch |err| blk: {
+            self.failure = err;
+            break :blk null;
+        };
+        self.done.store(true, .release);
+    }
+    fn finish(self: *Worker, bridge: *LocalTools.Bridge, app: *Application, thread: std.Thread) void {
+        bridge.shutdown(app);
+        thread.join();
+        if (self.outcome) |*outcome| outcome.deinit(a);
+    }
+};
+fn invocation(id: u64, command: []const u8, verdict: @import("../../../../ai/permission.zig").Verdict) Loop.Invocation {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(command, &hash, .{});
+    return .{ .key = .{ .owner = .{ .tab = id }, .turn_id = 1, .call_id = "local-call-1" }, .scope = .{ .owner = .{ .tab = id }, .content = .{ .session = id }, .members = .{ .ids = .{id} ++ @as([15]u64, @splat(0)), .len = 1 } }, .round_index = 0, .call_index = 0, .arguments = command, .arguments_hash = hash, .call = .{ .tool = .run_command, .command = command, .targets = .{ .ids = .{id} ++ @as([15]u64, @splat(0)), .len = 1 } }, .verdict = verdict, .policy_revision = 1, .timeout_ms = 5000 };
+}
+fn awaitResult(f: *Fixture, bridge: *LocalTools.Bridge, worker: *Worker) !void {
+    const deadline = clock.monotonicNs() + 6 * std.time.ns_per_s;
+    while (!worker.done.load(.acquire) and clock.monotonicNs() < deadline) try f.tick(bridge);
+    try std.testing.expect(worker.done.load(.acquire));
+    if (worker.failure) |err| return err;
+}
+
+test "Local AI bridge executes in the captured cwd and returns actual output without using the interactive PTY" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var bridge = LocalTools.Bridge.init(a);
+    defer bridge.deinit();
+    const owner = try f.prepare(&bridge);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = invocation(@backingInt(owner.session_id), "cat probe.txt", .allow_auto) };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer worker.finish(&bridge, f.app, thread);
+    try awaitResult(&f, &bridge, &worker);
+    const result = worker.outcome.?.targets[0];
+    try std.testing.expectEqual(Loop.Status.succeeded, result.status);
+    try std.testing.expectEqualStrings("LOCAL_AI_TOOL_OK", result.stdout);
+    try std.testing.expectEqualStrings(f.directory, result.cwd.?);
+    try std.testing.expectEqual(@as(?i32, 0), result.exit);
+    try std.testing.expect(result.local_released);
+    const binding = switch (f.app.sessions.queryService(owner, .terminal)) {
+        .available => |value| value,
+        else => return error.TerminalNotReady,
+    };
+    const service = try f.app.local_adapter.terminalService(binding);
+    var lines = try service.readLines(.{ .max_lines = 100, .max_bytes = 4096 }, a);
+    defer lines.deinit(a);
+    for (lines.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "LOCAL_AI_TOOL_OK") == null);
+}
+
+test "Local AI bridge approval is bound to the exact call and rejection starts no child" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var bridge = LocalTools.Bridge.init(a);
+    defer bridge.deinit();
+    const owner = try f.prepare(&bridge);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = invocation(@backingInt(owner.session_id), "printf REJECTED", .need_confirm) };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer worker.finish(&bridge, f.app, thread);
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try f.tick(&bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try std.testing.expect(bridge.active == null);
+    var changed = approval.arguments_hash;
+    changed[0] ^= 1;
+    try std.testing.expectError(error.StaleApproval, bridge.decide(approval.sequence, changed, true));
+    try bridge.decide(approval.sequence, approval.arguments_hash, false);
+    try awaitResult(&f, &bridge, &worker);
+    try std.testing.expectEqual(Loop.Status.rejected, worker.outcome.?.targets[0].status);
+    try std.testing.expectEqualStrings("ToolApprovalRejected", worker.outcome.?.targets[0].error_code.?);
+    try std.testing.expect(bridge.active == null);
+}
+
+test "Local AI bridge cancellation waits for actual child release" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var bridge = LocalTools.Bridge.init(a);
+    defer bridge.deinit();
+    const owner = try f.prepare(&bridge);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = invocation(@backingInt(owner.session_id), "sleep 10", .need_confirm) };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer worker.finish(&bridge, f.app, thread);
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try f.tick(&bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try bridge.decide(approval.sequence, approval.arguments_hash, true);
+    while (bridge.active == null and clock.monotonicNs() < deadline) try f.tick(&bridge);
+    try std.testing.expect(bridge.active != null);
+    worker.token.cancel();
+    try awaitResult(&f, &bridge, &worker);
+    try std.testing.expectEqual(Loop.Status.cancelled, worker.outcome.?.targets[0].status);
+    try std.testing.expect(worker.outcome.?.targets[0].local_released);
+    try std.testing.expect(bridge.active == null);
+}
+
+test "Local AI close gate ignores another generation and waits for the original process" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var bridge = LocalTools.Bridge.init(a);
+    defer bridge.deinit();
+    const owner = try f.prepare(&bridge);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = invocation(@backingInt(owner.session_id), "sleep 10", .allow_auto) };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer worker.finish(&bridge, f.app, thread);
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.active == null and clock.monotonicNs() < deadline) try f.tick(&bridge);
+    try std.testing.expect(bridge.active != null);
+    try std.testing.expectEqual(@import("../../../shell/host/application_host.zig").CloseReceipt.released, bridge.stopOwner(try owner.nextGeneration()));
+    try std.testing.expect(bridge.active != null and !worker.done.load(.acquire));
+    try std.testing.expectEqual(@import("../../../shell/host/application_host.zig").CloseReceipt.awaiting, bridge.stopOwner(owner));
+    try awaitResult(&f, &bridge, &worker);
+    try std.testing.expectEqual(Loop.Status.cancelled, worker.outcome.?.targets[0].status);
+    try std.testing.expect(worker.outcome.?.targets[0].local_released);
+    try std.testing.expectEqual(@import("../../../shell/host/application_host.zig").CloseReceipt.released, bridge.stopOwner(owner));
+}
+
+const GroupTools = @import("../host/ai_group_tools.zig");
+fn groupInvocation(ids: []const u64, command: []const u8) !Loop.Invocation {
+    const scope: scope_mod.Scope = .{ .owner = .{ .tab = 1 }, .content = .{ .group = 1 }, .members = blk: {
+        var targets: scope_mod.Targets = .{};
+        for (ids, 0..) |id, index| targets.ids[index] = id;
+        targets.len = ids.len;
+        break :blk targets;
+    } };
+    var value = invocation(ids[0], command, .need_confirm);
+    value.key.owner = scope.owner;
+    value.scope = scope;
+    value.call.targets = try scope.validate(ids);
+    return value;
+}
+fn tickGroup(f: *Fixture, bridge: *GroupTools.Bridge) !void {
+    try f.tick(null);
+    bridge.pump(f.app);
+}
+fn awaitGroup(f: *Fixture, bridge: *GroupTools.Bridge, worker: *Worker) !void {
+    const deadline = clock.monotonicNs() + 8 * std.time.ns_per_s;
+    while (!worker.done.load(.acquire) and clock.monotonicNs() < deadline) try tickGroup(f, bridge);
+    try std.testing.expect(worker.done.load(.acquire));
+    if (worker.failure) |err| return err;
+}
+fn prepareSecond(f: *Fixture, cwd: []const u8) !@import("../../../../host/identity.zig").SessionHandle {
+    const created = try f.app.createLocal(cwd);
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (clock.monotonicNs() < deadline) {
+        try f.tick(null);
+        if (probe.prepare(f.app, created.handle)) |_| return created.handle else |_| {}
+    }
+    return error.LocalServiceNotReady;
+}
+
+test "real group Local tools freeze both original sessions, approve once, preserve mixed outcomes and pin only ordering" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    const second = try prepareSecond(&f, "/tmp");
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    const pane1 = f.app.legacyForHandle(first).?;
+    const pane2 = f.app.legacyForHandle(second).?;
+    _ = try roster.join("group", pane1, 0);
+    _ = try roster.join("group", pane2, 0);
+    var bridge = GroupTools.Bridge.init(a);
+    defer bridge.deinit();
+    const ids = [_]u64{ @backingInt(first.session_id), @backingInt(second.session_id) };
+    const call = try groupInvocation(&ids, "if test -f probe.txt; then printf GROUP_FIRST_OK; else printf GROUP_SECOND_FAILURE; exit 7; fi");
+    try bridge.prepare(f.app, &roster, call.scope);
+    // M11：tab 上下文由 host.tab_context 拉取；分屏 tab 的每张卡片各自一条，内容由卡片类型组装。
+    const TabTool = @import("../host/ai_tab_context.zig").Tool(@TypeOf(f.app.*), @TypeOf(roster));
+    const tab_authority: @import("../../../../ai/host_tools.zig").Context = .{ .conversation_id = .{ .bytes = @splat(3) }, .task_id = .{ .bytes = @splat(4) }, .binding = call.scope.owner, .content = call.scope.content, .binding_revision = 1, .grant_revision = 1 };
+    const tab_env: TabTool.E = .{ .app = f.app, .roster = &roster, .context = tab_authority, .scope = call.scope, .context_window = 200_000 };
+    const whole_context = try TabTool.overview(&tab_env, .{ .object = .empty }, a);
+    defer a.free(whole_context);
+    const overview = try std.json.parseFromSlice(std.json.Value, a, whole_context, .{});
+    defer overview.deinit();
+    try std.testing.expectEqualStrings("split", overview.value.object.get("tab").?.object.get("kind").?.string);
+    const cards = overview.value.object.get("cards").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), cards.len);
+    for ([_]@import("../../../../host/identity.zig").SessionHandle{ first, second }, cards) |owner, card| {
+        const reference = try @import("../../../../ai/host_queries.zig").sessionRef(a, tab_authority, owner);
+        defer a.free(reference);
+        try std.testing.expectEqualStrings(reference, card.object.get("card_ref").?.string);
+        try std.testing.expect(card.object.get("available").?.bool);
+        // The owning Local adapter supplies this exact canonical identity inside each card summary.
+        try std.testing.expect(std.mem.indexOf(u8, card.object.get("summary").?.string, "host=本机 · zsh user= hops=0") != null);
+        try std.testing.expectEqual(@as(usize, 2), card.object.get("params").?.array.items.len);
+    }
+    // ai-followup：查询参数由终端卡片类型自己实现（最近 N 行、最近 N 条命令）；不支持的参数在第 3 步拒绝。
+    const query_args = try std.json.parseFromSlice(std.json.Value, a, "{\"max_lines\":5,\"limit\":3}", .{});
+    defer query_args.deinit();
+    var query_env = tab_env;
+    try TabTool.validateScope(&query_env, query_args.value, a);
+    try std.testing.expect(query_env.diagnostic() == null);
+    const queried = try TabTool.overview(&tab_env, query_args.value, a);
+    defer a.free(queried);
+    const queried_value = try std.json.parseFromSlice(std.json.Value, a, queried, .{});
+    defer queried_value.deinit();
+    for (queried_value.value.object.get("cards").?.array.items) |card| {
+        const text = card.object.get("summary").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, text, "(requested 5)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "shell commands (oldest first)") != null or std.mem.indexOf(u8, text, "Shell command history unavailable") != null);
+        try std.testing.expect(card.object.get("next_cursor").? == .null);
+    }
+    const cursor_args = try std.json.parseFromSlice(std.json.Value, a, "{\"cursor\":\"tc1.0000000000000000.1.1\"}", .{});
+    defer cursor_args.deinit();
+    try std.testing.expectError(error.InvalidCursor, TabTool.validateScope(&query_env, cursor_args.value, a));
+    try std.testing.expect(query_env.diagnostic() != null);
+    try std.testing.expectEqualSlices(u64, &ids, bridge.toolIds(.run_command).slice());
+    try std.testing.expectEqual(@as(usize, 0), bridge.toolIds(.read_remote_file).len);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = call };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        bridge.shutdown(f.app);
+        thread.join();
+        if (worker.outcome) |*outcome| outcome.deinit(a);
+    }
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try tickGroup(&f, &bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try std.testing.expect(approval.group);
+    const pending_impact = bridge.closeImpact(first);
+    try std.testing.expect(pending_impact.ai != 0);
+    try std.testing.expect(std.mem.indexOf(u8, pending_impact.detailText(), "待批准 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval.target, "generation") != null);
+    try std.testing.expect(!worker.done.load(.acquire));
+    try roster.pin("group", pane2);
+    try bridge.decide(approval.sequence, approval.arguments_hash, true);
+    try std.testing.expect(pending_impact.ai != bridge.closeImpact(first).ai);
+    try awaitGroup(&f, &bridge, &worker);
+    try std.testing.expectEqual(@as(u64, 0), bridge.closeImpact(first).ai);
+    try std.testing.expectEqual(@as(usize, 2), worker.outcome.?.targets.len);
+    try std.testing.expectEqual(Loop.Status.succeeded, worker.outcome.?.targets[0].status);
+    try std.testing.expectEqualStrings("GROUP_FIRST_OK", worker.outcome.?.targets[0].stdout);
+    try std.testing.expectEqual(Loop.Status.failed, worker.outcome.?.targets[1].status);
+    try std.testing.expectEqual(@as(?i32, 7), worker.outcome.?.targets[1].exit);
+    try std.testing.expectEqualStrings("GROUP_SECOND_FAILURE", worker.outcome.?.targets[1].stdout);
+    try std.testing.expect(worker.outcome.?.targets[0].local_released and worker.outcome.?.targets[1].local_released);
+}
+
+test "group tab tools are available while at least one AI card in the group is available" {
+    // PLUGIN_ARCH_PLAN 2.5.8 第 8 条：分屏 tab 的"工具可用"按卡片派生——组内至少一张 AI 卡片可用。
+    // 之前会话组 tab 一律为真（全部成员断开 / 失败时请求仍带着组工具）。
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    const second = try prepareSecond(&f, "/tmp");
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    const pane1 = f.app.legacyForHandle(first).?;
+    const pane2 = f.app.legacyForHandle(second).?;
+    _ = try roster.join("group", pane1, 0);
+    const group = try roster.join("group", pane2, 0);
+    const card_state = @import("../host/ai_tab_context.zig");
+    const tab1 = f.app.workspace.sessionTab(pane1).?;
+    const tab2 = f.app.workspace.sessionTab(pane2).?;
+    try std.testing.expect(card_state.unavailableReason(f.app, tab1) == null and card_state.unavailableReason(f.app, tab2) == null);
+    try std.testing.expect(card_state.groupToolsAvailable(f.app, group));
+    // 一张不可用（失败）：另一张仍可用，组 tab 的工具仍可用。
+    tab1.failed = true;
+    defer tab1.failed = false;
+    try std.testing.expectEqualStrings("failed", card_state.unavailableReason(f.app, tab1).?);
+    try std.testing.expect(card_state.groupToolsAvailable(f.app, group));
+    // 全部不可用（一张失败、一张关闭中）：组 tab 的工具不可用。
+    tab2.closing = true;
+    defer tab2.closing = false;
+    try std.testing.expectEqualStrings("closing", card_state.unavailableReason(f.app, tab2).?);
+    try std.testing.expect(!card_state.groupToolsAvailable(f.app, group));
+    // 已离组（不再 active）的成员不算：唯一可用的卡片离组后同样不可用。
+    tab2.closing = false;
+    try std.testing.expect(card_state.groupToolsAvailable(f.app, group));
+    for (group.members.items) |*member| if (member.pane_id == pane2) {
+        member.active = false;
+    };
+    try std.testing.expect(!card_state.groupToolsAvailable(f.app, group));
+    for (group.members.items) |*member| member.active = true;
+}
+
+test "AI shared history survives source Bridge disposal with concurrent owned snapshots and fresh live-owner reads" {
+    const Dynamic = @import("../host/ai_tools.zig");
+    const tools = @import("../../../../ai/plugin_tools.zig");
+    const Writer = struct {
+        bridge: *Dynamic.Bridge,
+        owner: @import("../../../../host/identity.zig").SessionHandle,
+        base: u64,
+        label: []const u8,
+        start: *std.atomic.Value(bool),
+        reads: *std.atomic.Value(usize),
+        done: *std.atomic.Value(usize),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.failure = err;
+            };
+            _ = self.done.fetchAdd(1, .release);
+        }
+        fn write(self: *@This()) !void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..16) |index| {
+                const history = self.bridge.operationHistory();
+                const id = self.base + index;
+                _ = try history.beginNew(self.owner, id, "fixture.read", @splat(0), 1);
+                try history.markSent(self.owner, id);
+                try history.finish(self.owner, id, true, self.label);
+                try history.resourcesReleased(self.owner, id);
+                try history.transition(self.owner, 9001, .verifying, self.label);
+                while (self.reads.load(.acquire) <= index) std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const Reader = struct {
+        host: Loop.Host,
+        invocation: tools.DynamicInvocation,
+        cancel: provider.CancelToken = .{},
+        done: std.atomic.Value(bool) = .init(false),
+        results: ?[]tools.ToolResult = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.results = self.host.execute_dynamic.?(self.host.context, self.invocation, a, &self.cancel) catch |err| blk: {
+                self.failure = err;
+                break :blk null;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const owner = try f.prepare(&probe);
+    var old = Dynamic.Bridge.init(a);
+    var old_alive = true;
+    defer if (old_alive) old.deinit();
+    try old.prepare(f.app, owner);
+    var next = Dynamic.Bridge.init(a);
+    defer next.deinit();
+    try next.prepare(f.app, owner);
+    try std.testing.expect(old.operationHistory() == &f.app.domain.operation_history);
+    try std.testing.expect(next.operationHistory() == old.operationHistory());
+    const history = old.operationHistory();
+    _ = try history.beginNew(owner, 9001, "fixture.write", @splat(0), 1);
+    try history.markSent(owner, 9001);
+    try history.transition(owner, 9001, .verifying, "seed result");
+    var retained = (try old.queryOperation(a, owner, 9001)).?;
+    defer retained.deinit();
+    var start: std.atomic.Value(bool) = .init(false);
+    var reads: std.atomic.Value(usize) = .init(0);
+    var done: std.atomic.Value(usize) = .init(0);
+    var first_writer: Writer = .{ .bridge = &old, .owner = owner, .base = 100, .label = "source result", .start = &start, .reads = &reads, .done = &done };
+    var next_writer: Writer = .{ .bridge = &next, .owner = owner, .base = 200, .label = "destination result", .start = &start, .reads = &reads, .done = &done };
+    const one = try std.Thread.spawn(.{}, Writer.run, .{&first_writer});
+    var one_joined = false;
+    defer if (!one_joined) {
+        start.store(true, .release);
+        reads.store(std.math.maxInt(usize), .release);
+        one.join();
+    };
+    const two = try std.Thread.spawn(.{}, Writer.run, .{&next_writer});
+    var two_joined = false;
+    defer if (!two_joined) {
+        start.store(true, .release);
+        reads.store(std.math.maxInt(usize), .release);
+        two.join();
+    };
+    start.store(true, .release);
+    while (done.load(.acquire) < 2) {
+        if (try next.queryOperation(a, owner, 9001)) |snapshot| {
+            var owned = snapshot;
+            try std.testing.expect(owned.value.stage == .verifying);
+            try std.testing.expect(std.mem.eql(u8, owned.value.result_text, "seed result") or std.mem.eql(u8, owned.value.result_text, "source result") or std.mem.eql(u8, owned.value.result_text, "destination result"));
+            owned.deinit();
+        }
+        _ = reads.fetchAdd(1, .release);
+    }
+    one.join();
+    one_joined = true;
+    two.join();
+    two_joined = true;
+    if (first_writer.failure) |err| return err;
+    if (next_writer.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 33), history.count());
+    try std.testing.expect(reads.load(.acquire) >= 16);
+    try std.testing.expectEqualStrings("seed result", retained.value.result_text);
+    try history.transition(owner, 9001, .outcome_unknown, "response lost");
+    try history.resourcesReleased(owner, 9001);
+    var old_table = try tools.cloneTable(old.requestTable().?, a);
+    defer old_table.deinit();
+    const arguments = try std.fmt.allocPrint(a, "{{\"session_ids\":[{d}]}}", .{@backingInt(owner.session_id)});
+    defer a.free(arguments);
+    var old_call = try old_table.parse(a, "read_terminal", arguments);
+    defer old_call.deinit();
+    old.shutdown(f.app);
+    old.deinit();
+    old_alive = false;
+    var unknown = (try next.queryOperation(a, owner, 9001)).?;
+    defer unknown.deinit();
+    try std.testing.expectEqual(@import("../../../../host/operation_store.zig").Stage.outcome_unknown, unknown.value.stage);
+    try std.testing.expectEqualStrings("response lost", unknown.value.result_text);
+    try std.testing.expect(!unknown.value.owner_closed);
+    var completed = (try next.queryOperation(a, owner, 100)).?;
+    defer completed.deinit();
+    try std.testing.expectEqualStrings("source result", completed.value.result_text);
+    const host = next.interface();
+    const stale: tools.DynamicInvocation = .{ .table = &old_table, .parsed = old_call, .turn_id = 1, .call_id = "old-binding", .arguments = arguments, .operation_id = 9100 };
+    try std.testing.expectError(error.StaleToolAuthority, host.execute_dynamic.?(host.context, stale, a, null));
+    var call = try next.requestTable().?.parse(a, "read_terminal", arguments);
+    defer call.deinit();
+    var fresh: tools.DynamicInvocation = .{ .table = next.requestTable().?, .parsed = call, .turn_id = 2, .call_id = "new-read", .arguments = arguments, .operation_id = 9001 };
+    try std.testing.expectError(error.ToolOperationAlreadyRecorded, host.execute_dynamic.?(host.context, fresh, a, null));
+    fresh.operation_id = 9200;
+    var reader: Reader = .{ .host = host, .invocation = fresh };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    defer {
+        reader.cancel.cancel();
+        next.shutdown(f.app);
+        thread.join();
+        if (reader.results) |results| {
+            for (results) |*result| result.deinit(a);
+            a.free(results);
+        }
+    }
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!reader.done.load(.acquire) and clock.monotonicNs() < deadline) {
+        try f.tick(null);
+        next.pump(f.app);
+    }
+    try std.testing.expect(reader.done.load(.acquire));
+    if (reader.failure) |err| return err;
+    try std.testing.expectEqual(tools.Status.succeeded, reader.results.?[0].status);
+    try std.testing.expectEqual(@import("../../../../host/operation_store.zig").Stage.succeeded, history.lookup(owner, 9200).?.stage);
+    try std.testing.expect(!history.lookup(owner, 9200).?.owner_closed);
+    try std.testing.expectEqual(@import("../../../../host/operation_store.zig").Stage.outcome_unknown, history.lookup(owner, 9001).?.stage);
+}
+
+test "SFTP AI registration prepares only file tools and rejects terminal or revoked source bindings" {
+    const sessions = @import("../../../../host/session_host.zig");
+    const plugins = @import("../../../../host/plugin_registry.zig");
+    const FileBridge = @import("../host/ai_file_tools.zig");
+    const FileHost = @import("../../../files/host/file_application_host.zig").Host;
+    const Dynamic = @import("../host/ai_tools.zig");
+    // Controlled adapter-boundary ready services, no remote network success is
+    // claimed. Catalog/preparation/preflight use the actual production classes.
+    const Adapter = struct {
+        fn create(_: *anyopaque, _: sessions.CreateRequest) !void {}
+        fn cancel(_: *anyopaque, _: sessions.OperationKey) sessions.CloseReceipt {
+            return .released;
+        }
+        fn close(_: *anyopaque, _: sessions.SessionHandle, _: sessions.OperationKey) !sessions.CloseReceipt {
+            return .released;
+        }
+        fn stale(_: *anyopaque, _: sessions.SessionHandle, _: sessions.OperationKey) void {}
+        fn tick(_: *anyopaque, _: *sessions.SessionHost) !bool {
+            return false;
+        }
+        fn shutdown(_: *anyopaque) sessions.CloseReceipt {
+            return .released;
+        }
+    };
+    var adapter: Adapter = .{};
+    var f: Fixture = undefined;
+    try f.initWithFilePlugin(.{ .adapter = .{ .registration = .{ .plugin_id = .sftp, .workspace_kind = .file, .services = plugins.requiredServices(.sftp) }, .context = &adapter, .vtable = &.{ .create = Adapter.create, .cancel = Adapter.cancel, .close = Adapter.close, .release_stale = Adapter.stale } }, .context = &adapter, .tick = Adapter.tick, .shutdown = Adapter.shutdown });
+    defer f.deinit();
+    const accepted = try f.app.create(.{ .connection_id = @fromBackingInt(888), .revision = 1, .protocol = .sftp, .name = "AI File Fixture", .host = "sftp-ai-fixture.invalid", .user = "fixture", .password = "fixture-only" }, 888, 0, "");
+    const directory = try f.app.sessions.reserveService(accepted.handle, accepted.operation, .directory);
+    const file_read = try f.app.sessions.reserveService(accepted.handle, accepted.operation, .file_read);
+    _ = try f.app.sessions.reserveService(accepted.handle, accepted.operation, .transfer);
+    try std.testing.expect(try f.app.sessions.ready(accepted.handle, accepted.operation, plugins.requiredServices(.sftp)));
+    try std.testing.expect(f.app.sessions.bindingIsLive(directory) and f.app.sessions.bindingIsLive(file_read));
+    const content_scope = try f.scope.childScope();
+    const content = try ui.box(f.cx, .{ .width = .fill(), .height = .fill() }, .{});
+    const attached = try f.app.attachFileSession(accepted.handle, accepted.operation, content, content_scope);
+    try std.testing.expect(try f.app.sessions.attached(accepted.handle, attached));
+    const manifest = f.app.sessions.manifestFor(accepted.handle).?;
+    // AI 能力来自会话呈现的 `file` 卡片类型（PL4a M9），清单上不再有 AI 字段。
+    try std.testing.expectEqualStrings("file", f.app.sessions.cardTypeFor(accepted.handle).?.id);
+    try std.testing.expect(f.app.sessions.cardAiFor(accepted.handle) != null);
+    try std.testing.expect(f.app.sessions.aiEngineFor(accepted.handle).? == FileBridge.createAdapter);
+    try std.testing.expectEqual(@as(usize, 2), manifest.tools.len);
+    const file_host = try FileHost.create(a, f.workspace);
+    defer {
+        _ = file_host.shutdownStep();
+        file_host.deinit() catch unreachable;
+    }
+    // This initialized provider only resolves the controlled session's existing
+    // typed directory/file_read source. No reader/backend is invoked by this test.
+    file_host.app = f.app;
+    var bridge = Dynamic.Bridge.init(a);
+    defer bridge.deinit();
+    bridge.configureFiles(file_host);
+    const host_tools = @import("../../../../ai/host_tools.zig");
+    const Query = struct {
+        fn invoke(_: *anyopaque, _: host_tools.Invocation, _: std.mem.Allocator) !host_tools.Result {
+            return error.UnexpectedDispatch;
+        }
+    };
+    const host_contributions = @import("../../../../ai/host_queries.zig").contributions ++ @import("../../../../ai/host_terminal_queries.zig").contributions ++ @import("../../../../ai/host_execution.zig").contributions ++ .{@import("../../../../ai/batch_output.zig").contribution};
+    try bridge.configureHost(.{ .context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = testTab(f.app, accepted.handle) }, .content = .{ .session = @backingInt(accepted.handle.session_id) }, .binding_revision = 1, .grant_revision = 1 }, .handler_context = &adapter, .invoke = Query.invoke, .contributions = &host_contributions });
+    try bridge.prepare(f.app, accepted.handle);
+    try std.testing.expectEqual(@as(usize, 8), bridge.requestTable().?.entries.len);
+    const prompt = try @import("../../../../ai/session_prompt.zig").build(a, .auto, bridge.wire);
+    defer a.free(prompt);
+    try expectRequestGolden("sftp", "231dddbd65d111609742542d0370b758e72c5491ebda4da210be0d4d45353425", bridge.wire, prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "File paths") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "host.run_in_terminal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "host.attach_shell") == null);
+    try std.testing.expectEqual(bridge.capability_fingerprint, bridge.capabilityFingerprint(f.app));
+    try std.testing.expect(bridge.requestTable().?.lookup("host__get_usession") != null);
+    for (@import("../../../../ai/host_terminal_queries.zig").contributions ++ @import("../../../../ai/host_execution.zig").contributions ++ .{@import("../../../../ai/batch_output.zig").contribution}) |contribution| {
+        var name: [64]u8 = undefined;
+        try std.testing.expect(bridge.requestTable().?.lookup(try @import("../../../../ai/plugin_tools.zig").encodeName(&name, contribution.definition.id)) == null);
+        for (bridge.host_binding.?.contributions) |advertised| try std.testing.expect(!std.mem.eql(u8, advertised.definition.id, contribution.definition.id));
+    }
+    try std.testing.expectEqualSlices(u64, &.{@backingInt(accepted.handle.session_id)}, (try bridge.toolIds(.list_remote_files)).slice());
+    try std.testing.expectEqual(@as(usize, 1), (try bridge.toolIds(.read_remote_file)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try bridge.toolIds(.run_command)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try bridge.toolIds(.read_terminal)).len);
+    var original = FileBridge.Bridge.init(a);
+    defer original.deinit();
+    original.files = file_host;
+    try original.prepare(f.app, accepted.handle);
+    var call = invocation(@backingInt(accepted.handle.session_id), "", .allow_auto);
+    try std.testing.expectError(error.UnsupportedTool, original.preflight(f.app, call));
+    call.call.tool = .read_terminal;
+    try std.testing.expectError(error.UnsupportedTool, original.preflight(f.app, call));
+    call.call.tool = .list_remote_files;
+    call.call.path = "/";
+    try original.preflight(f.app, call);
+    call.call.tool = .read_remote_file;
+    try original.preflight(f.app, call);
+    // M11：文件卡片的概览由它自己的引擎组装（当前目录与可用工具说明），身份字段单独给出。
+    const FileTabTool = @import("../host/ai_tab_context.zig").Tool(@TypeOf(f.app.*), @import("../../../workspace/model/group_model.zig").Roster);
+    const file_tab = for (f.app.workspace.tabs.items) |item| {
+        if (item.content_owner == .session and item.content_owner.session.eql(accepted.handle)) break item;
+    } else return error.StaleSession;
+    const file_scope: scope_mod.Scope = .{ .owner = .{ .tab = @backingInt(file_tab.tab_id) }, .content = .{ .session = @backingInt(accepted.handle.session_id) }, .members = .{ .ids = .{@backingInt(accepted.handle.session_id)} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const file_env: FileTabTool.E = .{ .app = f.app, .roster = null, .context = .{ .conversation_id = .{ .bytes = @splat(5) }, .task_id = .{ .bytes = @splat(6) }, .binding = file_scope.owner, .content = file_scope.content, .binding_revision = 1, .grant_revision = 1 }, .scope = file_scope, .context_window = 200_000 };
+    const file_overview = try FileTabTool.overview(&file_env, .{ .object = .empty }, a);
+    defer a.free(file_overview);
+    try std.testing.expect(std.mem.indexOf(u8, file_overview, "Only directory and bounded text-file tools are available.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, file_overview, "\"kind\":\"single\"") != null);
+    // ai-followup：文件卡片支持 limit / cursor（目录项分页），不支持 max_lines——拒绝并说明。
+    try std.testing.expect(std.mem.indexOf(u8, file_overview, "\"params\":[\"limit\",\"cursor\"]") != null);
+    const lines_args = try std.json.parseFromSlice(std.json.Value, a, "{\"max_lines\":10}", .{});
+    defer lines_args.deinit();
+    var file_query_env = file_env;
+    file_query_env.file_host = @ptrCast(file_host);
+    try std.testing.expectError(error.UnsupportedParameter, FileTabTool.validateScope(&file_query_env, lines_args.value, a));
+    try std.testing.expect(std.mem.indexOf(u8, file_query_env.diagnostic().?, "(file) does not support max_lines; it accepts limit, cursor.") != null);
+    const limit_args = try std.json.parseFromSlice(std.json.Value, a, "{\"limit\":5}", .{});
+    defer limit_args.deinit();
+    try FileTabTool.validateScope(&file_query_env, limit_args.value, a);
+    const file_page = try FileTabTool.overview(&file_query_env, limit_args.value, a);
+    defer a.free(file_page);
+    try std.testing.expect(std.mem.indexOf(u8, file_page, "Remote directory ") != null or std.mem.indexOf(u8, file_page, "summary unavailable: ") != null);
+    try std.testing.expect(f.app.sessions.queryService(accepted.handle, .exec) == .unsupported);
+    try std.testing.expect(f.app.sessions.queryService(accepted.handle, .terminal) == .unsupported);
+    try std.testing.expect(try f.app.sessions.revokeTypedService(accepted.handle, accepted.operation, .{ .name = "file_read" }));
+    try std.testing.expect(bridge.capability_fingerprint != bridge.capabilityFingerprint(f.app));
+    try std.testing.expectError(error.StaleBinding, original.preflight(f.app, call));
+}
+
+test "real group roster changes invalidate a pending approval and preflight stops every target" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    const second = try prepareSecond(&f, "/tmp");
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    const pane1 = f.app.legacyForHandle(first).?;
+    const pane2 = f.app.legacyForHandle(second).?;
+    _ = try roster.join("group", pane1, 0);
+    _ = try roster.join("group", pane2, 0);
+    var bridge = GroupTools.Bridge.init(a);
+    defer bridge.deinit();
+    const ids = [_]u64{ @backingInt(first.session_id), @backingInt(second.session_id) };
+    const call = try groupInvocation(&ids, "printf SHOULD_NEVER_EXECUTE");
+    try bridge.prepare(f.app, &roster, call.scope);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = call };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        bridge.shutdown(f.app);
+        thread.join();
+        if (worker.outcome) |*outcome| outcome.deinit(a);
+    }
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try tickGroup(&f, &bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try roster.leave("group", pane2);
+    try bridge.decide(approval.sequence, approval.arguments_hash, true);
+    try awaitGroup(&f, &bridge, &worker);
+    for (worker.outcome.?.targets) |target| {
+        try std.testing.expectEqual(Loop.Status.rejected, target.status);
+        try std.testing.expectEqualStrings("GroupMembershipChanged", target.error_code.?);
+        try std.testing.expectEqualStrings("", target.stdout);
+        try std.testing.expect(target.exit == null);
+    }
+    try std.testing.expect(bridge.pendingApproval() == null);
+}
+
+test "real group stop revokes pending approval and drains original exchange without dispatch" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    _ = try roster.join("group", f.app.legacyForHandle(first).?, 0);
+    var bridge = GroupTools.Bridge.init(a);
+    defer bridge.deinit();
+    const call = try groupInvocation(&.{@backingInt(first.session_id)}, "printf NEVER_AFTER_GROUP_STOP");
+    try bridge.prepare(f.app, &roster, call.scope);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = call };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        bridge.shutdown(f.app);
+        thread.join();
+        if (worker.outcome) |*outcome| outcome.deinit(a);
+    }
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try tickGroup(&f, &bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try std.testing.expectEqual(@import("../../../../host/session_host.zig").CloseReceipt.released, bridge.stopGroup(999));
+    try std.testing.expectEqual(@import("../../../../host/session_host.zig").CloseReceipt.awaiting, bridge.stopGroup(1));
+    try std.testing.expectError(error.StaleApproval, bridge.decide(approval.sequence, approval.arguments_hash, true));
+    try awaitGroup(&f, &bridge, &worker);
+    try std.testing.expectEqual(Loop.Status.cancelled, worker.outcome.?.targets[0].status);
+    try std.testing.expect(!worker.outcome.?.targets[0].remote_effect_unknown);
+    try std.testing.expect(worker.outcome.?.targets[0].exit == null);
+    try std.testing.expectEqualStrings("", worker.outcome.?.targets[0].stdout);
+    try std.testing.expectEqual(@import("../../../../host/session_host.zig").CloseReceipt.released, bridge.stopGroup(1));
+    try std.testing.expectEqual(@as(u64, 0), bridge.closeImpact(first).ai);
+}
+
+test "real group newly joined member cannot inherit pending approval or frozen tool targets" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    const second = try prepareSecond(&f, "/tmp");
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    _ = try roster.join("group", f.app.legacyForHandle(first).?, 0);
+    var bridge = GroupTools.Bridge.init(a);
+    defer bridge.deinit();
+    const ids = [_]u64{@backingInt(first.session_id)};
+    const call = try groupInvocation(&ids, "printf NEW_MEMBER_MUST_NOT_INHERIT");
+    try bridge.prepare(f.app, &roster, call.scope);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = call };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        bridge.shutdown(f.app);
+        thread.join();
+        if (worker.outcome) |*outcome| outcome.deinit(a);
+    }
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try tickGroup(&f, &bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try std.testing.expect(bridge.writeRisk(first));
+    try std.testing.expect(!bridge.writeRisk(second));
+    _ = try roster.join("group", f.app.legacyForHandle(second).?, 0);
+    try std.testing.expectEqualSlices(u64, &ids, bridge.toolIds(.run_command).slice());
+    try bridge.decide(approval.sequence, approval.arguments_hash, true);
+    try awaitGroup(&f, &bridge, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.outcome.?.targets.len);
+    const result = worker.outcome.?.targets[0];
+    try std.testing.expectEqual(Loop.Status.rejected, result.status);
+    try std.testing.expectEqualStrings("GroupMembershipChanged", result.error_code.?);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(result.exit == null and !result.remote_effect_unknown);
+    try std.testing.expect(!bridge.writeRisk(first));
+}
+
+test "real group active child observes outer request stop while worker is blocked in execute" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const first = try f.prepare(&probe);
+    try f.tmp.dir.createDir(std.testing.io, "second", .default_dir);
+    const second_directory = try f.tmp.dir.realPathFileAlloc(std.testing.io, "second", a);
+    defer a.free(second_directory);
+    const second = try prepareSecond(&f, second_directory);
+    var roster = @import("../../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    _ = try roster.join("group", f.app.legacyForHandle(first).?, 0);
+    _ = try roster.join("group", f.app.legacyForHandle(second).?, 0);
+    var bridge = GroupTools.Bridge.init(a);
+    defer bridge.deinit();
+    const ids = [_]u64{ @backingInt(first.session_id), @backingInt(second.session_id) };
+    // Publish the real child's PID only after fork. A queued exec alone also
+    // reports write risk, but cannot exercise exit/ownership observation races.
+    const call = try groupInvocation(&ids, "sleep 10 & child=$!; printf '%s' \"$child\" > cancel-ready; wait; printf MUST_NOT_FINISH");
+    try bridge.prepare(f.app, &roster, call.scope);
+    var worker: Worker = .{ .host = bridge.interface(), .invocation = call };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        bridge.shutdown(f.app);
+        thread.join();
+        if (worker.outcome) |*outcome| outcome.deinit(a);
+    }
+    const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (bridge.pendingApproval() == null and clock.monotonicNs() < deadline) try tickGroup(&f, &bridge);
+    const approval = bridge.pendingApproval() orelse return error.ApprovalMissing;
+    try bridge.decide(approval.sequence, approval.arguments_hash, true);
+    const first_child = bridge.children.items[0];
+    var running_child: c_int = 0;
+    while (clock.monotonicNs() < deadline) {
+        const ready = f.tmp.dir.readFileAlloc(std.testing.io, "cancel-ready", a, .limited(32)) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (ready) |bytes| {
+            defer a.free(bytes);
+            running_child = std.fmt.parseInt(c_int, bytes, 10) catch 0;
+        }
+        const execution = first_child.bridge.vtable.impact(first_child.bridge.context, first);
+        if (running_child > 0 and first_child.bridge.vtable.risk(first_child.bridge.context, first) and std.mem.indexOf(u8, execution.detailText(), "执行中 1") != null) break;
+        try tickGroup(&f, &bridge);
+    }
+    try std.testing.expect(running_child > 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(running_child, @fromBackingInt(@intCast(0))));
+    try std.testing.expect(first_child.bridge.vtable.risk(first_child.bridge.context, first));
+    const execution = first_child.bridge.vtable.impact(first_child.bridge.context, first);
+    try std.testing.expect(std.mem.indexOf(u8, execution.detailText(), "执行中 1") != null);
+    const started = clock.monotonicNs();
+    worker.token.cancel();
+    try awaitGroup(&f, &bridge, &worker);
+    try std.testing.expect(clock.monotonicNs() - started < 5 * std.time.ns_per_s);
+    for (worker.outcome.?.targets) |target| {
+        if (target.status != .cancelled) std.debug.print("group cancel status={s} error={s} released={}\n", .{ @tagName(target.status), target.error_code orelse "none", target.local_released });
+        try std.testing.expectEqual(Loop.Status.cancelled, target.status);
+        try std.testing.expectEqualStrings("", target.stdout);
+        try std.testing.expect(target.local_released and !target.remote_effect_unknown);
+    }
+    try std.testing.expect(!bridge.writeRisk(first));
+    try std.testing.expect(!bridge.writeRisk(second));
+}
+
+test "session capabilities Local native catalog excludes shell attachment and keeps PTY execution" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var probe = LocalTools.Bridge.init(a);
+    defer probe.deinit();
+    const owner = try f.prepare(&probe);
+    var bridge = @import("../host/ai_tools.zig").Bridge.init(a);
+    defer bridge.deinit();
+    const host = @import("../../../../ai/host_tools.zig");
+    const Query = struct {
+        fn invoke(_: *anyopaque, _: host.Invocation, _: std.mem.Allocator) !host.Result {
+            return error.UnexpectedDispatch;
+        }
+    };
+    const contributions = @import("../../../../ai/host_queries.zig").contributions ++ @import("../../../../ai/host_terminal_queries.zig").contributions ++ @import("../../../../ai/host_execution.zig").contributions ++ .{@import("../../../../ai/batch_output.zig").contribution};
+    try bridge.configureHost(.{ .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = testTab(f.app, owner) }, .content = .{ .session = @backingInt(owner.session_id) }, .binding_revision = 1, .grant_revision = 1 }, .handler_context = &f, .invoke = Query.invoke, .contributions = &contributions });
+    try bridge.prepare(f.app, owner);
+    const prompt = @import("../../../../ai/session_prompt.zig");
+    try std.testing.expect(prompt.has(bridge.wire, "host.run_in_terminal"));
+    try std.testing.expect(prompt.has(bridge.wire, "host.wait_execution"));
+    try std.testing.expect(prompt.has(bridge.wire, "host.read_command_output"));
+    try std.testing.expect(!prompt.has(bridge.wire, "host.attach_shell"));
+    const system = try prompt.build(a, .auto, bridge.wire);
+    defer a.free(system);
+    try std.testing.expect(std.mem.indexOf(u8, system, "Use host__run_uin_uterminal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "host.attach_shell") == null);
+    // The terminal-read facade can omit native execution. Reading the screen
+    // must not advertise PTY control merely because it has a terminal.
+    const tab = f.workspace.sessionTab(f.app.legacyForHandle(owner).?).?;
+    const surface = tab.terminal.?.terminal_surface.?;
+    const original = surface.composite.raw.vtable;
+    var readonly = original.*;
+    readonly.execution_request = null;
+    surface.composite.raw.vtable = &readonly;
+    defer surface.composite.raw.vtable = original;
+    try std.testing.expect(bridge.capability_fingerprint != bridge.capabilityFingerprint(f.app));
+    try bridge.beginRequest();
+    try bridge.configureHost(.{ .context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = testTab(f.app, owner) }, .content = .{ .session = @backingInt(owner.session_id) }, .binding_revision = 1, .grant_revision = 1 }, .handler_context = &f, .invoke = Query.invoke, .contributions = &contributions });
+    try bridge.prepare(f.app, owner);
+    try std.testing.expect(prompt.has(bridge.wire, "host.read_terminal"));
+    for (@import("../../../../ai/host_execution.zig").contributions) |contribution| try std.testing.expect(!prompt.has(bridge.wire, contribution.definition.id));
+}
+
+test "PL4a M9 golden: builtin session AI derives from card types exactly as the removed manifest fields did" {
+    const sessions = @import("../../../../host/session_host.zig");
+    const plugins = @import("../../../../host/plugin_registry.zig");
+    const Dummy = struct {
+        var context: u8 = 0;
+        fn create(_: *anyopaque, _: sessions.CreateRequest) !void {}
+        fn cancel(_: *anyopaque, _: sessions.OperationKey) sessions.CloseReceipt {
+            return .released;
+        }
+        fn close(_: *anyopaque, _: @import("../../../../host/identity.zig").SessionHandle, _: sessions.OperationKey) !sessions.CloseReceipt {
+            return .released;
+        }
+        fn stale(_: *anyopaque, _: @import("../../../../host/identity.zig").SessionHandle, _: sessions.OperationKey) void {}
+        const vtable: sessions.Adapter.VTable = .{ .create = create, .cancel = cancel, .close = close, .release_stale = stale };
+    };
+    var ssh_services = plugins.requiredServices(.ssh);
+    ssh_services.bits |= plugins.Services.of(&.{.forward}).bits;
+    const adapters = [_]sessions.Adapter{
+        .{ .registration = .{ .plugin_id = .local, .workspace_kind = .terminal, .services = plugins.requiredServices(.local) }, .context = &Dummy.context, .vtable = &Dummy.vtable },
+        .{ .registration = .{ .plugin_id = .ssh, .workspace_kind = .terminal, .services = ssh_services }, .context = &Dummy.context, .vtable = &Dummy.vtable },
+        .{ .registration = .{ .plugin_id = .sftp, .workspace_kind = .file, .services = plugins.requiredServices(.sftp) }, .context = &Dummy.context, .vtable = &Dummy.vtable },
+    };
+    var host = try sessions.SessionHost.init(a, &adapters);
+    defer host.deinit();
+    // 改动前清单上的值（linked_plugins）：integration.ai = true；ai_adapter_factory 分别是三个兼容引擎；
+    // ai_context 只有身份（有引擎时不被使用）。
+    const Golden = struct { id: []const u8, card: []const u8, engine: @import("../../../../ai/legacy_adapter.zig").Factory };
+    const golden = [_]Golden{
+        .{ .id = "local", .card = "terminal", .engine = LocalTools.createAdapter },
+        .{ .id = "ssh", .card = "terminal", .engine = @import("../host/ai_ssh_tools.zig").createAdapter },
+        .{ .id = "sftp", .card = "file", .engine = @import("../host/ai_file_tools.zig").createAdapter },
+    };
+    for (golden) |item| {
+        const manifest = host.registry.find(item.id).?;
+        const card = host.registry.cardTypeFor(manifest).?;
+        try std.testing.expectEqualStrings(item.card, card.id);
+        try std.testing.expect(card.ai != null);
+        try std.testing.expect(card.ai.?.summary == .session_engine);
+        try std.testing.expect(card.ai.?.engineFor(manifest.id).? == item.engine);
+        // cards-float：会话卡片 = 标签页 · 分屏 · 浮动，浮动外框的放置动作都由注册表推出。
+        try std.testing.expect(card.placements.standalone_tab and card.placements.split and card.placements.float);
+        const derived = @import("../../../../host/card_types.zig").floatDescriptor(card).?;
+        try std.testing.expect(derived.supports(.open_as_tab) and derived.supports(.dock_to_split) and !derived.supports(.minimize) and derived.supports(.close));
+    }
+    // 宿主内置的非会话类型：ai.chat 浮动 + 分屏（cards-float）、不能独立成 tab、不声明 AI，浮动声明就是 AI 浮动层的 descriptor；
+    // history 可独立 / 浮动、不进分屏、每 tab 最多一张浮动。
+    const chat = host.registry.cardType("ai.chat").?;
+    try std.testing.expect(chat.ai == null and chat.binding == .tab and !chat.placements.standalone_tab and chat.placements.split and chat.placements.float);
+    try std.testing.expectEqualStrings(@import("../../../../ai/float_model.zig").descriptor.id, chat.float.?.id);
+    try std.testing.expect(chat.float.?.default_size == @import("../../../../ai/float_model.zig").descriptor.default_size);
+    const history = host.registry.cardType("history").?;
+    try std.testing.expect(history.ai == null and history.placements.standalone_tab and !history.placements.split and history.default_placement == .float and history.float_per_tab.? == 1);
+    // PL4b H5：过渡的归档类型 `history.archive` 已删除，会话记录只剩 `history` 一种卡片。
+    try std.testing.expect(host.registry.cardType("history.archive") == null);
+    try std.testing.expect(host.registry.cardType("session").?.ai == null);
+}
+
+/// 单卡 tab 的归属（M10）：会话卡片所在 tab 的 TabId。
+fn testTab(app: anytype, handle: @import("../../../../host/identity.zig").SessionHandle) u64 {
+    for (app.workspace.tabs.items) |tab| if (tab.content_owner == .session and tab.content_owner.session.eql(handle)) return @backingInt(tab.tab_id);
+    unreachable;
+}

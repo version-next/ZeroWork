@@ -4,8 +4,8 @@ const std = @import("std");
 const terminal = @import("../../host/terminal_service.zig");
 const Binding = @import("../../host/session_host.zig").ServiceHandle;
 const Owner = @import("../../host/identity.zig").SessionHandle;
-const Native = @import("../../ui/session_runtime.zig").SessionRuntime;
-const ReadSource = @import("../../ui/terminal_document_source.zig").Source;
+const Native = @import("../../features/workspace/host/session_runtime.zig").SessionRuntime;
+const ReadSource = @import("../../host/terminal_document_source.zig").Source;
 const encoder = @import("../../vt/ghostty_input.zig");
 
 pub const Provider = struct {
@@ -121,7 +121,11 @@ pub const Provider = struct {
         return .{ .owner = self.source.owner, .output_sequence = self.native.worker.vt.snapshot().output_sequence, .geometry_revision = self.geometry.revision, .input_revision = self.input_sequence, .read_only = !self.acceptsInput(), .eof_seen = self.ended(), .projection = projection, .applied_theme_revision = if (self.applied_theme) |t| t.revision else 0 };
     }
     fn gate(self: *Provider, sequence: u64, mode_revision: u64) !void {
-        if (!self.acceptsInput()) return error.SessionNotWritable;
+        if (self.writable()) {
+            try self.native.worker.replay.requireActive();
+        } else if (!self.native.worker.allowsBufferedOrdinaryInput()) {
+            return error.SessionNotWritable;
+        }
         if (self.pending_paste != null) return error.InputFull;
         if (sequence <= self.input_sequence) return error.StaleInput;
         if (mode_revision != self.native.worker.vt.mode_revision) return error.StaleMode;
@@ -419,7 +423,7 @@ test "SSH terminal provider preserves the registered binding and rejects a diffe
 
 // No socket or UI surrogate: exercise the production Provider, Ghostty mode
 // snapshot, replay admission and shell lease with a small real byte queue.
-const PasteFixture = struct {
+const InputFixture = struct {
     const Worker = @import("../../vt/ssh_worker.zig").SshWorker;
     const a = std.testing.allocator;
     worker: Worker = undefined,
@@ -457,8 +461,34 @@ const PasteFixture = struct {
     }
 };
 
+test "SSH input waits for native attachment without losing text before Return" {
+    var fixture: InputFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const service = fixture.provider.service();
+    const revision = fixture.worker.vt.mode_revision;
+    const operation = try fixture.worker.replay.notificationKey();
+    fixture.worker.replay.configure(operation, false, false);
+    fixture.worker.text.timing = .{};
+    const epoch = fixture.worker.shell_execution.?.lease.input_epoch;
+    const text: terminal.WriteRequest = .{ .input_sequence = 1, .mode_revision = revision, .bytes = "first" };
+    const enter: terminal.KeyRequest = .{ .input_sequence = 2, .mode_revision = revision, .event = .{ .key = .enter } };
+
+    try std.testing.expectError(error.WorkerBusy, service.write(text));
+    try std.testing.expectError(error.WorkerBusy, service.writeKey(enter));
+    try std.testing.expectEqual(@as(u64, 0), fixture.provider.input_sequence);
+    try std.testing.expectEqual(epoch, fixture.worker.shell_execution.?.lease.input_epoch);
+    try std.testing.expectEqual(@as(usize, 0), fixture.worker.input.pending());
+
+    try std.testing.expect(try fixture.worker.replay.attached(&fixture.worker.input, operation, .{}));
+    _ = try service.write(text);
+    _ = try service.writeKey(enter);
+    var bytes: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("first\r", fixture.worker.input.drain(&bytes));
+}
+
 test "SSH paste lease rejects prepared commit without pending bytes or sequence and never replays after handoff" {
-    var f: PasteFixture = .{};
+    var f: InputFixture = .{};
     try f.init();
     defer f.deinit();
     const service = f.provider.service();
@@ -480,7 +510,7 @@ test "SSH paste lease rejects prepared commit without pending bytes or sequence 
 }
 
 test "SSH paste lease preserves accepted partial bytes and blocks a new execution" {
-    var f: PasteFixture = .{};
+    var f: InputFixture = .{};
     try f.init();
     defer f.deinit();
     const service = f.provider.service();

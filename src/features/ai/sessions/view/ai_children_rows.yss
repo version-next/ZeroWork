@@ -1,0 +1,8 @@
+//! 子智能体弹层的行（O8 C534cF）与子对话的「任务记录」行：原生 `W.Pressable` 的 `look`，随主题由 zenit 按行自身状态解析
+//! （悬停 / 按下的底色是 zenit 交互 token），不再在挂载时把 token 取成定值、也不在主题变化时由视图重设。
+const ui = @import("ui");
+
+/// 子智能体行：44 高，左右 8，间距 10，圆角 6；悬停 bg-hover，按下 bg-active。
+style child_row { width: fill; height: 44; flex-shrink: 0; direction: row; align-items: center; justify: start; padding: 0 8; gap: 10; corner-radius: 6; :hover { background: bg-hover; } :active { background: bg-active; } }
+/// 任务记录行：整宽 28 高，间距 6，控件圆角；悬停 / 按下同 ghost 控件的交互底色。
+style history_row { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; gap: 6; corner-radius: control; background: transparent; :hover { background: bg-hover; } :active { background: button-pressed-bg; } }

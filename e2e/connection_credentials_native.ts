@@ -1,4 +1,5 @@
 /** Owned loopback regression: save a prompted password, open a second session, inspect focus. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,readFile,writeFile,open} from 'node:fs/promises';
@@ -8,7 +9,8 @@ import * as h from '../zig-out/share/zenit/harness/client.ts';
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);await mkdir(out,{recursive:true});
 const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-password-regression-'))),data=join(iso,'data'),rpc=join(iso,'rpc');await mkdir(data);await mkdir(rpc);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const peerLog=await open(join(out,'peer.log'),'w'),log=await open(join(out,'app.log'),'w');
-const peer=spawn('python3',['e2e/builtin_records_ssh_peer.py','--out',join(out,'peer')],{stdio:['ignore',peerLog.fd,peerLog.fd]});let app:any;
+assert(process.env.ZW_TEST_PYTHON,'ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used');
+const peer=spawn(process.env.ZW_TEST_PYTHON,['-I','e2e/builtin_records_ssh_peer.py','--out',join(out,'peer')],{stdio:['ignore',peerLog.fd,peerLog.fd]});let app:any;
 const shown=(n:any)=>n&&n.visible!==false&&n.hidden!==true&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const visible=async(id:string)=>(await h.query(id)).find(shown);
 async function click(id:string){const n=await h.waitFor(()=>visible(id),15000);assert((await h.clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok);await h.sleep(120)}
@@ -20,7 +22,10 @@ try{
  await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\n');
  app=spawn(binary,[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',log.fd,log.fd]});
  await h.waitForServerReady(30000);await h.resizeWindow(1200,800);
- const host=await h.waitFor(()=>visible('sidebar.host'));await h.clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2,2);
+
+ // 侧栏契约（design-r3 A2，fe28ab5b；sidebar_view.zig HostRow.onEvent）：单击主机行只选中，重复点击不连接；
+ // 选中行行尾的原生“连接”按钮（sidebar.host.connect_button）或 Return 才发起连接。
+ await click('sidebar.host');await click('sidebar.host.connect_button');
  await h.waitFor(()=>visible('plugin.challenge.answer.0'));await click('plugin.challenge.remember');const field=await visible('plugin.challenge.answer.0'),remember=await visible('plugin.challenge.remember');assert(remember.rect.y-(field.rect.y+field.rect.h)<=10);assert(!await visible('plugin.challenge.error'));await writeFile(join(out,'challenge-geometry.json'),JSON.stringify({field:field.rect,remember:remember.rect},null,2));report.checks.push('Password form fits content and empty error row is hidden');await h.screenshot(join(out,'password-save-option.png'));
  await click('plugin.challenge.answer.0');await h.type_(ready.password);await click('plugin.challenge.submit');
  await h.waitFor(async()=>!(await visible('plugin.challenge.modal'))&&await visible('terminal.input'),30000);await h.sleep(700);

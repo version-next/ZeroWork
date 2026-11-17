@@ -60,6 +60,9 @@ pub const Transition = enum {
     /// opacity + scale 0.98 (origin at anchor side). 6px slide-to-anchor via
     /// Popover positioner (exclusive translate); see dropdownSlideOffset.
     dropdown,
+    /// Fade while sliding 4px toward the anchor. A bottom panel rises into
+    /// place. Enter 150ms, exit 100ms.
+    anchored_fade,
     /// Liquid Glass popover (macOS .popover; measured in native_menu_morph.swift):
     /// spring-scale from origin (arrow tip to anchor), opacity = min(scale, 1).
     /// Enter: spring(0.336, 0.783), peak 1.019. Exit: 1 - spring(0.378, 0.797),
@@ -73,6 +76,15 @@ pub const Transition = enum {
     slide_right,
     slide_left,
     slide_top,
+
+    /// Signed travel on enter. Positive moves away from the anchor.
+    pub fn anchorSlidePx(self: Transition) f32 {
+        return switch (self) {
+            .dropdown => 6,
+            .anchored_fade => -4,
+            else => 0,
+        };
+    }
 };
 
 pub const glass_popover_enter_ms: f32 = 460;
@@ -169,6 +181,10 @@ pub const TransitionController = struct {
                 .entering => 160,
                 .exiting => 120,
             },
+            .anchored_fade => switch (direction) {
+                .entering => 150,
+                .exiting => 100,
+            },
             .glass_popover => switch (direction) {
                 .entering => glass_popover_enter_ms,
                 .exiting => glass_popover_exit_ms,
@@ -194,7 +210,7 @@ pub const TransitionController = struct {
         return switch (transition) {
             .none => .linear,
             .fade, .fade_fast => .ease_out_quad,
-            .scale_fade, .dropdown => .ease_out_cubic,
+            .scale_fade, .dropdown, .anchored_fade => .ease_out_cubic,
             // Visual value from glassPopoverScale directly; no easing applied.
             .glass_popover, .menu_fade => .linear,
             // iOS sheet feel: high initial velocity, long-tail deceleration; smoother
@@ -207,7 +223,7 @@ pub const TransitionController = struct {
         return switch (transition) {
             .none => 0,
             .fade, .fade_fast => 24,
-            .scale_fade, .dropdown, .glass_popover, .menu_fade => 24,
+            .scale_fade, .dropdown, .anchored_fade, .glass_popover, .menu_fade => 24,
             .slide_bottom, .slide_right, .slide_left, .slide_top => 24,
         };
     }
@@ -319,7 +335,7 @@ pub const TransitionController = struct {
             .fade, .fade_fast => {
                 node.setOpacityRaw(opacity_t);
             },
-            .dropdown => {
+            .dropdown, .anchored_fade => {
                 // Host owns translate (Popover writes rest + current offset each frame);
                 // here applies delta = new - old (old inferred from node opacity), same
                 // frame.
@@ -334,6 +350,8 @@ pub const TransitionController = struct {
                     node.style.translate_x += self.slide[0] * ((1 - opacity_t) - (1 - old_t));
                     node.style.translate_y += self.slide[1] * ((1 - opacity_t) - (1 - old_t));
                 }
+                // The slide still in the translate: transient, out of the surface rest origin.
+                ext.motion_offset = if (reduce_motion) .{ 0, 0 } else .{ self.slide[0] * (1 - opacity_t), self.slide[1] * (1 - opacity_t) };
             },
             .menu_fade => node.setOpacityRaw(self.visualValue()),
             .glass_popover => {
@@ -361,24 +379,32 @@ pub const TransitionController = struct {
                 const r = node.rectFromWorldOrFallback();
                 const offset = (1.0 - motion_t) * r.h;
                 node.style.translate_y = offset;
+                // The whole slide is transient (the rest translate is 0).
+                node.style.ensureExtPanic(allocator).motion_offset = .{ 0, offset };
             },
             .slide_right => {
                 node.setOpacityRaw(if (reduce_motion) opacity_t else slideOpacity(self.progress));
                 const r = node.rectFromWorldOrFallback();
                 const offset = (1.0 - motion_t) * r.w;
                 node.style.translate_x = offset;
+                // The whole slide is transient (the rest translate is 0).
+                node.style.ensureExtPanic(allocator).motion_offset = .{ offset, 0 };
             },
             .slide_left => {
                 node.setOpacityRaw(if (reduce_motion) opacity_t else slideOpacity(self.progress));
                 const r = node.rectFromWorldOrFallback();
                 const offset = -(1.0 - motion_t) * r.w;
                 node.style.translate_x = offset;
+                // The whole slide is transient (the rest translate is 0).
+                node.style.ensureExtPanic(allocator).motion_offset = .{ offset, 0 };
             },
             .slide_top => {
                 node.setOpacityRaw(if (reduce_motion) opacity_t else slideOpacity(self.progress));
                 const r = node.rectFromWorldOrFallback();
                 const offset = -(1.0 - motion_t) * r.h;
                 node.style.translate_y = offset;
+                // The whole slide is transient (the rest translate is 0).
+                node.style.ensureExtPanic(allocator).motion_offset = .{ 0, offset };
             },
         }
         // Overlay enter/exit transitions here only touch compositor-managed
@@ -449,6 +475,24 @@ pub const TransitionController = struct {
         };
     }
 
+    /// This controller at its fully shown end: an enter's last frame, an exit's first. `apply`ing
+    /// it writes exactly the open state of every property this transition animates (opacity,
+    /// scale, slide translate, motion offset, the dropdown offset relative to the node's current
+    /// opacity), so it undoes whatever the transition left on a node without a second definition
+    /// of "shown". Host-fed state (the dropdown `slide`) is kept.
+    pub fn shown(self: TransitionController) TransitionController {
+        var ctrl = self;
+        ctrl.progress = 1.0;
+        ctrl.elapsed_ms = switch (ctrl.direction) {
+            .entering => durationMs(ctrl.transition, .entering),
+            .exiting => 0,
+        };
+        ctrl.amplitude = 1;
+        ctrl.delay_remaining_ms = 0;
+        ctrl.pending_first_tick = false;
+        return ctrl;
+    }
+
     pub fn isComplete(self: *const TransitionController) bool {
         if (self.transition == .none) return true;
         return switch (self.direction) {
@@ -490,14 +534,14 @@ pub const TransitionController = struct {
 pub fn transitionAffectsOpacity(transition: Transition) bool {
     return switch (transition) {
         .none => false,
-        .fade, .fade_fast, .scale_fade, .dropdown, .glass_popover, .menu_fade, .slide_bottom, .slide_right, .slide_left, .slide_top => true,
+        .fade, .fade_fast, .scale_fade, .dropdown, .anchored_fade, .glass_popover, .menu_fade, .slide_bottom, .slide_right, .slide_left, .slide_top => true,
     };
 }
 
 /// Whether transition affects transform (translate / scale).
 pub fn transitionAffectsTransform(transition: Transition) bool {
     return switch (transition) {
-        .scale_fade, .dropdown, .glass_popover, .slide_bottom, .slide_right, .slide_left, .slide_top => true,
+        .scale_fade, .dropdown, .anchored_fade, .glass_popover, .slide_bottom, .slide_right, .slide_left, .slide_top => true,
         .none, .fade, .fade_fast, .menu_fade => false,
     };
 }

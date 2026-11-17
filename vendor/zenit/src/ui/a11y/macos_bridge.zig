@@ -1754,7 +1754,7 @@ test "macos_bridge: retained push preserves exact target flags priority and focu
     var labels = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer labels.map.deinit();
     const text = "Danger";
-    const hash = std.hash.Wyhash.hash(0, text);
+    const hash = @import("trace").work_counters.hashText(0, text);
     try labels.map.put(hash, text);
     const id = AXId.node(.{ .index = 0, .generation = 0 });
     var ref = PushCxRef{ .window_id = 77, .label_ctx = &labels, .label_resolver = &TestLabelCtx.resolve };

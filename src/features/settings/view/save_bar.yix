@@ -1,0 +1,106 @@
+//! Save Bar、“恢复默认…”与确认对话框（H-save，人工验收反馈第 4 条；规则在 `model/save_flow.zig`）。
+//!
+//! - Save Bar：只在当前作用域（右侧显示的子页）有未保存改动时出现——右下浮动的原生 `W.GlassBox` 胶囊，
+//!   里面是状态文字、“撤销”“保存”两个原生 `W.Button`（只用 `variant` / `size`，不覆盖外观）。干净、已保存时不出现；
+//!   保存成功 / 失败弹原生 Toast：窗口里一个 `<W.NotificationHost>`（底部居中），请求来自 view-model 的 `toast` 信号（S-19，G38），
+//!   宿主不持有 Notifier。
+//! - 恢复默认：正文底部一行原生 ghost 按钮，只在当前作用域的值与默认值不同时可点；点了先确认。
+//! - 确认对话框：原生 `W.Modal` 默认外观（默认遮罩、默认面板底色、默认标题栏），常驻挂载（有原生退出动画），打开时焦点在对话框里。
+//!   “未保存的设置”（关窗 / 离开当前子页）与“恢复默认设置？”共用一个，按 `ViewModel.promptKind` 切文案与按钮。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const S = @import("styles.yss");
+
+fn shown(vm: *m.ViewModel) bool {
+    return vm.footerVisible();
+}
+fn message(vm: *m.ViewModel) []const u8 {
+    return vm.footerMessage();
+}
+fn danger(vm: *m.ViewModel) bool {
+    return vm.footerDanger();
+}
+fn saving(vm: *m.ViewModel) bool {
+    return vm.isSaving();
+}
+fn revertDisabled(vm: *m.ViewModel) bool {
+    return !vm.revertEnabled();
+}
+fn saveDisabled(vm: *m.ViewModel) bool {
+    return !vm.saveEnabled();
+}
+fn resetShown(vm: *m.ViewModel) bool {
+    return vm.resetShown();
+}
+fn resetDisabled(vm: *m.ViewModel) bool {
+    return !vm.resetEnabled();
+}
+/// 保存中忽略点击（禁用的按钮本身不派发点击）。
+fn run(vm: *m.ViewModel, command: m.Command) void {
+    if (vm.controller.state() == .saving) return;
+    vm.dispatch(m.Intent.runCommand(command));
+}
+fn decide(vm: *m.ViewModel, decision: m.Decision) void {
+    vm.dispatch(m.Intent.decideWith(decision));
+}
+/// 遮罩点击已关掉；Escape / 标题栏关闭按钮只“提议”关闭——按“继续编辑 / 取消”处理。
+fn openChanged(vm: *m.ViewModel, open: bool) void {
+    if (!open) decide(vm, .cancel);
+}
+/// view-model 的 Toast 请求换成 zenit 的 `NotificationPost`（同 `focusRequest` 的写法：view-model 不引用视图层类型）。
+fn toastPost(vm: *m.ViewModel) W.NotificationPost {
+    const ask = vm.toast();
+    if (ask.seq == 0) return .{};
+    return .{ .seq = ask.seq, .op = .{ .hint = .{ .text = ask.text, .mark = switch (ask.tone) {
+        .success => .success,
+        .failure => .@"error",
+    } } } };
+}
+
+pub fn SaveBar(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.footer" style={S.save_bar_slot} visible={shown(vm)}>
+            <W.GlassBox shape={.capsule} padding={.{ .top = 4, .right = 4, .bottom = 4, .left = 14 }} bodyGap={8} parts={.{ .body = .{ .style = S.save_bar_row } }}>
+                <text testId="settings.footer.state" style={S.FooterStatus.of(.{ .danger = danger(vm) })} box={S.footer_state_box}>{message(vm)}</text>
+                <W.Button testId={m.ids.revert} label="撤销" a11yLabel="撤销更改" variant={.ghost} size={.sm} disabled={revertDisabled(vm)} onClick={run(vm, .revert)} />
+                <W.Button testId={m.ids.save} label="保存" a11yLabel="保存更改" variant={.primary} size={.sm} disabled={saveDisabled(vm)} loading={saving(vm)} onClick={run(vm, .save)} />
+            </W.GlassBox>
+        </box>
+    );
+}
+
+/// 正文底部的“恢复默认…”：位置固定在最后一个面板下面、右对齐，远离常用控件；作用域没有可编辑字段时不显示。
+pub fn ResetRow(vm: *m.ViewModel) View {
+    return (
+        <box style={S.reset_row} visible={resetShown(vm)}>
+            <W.Button testId={m.ids.reset} label="恢复默认…" a11yLabel="恢复本页默认设置" variant={.ghost} size={.sm} disabled={resetDisabled(vm)} onClick={run(vm, .reset_defaults)} />
+        </box>
+    );
+}
+
+/// 外层 box 只是挂载点：原生 Modal 与 Toast 栈（`W.NotificationHost`）都挂到窗口的浮层根上（portal），自己在模板里不留节点
+/// （组件根不能为空）。
+/// 常驻挂载、`open` 跟随 view-model（原生的打开 / 退出动画都在）：关着的对话框不在 Tab 顺序里（上游 G36），每次打开时焦点落到
+/// 声明了 `autoFocus` 的“继续编辑 / 取消”（上游 G37：关着时不抢焦点，打开时才聚焦；这里有意把焦点给安全的选项）。
+/// 标题栏关闭钮是原生 Button，在正文之后进入 Tab 顺序，经结果部件 `close_button` 命名为 `settings.confirmation.close`。
+pub fn Confirmation(vm: *m.ViewModel) View {
+    return (
+        <box style={S.confirm_anchor}>
+        <W.Modal open={vm.promptOpen()} onOpenChange={|o| openChanged(vm, o)} title={vm.promptTitle()} closeOnOverlay={false} width={440} parts={.{ .close_button = m.ids.confirmation_close }}>
+            <box testId={m.ids.confirmation} style={S.confirm_body}>
+                <text style={S.ConfirmMessage.of(.{ .problem = vm.promptProblem() })} box={S.confirm_text_box}>{vm.promptMessage()}</text>
+                <text style={S.confirm_notice} box={S.confirm_text_box}>{vm.promptNotice()}</text>
+                <box style={S.confirm_actions}>
+                    <W.Button testId={m.ids.confirmation_cancel} focusId={m.focus_ids.confirmation_cancel} autoFocus={true} label={vm.promptCancelLabel()} variant={.secondary} onClick={decide(vm, .cancel)} />
+                    <spacer />
+                    <W.Button testId={m.ids.confirmation_discard} label="放弃更改" variant={.danger} visible={vm.promptAsksSave()} onClick={decide(vm, .discard)} />
+                    <W.Button testId={m.ids.confirmation_save} label={vm.promptSaveLabel()} variant={.primary} visible={vm.promptAsksSave()} onClick={decide(vm, .save)} />
+                    <W.Button testId={m.ids.confirmation_reset} label="恢复默认" variant={.primary} visible={vm.promptAsksReset()} onClick={decide(vm, .reset)} />
+                </box>
+            </box>
+        </W.Modal>
+        <W.NotificationHost post={toastPost(vm)} position={.bottom_center} />
+        </box>
+    );
+}

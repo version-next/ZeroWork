@@ -1,0 +1,24 @@
+//! 关于与更新面板（P3 3e 第二批）的样式：版本卡（应用图标、名称、版本行、更新块）。
+//! 状态徽标是原生 `W.Tag`、检查更新是原生 primary `W.Button`（默认外观，不覆盖）、发布来源是原生 link 按钮；
+//! 这里只有布局盒子与文字。几何沿用旧 `settings_updates_styles`（`Vbefc`）；颜色全部是 token。
+const ui = @import("ui");
+
+/// 版本卡（`Vbefc` › Body）：内边距 14、间距 14、圆角 12，窗面静止底色（同其它面板的正文卡片）。
+style card { width: fill; direction: column; gap: 14; padding: 14; corner-radius: 12; background: zw-window-rest; overflow: hidden; flex-shrink: 0; min-width: 0; }
+/// 身份行（`sPPyy`）：64pt 应用图标 + 名称 / 版本，间距 14。
+style identity { width: fill; direction: row; align-items: center; gap: 14; flex-shrink: 0; min-width: 0; }
+/// 应用图标（`Ebev1`）：64、圆角 14，品牌对角渐变（`zw-primary*` token；图标墨色 `zw-primary-fg`），终端图标 30。
+style app_mark { width: 64; height: 64; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 14; background: zw-primary; gradient: zw-primary zw-primary-to diagonal; }
+style app_mark_icon { width: 30; height: 30; icon-color: zw-primary-fg; }
+style identity_text { width: fill; flex: 1; min-width: 0; direction: column; gap: 3; }
+style app_name { font-size: 18; font-weight: 600; line-height: {24.0 / 18.0}; color: fg-primary; }
+style version_text { font-size: 11.5; font-weight: 400; line-height: {17.0 / 11.5}; color: zw-fg-supporting; wrap: word; }
+style version_text_box { width: fill; min-width: 0; }
+/// 更新块（`vUN0f`）：圆角 10、内边距 [14, 16]、间距 12；有可用的新版本时换成强调面，否则是输入面。
+recipe Banner {
+  base { width: fill; direction: row; align-items: center; gap: 12; padding: 14 16; corner-radius: 10; background: bg-primary; flex-shrink: 0; min-width: 0; }
+  flag available { background: accent-tag-bg; }
+}
+style banner_text { width: fill; flex: 1; min-width: 0; direction: column; gap: 2; }
+style banner_title { font-size: 14; font-weight: 600; line-height: {20.0 / 14.0}; color: fg-primary; wrap: word; }
+style banner_note { font-size: 12; font-weight: 400; line-height: 1.5; color: zw-fg-supporting; wrap: word; }

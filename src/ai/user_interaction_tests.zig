@@ -2,7 +2,7 @@ const std = @import("std");
 const Q = @import("user_interaction.zig");
 const host = @import("host_tools.zig");
 const a = std.testing.allocator;
-const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 };
+const context: host.Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 101 }, .content = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 };
 const json = "{\"question\":\"如何处理？\",\"options\":[{\"id\":\"reload\",\"label\":\"平滑重载\"},{\"id\":\"restart\",\"label\":\"重启\"}]}";
 fn invocation(value: std.json.Value, wire: []const u8) !host.Invocation {
     var hash: [32]u8 = undefined;
@@ -81,4 +81,28 @@ test "user interaction validates bounded unique options and custom answers" {
     var tampered = try invocation(valid.value, freeform);
     tampered.arguments_hash = @splat(0);
     try std.testing.expectError(error.InvalidUserQuestion, broker.begin(tampered, a));
+}
+
+test "a question appearing and going away publishes to the bound window only (LIFECYCLE.md §5.3)" {
+    const publication = @import("publication.zig");
+    const presentation = @import("../platform/presentation_wakeup.zig");
+    _ = presentation.take();
+    const window = presentation.registerWindow(0xb5e1);
+    defer presentation.unregisterWindow(0xb5e1, window);
+    var wake: publication.Wake = .{};
+    wake.bind(window);
+    var broker: Q.Broker = .{ .wake = &wake };
+    broker.configure(context);
+    defer broker.stop();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const before = publication.revision();
+    const ticket = try broker.begin(try invocation(parsed.value, json), a);
+    try std.testing.expect(publication.revision() > before);
+    try std.testing.expect(!presentation.take());
+    try std.testing.expect(presentation.takeWindow(0xb5e1));
+    const shown = publication.revision();
+    broker.finish(ticket);
+    try std.testing.expect(publication.revision() > shown);
+    try std.testing.expect(presentation.takeWindow(0xb5e1));
 }

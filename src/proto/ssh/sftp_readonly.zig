@@ -18,6 +18,7 @@ pub const page_limit = 128;
 pub const entry_limit = 4096;
 const request_limit = 8;
 const budget_ns = 30 * std.time.ns_per_s;
+const os_release_limit = 8192;
 
 pub const EndpointRef = struct {
     kind: enum { sftp } = .sftp,
@@ -298,19 +299,11 @@ pub const Service = struct {
                 self.event(.ready, .released);
             }
         }
-        // No shell is opened. Metadata uses a bounded independent exec
-        // channel on this same IO owner; SFTP requests retain their own lane.
-        var os_bridge = @import("exec_bridge.zig").SshExecBridge.init(session, std.heap.c_allocator);
-        defer os_bridge.deinitLocal();
-        var os_probe = os_bridge.diagnostic(@import("remote_os.zig").command, .{ .timeout_ms = 3000, .capture_cap = 8192 }) catch null;
+        // SFTP-only: this binding never sends an exec, shell or PTY request.
+        // OS identification uses the SFTP connection itself and runs once, on
+        // the first idle turn, so the first user request is not delayed.
+        var os_detected = false;
         while (!self.closing.load(.acquire)) {
-            if (os_probe) |handle| {
-                os_bridge.step() catch {};
-                if (@import("exec_bridge.zig").SshExecBridge.pollHandle(handle)) |result| {
-                    if (result.status == .completed) self.detected_os.store(@import("remote_os.zig").parse(result.stdout), .release);
-                    if ((os_bridge.closeCall(handle) catch .awaiting) == .released) os_probe = null;
-                }
-            }
             self.mutex.lock();
             var next: ?*Work = null;
             for (self.works.items) |work| if (!work.active and !work.finished) {
@@ -327,10 +320,43 @@ pub const Service = struct {
                 };
                 result.value.cleanup = context.cleanup;
                 self.publishFinal(work, result);
+            } else if (!os_detected) {
+                os_detected = true;
+                self.detectOs();
             } else pause(-1);
         }
         self.drainCancelled();
         self.finishClose();
+    }
+
+    /// remote_os.fromSftp over: the handshake banner (no packet), then
+    /// os-release read over SFTP, then the home directory's path style.
+    /// Unreadable sources are skipped; the result may stay `.unknown`.
+    fn detectOs(self: *Service) void {
+        const remote_os = @import("remote_os.zig");
+        var banner_buffer: [256]u8 = undefined;
+        const banner = remote_os.parseBanner(self.session.?.serverBanner(&banner_buffer));
+        var release: remote_os.Kind = .unknown;
+        var path_style: remote_os.Kind = .unknown;
+        if (!remote_os.bannerIsFinal(banner)) {
+            var context: Context = .{ .service = self, .deadline = clock.monotonicNs() + budget_ns };
+            for ([_][:0]const u8{ "/etc/os-release", "/usr/lib/os-release" }) |path| {
+                if (self.closing.load(.acquire)) return;
+                var buffer: [os_release_limit]u8 = undefined;
+                const bytes = context.readSmallFile(path, &buffer) catch continue;
+                release = remote_os.parse(bytes);
+                break;
+            }
+            if (remote_os.fromSftp(banner, release, .unknown) == .unknown and !self.closing.load(.acquire)) {
+                var buffer: [path_limit + 1]u8 = undefined;
+                if (context.call(ssh.Session.sftpRealpath, .{ &self.session.?, ".", &buffer })) |home| {
+                    path_style = remote_os.parseSftpPath(home);
+                } else |_| {}
+            }
+            if (context.cleanup != .released) return;
+        }
+        if (@import("../../platform/runtime_mode.zig").automation) std.debug.print("SFTP_OS_DETECTED {{\"binding_id\":{d},\"banner\":\"{s}\",\"os_release\":\"{s}\",\"path_style\":\"{s}\"}}\n", .{ self.endpoint.binding_id, @tagName(banner), @tagName(release), @tagName(path_style) });
+        self.detected_os.store(remote_os.fromSftp(banner, release, path_style), .release);
     }
 
     fn publishFinal(self: *Service, work: *Work, result: OwnedResult) void {
@@ -447,6 +473,20 @@ const Context = struct {
             }
             pause(self.service.session.?.socket_fd);
         }
+    }
+    /// At most `buffer.len` bytes of a regular file; used only for os-release.
+    fn readSmallFile(self: *Context, path: [:0]const u8, buffer: []u8) ![]const u8 {
+        var handle = try self.call(ssh.Session.sftpOpenReadonly, .{ &self.service.session.?, path, false });
+        defer self.closeHandle(&handle);
+        const opened = try self.call(ssh.SftpReadonlyHandle.stat, .{&handle});
+        if (opened.kind != .file) return error.NotRegularFile;
+        var used: usize = 0;
+        while (used < buffer.len) {
+            const count = try self.call(ssh.SftpReadonlyHandle.read, .{ &handle, buffer[used..] });
+            if (count == 0) break;
+            used += count;
+        }
+        return buffer[0..used];
     }
     fn canonical(self: *Context, allocator: std.mem.Allocator, path: [:0]const u8) ![:0]u8 {
         var buffer: [path_limit + 1]u8 = undefined;

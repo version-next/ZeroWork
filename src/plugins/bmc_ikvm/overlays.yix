@@ -1,0 +1,69 @@
+//! KVM 卡片浮层（Pencil j8WXoF「ZW · KVM 卡片浮层 2026-11-13」）。只用 zenit 原生组件：
+//!
+//! - O1 工具栏状态区：`W.Tag`（sm；warning = 电源执行中、accent = AI 操作、info = 键鼠已捕获、neutral = AI 观察），
+//!   AI 操作时跟一个 `W.Button`（secondary sm）"接管"。同一时刻只显示优先级最高的一个（宿主算好再写信号）。
+//! - O2 性能 HUD：`W.TooltipSurface`（固定深色底，不随应用主题翻转——背景永远是远程画面），画面右上。
+//! - O3 底部提示条：`W.HintCapsule`（通知 hint 胶囊的就地版），画面底边居中，两侧各留 84 给图标列。
+//! - O4 "等待画面"中心卡：`W.Alert` info（电源执行中、无信号）。
+//! - O5 AI 操作描边：画面外圈 8 pt 黑边内侧 2 px accent，不压远程像素。
+//!
+//! 位置、显隐、文字全部是 `views.zig` 在画面几何或 KVM 控制器状态变化时写的信号；O2 / O3 的淡入淡出由宿主做
+//! 不透明度动画。画面浮层（O2–O5）都不参与命中，不拦截远程输入。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("overlays.yss");
+
+pub const ids = struct {
+    pub const status = "bmc.status";
+    pub const status_tag = "bmc.status.tag";
+    pub const takeover = "bmc.status.takeover";
+    pub const hud = "bmc.fps";
+    pub const hud_text = "bmc.fps.display";
+    pub const hint = "bmc.input_hint";
+    pub const waiting = "bmc.waiting";
+    pub const ai_frame = "bmc.ai_frame";
+};
+
+/// O1：工具栏里标题与连接状态右侧的状态区。
+pub fn Status(shown: bool, label: []const u8, color: W.TagColor, takeover: bool, onTakeover: ?Handler(void) = null) View {
+    return (
+        <row testId={ids.status} style={S.status} visible={shown}>
+            <W.Tag testId={ids.status_tag} label={label} color={color} size={.sm} />
+            <W.Button testId={ids.takeover} label="接管" a11yLabel="接管：停止 AI 操作，交还键鼠" variant={.secondary} size={.sm} visible={takeover} onClick={onTakeover} />
+        </row>
+    );
+}
+
+/// O2：性能 HUD。`right` / `top` 是相对视频卡片的右边距与上边距。
+pub fn Hud(shown: bool, right: f32, top: f32, text: []const u8) View {
+    return (
+        <box testId={ids.hud} style={S.hud.of(.{ .right = right, .top = top })} visible={shown}>
+            <W.TooltipSurface testId={ids.hud_text} text={text} fixedDark={true} fontSize={11} wrap={.none} />
+        </box>
+    );
+}
+
+/// O3：底部提示条。`left` / `width` 是画面内留出图标列后的可用区间，`bottom` 是相对视频卡片的下边距。
+pub fn Hint(shown: bool, left: f32, width: f32, bottom: f32, text: []const u8) View {
+    return (
+        <row testId={ids.hint} style={S.hint.of(.{ .left = left, .width = width, .bottom = bottom })} visible={shown}>
+            <W.HintCapsule text={text} maxWidth={width} />
+        </row>
+    );
+}
+
+/// O4：等待画面（电源执行中、无信号）。旧画面保留在下面。
+pub fn Waiting(shown: bool, left: f32, top: f32, width: f32, title: []const u8, message: []const u8) View {
+    return (
+        <box testId={ids.waiting} style={S.waiting.of(.{ .left = left, .top = top, .width = width })} visible={shown}>
+            <W.Alert variant={.info} title={title} message={message} />
+        </box>
+    );
+}
+
+/// O5：AI 操作描边（在 8 pt 黑边内侧，不压远程像素）。`width` / `height` = 视频卡片 − 12。
+pub fn AiFrame(shown: bool, width: f32, height: f32) View {
+    return (
+        <box testId={ids.ai_frame} style={S.ai_frame.of(.{ .width = width, .height = height })} visible={shown} />
+    );
+}

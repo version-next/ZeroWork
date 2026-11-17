@@ -5,6 +5,7 @@
  * Captures are the real Metal surface; native traffic lights need a separate
  * native-window capture. Synthetic keys/IME do not prove a real input method.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile, open, cp, realpath } from "node:fs/promises";
@@ -32,7 +33,7 @@ async function visibleTabOrder(): Promise<string[]> {
     if (visible && /^tabs\.tab\.[0-9]+$/.test(node.test_id ?? "") && node.rect.w > 0 && node.rect.h > 0) tabs.push(node);
     for (const child of node.children ?? []) visit(child, visible);
   };
-  visit(await tree(), true);
+  visit(await tree({ root: "tabs.strip" }), true);
   return tabs.sort((a, b) => a.rect.x - b.rect.x).map((node) => node.test_id!);
 }
 
@@ -168,10 +169,10 @@ try {
         const path = join(output, `${step.name}.png`);
         const captured = await screenshot(path);
         if (!captured.ok) throw new Error(`Capture failed: ${step.name}`);
-        const nodeTree = await tree();
+        const nodeTree = await tree({ visibleOnly: true });
         await writeFile(join(output, `${step.name}.tree.json`), JSON.stringify(nodeTree, null, 2));
         if (!nodeTree.rect) {
-          const bounded = Object.fromEntries(await Promise.all(["workspace.body", "workspace.sidebar.collapsed", "history.panel", "ai.panel", "settings.panel", "tabs.strip", "wizard.steps", "wizard.protocol", "wizard.footer", "wizard.close"].map(async id => [id, await query(id)])));
+          const bounded = Object.fromEntries(await Promise.all(["workspace.body", "workspace.sidebar.restore", "history.panel", "ai.panel", "settings.panel", "tabs.strip", "wizard.steps", "wizard.protocol", "wizard.footer", "wizard.close"].map(async id => [id, await query(id)])));
           await writeFile(join(output, `${step.name}.queries.json`), JSON.stringify(bounded, null, 2));
           record.tree_limit = "Full tree RPC exceeded its buffer; bounded projections saved separately.";
         }
@@ -303,7 +304,7 @@ try {
   if (serverReady && child.exitCode === null && child.signalCode === null) {
     const diagnostics = await Promise.allSettled([
       screenshot(join(output, "failure.png")),
-      tree().then((value) => writeFile(join(output, "failure.tree.json"), JSON.stringify(value, null, 2))),
+      tree({ visibleOnly: true }).then((value) => writeFile(join(output, "failure.tree.json"), JSON.stringify(value, null, 2))),
     ]);
     evidence.failure_diagnostics = diagnostics.map((result) => result.status);
   }

@@ -1,10 +1,11 @@
 //! Application-owned filesystem lifecycle. Call prepare before opening stores
 //! or logs. Stop writers, beginReset, erase Keychain, then eraseOwned.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const Paths = @import("paths.zig").Paths;
 const Dir = std.Io.Dir;
-const private_dir: std.Io.File.Permissions = @fromBackingInt(0o700);
-const private_file: std.Io.File.Permissions = @fromBackingInt(0o600);
+const private_dir: std.Io.File.Permissions = @fromBackingInt(persist.private_dir_mode);
+const private_file: std.Io.File.Permissions = persist.private_file;
 
 pub const PrepareReport = struct {
     migrated_legacy: bool = false,
@@ -27,7 +28,9 @@ pub const EraseReport = struct {
 /// the live account root, rather than accepting arbitrary injected fields.
 pub fn validate(paths: *const Paths) !void {
     if (paths.is_override) {
-        const account = try @import("../platform/account.zig").home(paths.allocator);
+        // Protection only: the live account root is never an erase target,
+        // whichever home this build derives its own paths from.
+        const account = try @import("../platform/user_dirs.zig").accountHome(paths.allocator);
         defer paths.allocator.free(account);
         {
             if (std.mem.eql(u8, paths.directory, account) or (std.mem.startsWith(u8, account, paths.directory) and account.len > paths.directory.len and account[paths.directory.len] == '/')) return error.InvalidOwnedPaths;
@@ -203,11 +206,7 @@ fn persistResetMarker(io: std.Io, data: Dir) !void {
 }
 
 fn syncDirectory(dir: Dir) !void {
-    while (true) switch (std.posix.errno(std.c.fsync(dir.handle))) {
-        .SUCCESS => break,
-        .INTR => continue,
-        else => return error.ResetMarkerSyncFailed,
-    };
+    persist.syncDirectory(dir) catch return error.ResetMarkerSyncFailed;
 }
 
 pub fn prepare(io: std.Io, paths: *const Paths) !PrepareReport {

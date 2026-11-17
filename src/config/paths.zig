@@ -1,4 +1,5 @@
 const std = @import("std");
+const user_dirs = @import("../platform/user_dirs.zig");
 
 /// The user data location shared by application settings, host assets and logs.
 /// Paths are owned, so callers may release the account source immediately.
@@ -14,11 +15,14 @@ pub const Paths = struct {
     home_directory: ?[]u8 = null,
     is_override: bool = true,
 
-    pub const bundle_id = "com.zerowork.app";
+    pub const bundle_id = user_dirs.bundle_id;
 
     pub fn forApplication(allocator: std.mem.Allocator) !Paths {
-        if (@import("../testing/data_directory.zig").override()) |directory| return fromDirectory(allocator, directory);
-        const home = try @import("../platform/account.zig").home(allocator);
+        if (@import("../shared/testing/data_directory.zig").override()) |directory| {
+            try user_dirs.checkDataOverride(std.mem.trimEnd(u8, directory, "/"));
+            return fromDirectory(allocator, directory);
+        }
+        const home = try user_dirs.home(allocator);
         defer allocator.free(home);
         return fromHome(allocator, home);
     }
@@ -26,20 +30,20 @@ pub const Paths = struct {
     pub fn fromHome(allocator: std.mem.Allocator, home: []const u8) !Paths {
         const clean = std.mem.trimEnd(u8, home, "/");
         if (!isSafeAbsolute(clean)) return error.InvalidHomeDirectory;
-        const directory = try std.fs.path.join(allocator, &.{ clean, "Library", "Application Support", bundle_id });
+        const directory = try user_dirs.appSupportIn(allocator, clean);
         defer allocator.free(directory);
         var result = try fromDirectory(allocator, directory);
         errdefer result.deinit();
-        const known_hosts = try std.fs.path.join(allocator, &.{ clean, ".ssh", "known_hosts" });
+        const known_hosts = try user_dirs.knownHostsIn(allocator, clean);
         allocator.free(result.known_hosts);
         result.known_hosts = known_hosts;
-        const cache = try std.fs.path.join(allocator, &.{ clean, "Library", "Caches", bundle_id });
+        const cache = try user_dirs.cachesIn(allocator, clean);
         allocator.free(result.cache_directory);
         result.cache_directory = cache;
-        const diagnostics = try std.fs.path.join(allocator, &.{ clean, "Library", "Logs", bundle_id });
+        const diagnostics = try user_dirs.logsIn(allocator, clean);
         allocator.free(result.diagnostic_directory);
         result.diagnostic_directory = diagnostics;
-        result.legacy_directory = try std.fs.path.join(allocator, &.{ clean, ".zerowork" });
+        result.legacy_directory = try user_dirs.legacyDataIn(allocator, clean);
         result.home_directory = try allocator.dupe(u8, clean);
         result.is_override = false;
         return result;
@@ -141,9 +145,9 @@ test "explicit data directory is absolute owned and isolated from HOME" {
 test "application paths use the account unless explicitly isolated by the test runner" {
     var actual = try Paths.forApplication(std.testing.allocator);
     defer actual.deinit();
-    const home = try @import("../platform/account.zig").home(std.testing.allocator);
+    const home = try user_dirs.home(std.testing.allocator);
     defer std.testing.allocator.free(home);
-    var expected = if (@import("../testing/data_directory.zig").override()) |directory|
+    var expected = if (@import("../shared/testing/data_directory.zig").override()) |directory|
         try Paths.fromDirectory(std.testing.allocator, directory)
     else
         try Paths.fromHome(std.testing.allocator, home);

@@ -11,9 +11,9 @@ const sftp = @import("../transfer/sftp_engine.zig");
 const retained_store = @import("retained_transfer_store.zig");
 const retained_runtime = @import("file_transfer_runtime.zig");
 const native_transfers = @import("file_transfer_host.zig");
-const authentication = @import("../ui/file_authentication.zig");
+const authentication = @import("file_authentication.zig");
 const routes = @import("socks_route_host.zig");
-const background = @import("../ui/socks_background_model.zig");
+const background = @import("socks_background_model.zig");
 const ssh = @import("../proto/ssh/session.zig");
 const Config = @import("../config/config.zig").Config;
 

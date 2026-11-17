@@ -1,0 +1,120 @@
+[meta]
+config_revision = 1
+
+[ui]
+icon_background = "transparent"
+theme = "dark"
+font_family = "JetBrains Mono"
+font_size = 15
+font_weight = "regular"
+line_height = 1.5
+cursor_style = "bar"
+sidebar_collapsed = false
+input_line_highlight = true
+timestamp_gutter = false
+command_info = true
+scrollback_limit = 25000
+terminal_right_click = "menu"
+float_card_transition = "anchor"
+
+[ui.materials]
+blur_px = 0
+
+[ui.materials.background]
+enabled = false
+path = ""
+source = "file"
+order = "sequential"
+interval_minutes = 5
+fit = "fill"
+alignment_x = "center"
+alignment_y = "center"
+transparency = 0
+
+[updates]
+auto_check = true
+
+[completion]
+enabled = true
+
+[transfer]
+dedicated_connection = true
+window_chunks = 16
+chunk_kb = 64
+download_dir = "~/Downloads"
+verify_md5 = false
+shared_pacing_kbps = 2048
+resume = true
+max_tasks = 2
+conflict_policy = "ask"
+
+[ssh]
+keepalive_sec = 30
+reconnect_max = 4
+reconnect_backoff = [2,3,5,8,13]
+connect_timeout_sec = 15
+term = "xterm-256color"
+compression = false
+auto_shell_integration = true
+auto_reconnect = true
+buffer_input = true
+socks_port = 1080
+socks_bind = "127.0.0.1"
+otp_modal = true
+totp_autofill = false
+
+[ai]
+default_provider = "anthropic"
+permission_mode = "auto"
+execution_mode = "auto"
+session_retention = "auto_idle"
+follow_up_mode = "steer"
+step_display = "collapsed"
+redact_ip = false
+error_hint = true
+provider_count = 0
+child_context_mode = "independent"
+child_reuse_policy = "new"
+
+[log]
+ring_mb = 64
+checkpoint_sec = 30
+retention_days = 14
+export_format = "txt_cast"
+
+[notify]
+transfer_done = false
+reconnect = true
+ai_ready = false
+bell = false
+tab_dot = true
+quiet_hours = "22:00-08:00"
+
+[keys]
+new_tab = "cmd+t"
+close_tab = "cmd+w"
+tab_1 = "cmd+1"
+tab_2 = "cmd+2"
+tab_3 = "cmd+3"
+tab_4 = "cmd+4"
+tab_5 = "cmd+5"
+tab_6 = "cmd+6"
+tab_7 = "cmd+7"
+tab_8 = "cmd+8"
+tab_9 = "cmd+9"
+previous_tab = "cmd+shift+left_bracket"
+next_tab = "cmd+shift+right_bracket"
+recent_tab = "ctrl+tab"
+split_vertical = "cmd+d"
+split_horizontal = "cmd+shift+d"
+copy = "cmd+c"
+paste = "cmd+v"
+search = "cmd+f"
+completion = "cmd+semicolon"
+accept_completion = "right"
+quick_connect = "cmd+k"
+reconnect = "cmd+r"
+sidebar = "cmd+b"
+ai = "cmd+j"
+upload = "cmd+u"
+broadcast = "cmd+shift+i"

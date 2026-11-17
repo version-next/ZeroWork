@@ -1,0 +1,61 @@
+//! 面板正文的登记表（P3 3e）：内容页按“当前位置”挂哪个分类的 `.yix` 面板（九个分类都有自己的面板）。
+//!
+//! 加一个分类：① `model/pane_fields.zig` 写该分类的行与面板并登记进 `pages`；② 在下面 `Block` 的
+//! `{if}` 链里加一行 `else if (is(page, N)) <X.XPanes vm={vm} />`。
+//!
+//! 内容页按纪元整页挂载（导航 / 搜索词变化换纪元），所以“当前位置”在一个纪元里固定，这里读 Controller 不建依赖。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const F = @import("../window_frame.zig");
+const S = @import("../styles.yss");
+const Ssh = @import("ssh.yix");
+const Transfer = @import("transfer.yix");
+const Notify = @import("notify.yix");
+const Data = @import("data.yix");
+const Keys = @import("keys.yix");
+const Updates = @import("updates.yix");
+const Appearance = @import("appearance.yix");
+const Plugins = @import("plugins.yix");
+const Ai = @import("ai.yix");
+
+const category_count = m.catalog.categories.len;
+
+fn is(page: usize, index: usize) bool {
+    return page == index;
+}
+fn searching(vm: *m.ViewModel) bool {
+    return vm.contentMode() == .search;
+}
+fn current(vm: *m.ViewModel) usize {
+    return vm.controller.model.page_index;
+}
+fn blockShown(vm: *m.ViewModel, page: usize) bool {
+    return !searching(vm) or vm.pageShownInResults(page);
+}
+fn noHits(vm: *m.ViewModel) bool {
+    return vm.noHits();
+}
+
+/// 一个分类的正文。搜索时没有命中的分类整块不显示。
+fn Block(vm: *m.ViewModel, frame: *F.Frame, page: usize) View {
+    return (
+        <box style={S.category_block} visible={blockShown(vm, page)}>
+            {if (is(page, 0)) <Appearance.AppearancePanes vm={vm} frame={frame} /> else if (is(page, 1)) <Keys.KeysPanes vm={vm} /> else if (is(page, 2)) <Ssh.SshPanes vm={vm} /> else if (is(page, 3)) <Transfer.TransferPanes vm={vm} /> else if (is(page, 6)) <Notify.NotifyPanes vm={vm} /> else if (is(page, 7)) <Data.DataPanes vm={vm} /> else if (is(page, 8)) <Updates.UpdatesPanes vm={vm} /> else if (is(page, 5)) <Plugins.PluginsPanes vm={vm} /> else <Ai.AiPanes vm={vm} />}
+        </box>
+    );
+}
+
+/// 内容页的正文：当前分类（整页或子页面），或搜索结果（各分类按顺序，`settings.search.results`）。
+pub fn Body(vm: *m.ViewModel, frame: *F.Frame) View {
+    return (
+        <box style={S.category_block}>
+            {if (searching(vm)) <box testId="settings.search.results" style={S.search_results}>
+                {for (0..category_count) |i| <Block vm={vm} frame={frame} page={i} />}
+                <box visible={noHits(vm)}>
+                    <W.Empty icon={ui.icons.search} title="没有匹配的设置" description="换个关键词试试，或清空搜索。" />
+                </box>
+            </box> else <Block vm={vm} frame={frame} page={current(vm)} />}
+        </box>
+    );
+}

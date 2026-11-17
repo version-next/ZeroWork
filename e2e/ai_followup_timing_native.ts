@@ -1,10 +1,14 @@
 /** Follow-up admission, response-boundary consumption, and paused-input recovery. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdir, mkdtemp, writeFile, readFile, open, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.argv[2] ?? '/private/tmp/zw-followup-build');
 const out = resolve(process.argv[3] ?? '/private/tmp/zw-followup-evidence');
 await mkdir(out, { recursive: true });
@@ -19,8 +23,7 @@ let held: any = null, fixtureFailure: string | null = null;
 const server = createServer(async (req, res) => {
   try {
     if (req.method !== 'POST') return res.end('{"data":[{"id":"followup-fixture"}]}');
-    let raw = ''; for await (const part of req) raw += part;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
     if (!body.tools?.length) return res.end(frame({ content: '消息引导验证' }) + done);
     requests.push(body);
@@ -60,11 +63,17 @@ const capture = async (name: string) => { assert((await h.screenshot(join(out, n
 const report: any = { status: 'running', checks: [] };
 try {
   await h.waitForServerReady(60000); await h.resizeWindow(1440, 1000);
-  await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+  await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
   await send('FIRST_TASK 检查消息引导');
   await h.waitFor(async () => held || null, 15000);
+  // Pencil Kaf7E A8（cfbcdf60；ai_host.zig syncActions: setActions(busy, !(busy and !draft))）：
+  // 回合进行中、输入框为空时只显示“停止”，发送按钮收起；输入了补充内容后发送按钮出现，提示说明将引导当前任务。
+  await visible('ai.stop');
+  await h.waitFor(async () => !(await h.query('ai.send')).some(shown) || null, 5000);
+  await click('ai.prompt'); await h.type_('STEER_ONE 按补充信息继续');
   await sendHint('引导当前任务');
-  await send('STEER_ONE 按补充信息继续');
+  assert((await h.query('ai.stop')).some(shown), 'Stop stays available while a steering draft is shown');
+  await click('ai.send');
   await visible('ai.followup.pending');
   assert(text(await h.query('ai.followup.status')).includes('待处理'));
   assert.equal(requests.length, 1, 'acceptance does not restart the in-flight response');
@@ -82,7 +91,7 @@ try {
   assert.equal((await h.query('ai.followup.consumed')).length, 1);
   assert.equal((await h.query('ai.followup.pending')).length, 0);
   assert.equal((await h.query('ai.followup.status')).length, 0);
-  const journal = (await readFile(join(data, 'ai-sessions.jsonl'), 'utf8')).trim().split('\n').map(s => JSON.parse(s));
+  const journal = (await readFile(join(data, 'ai-sessions.v4.jsonl'), 'utf8')).trim().split('\n').map(s => JSON.parse(s));
   const consumed = journal.filter((e: any) => e.receipt?.delivery === 'consumed').map((e: any) => e.receipt);
   assert.equal(consumed.length, 2); assert.equal(consumed[0].turn, consumed[1].turn);
   await capture('02-consumed');

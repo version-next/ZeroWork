@@ -111,11 +111,49 @@ pub const Store = struct {
     input_persist: ?input.Persist = null,
     budget: input.Budget = .{},
     task_facts: std.ArrayList(@import("task_budget.zig").Owned) = .empty,
+    /// Told after every change to which conversations exist or to any conversation's binding
+    /// (`observeBindings`): the presentation layer's bound-session count follows it instead of
+    /// recounting the records every frame.
+    binding_observers: std.ArrayList(BindingObserver) = .empty,
+
+    pub const BindingObserver = struct { context: *anyopaque, changed: *const fn (context: *anyopaque) void };
 
     pub fn init(a: std.mem.Allocator) Store {
         return .{ .allocator = a };
     }
+    /// The one way a record's binding changes (observers are told after the write).
+    fn setBinding(self: *Store, record: *Record, value: ?Binding) void {
+        record.binding = value;
+        self.bindingsChanged();
+    }
+    /// Called after a record's binding changed or a record was added / removed.
+    fn bindingsChanged(self: *Store) void {
+        for (self.binding_observers.items) |observer| observer.changed(observer.context);
+    }
+    /// Registers `observer` until `unobserveBindings` with the same context (one per context).
+    pub fn observeBindings(self: *Store, observer: BindingObserver) !void {
+        for (self.binding_observers.items) |*existing| if (existing.context == observer.context) {
+            existing.* = observer;
+            return;
+        };
+        try self.binding_observers.append(self.allocator, observer);
+    }
+    pub fn unobserveBindings(self: *Store, context: *anyopaque) void {
+        for (self.binding_observers.items, 0..) |observer, index| if (observer.context == context) {
+            _ = self.binding_observers.orderedRemove(index);
+            return;
+        };
+    }
+    /// Top-level conversations bound to an assistant (the AI 会话 button's count).
+    pub fn boundCount(self: *const Store) usize {
+        var count: usize = 0;
+        for (self.records.items) |record| {
+            if (record.child == null and record.binding != null) count += 1;
+        }
+        return count;
+    }
     pub fn deinit(self: *Store) void {
+        self.binding_observers.deinit(self.allocator);
         for (self.task_facts.items) |*fact| fact.deinit();
         self.task_facts.deinit(self.allocator);
         for (self.records.items) |record| record.deinit(self.allocator);
@@ -163,11 +201,10 @@ pub const Store = struct {
         for (self.agents.items) |value| if (value.id.eql(id)) return value;
         return null;
     }
+    /// 新绑定只接受 tab 归属（M10）。旧日志里的 `session` / `group` 归属只读，只在回放时出现。
     pub fn attach(self: *Store, owner: scope.Owner) !*Agent {
-        switch (owner) {
-            .session => |id| if (id == 0) return error.InvalidOwner,
-            .group => |id| if (id == 0) return error.InvalidOwner,
-        }
+        if (owner.legacy()) return error.ReadOnlyOwner;
+        if (owner.raw() == 0) return error.InvalidOwner;
         for (self.agents.items) |value| if (value.role == .attached and value.owner.eql(owner)) {
             if (value.current) |id| if (self.find(id).?.needs_recovery) return error.RecoveryRequired;
             if (!value.closing) return value;
@@ -217,10 +254,11 @@ pub const Store = struct {
         const revision = try identity.advance(record.revision);
         try self.save(.{ .kind = .create, .conversation = record.id, .agent = target.id, .owner = target.owner, .revision = revision, .environment = target.environment });
         record.revision = revision;
-        record.binding = .{ .agent = target.id, .owner = target.owner };
+        self.setBinding(record, .{ .agent = target.id, .owner = target.owner });
         record.initial_origin = target.owner;
         target.current = record.id;
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         const ticket = try self.fence(record.id);
         record.inbox.changeFence(ticket);
         return ticket;
@@ -252,11 +290,12 @@ pub const Store = struct {
         record.historical_messages = messages.len;
         record.inbox.fence.conversation = id;
         if (target) |value| {
-            record.binding = .{ .agent = value.id, .owner = owner };
+            self.setBinding(record, .{ .agent = value.id, .owner = owner });
             value.current = id;
             record.inbox.changeFence(.{ .agent = value.id, .conversation = id, .binding = next, .environment = value.environment });
         } else record.closed_revision = revision;
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         return record;
     }
     /// Welcome-page first send: body ownership, queue budget and binding are
@@ -274,10 +313,11 @@ pub const Store = struct {
         const receipt = try record.inbox.admit(ticket, id, message, mode);
         try self.save(.{ .kind = .create, .conversation = record.id, .agent = target.id, .owner = target.owner, .revision = record.revision, .environment = target.environment, .initial_input = receipt, .messages = record.inbox.entries.items[0].payload.messages });
         record.inbox.persist = self.input_persist;
-        record.binding = .{ .agent = target.id, .owner = target.owner };
+        self.setBinding(record, .{ .agent = target.id, .owner = target.owner });
         record.initial_origin = target.owner;
         target.current = record.id;
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         return ticket;
     }
     pub fn beginEnd(self: *Store, expected: input.Fence, operation: identity.HostOperationId) !bool {
@@ -309,7 +349,7 @@ pub const Store = struct {
         try self.save(.{ .kind = .unbind, .conversation = record.id, .revision = revision, .operation = operation, .turn = record.last_turn, .messages = record.history.messages, .draft = record.draft });
         record.revision = revision;
         record.closed_revision = expected.binding;
-        record.binding = null;
+        self.setBinding(record, null);
         record.last_end = pending;
         record.ending = null;
         record.transition = null;
@@ -330,7 +370,7 @@ pub const Store = struct {
         if (record.closed_revision == null and record.parent == null) return error.MissingEndReceipt;
         const revision = try identity.advance(record.revision);
         try self.save(.{ .kind = .bind, .conversation = id, .agent = target.id, .owner = target.owner, .revision = revision, .environment = target.environment });
-        record.binding = .{ .agent = target.id, .owner = target.owner };
+        self.setBinding(record, .{ .agent = target.id, .owner = target.owner });
         record.revision = revision;
         target.current = id;
         record.historical_messages = record.history.messages.len;
@@ -446,8 +486,9 @@ pub const Store = struct {
         record.last_turn = pinned.turn;
         record.historical_messages = record.history.messages.len;
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         if (target) |agent_value| {
-            record.binding = .{ .agent = agent_value.id, .owner = agent_value.owner };
+            self.setBinding(record, .{ .agent = agent_value.id, .owner = agent_value.owner });
             agent_value.current = record.id;
             record.inbox.changeFence(try self.fence(record.id));
         }
@@ -494,8 +535,9 @@ pub const Store = struct {
         record.last_turn = selected_checkpoint.turn;
         record.historical_messages = record.history.messages.len;
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         if (target) |value| {
-            record.binding = .{ .agent = value.id, .owner = value.owner };
+            self.setBinding(record, .{ .agent = value.id, .owner = value.owner });
             value.current = record.id;
             record.inbox.changeFence(try self.fence(record.id));
         }
@@ -525,7 +567,9 @@ pub const Store = struct {
         if (record.ending != null) return error.LifecycleBusy;
         if (record.child != null or self.hasBoundChildren(record.id)) return error.ChildSettlementRequired;
         for (self.agents.items) |other| if (other.role == .attached and !other.id.eql(expected.agent) and other.owner.eql(owner) and !other.closing) return error.BindingConflict;
-        if (record.binding.?.owner != .session or owner != .group or owner.group == 0) return error.InvalidBindingHandoff;
+        // M10：把一个 tab 的对话交给它并入的容器 tab；两端都是 tab 归属。
+        const from = record.binding.?.owner;
+        if (from != .tab or owner != .tab or owner.tab == 0 or from.tab == owner.tab) return error.InvalidBindingHandoff;
         const revision = try identity.advance(record.revision);
         const target = self.agent(expected.agent).?;
         const environment = try identity.advance(target.environment);
@@ -571,6 +615,7 @@ pub const Store = struct {
         try self.save(.{ .kind = .child_create, .conversation = record.id, .revision = record.revision, .child_info = record.child.?.info, .parent_binding = parent, .messages = record.history.messages, .initial_origin = record.initial_origin });
         self.agents.appendAssumeCapacity(agent_value);
         self.records.appendAssumeCapacity(record);
+        self.bindingsChanged();
         return record;
     }
     /// Stage identity/binding/input under the serialized controller and publish
@@ -597,6 +642,7 @@ pub const Store = struct {
         errdefer if (created) {
             const removed = self.records.pop().?;
             removed.deinit(self.allocator);
+            self.bindingsChanged();
             const removed_agent = self.agents.pop().?;
             self.allocator.free(removed_agent.targets);
             self.allocator.destroy(removed_agent);
@@ -615,7 +661,7 @@ pub const Store = struct {
         for (record.inbox.entries.items) |entry| if (!input.terminal(entry.receipt.delivery)) return error.SubmissionUnconfirmed;
         const ticket = try self.bindChild(parent, agent_value.id, revision, live, targets);
         errdefer {
-            record.binding = null;
+            self.setBinding(record, null);
             record.revision = revision;
             record.closed_revision = old_closed;
             record.inbox.fence = old_fence;
@@ -746,7 +792,7 @@ pub const Store = struct {
         agent_value.owner = live.owner;
         agent_value.closing = false;
         agent_value.current = record.id;
-        record.binding = .{ .agent = agent_id, .owner = live.owner };
+        self.setBinding(record, .{ .agent = agent_id, .owner = live.owner });
         record.revision = next;
         record.historical_messages = record.history.messages.len;
         const ticket = try self.fence(record.id);
@@ -819,6 +865,7 @@ pub const Store = struct {
             };
             record.deinit(self.allocator);
             _ = self.records.orderedRemove(index);
+            self.bindingsChanged();
             return;
         };
     }
@@ -849,6 +896,7 @@ pub const Store = struct {
             agent_value.* = .{ .id = info.agent, .role = .child, .owner = parent_record.binding.?.owner, .closing = true };
             self.agents.appendAssumeCapacity(agent_value);
             self.records.appendAssumeCapacity(fresh);
+            self.bindingsChanged();
             return;
         }
         if (event.child_info != null or event.children != null or event.messages.len != 0 or event.parent != null or event.source_revision != null or event.initial_input != null or event.presentation != null or event.draft != null or event.turn != 0) return error.InvalidSessionJournal;
@@ -872,7 +920,7 @@ pub const Store = struct {
         agent_value.parent_binding = parent;
         agent_value.owner = owner;
         agent_value.environment = event.environment;
-        record.binding = .{ .agent = agent_id, .owner = owner };
+        self.setBinding(record, .{ .agent = agent_id, .owner = owner });
         record.revision = event.revision;
         record.needs_recovery = true;
     }
@@ -890,6 +938,7 @@ pub const Store = struct {
             try self.save(.{ .kind = .remove, .conversation = id, .revision = record.revision });
             record.deinit(self.allocator);
             _ = self.records.orderedRemove(index);
+            self.bindingsChanged();
             return;
         };
         return error.ConversationNotFound;
@@ -974,6 +1023,7 @@ pub const Store = struct {
             if (event.presentation) |bytes| fresh.presentation = try self.allocator.dupe(u8, bytes);
             fresh.history = try wire.History.copy(self.allocator, if (event.initial_input != null) &.{} else event.messages, "");
             self.records.appendAssumeCapacity(fresh);
+            self.bindingsChanged();
             record = fresh;
         }
         const value = record orelse return error.InvalidSessionJournal;
@@ -998,7 +1048,7 @@ pub const Store = struct {
                 target.?.current = value.id;
                 target.?.owner = owner;
                 target.?.environment = event.environment;
-                value.binding = .{ .agent = aid, .owner = owner };
+                self.setBinding(value, .{ .agent = aid, .owner = owner });
                 value.revision = event.revision;
                 value.needs_recovery = true;
                 value.historical_messages = value.history.messages.len;
@@ -1028,7 +1078,7 @@ pub const Store = struct {
                 value.revision = event.revision;
                 value.last_end = value.ending;
                 value.ending = null;
-                value.binding = null;
+                self.setBinding(value, null);
                 value.needs_recovery = false;
             },
             .environment => {
@@ -1079,6 +1129,7 @@ pub const Store = struct {
                 for (self.records.items, 0..) |entry, i| if (entry == value) {
                     value.deinit(self.allocator);
                     _ = self.records.orderedRemove(i);
+                    self.bindingsChanged();
                     return;
                 };
             },

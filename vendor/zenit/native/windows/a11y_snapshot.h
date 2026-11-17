@@ -20,6 +20,10 @@ constexpr uint32_t secure_state = 1u << 17;
 constexpr size_t max_geometry_segments = 65536, max_geometry_bytes = 8 * 1024 * 1024;
 using Text = ZenitA11yText;
 using InputNode = ZenitA11yNode;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+inline thread_local size_t offset_mapping_passes = 0, offset_mapping_bytes = 0;
+inline thread_local int offset_mapping_allocation_fail_after = -1;
+#endif
 struct Viewport { double x = 0, y = 0, width = 0, height = 0, scale = 1; };
 struct Node {
     uint32_t id, parent_index, state;
@@ -42,64 +46,82 @@ struct Node {
 
 };
 struct Index { uint32_t id, index; };
+// The value has already passed copy()'s strict UTF-8 validation. Store UTF-16
+// positions at scalar starts once; every offset consumer shares this table.
+// Continuation entries stay uninitialized and are rejected before lookup.
+class TextOffsets final {
+    Text text;
+    uint32_t *positions = nullptr;
+public:
+    explicit TextOffsets(Text source): text(source) {
+        if (!text.length || text.length > SIZE_MAX/sizeof(uint32_t)-1) return;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+        if (offset_mapping_allocation_fail_after == 0) return;
+        if (offset_mapping_allocation_fail_after > 0) --offset_mapping_allocation_fail_after;
+#endif
+        positions = (uint32_t *)malloc((text.length+1)*sizeof(uint32_t));
+        if (!positions) return;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+        ++offset_mapping_passes;
+#endif
+        size_t byte = 0; uint32_t wide = 0;
+        while (byte < text.length) {
+            positions[byte] = wide;
+            const unsigned char lead = (unsigned char)text.bytes[byte];
+            const size_t size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+            offset_mapping_bytes += size;
+#endif
+            byte += size; wide += size == 4 ? 2 : 1;
+        }
+        positions[text.length] = wide;
+    }
+    ~TextOffsets() { free(positions); }
+    TextOffsets(const TextOffsets &) = delete;
+    TextOffsets &operator=(const TextOffsets &) = delete;
+    bool ready() const { return !text.length || positions; }
+    bool get(uint32_t byte, uint32_t &wide) const {
+        if (byte > text.length || (byte < text.length && ((unsigned char)text.bytes[byte] & 0xc0) == 0x80)) return false;
+        wide = byte ? positions[byte] : 0;
+        return true;
+    }
+};
 class Snapshot final {
     volatile LONG refs = 1;
     Node *nodes_ = nullptr;
     Index *index_ = nullptr;
     size_t count_ = 0;
-    struct GeometryOffset { uint32_t byte; size_t endpoint; };
-    static int compare_geometry_offset(const void *a, const void *b) {
-        uint32_t x = ((const GeometryOffset *)a)->byte, y = ((const GeometryOffset *)b)->byte;
-        return x < y ? -1 : x > y ? 1 : 0;
-    }
-    static bool copy_segments(const InputNode &in, const ZenitA11yGeometry &source, bool ready, bool allow_empty,
+    static bool copy_segments(const TextOffsets &offsets, const ZenitA11yGeometry &source, bool ready, bool allow_empty,
         ZenitA11yGeometrySegment *&output, size_t &output_count, size_t &budget) {
         const size_t count = source.count;
         if (!ready) return count == 0;
         if (!count) return true;
         if (!source.segments || count > max_geometry_segments ||
             count > (max_geometry_bytes-budget)/sizeof(ZenitA11yGeometrySegment)) return false;
-        auto *offsets = (GeometryOffset *)malloc(2*count*sizeof(GeometryOffset));
         output = (ZenitA11yGeometrySegment *)malloc(count*sizeof(ZenitA11yGeometrySegment));
-        if (!offsets || !output) { free(offsets); return false; }
+        if (!output) return false;
         output_count = count; budget += count*sizeof(ZenitA11yGeometrySegment);
         for (size_t i = 0; i < count; ++i) {
             const auto &piece = source.segments[i];
-            if ((allow_empty ? piece.start > piece.end : piece.start >= piece.end) || piece.end > in.value.length ||
+            if ((allow_empty ? piece.start > piece.end : piece.start >= piece.end) ||
                 (allow_empty && i && piece.start < source.segments[i-1].end) ||
                 !isfinite(piece.x) || !isfinite(piece.y) || !isfinite(piece.width) || !isfinite(piece.height) ||
-                piece.width < 0 || piece.height < 0 || (allow_empty && piece.height <= 0)) { free(offsets); return false; }
+                piece.width < 0 || piece.height < 0 || (allow_empty && piece.height <= 0)) return false;
             output[i] = piece;
-            offsets[2*i] = {piece.start, 2*i}; offsets[2*i+1] = {piece.end, 2*i+1};
+            // Preserve visual/bidi order; no sorting or additional text scan.
+            if (!offsets.get(piece.start, output[i].start) || !offsets.get(piece.end, output[i].end)) return false;
         }
-        // Visual order is not logical order for bidi. Sort endpoint requests,
-        // scan validated UTF-8 once, then scatter UTF-16 offsets back into the
-        // original visual ordering. Avoid conversion of every text prefix.
-        qsort(offsets, 2*count, sizeof(GeometryOffset), compare_geometry_offset);
-        size_t byte = 0; uint32_t wide = 0;
-        for (size_t i = 0; i < 2*count; ++i) {
-            const uint32_t target = offsets[i].byte;
-            while (byte < target) {
-                unsigned char lead = (unsigned char)in.value.bytes[byte];
-                size_t size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
-                byte += size; wide += size == 4 ? 2 : 1;
-            }
-            if (byte != target) { free(offsets); return false; }
-            auto &piece = output[offsets[i].endpoint/2];
-            if (offsets[i].endpoint & 1) piece.end = wide; else piece.start = wide;
-        }
-        free(offsets); return true;
+        return true;
     }
-    static bool copy_carets(const InputNode &in, Node &out, size_t &budget) {
+    static bool copy_carets(const InputNode &in, const TextOffsets &offsets, Node &out, size_t &budget) {
         const size_t count = in.carets.count;
         if (!in.carets_ready) return count == 0;
         out.carets_ready = true;
         if (!count) return true;
         if (!in.carets.candidates || count > max_geometry_segments ||
             count > (max_geometry_bytes-budget)/sizeof(ZenitA11yCaretCandidate)) return false;
-        auto *offsets = (GeometryOffset *)malloc(count*sizeof(GeometryOffset));
         out.carets = (ZenitA11yCaretCandidate *)malloc(count*sizeof(ZenitA11yCaretCandidate));
-        if (!offsets || !out.carets) { free(offsets); return false; }
+        if (!out.carets) return false;
         out.caret_count = count; budget += count*sizeof(ZenitA11yCaretCandidate);
         for (size_t i = 0; i < count; ++i) {
             const auto &piece = in.carets.candidates[i];
@@ -110,30 +132,16 @@ class Snapshot final {
                 (piece.visible && (!isfinite(piece.visible_first_x) || !isfinite(piece.visible_first_y) ||
                     !isfinite(piece.visible_last_x) || !isfinite(piece.visible_last_y) ||
                     (piece.visible_first_x == piece.visible_last_x && piece.visible_first_y == piece.visible_last_y)))) {
-                free(offsets); return false;
+                return false;
             }
             out.carets[i] = piece;
             if (!piece.visible) {
                 out.carets[i].visible_first_x = out.carets[i].visible_first_y = 0;
                 out.carets[i].visible_last_x = out.carets[i].visible_last_y = 0;
             }
-            offsets[i] = {piece.offset,i};
+            if (!offsets.get(piece.offset, out.carets[i].offset)) return false;
         }
-        // Preserve bidi ordering, repeated offsets and affinity. Convert all
-        // requested byte offsets in one sorted UTF-8 scan, then scatter back.
-        qsort(offsets,count,sizeof(GeometryOffset),compare_geometry_offset);
-        size_t byte = 0; uint32_t wide = 0;
-        for (size_t i = 0; i < count; ++i) {
-            const uint32_t target = offsets[i].byte;
-            while (byte < target) {
-                unsigned char lead = (unsigned char)in.value.bytes[byte];
-                size_t size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
-                byte += size; wide += size == 4 ? 2 : 1;
-            }
-            if (byte != target) { free(offsets); return false; }
-            out.carets[offsets[i].endpoint].offset = wide;
-        }
-        free(offsets); return true;
+        return true;
     }
     static int compare(const void *a, const void *b) {
         uint32_t x = ((const Index *)a)->id, y = ((const Index *)b)->id;
@@ -153,17 +161,11 @@ class Snapshot final {
         budget += text.length;
         return result;
     }
-    static bool offset(Text text, uint32_t byte, uint32_t &wide) {
-        if (byte > text.length || (byte < text.length && ((unsigned char)text.bytes[byte] & 0xc0) == 0x80)) return false;
-        if (!byte) { wide = 0; return true; }
-        int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.bytes, (int)byte, nullptr, 0);
-        if (!count) return false;
-        wide = (uint32_t)count;
-        return true;
-    }
     ~Snapshot() {
         for (size_t i = 0; i < count_; ++i) {
-            free((void *)nodes_[i].name); free((void *)nodes_[i].description); free((void *)nodes_[i].value);
+            // Unlabelled static text shares its owned value as its UIA Name.
+            if (nodes_[i].name != nodes_[i].value) free((void *)nodes_[i].name);
+            free((void *)nodes_[i].description); free((void *)nodes_[i].value);
             free((void *)nodes_[i].identifier); free(nodes_[i].characters); free(nodes_[i].words); free(nodes_[i].paragraphs); free(nodes_[i].lines);
             free(nodes_[i].geometry); free(nodes_[i].carets); free(nodes_[i].rows);
         }
@@ -219,8 +221,11 @@ public:
             out.value_now = in.value_now; out.value_min = in.value_min; out.value_max = in.value_max;
             out.small_change = in.small_change; out.large_change = in.large_change;
             if (in.state & secure_state) out.value_now = out.value_min = out.value_max = 0;
-            out.name = copy(in.name, budget); out.description = copy(in.description, budget);
             out.value = copy(in.state & secure_state ? Text{nullptr, 0} : in.value, budget);
+            // AXStaticText uses Value; UIA Text uses Name and has no ValuePattern.
+            // Preserve explicit labels and avoid copying/counting visible text twice.
+            out.name = in.role == 52 && !in.name.length ? out.value : copy(in.name, budget);
+            out.description = copy(in.description, budget);
             out.identifier = copy(in.identifier, budget);
             if (!out.name || !out.description || !out.value || !out.identifier) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
             // Password snapshots expose neither text length nor caret/selection
@@ -230,14 +235,19 @@ public:
             out.uniform_format = in.uniform_format && out.editable;
             out.can_scroll = in.can_scroll && out.editable;
             if (out.editable) {
+                // Scratch is per value and freed before publication, not retained
+                // by snapshots/proxies. String validation above bounds it to
+                // 4*(max_string_bytes+1) bytes even for hostile input.
+                const TextOffsets offsets(in.value);
+                if (!offsets.ready()) { last_reject_line = __LINE__; last_reject_reason = "text offset mapping allocation"; delete snapshot; return nullptr; }
                 const uint32_t visible_end = in.visible_end == UINT32_MAX ? (uint32_t)in.value.length : in.visible_end;
                 if (in.visible_start > visible_end ||
-                    !offset(in.value, (uint32_t)in.value.length, out.text_length) ||
-                    !offset(in.value, in.selection_start, out.selection_start) ||
-                    !offset(in.value, in.selection_end, out.selection_end) ||
-                    !offset(in.value, in.caret, out.caret) ||
-                    !offset(in.value, in.visible_start, out.visible_start) ||
-                    !offset(in.value, visible_end, out.visible_end)) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
+                    !offsets.get((uint32_t)in.value.length, out.text_length) ||
+                    !offsets.get(in.selection_start, out.selection_start) ||
+                    !offsets.get(in.selection_end, out.selection_end) ||
+                    !offsets.get(in.caret, out.caret) ||
+                    !offsets.get(in.visible_start, out.visible_start) ||
+                    !offsets.get(visible_end, out.visible_end)) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
                 const ZenitA11yOffsets inputs[] = {in.characters, in.words, in.paragraphs, in.lines};
                 uint32_t **outputs[] = {&out.characters, &out.words, &out.paragraphs, &out.lines};
                 size_t *counts[] = {&out.character_count, &out.word_count, &out.paragraph_count, &out.line_count};
@@ -248,25 +258,16 @@ public:
                     *outputs[unit] = (uint32_t *)malloc(count*sizeof(uint32_t));
                     if (!*outputs[unit]) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
                     *counts[unit] = count; boundary_budget += count;
-                    // The value was validated above. Advance once across its
-                    // UTF-8 scalars instead of rescanning every prefix (O(n²)).
-                    size_t byte = 0; uint32_t wide = 0;
                     for (size_t j = 0; j < count; ++j) {
                         uint32_t target = inputs[unit].bytes[j];
                         if (target > in.value.length || (j && target <= inputs[unit].bytes[j-1])) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
-                        while (byte < target) {
-                            unsigned char lead = (unsigned char)in.value.bytes[byte];
-                            size_t size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
-                            byte += size; wide += size == 4 ? 2 : 1;
-                        }
-                        if (byte != target) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
-                        (*outputs[unit])[j] = wide;
+                        if (!offsets.get(target, (*outputs[unit])[j])) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
                     }
                 }
                 out.geometry_ready = in.geometry_ready; out.rows_ready = in.rows_ready;
-                if (!copy_segments(in,in.geometry,in.geometry_ready,false,out.geometry,out.geometry_count,geometry_budget) ||
-                    !copy_segments(in,in.rows,in.rows_ready,true,out.rows,out.row_count,row_budget) ||
-                    !copy_carets(in,out,caret_budget)) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
+                if (!copy_segments(offsets,in.geometry,in.geometry_ready,false,out.geometry,out.geometry_count,geometry_budget) ||
+                    !copy_segments(offsets,in.rows,in.rows_ready,true,out.rows,out.row_count,row_budget) ||
+                    !copy_carets(in,offsets,out,caret_budget)) { last_reject_line = __LINE__; delete snapshot; return nullptr; }
             }
 
             snapshot->index_[i] = {in.id, (uint32_t)i};

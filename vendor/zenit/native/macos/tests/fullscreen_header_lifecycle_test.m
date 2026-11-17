@@ -1,6 +1,7 @@
 // Hidden AppKit windows only. No ordering, native input or fullscreen Spaces.
-#define ZENIT_TEST_RENDER_COPY_FIXTURE
 #define ZENIT_MENU_ACTIONS_NO_MAIN
+// This test checks real texture copies with its own fixture below.
+#define ZENIT_TEST_RENDER_COPY_FIXTURE
 #import "menu_actions_test.m"
 #import <objc/runtime.h>
 
@@ -303,7 +304,7 @@ static NSToolbar *observeCapturedToolbar(NSWindow *window,SEL selector) {
 static void actualAppKitCaptureHook(void) {
     void *raw=macos_create_window(640,400,"Hidden native configuration capture");
     WindowWrapper *owner=(__bridge WindowWrapper *)raw;
-    assert(macos_chrome_configure(raw,1,1,38));assert(macos_fullscreen_header_configure(raw,2,38));
+    assert(macos_chrome_configure(raw,1,1,38,0));assert(macos_fullscreen_header_configure(raw,2,38));
     assert(!owner.window.toolbar && !owner.fullscreenHeader.header);
     __block unsigned willEnterNotifications=0;
     id token=[NSNotificationCenter.defaultCenter addObserverForName:NSWindowWillEnterFullScreenNotification object:owner.window queue:nil usingBlock:^(NSNotification *n) {willEnterNotifications++;}];
@@ -517,7 +518,7 @@ static void closeDuringEntry(void) {
     void *raw=macos_create_window(640,400,"Hidden close during entry");
     WindowWrapper *w=(__bridge WindowWrapper *)raw;
     assertMiniActionDispatch(w,1); // Unordered but open windows still dispatch.
-    assert(macos_chrome_configure(raw,1,1,38));assert(macos_fullscreen_header_configure(raw,2,38));
+    assert(macos_chrome_configure(raw,1,1,38,0));assert(macos_fullscreen_header_configure(raw,2,38));
     [w windowWillEnterFullScreen:[NSNotification notificationWithName:NSWindowWillEnterFullScreenNotification object:w.window]];
     assert(w.fullscreenEntryStarted && w.nativeFullscreenEntering && w.chromeFullscreenTransition);
     assert(w.fullscreenHeader.observedButtons.count && w.trafficLightsObservedViews.count);
@@ -628,7 +629,7 @@ int main(int argc,char **argv) { @autoreleasepool {
     actualAppKitCaptureHook();closeDuringEntry();detachedHeaderCallbacks();
     void *raw=macos_create_window(980,600,"Hidden header lifecycle");
     WindowWrapper *w=(__bridge WindowWrapper *)raw;
-    assert(macos_chrome_configure(raw,1,1,38));
+    assert(macos_chrome_configure(raw,1,1,38,0));
     snapshot(w,@"hidden-policy");
     id originalRadius=cornerRadius(w.window);
     NSToolbar *original=w.window.toolbar;NSWindowToolbarStyle originalStyle=w.window.toolbarStyle;
@@ -677,7 +678,10 @@ int main(int argc,char **argv) { @autoreleasepool {
     assert(macos_should_render_window(raw)==1);
     w.fullscreenHeader.pendingDeadline=CACurrentMediaTime()-1;
     assert(macos_should_render_window(raw)==0); // No unbounded occlusion bypass.
-    w.fullscreenHeader.pendingDeadline=prewarmDeadline;setenv("ZENIT_E2E_BACKGROUND","1",1);
+    // The RPC visual suite can render the hidden window without ordering it front.
+    setenv("ZENIT_E2E_BACKGROUND","1",1);
+    assert(!w.window.visible && macos_should_render_window(raw)==1);
+    w.fullscreenHeader.pendingDeadline=prewarmDeadline;
     assert(macos_fullscreen_header_take_frame_request(raw)==1);
     assert(macos_fullscreen_header_take_frame_request(raw)==0);
     assert(macos_chrome_action(raw,3,1));[w.window toggleFullScreen:nil];

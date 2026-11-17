@@ -15,6 +15,8 @@ typedef struct {
 typedef struct { float x, y; uint32_t buttons, focused; } ZenitWaylandInputState;
 typedef struct { float x, y; uint32_t button, pressed, cancelled; } ZenitWaylandButtonEvent;
 typedef struct { float x, y, dx, dy; } ZenitWaylandScrollEvent;
+/* kind: 1 button, 2 key, 3 text, 4 motion, 5 scroll, 6 preedit, 7 commit, 8 delete surrounding,
+ * 9 pointer left the surface. */
 typedef struct {
     uint32_t kind, keycode, modifiers, button, pressed, cancelled, text_length;
     float x, y, dx, dy;
@@ -62,6 +64,7 @@ int zenit_wayland_ime_discard(ZenitWaylandWindow *window);
 int zenit_wayland_ime_set_cursor_rect(ZenitWaylandWindow *window, int32_t x, int32_t y, int32_t width, int32_t height);
 int zenit_wayland_ime_set_surrounding(ZenitWaylandWindow *window, const char *text, size_t length, uint32_t cursor, uint32_t anchor);
 int zenit_wayland_poll(ZenitWaylandWindow *window, int timeout_ms);
+int zenit_wayland_poll_wake(ZenitWaylandWindow *window, int timeout_ms, int wake_fd);
 int zenit_wayland_metrics(ZenitWaylandWindow *window, ZenitWaylandSurface *out);
 int zenit_wayland_request_frame(ZenitWaylandWindow *window);
 int zenit_wayland_request_frame_clock(ZenitWaylandWindow *window);

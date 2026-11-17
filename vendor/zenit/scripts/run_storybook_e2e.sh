@@ -29,6 +29,10 @@ else
   RPCDIR="$(mktemp -d "/tmp/zenit_e2e_rpc.${PORT}.XXXXXX")" || { echo "mktemp failed" >&2; exit 71; }
   RPCDIR_AUTO=1
 fi
+# Incidentally reclaim historic auto dirs over 1 day old (dot-naming pattern only
+# matches mktemp products, won't touch manual workflow fixed dir
+# zenit_e2e_rpc_<port>).
+find /tmp -maxdepth 1 -type d -name "zenit_e2e_rpc.*.??????" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 APP="${ZENIT_E2E_APP:-zig-out/zenit Storybook.app/Contents/MacOS/storybook}"
 BUN="${ZENIT_E2E_BUN:-bun}"
 APP_LOG="${ZENIT_E2E_APP_LOG:-/tmp/zenit_storybook_app.log}"
@@ -37,6 +41,7 @@ MANIFEST="${ZENIT_E2E_MANIFEST:-${EVIDENCE_DIR}/manifest.json}"
 CRASH_REPORT_DIR="${ZENIT_CRASH_REPORT_DIR:-${HOME}/Library/Logs/DiagnosticReports}"
 
 APP_PID=""
+LAUNCHED_APP_PID=""
 RUNNER_PID=""
 GATE_STATUS="FAIL"
 GATE_RC=1
@@ -91,10 +96,16 @@ cleanup() {
     find "$RPCDIR" -maxdepth 1 -type f \( -name 'req-*.json' -o -name 'res-*.json' \) \
       -exec cp {} "$EVIDENCE_DIR/" \; 2>/dev/null || true
   fi
-  if [[ -d "$CRASH_REPORT_DIR" ]]; then
-    find "$CRASH_REPORT_DIR" -maxdepth 1 -type f \
-      \( -name 'storybook*.ips' -o -name 'storybook*.crash' \) -mmin -15 \
-      -exec cp {} "$EVIDENCE_DIR/" \; 2>/dev/null || true
+  if [[ -d "$CRASH_REPORT_DIR" && -n "$LAUNCHED_APP_PID" ]]; then
+    # Only this run's app: parallel instances share the report directory, and a report
+    # names its process ("pid" : N in an .ips body, "Process: storybook [N]" in a .crash file).
+    local report
+    while IFS= read -r report; do
+      if grep -Eq "\"pid\" *: *${LAUNCHED_APP_PID}[^0-9]|\[${LAUNCHED_APP_PID}\]" "$report" 2>/dev/null; then
+        cp "$report" "$EVIDENCE_DIR/" 2>/dev/null || true
+      fi
+    done < <(find "$CRASH_REPORT_DIR" -maxdepth 1 -type f \
+      \( -name 'storybook*.ips' -o -name 'storybook*.crash' \) -mmin -15 2>/dev/null)
   fi
   if [[ "${RPCDIR_AUTO:-0}" == "1" && -d "$RPCDIR" ]]; then
     rm -rf "$RPCDIR"
@@ -142,17 +153,37 @@ else
   mkdir -p "$RPCDIR"
 fi
 
-echo "==> launch app"
+TEST_FILE="${ZENIT_E2E_TEST_FILE:-e2e/storybook.test.ts}"
+# Storybook drives input through RPC. On macOS the regular app intentionally
+# stops presenting when another window covers it, even though RPC can update
+# its tree. Use the existing background mode for the visual suite so the
+# desktop does not determine whether its Metal frames are submitted.
+case "${TEST_FILE#./}" in
+  e2e/storybook.test.ts|"$PWD/e2e/storybook.test.ts")
+    if [[ -z "${ZENIT_E2E_BACKGROUND+x}" && "$(uname -s)" == Darwin ]]; then
+      export ZENIT_E2E_BACKGROUND=1
+    fi
+    ;;
+esac
+
+echo "==> launch app (background: ${ZENIT_E2E_BACKGROUND:-0})"
+mkdir -p "$(dirname "$APP_LOG")"
 # Isolate real mouse: developer uses computer while running, system pointer
 # events no longer override harness-injected input. Set
 # ZENIT_E2E_ISOLATE_POINTER=0 when real mouse needed.
+# The app clipboard lives on a private named pasteboard (native/macos/clipboard_pasteboard.h):
+# parallel instances cannot read each other's copies and the run leaves the developer's
+# clipboard alone. ZENIT_E2E_PASTEBOARD= (empty) uses the system pasteboard.
+PASTEBOARD="${ZENIT_E2E_PASTEBOARD-zenit.e2e.$(basename "$RPCDIR")}"
+ZENIT_E2E_PASTEBOARD="$PASTEBOARD" \
 ZENIT_E2E_ISOLATE_POINTER="${ZENIT_E2E_ISOLATE_POINTER:-1}" ZENIT_E2E_FILE_RPC_DIR="$RPCDIR" "$APP" >"$APP_LOG" 2>&1 &
 APP_PID=$!
+LAUNCHED_APP_PID=$APP_PID
 echo "    app pid=$APP_PID  log=$APP_LOG"
 
-TEST_FILE="${ZENIT_E2E_TEST_FILE:-e2e/storybook.test.ts}"
 echo "==> run e2e ($BUN $TEST_FILE)"
-ZENIT_E2E_FILE_RPC_DIR="$RPCDIR" "$BUN" "$TEST_FILE" &
+# The runner learns the pasteboard name so a test can prove the system clipboard stayed untouched.
+ZENIT_E2E_PASTEBOARD="$PASTEBOARD" ZENIT_E2E_FILE_RPC_DIR="$RPCDIR" "$BUN" "$TEST_FILE" &
 RUNNER_PID=$!
 
 while true; do

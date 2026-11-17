@@ -8,7 +8,7 @@ const ssh = @import("../proto/ssh/session.zig");
 const Route = @import("../proto/ssh/jump_transport.zig").Route;
 const known = @import("../proto/ssh/host_key_store.zig");
 const progress = @import("../proto/ssh/connection_progress.zig");
-const Snapshot = @import("../ui/session_lifecycle.zig").Snapshot;
+const Snapshot = @import("session_lifecycle.zig").Snapshot;
 const allocator = std.heap.c_allocator;
 const Forward = @import("../proto/ssh/forward_service.zig").Service;
 

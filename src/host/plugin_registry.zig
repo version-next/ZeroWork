@@ -75,7 +75,6 @@ pub const Integration = struct {
     auxiliary_readonly: bool = false,
     auxiliary_transfer: bool = false,
     directory_recovery: bool = false,
-    ai: bool = false,
 };
 pub const PreferenceField = struct {
     key: []const u8,
@@ -109,14 +108,13 @@ pub const QuickCreateContribution = struct {
     encode_creation_payload: ?*const fn (std.mem.Allocator, ?[]const u8) anyerror![]u8 = null,
 };
 pub const RendererDefinition = @import("plugin_ui_contract.zig").RendererDefinition;
-pub const AiContextContribution = struct {
-    identity: []const u8,
-    context: ?*anyopaque = null,
-    summarize: ?*const fn (?*anyopaque, @import("identity.zig").SessionHandle, std.mem.Allocator) anyerror![]const u8 = null,
-};
+pub const card_types = @import("card_types.zig");
+pub const CardTypeDef = card_types.CardTypeDef;
 pub const PluginManifest = struct {
     id: []const u8,
     display_name: []const u8,
+    /// 给用户看的一句话说明（设置页的插件说明）；只写清单里有服务 / 工具支撑的功能。null 时回落为 `workspace_kind`。
+    summary: ?[]const u8 = null,
     plugin_version: []const u8 = plugin_version,
     origin: Origin = .bundled,
     host_api_version: u32 = host_api_version,
@@ -139,8 +137,11 @@ pub const PluginManifest = struct {
     notifications: []const @import("notification_coordinator.zig").NotificationDefinition = &.{},
     tools: []const @import("../ai/plugin_tools.zig").ToolBinding = &.{},
     tool_definitions: []const @import("../ai/plugin_tools.zig").ToolDefinition = &.{},
-    ai_context: ?AiContextContribution = null,
-    ai_adapter_factory: ?@import("../ai/legacy_adapter.zig").Factory = null,
+    /// 本插件的会话呈现为哪种卡片类型（内置类型或本插件 `cards` 里定义的类型）。AI 能力只看这个
+    /// 卡片类型的 `ai` 声明（PLUGIN_ARCH_PLAN 2.5.8）；null 表示会话呈现为通用会话卡片（不声明 AI）。
+    card_type: ?[]const u8 = null,
+    /// 本插件定义的卡片类型；与宿主内置类型一起在发布时校验，一次性进入不可变快照。
+    cards: []const CardTypeDef = &.{},
     legacy_descriptor: ?PluginDescriptor = null,
     legacy_registration: ?AdapterRegistration = null,
     pub fn supports(self: PluginManifest, requirement: ServiceRequirement) bool {
@@ -156,13 +157,15 @@ pub const Availability = enum {
     }
 };
 pub const BuiltinSnapshot = struct { descriptor: PluginDescriptor, availability: Availability, ready_services: Services };
-pub const RegistrySnapshot = struct { entries: []const PluginManifest, renderers: []const RendererDefinition };
+pub const RegistrySnapshot = struct { entries: []const PluginManifest, renderers: []const RendererDefinition, card_types: []const CardTypeDef = &.{} };
 pub const Registry = struct {
     arena: ?std.heap.ArenaAllocator = null,
     published: RegistrySnapshot = .{ .entries = &.{}, .renderers = &.{} },
     legacy_snapshots: []const BuiltinSnapshot = &builtin_snapshots,
     descriptors: []const PluginDescriptor = &builtin_descriptors,
     registrations: []const AdapterRegistration = &.{},
+    /// 统一工具注册表的不可变快照（PLUGIN_ARCH_PLAN 2.9），与插件清单同时发布。
+    tools: @import("../ai/tool_registry.zig").Snapshot = .{},
 
     /// Metadata-only planning registry. No factory is exposed as executable.
     pub fn builtins() Registry {
@@ -178,6 +181,14 @@ pub const Registry = struct {
     pub fn find(self: Registry, id: []const u8) ?*const PluginManifest {
         for (self.published.entries) |*manifest| if (std.mem.eql(u8, manifest.id, id)) return manifest;
         return null;
+    }
+    /// 已发布的卡片类型（宿主内置 + 插件 `cards`）。发布后不可变，没有运行期登记入口。
+    pub fn cardType(self: Registry, id: []const u8) ?*const CardTypeDef {
+        return card_types.find(self.published.card_types, id);
+    }
+    /// 插件会话呈现的卡片类型；未声明时是通用会话卡片 `session`（内置登记）。
+    pub fn cardTypeFor(self: Registry, manifest: *const PluginManifest) ?*const CardTypeDef {
+        return self.cardType(manifest.card_type orelse card_types.ids.session);
     }
     pub fn renderer(self: Registry, kind: []const u8) ?*const RendererDefinition {
         for (self.published.renderers) |*definition| if (std.mem.eql(u8, definition.kind, kind)) return definition;
@@ -209,19 +220,29 @@ pub const PluginHost = struct {
     allocator: std.mem.Allocator,
     manifests_list: std.ArrayList(PluginManifest) = .empty,
     renderers: std.ArrayList(RendererDefinition) = .empty,
+    /// 宿主内置卡片类型：只由组合根在发布前登记（`linked_plugins.initRegistry`）。
+    host_card_types: std.ArrayList(CardTypeDef) = .empty,
     apis: []const ApiDefinition = &.{.{ .id = "host", .major = host_api_version }},
+    /// 宿主工具分组，由组合根注入（`host_tool_catalog.groups`）；与插件工具一起登记进统一工具注册表。
+    host_tools: []const @import("../ai/tool_registry.zig").HostGroupEntry = &.{},
+    /// 直接按 `ToolDef` 写的宿主工具（M11 的 `host.tab_context`）。
+    host_native: []const @import("../ai/tool_def.zig").ToolDef = &.{},
     pub fn init(allocator: std.mem.Allocator) PluginHost {
         return .{ .allocator = allocator };
     }
     pub fn deinit(self: *PluginHost) void {
         self.manifests_list.deinit(self.allocator);
         self.renderers.deinit(self.allocator);
+        self.host_card_types.deinit(self.allocator);
     }
     pub fn register(self: *PluginHost, manifest: PluginManifest) !void {
         try self.manifests_list.append(self.allocator, manifest);
     }
     pub fn registerRenderer(self: *PluginHost, definition: RendererDefinition) !void {
         try self.renderers.append(self.allocator, definition);
+    }
+    pub fn registerCardType(self: *PluginHost, definition: CardTypeDef) !void {
+        try self.host_card_types.append(self.allocator, definition);
     }
     pub fn publish(self: *PluginHost) !Registry {
         const manifests = self.manifests_list.items;
@@ -242,15 +263,40 @@ pub const PluginHost = struct {
             };
             if (!shared) try definitions.append(self.allocator, definition);
         };
+        var cards: std.ArrayList(CardTypeDef) = .empty;
+        defer cards.deinit(self.allocator);
+        try cards.appendSlice(self.allocator, self.host_card_types.items);
+        for (manifests) |manifest| try cards.appendSlice(self.allocator, manifest.cards);
+        for (cards.items, 0..) |definition, i| {
+            try card_types.validate(definition, knownHostTool);
+            for (cards.items[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, definition.id)) return error.DuplicateCardType;
+        }
         for (manifests, 0..) |manifest, i| {
             if (!validId(manifest.id) or manifest.display_name.len == 0 or manifest.plugin_version.len == 0) return error.InvalidDescriptor;
+            // 会话卡片：清单引用的卡片类型必须已登记且绑定会话；插件自己定义的卡片若列出
+            // 自有工具，这些工具必须在本插件的工具绑定里（2.5.8 注册校验）。
+            // 未声明时会话呈现为通用会话卡片（组合根登记的 `session`）。
+            if (manifest.card_type) |id| {
+                const card = card_types.find(cards.items, id) orelse return error.UnknownCardType;
+                if (card.binding != .session) return error.CardTypeNotSessionBound;
+            }
+            for (manifest.cards) |definition| if (definition.ai) |ai| if (ai.tools == .own) for (ai.tools.own) |tool_id| {
+                const bound = for (manifest.tools) |binding| {
+                    if (std.mem.eql(u8, binding.definition_id, tool_id)) break true;
+                } else false;
+                if (!bound) return error.UnknownCardTool;
+            };
             if (manifest.host_api_version != host_api_version) return error.IncompatibleHostVersion;
             for (manifests[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, manifest.id)) return error.DuplicatePlugin;
+            // 路线条目与已注册插件冲突即失败（PLUGIN_ARCH_PLAN 2.6 第 4 条）：实现落地时必须同时删掉条目。
+            if (@import("plugin_roadmap.zig").find(manifest.id) != null) return error.RoadmapConflict;
             if (manifest.session_factory == null) return error.MissingSessionFactory;
             if (manifest.icons.settings.len == 0 or manifest.icons.protocol.len == 0 or manifest.icons.tab.len == 0) return error.InvalidIcon;
             try tool_api.validateBindings(manifest.id, definitions.items, manifest.tools, manifest.services);
             if (manifest.settings_section) |section| for (section.fields, 0..) |field, n| {
                 if (!validId(field.key) or field.label.len == 0) return error.InvalidPreference;
+                // `host.` 前缀留给宿主自己的每插件设置（如 Q5 的 `host.enabled`，PLUGIN_ARCH_PLAN 2.2 第 7 条）。
+                if (std.mem.startsWith(u8, field.key, @import("plugin_enablement.zig").reserved_prefix)) return error.ReservedPreference;
                 for (section.fields[0..n]) |other| if (std.mem.eql(u8, field.key, other.key)) return error.DuplicatePreference;
                 if (field.kind == .choice and field.options.len == 0) return error.InvalidPreference;
                 for (field.options, 0..) |option, option_index| {
@@ -348,9 +394,10 @@ pub const PluginHost = struct {
         }
         // Copy all metadata (including strings) so later mutation of collection
         // storage cannot change a published registry. Runtime contexts stay borrowed.
-        const clone = @import("../ui/session_lifecycle.zig").cloneValue;
+        const clone = @import("session_lifecycle.zig").cloneValue;
         const owned = try clone([]const PluginManifest, allocator, sorted);
         const renderer_defs = try clone([]const RendererDefinition, allocator, self.renderers.items);
+        const card_defs = try clone([]const CardTypeDef, allocator, cards.items);
         var descriptors: std.ArrayList(PluginDescriptor) = .empty;
         var registrations: std.ArrayList(AdapterRegistration) = .empty;
         var snapshots: std.ArrayList(BuiltinSnapshot) = .empty;
@@ -359,9 +406,29 @@ pub const PluginHost = struct {
             if (manifest.legacy_registration) |registration| try registrations.append(allocator, registration);
             try snapshots.append(allocator, .{ .descriptor = descriptor, .availability = .available, .ready_services = if (manifest.legacy_registration) |r| r.services else .{} });
         };
-        return .{ .arena = arena, .published = .{ .entries = owned, .renderers = renderer_defs }, .descriptors = try descriptors.toOwnedSlice(allocator), .registrations = try registrations.toOwnedSlice(allocator), .legacy_snapshots = try snapshots.toOwnedSlice(allocator) };
+        // 统一工具注册表：宿主分组与（已克隆的）插件清单走同一个注册入口，两阶段校验后发布快照。
+        var tool_builder = @import("../ai/tool_registry.zig").Builder.init(self.allocator);
+        defer tool_builder.deinit();
+        for (self.host_tools) |group| try tool_builder.registerHost(group.group, group.contributions);
+        for (self.host_native) |def| try tool_builder.register(def);
+        // 与上面的绑定校验一致：插件可以绑定任一清单声明的（同名同义）定义。
+        var owned_definitions: std.ArrayList(tool_api.ToolDefinition) = .empty;
+        defer owned_definitions.deinit(self.allocator);
+        for (owned) |manifest| for (manifest.tool_definitions) |definition| {
+            for (owned_definitions.items) |earlier| {
+                if (std.mem.eql(u8, earlier.id, definition.id)) break;
+            } else try owned_definitions.append(self.allocator, definition);
+        };
+        for (owned) |manifest| try tool_builder.registerPlugin(manifest.id, manifest.content_renderer, owned_definitions.items, manifest.tools, manifest.services);
+        const tool_snapshot = try tool_builder.publish(allocator);
+        return .{ .arena = arena, .published = .{ .entries = owned, .renderers = renderer_defs, .card_types = card_defs }, .descriptors = try descriptors.toOwnedSlice(allocator), .registrations = try registrations.toOwnedSlice(allocator), .legacy_snapshots = try snapshots.toOwnedSlice(allocator), .tools = tool_snapshot };
     }
 };
+fn knownHostTool(name: []const u8) bool {
+    if (@import("../ai/host_terminal_queries.zig").supports(name)) return true;
+    for (@import("../ai/host_queries.zig").contributions) |item| if (std.mem.eql(u8, item.definition.id, name)) return true;
+    return false;
+}
 fn less(a: PluginManifest, b: PluginManifest) bool {
     return if (a.order != b.order) a.order < b.order else std.mem.order(u8, a.id, b.id) == .lt;
 }
@@ -434,6 +501,21 @@ test "quick creation action conflicts reject the entire registry" {
     second.quick_create = first.quick_create;
     try collector.register(second);
     try std.testing.expectError(error.DuplicateCreationAction, collector.publish());
+}
+
+test "a plugin whose id is still a roadmap entry fails registration" {
+    const roadmap = @import("plugin_roadmap.zig");
+    var collector = PluginHost.init(std.testing.allocator);
+    defer collector.deinit();
+    try collector.registerRenderer(.{ .kind = "shared", .shared_renderer = true });
+    try collector.register(RegistryTestFactory.manifest("native.ok"));
+    try collector.register(RegistryTestFactory.manifest(roadmap.entries[0].id));
+    try std.testing.expectError(error.RoadmapConflict, collector.publish());
+    // 删掉冲突的清单后，其余照常发布。
+    _ = collector.manifests_list.pop();
+    var registry = try collector.publish();
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(usize, 1), registry.manifests().len);
 }
 
 test "a transferable renderer requires provider context rebinding before publication" {

@@ -318,18 +318,6 @@ pub const UnsupportedWindow = struct {
         _ = self;
     }
 
-    /// No native window action is supported by this backend.
-    pub fn minimize(self: *UnsupportedWindow) bool {
-        _ = self;
-        return false;
-    }
-
-    /// No native window action is supported by this backend.
-    pub fn zoom(self: *UnsupportedWindow) bool {
-        _ = self;
-        return false;
-    }
-
     pub fn getScrollDelta(self: *UnsupportedWindow) ?ScrollEvent {
         _ = self;
         return null;

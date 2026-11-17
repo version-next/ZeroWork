@@ -1,4 +1,6 @@
 /** Real app idle audit: owned local AI, failed TCP connection and loopback SFTP. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {createServer} from 'node:http';
@@ -6,6 +8,8 @@ import {createServer as tcpServer} from 'node:net';
 import {createHash} from 'node:crypto';
 import {mkdir, mkdtemp, realpath, open, readFile, writeFile, rm} from 'node:fs/promises';
 import {resolve, join} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? 'zig-out');
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
@@ -24,8 +28,7 @@ const frame = (content: string) => 'data: ' + JSON.stringify({choices: [{index: 
 let mode = 'complete', held: any = null, stopStarted = false;
 const server = createServer(async (req, res) => {
     if (req.method !== 'POST') { res.end(JSON.stringify({data: [{id: 'idle-model'}]})); return; }
-    let raw = ''; for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);
     if (body.messages[0]?.content?.startsWith('将用户的问题概括')) {
         res.writeHead(200, {'content-type': 'text/event-stream'}); res.end(frame('闲置检查') + 'data: [DONE]\n\n'); return;
     }
@@ -39,7 +42,9 @@ const httpPort = (server.address() as any).port;
 const unused = tcpServer(); await new Promise<void>(done => unused.listen(0, '127.0.0.1', done));
 const failedPort = (unused.address() as any).port; await new Promise<void>(done => unused.close(() => done()));
 const peerLog = await open(join(out, 'peer.log'), 'w');
-const peer = spawn(process.env.ZW_TEST_PYTHON ?? 'python3', ['e2e/sftp_v3_peer.py', '--out', peerOut], {stdio: ['ignore', peerLog.fd, peerLog.fd]});
+// Audited interpreter only (runner passes it for `python: true` entries); -I keeps cwd / user site out of sys.path.
+assert(process.env.ZW_TEST_PYTHON, 'ZW_TEST_PYTHON (audited Python with paramiko) is required');
+const peer = spawn(process.env.ZW_TEST_PYTHON, ['-I', 'e2e/sftp_v3_peer.py', '--out', peerOut], {stdio: ['ignore', peerLog.fd, peerLog.fd]});
 const peerExited = new Promise(done => peer.once('exit', done));
 let app: any = null, appExited: Promise<any> | null = null;
 const log = await open(join(out, 'app.log'), 'w');
@@ -86,17 +91,31 @@ default=true
     await h.waitForServerReady(60000);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
     await h.resizeWindow(1440, 900);
-    const cpuMs = () => execFileSync('/bin/ps', ['-p', String(app.pid), '-o', 'time='], {encoding: 'utf8'}).trim().split(':').map(Number).reduce((sum, part) => sum * 60 + part, 0) * 1000;
+    const cpuMs = () => psCompat(['-p', String(app.pid), '-o', 'time=']).trim().split(':').map(Number).reduce((sum, part) => sum * 60 + part, 0) * 1000;
+    /** True once no frame has been rendered for `quietMs`; false if that never happens within `limitMs`. */
+    async function framesQuiet(quietMs: number, limitMs: number): Promise<boolean> {
+        let last = (await h.stats()).frame_count, since = performance.now();
+        const end = since + limitMs;
+        while (performance.now() < end) {
+            await pause(100);
+            const frames = (await h.stats()).frame_count;
+            if (frames !== last) { last = frames; since = performance.now(); } else if (performance.now() - since >= quietMs) return true;
+        }
+        return false;
+    }
     async function measure(name: string, id: string) {
         await h.mouseMove(4, 4);
-        await pause(5000); // Let completion receipts, discovery and transient overlays settle.
-        let previous = '', stable = 0;
-        for (let i = 0; i < 20 && stable < 5; i++) {
+        // Let completion receipts, discovery and transient overlays settle: wait (time bounded) until no frame has been rendered for
+        // 1.5 s. A view that never goes quiet is exactly what the measurement below records, so the settle wait does not throw.
+        report.settle = report.settle ?? {};
+        report.settle[name] = await framesQuiet(1500, 15000);
+        // The measured node set must have been unchanged for 1.25 s before sampling (time-bounded, not a poll count).
+        let previous = '', since = performance.now();
+        await h.waitFor(async () => {
             const current = JSON.stringify((await h.query(id)).filter(shown).map((n: any) => n.id));
-            stable = current === previous ? stable + 1 : 0;
-            previous = current;
-            await pause(250);
-        }
+            if (current !== previous) { previous = current; since = performance.now(); }
+            return performance.now() - since >= 1250 || null;
+        }, 10000);
         const nodes = (await h.query(id)).filter(shown).map((n: any) => n.id);
         assert(nodes.length > 0, `${name}: terminal state is visible`);
         const before = await h.stats(), start = performance.now(), cpu = cpuMs();
@@ -104,18 +123,34 @@ default=true
         const cpuDeltaMs = cpuMs() - cpu, elapsedMs = performance.now() - start;
         const after = await h.stats(), afterNodes = (await h.query(id)).filter(shown).map((n: any) => n.id);
         const sample = {name, cpuPercent: 100 * cpuDeltaMs / elapsedMs, frameDelta: after.frame_count - before.frame_count, stableNodes: JSON.stringify(nodes) === JSON.stringify(afterNodes)};
+        // Caret evidence (zenit runtime: a blinking caret is drawn by native caret flips once admitted, otherwise by ordinary frames).
+        const caret = (st: any) => Object.fromEntries(['caret_flipping', 'caret_visible', 'caret_rect_count', 'caret_entries', 'caret_flips', 'caret_attempts', 'caret_gate_blocked', 'caret_admission_failures', 'caret_rejections'].map(k => [k, st[k]]));
+        (sample as any).caret = {before: caret(before), after: caret(after)};
         report.samples.push(sample);
+        if (sample.frameDelta > 2) {
+            // Evidence for a failing sample: what holds focus and whether the redraw is periodic (per-second frame deltas).
+            // Windows are silent (no harness traffic inside them): a periodic redraw scales with the window length.
+            const diagnostic: any = {focused: await h.focused().catch((e: any) => String(e)), silentWindows: [], changed: []};
+            // tree({visibleOnly}) — the full tree exceeds the harness result buffer.
+            const leaves = async () => new Map<number, string>(flat(await h.tree({visibleOnly: true})).map((n: any) => [n.id, JSON.stringify([n.test_id, n.component, n.text, n.rect, n.effective_opacity, n.bg_rgba, n.world_transform])]));
+            const first = await leaves();
+            for (const ms of [1000, 6000]) { const a = (await h.stats()).frame_count; await pause(ms); diagnostic.silentWindows.push({ms, frames: (await h.stats()).frame_count - a}); }
+            const second = await leaves();
+            for (const [nodeId, value] of second) if (first.get(nodeId) !== value) diagnostic.changed.push({before: first.get(nodeId) ?? null, after: value});
+            (sample as any).diagnostic = diagnostic;
+        }
         if (sample.frameDelta > 2) execFileSync('/usr/bin/sample', [String(app.pid), '1', '1', '-file', join(out, name + '-sample.txt')], {stdio: 'ignore'});
         await h.screenshot(join(out, name + '.png'));
         if (sample.frameDelta <= 2 && sample.stableNodes && sample.cpuPercent < 40) report.checks.push(name);
     }
     const connect = async (name: string) => {
         const row = await h.waitFor(async () => (await h.query('sidebar.host')).find((n: any) => shown(n) && text(n).includes(name)) ?? null, 15000);
-        assert((await h.clickAt(row.rect.x + 60, row.rect.y + row.rect.h / 2)).ok); await click('sidebar.host.connect');
+        // design-r3 A2 (src/features/shell/view/sidebar_host_connect.yix): a row click only selects; the selected row's native “连接” connects.
+        assert((await h.clickAt(row.rect.x + 60, row.rect.y + row.rect.h / 2)).ok); await click('sidebar.host.connect_button');
     };
     if (!process.env.ZW_IDLE_TRANSFER_ONLY) {
         // Local terminal only: no user-owned SSH connection is selected.
-        await click('toolbar.new_session'); await click('session.menu.local'); await visible('terminal.surface'); await click('toolbar.ai');
+        await click('toolbar.new_session'); await click('session.menu.local'); await visible('terminal.surface'); await click(await aiToggleId());
         let turns = 0;
         for (const state of ['complete', 'failed', 'stopped']) {
             mode = state;
@@ -128,9 +163,12 @@ default=true
         }
         await click('ai.collapse');
         await connect('Idle failed SSH');
-        await h.waitFor(async () => (await h.query('connection.progress.dismiss')).find((n: any) => shown(n) && !n.disabled) ?? null, 30000);
-        await measure('connection-failed-visible', 'connection.progress');
-        await click('connection.progress.dismiss');
+        // design-r3 稿 1 (connection_failure.yix): a failed attempt replaces the progress card with the failure view in the
+        // session pane; auto_reconnect=false ⇒ no pending retry, “立即重试” is the terminal action. There is no 关闭 button
+        // any more: Escape inside the pane closes the result (connection_progress_view.zig paneKey).
+        await h.waitFor(async () => (await h.query('connection.progress.failure.retry_now')).find((n: any) => shown(n) && !n.disabled) ?? null, 30000);
+        await measure('connection-failed-visible', 'connection.progress.failure');
+        await click('connection.progress.failure.title'); await h.key('escape');
         await h.waitFor(async () => !(await h.query('connection.progress')).some(shown) || null, 10000);
     }
     await connect('Idle SFTP');
@@ -152,14 +190,26 @@ default=true
     await h.dragAt(x, y, 0); await h.dragAt(x, y, 3, 'file://' + encodeURI(path)); await click('files.copy.submit');
     const sha256 = createHash('sha256').update(payload).digest('hex');
     await h.waitFor(async () => { try { const s = JSON.parse(await readFile(join(peerOut, 'state.json'), 'utf8')); return s.files['/fixture/idle-upload.bin']?.sha256 === sha256 || null; } catch { return null; } }, 30000);
-    await h.waitFor(async () => (await h.query('status.transfer.name')).some((n: any) => text(n).includes('idle-upload.bin')) && (await h.query('status.transfer.speed')).some((n: any) => text(n).includes('已完成')) || (await h.query('status.transfer.percent')).some((n: any) => text(n).includes('100')) || null, 15000);
+    // Island B v3 has no bottom status bar (status.transfer stays unmounted from view): a finished upload's terminal state is its row
+    // in the session's upload tray (transfer.session.tray, transfer_manager_view.zig), status "已完成 100%".
+    const doneRow = async () => { const tray = (await h.query('transfer.session.tray')).find(shown); return tray && flat(tray).find((n: any) => n.test_id === 'transfer.task' && shown(n) && text(n).includes('idle-upload.bin') && /已完成 100%/.test(text(n))); };
+    try { await h.waitFor(async () => await doneRow() ?? null, 15000); }
+    catch (error) {
+        // Evidence for the failure: does the row only catch up once unrelated input wakes the window?
+        const tray = (await h.query('transfer.session.tray')).find(shown);
+        report.stale_tray = {before_input: tray ? text(tray) : null};
+        await h.mouseMove(700, 500); await h.mouseMove(720, 520);
+        await h.waitFor(async () => await doneRow() ?? null, 3000).then(() => { report.stale_tray.after_input = 'completed row shown after pointer input'; }, () => { report.stale_tray.after_input = null; });
+        throw new Error(`The completed upload (peer SHA-256 matched) never shows as 已完成 in the session tray: ${JSON.stringify(report.stale_tray)} (${error})`);
+    }
     report.transfer = {bytes: payload.length, sha256, actualLoopbackUpload: true};
     const completed: any = await h.waitFor(async () => {
         const snapshot = await h.request('POST', '/zerowork/windows', {});
         return snapshot.tasks?.find((task: any) => task.state === 'succeeded' && task.cleanup === 'released') ?? null;
     }, 15000);
     report.transfer.cleanup = completed.cleanup;
-    await measure('transfer-complete', 'status.transfer');
+    await measure('transfer-complete', 'transfer.session.tray');
+    assert(await doneRow(), 'The completed upload row is still shown after the idle window');
     await click('toolbar.transfers'); await visible('transfer.manager');
     await measure('transfer-complete-list-open', 'transfer.task');
     assert.equal(report.samples.length, process.env.ZW_IDLE_TRANSFER_ONLY ? 2 : 6);

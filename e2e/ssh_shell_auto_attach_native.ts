@@ -2,11 +2,14 @@
  * Exercises proactive notices and missed alias detection through the same AI
  * attachment API after ordinary shell entry, without human attachment/approval clicks.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,readFile,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson,pollWithin} from './provider_fixture.ts';
 const prefix=process.env.ZW_NESTED_PREFIX??'/private/tmp/zw-shell-auto-build';
 const python=process.env.ZW_TEST_PYTHON??'/private/tmp/zw-nested-shell-test-venv/bin/python';
 const out=resolve(process.argv[2]??'/private/tmp/zw-shell-auto-native');await mkdir(out,{recursive:true});
@@ -22,7 +25,7 @@ const emitted=new Set<string>();
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'shell-auto-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;const request=JSON.parse(raw),results=new Map<string,any>();
+  const request=await readRequestJson(req),results=new Map<string,any>();
   await writeFile(join(out,phase+'-latest-request.json'),JSON.stringify(request,null,2));
   for(const message of request.messages??[]){
    if(message.role==='tool'){const envelope=JSON.parse(message.content),body=bodyOf(envelope);results.set(message.tool_call_id,body);report.observations[message.tool_call_id]={envelope,body}}
@@ -42,8 +45,8 @@ const server=createServer(async(req,res)=>{
    if(!get('run'))return emit('run','host.run_in_terminal',{session_ref:reference,request_key:'unknown-run',command:"PROMPT_COMMAND=__zw_osc_arm; printf 'UNKNOWN_SCREEN_OK\\n'",shell_id:source.control.shell_context.id,shell_revision:source.control.shell_context.revision});
    const run=get('run');assert(run.execution_ref,JSON.stringify(run));
    let last=run;
-   for(let i=0;i<4&&!JSON.stringify(last).includes('outcome_unknown');i++){
-    const value=get('wait-'+i);if(!value)return emit('wait-'+i,'host.wait_execution',{execution_ref:run.execution_ref,wait_ms:3000});last=value;
+   for(let i=0;!JSON.stringify(last).includes('outcome_unknown');i++){
+    const value=get('wait-'+i);if(!value){if(!pollWithin(phase+'-wait',30000))break;return emit('wait-'+i,'host.wait_execution',{execution_ref:run.execution_ref,wait_ms:3000})}last=value;
    }
    assert(JSON.stringify(last).includes('outcome_unknown'),JSON.stringify(last));
    assert.equal(last.snapshot.process,null);
@@ -67,9 +70,9 @@ const server=createServer(async(req,res)=>{
   if(!get('attach'))return emit('attach','host.attach_shell',attachArgs);
   assert.equal(get('attach').state,'attaching');
   let current:any;
-  for(let i=0;i<12;i++){
+  for(let i=0;;i++){
    const snapshot=get('ready-'+i);
-   if(!snapshot){await new Promise(r=>setTimeout(r,450));return emit('ready-'+i,'host.get_session',{session_ref:reference})}
+   if(!snapshot){if(!pollWithin(phase+'-ready',15000))break;await new Promise(r=>setTimeout(r,450));return emit('ready-'+i,'host.get_session',{session_ref:reference})}
    current=snapshot.session;if(current.control.shell_context.prompt_ready)break;
   }
   assert(current?.control.shell_context.prompt_ready,JSON.stringify(current));
@@ -81,8 +84,8 @@ const server=createServer(async(req,res)=>{
   if(!get('run'))return emit('run','host.run_in_terminal',{session_ref:reference,request_key:phase+'-run',command:`printf 'SHELL_AUTO_${phase}_OK\\n'`,shell_id:current.control.shell_context.id,shell_revision:current.control.shell_context.revision});
   assert(get('run').execution_ref,JSON.stringify(get('run')));
   let execution:any;
-  for(let i=0;i<5;i++){
-   const value=get('wait-'+i);if(!value)return emit('wait-'+i,'host.wait_execution',{execution_ref:get('run').execution_ref,wait_ms:3000});
+  for(let i=0;;i++){
+   const value=get('wait-'+i);if(!value){if(!pollWithin(phase+'-wait',30000))break;return emit('wait-'+i,'host.wait_execution',{execution_ref:get('run').execution_ref,wait_ms:3000})}
    execution=value;if(JSON.stringify(value).includes('interval_recorded'))break;
   }
   assert(JSON.stringify(execution).includes('interval_recorded'),JSON.stringify(execution));
@@ -115,11 +118,11 @@ try{
  await h.waitForServerReady(60000);await h.resizeWindow(1440,900);const row=await visible('sidebar.host');await h.mouseMove(row.rect.x+row.rect.w-18,row.rect.y+row.rect.h/2);await click('sidebar.host.connect');
  await h.waitFor(async()=>{const modal=(await h.query('plugin.challenge.modal')).find(shown);if(modal){if(flat(modal).some((n:any)=>n.test_id==='plugin.challenge.choice.1'&&shown(n)))await click('plugin.challenge.choice.1');else if(flat(modal).some((n:any)=>n.test_id==='plugin.challenge.secret'&&shown(n))){await click('plugin.challenge.secret');await h.type_(ready.password);await click('plugin.challenge.submit')}}return text(await h.query('terminal.input')).includes('fixture>')||null},30000);
  await h.waitFor(async()=>{try{return JSON.parse(await readFile(join(iso,'peer','state.json'),'utf8')).contexts.length>=1||null}catch{return null}},25000);
- await command(`ssh -i "$HOME/nested-test-key" -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -p ${ready.port} shell-fixture@127.0.0.1`);await h.sleep(400);await click('toolbar.ai');await click('ai.maximize');await ask();await capture('01-ordinary-switch-ai-attached');
+ await command(`ssh -i "$HOME/nested-test-key" -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -p ${ready.port} shell-fixture@127.0.0.1`);await h.sleep(400);await click(await aiToggleId());await click('ai.maximize');await ask();await capture('01-ordinary-switch-ai-attached');
  assert(report.notices.some((notice:string)=>{try{return JSON.parse(JSON.parse(notice).shell_switches_json).some((item:any)=>item.kind==='ssh'&&item.pending)}catch{return false}}),'switch notice must reach the model');
  report.checks.push('Stale screen/input evidence rejects without initialization; repeated key returns duplicate without reinitializing; changed arguments with the same key reject');
  report.checks.push('Ordinary nested SSH entry -> bound model notice -> terminal read -> AI attach -> verified business execution; zero human attach or permission clicks');
- await click('ai.collapse');await command("alias inner='bash --noprofile --norc -i'");await h.sleep(200);await command('inner');await h.sleep(250);phase='fallback';await click('toolbar.ai');await click('ai.maximize');await ask();await capture('02-missed-alias-ai-recovery');
+ await click('ai.collapse');await command("alias inner='bash --noprofile --norc -i'");await h.sleep(200);await command('inner');await h.sleep(250);phase='fallback';await click(await aiToggleId());await click('ai.maximize');await ask();await capture('02-missed-alias-ai-recovery');
  report.checks.push('Alias entry missed by classifier -> known-unsent business rejection -> terminal read -> same AI attachment API -> one successful execution');
  phase='unknown';await ask();await capture('03-unknown-result-screen-observation');
  report.checks.push('Real missing Shell completion keeps exit unknown, permits a subsequent model round reading the terminal, and removes command/attachment effects from the tool catalog');

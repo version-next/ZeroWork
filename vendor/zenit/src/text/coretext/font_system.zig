@@ -96,7 +96,7 @@ pub const FontSystem = struct {
             if (std.mem.eql(u8, descriptor.family, "system")) descriptor.family = fam;
         }
         // Convert FontWeight to numeric weight
-        const weight: c_int = descriptor.numeric_weight orelse switch (descriptor.weight) {
+        const tier_weight: c_int = switch (descriptor.weight) {
             .thin => 100,
             .light => 300,
             .regular => 400,
@@ -112,12 +112,12 @@ pub const FontSystem = struct {
         const family_z = try self.allocator.dupeSentinel(u8, descriptor.family, 0);
         defer self.allocator.free(family_z);
 
-        const ct_font = ct.coretext_find_font(
-            family_z.ptr,
-            descriptor.size,
-            weight,
-            italic,
-        ) orelse {
+        // numeric_weight is opt-in: null keeps the tier lookup (hot path) byte-for-byte.
+        const weight: c_int = if (descriptor.numeric_weight) |w| w else tier_weight;
+        const ct_font = (if (descriptor.numeric_weight != null)
+            ct.coretext_find_font_exact_weight(family_z.ptr, descriptor.size, weight, italic)
+        else
+            ct.coretext_find_font(family_z.ptr, descriptor.size, weight, italic)) orelse {
             std.log.err("[FontSystem/CoreText] Failed to find font: {s}", .{descriptor.family});
             return error.FontNotFound;
         };
@@ -180,6 +180,13 @@ pub const Font = struct {
             .scale_factor = self.scale_factor,
         };
         return font;
+    }
+
+    /// Actual CSS-numeric 'wght' coordinate read back from the native face; null for
+    /// non-variable faces. Unlike `weight` (the requested number), this is what renders.
+    pub fn variableWeight(self: *const Font) ?f64 {
+        const value = ct.coretext_font_weight_value(self.ct_font);
+        return if (std.math.isFinite(value) and value >= 0) value else null;
     }
 
     pub fn pixelSize(self: *const Font) f32 {

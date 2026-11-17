@@ -21,6 +21,8 @@ const a11y_macos_bridge_mod = @import("../a11y/macos_bridge.zig");
 const actions_mod = @import("../actions.zig");
 const cx_cursor = @import("cx_cursor.zig");
 const cx_hit_target = @import("cx_hit_target.zig");
+const interaction_semantics = @import("interaction_semantics.zig");
+const cx_hover = @import("cx_hover.zig");
 const cx_runtime_index = @import("cx_runtime_index.zig");
 const debug_env = @import("debug_env.zig");
 const devtoolsHitDebugEnabled = debug_env.devtoolsHitDebugEnabled;
@@ -39,11 +41,14 @@ pub fn handleMouseDown(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
 
 pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers: Modifiers) void {
     self.focus_manager.noteInputModality(.pointer);
+    cx_hover.notePointerAt(self, x, y);
     self.mouse_x = x;
     self.mouse_y = y;
     self.cursor_state.pointer_valid = true;
+    self.hover_sync.pointer_over_content = true;
     defer cx_cursor.updateCursorShape(self);
     self.needs_redraw = true;
+    if (self.tooltip_state.dismiss) |dismiss| dismiss.invoke();
     // New press of same key means previous press's up (if swallowed) is lost (can't have two
     // unpaired downs of same key); stale flag would swallow this press's normal up.
     if (self.swallowed_press_button == button) self.swallowed_press_button = null;
@@ -79,7 +84,11 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
 
         // `close_and_consume` overlay: outside the panel, this press only closes; both press and
         // following release don't dispatch (no click synthesis, no focus change).
-        if (self.overlay_stack.consumeOutsidePress(target)) {
+        // A swallowed press whose release was lost counts as released: it closes its overlay,
+        // and this new press is an ordinary one.
+        const finished_lost_press = self.overlay_stack.consumed_press_layer != null;
+        self.overlay_stack.commitConsumedPress();
+        if (!finished_lost_press and self.overlay_stack.consumeOutsidePress(raw_target)) {
             self.swallowed_press_button = button;
             if (button == .left) self.gesture_arena.reset();
             return;
@@ -103,7 +112,8 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
 
         // Record which overlay this press belongs to before dispatch: handler may close it
         // immediately, invalidating references.
-        const press_owner = self.overlay_stack.findPressOwner(target);
+        const press_owner = self.overlay_stack.findPressOwner(raw_target);
+        const press_mark = self.overlay_stack.activationMark();
         _ = self.dispatcher.dispatchMouseDownButton(x, y, target, .left, modifiers);
         rebuildRuntimeIndexesIfCurrentRootDirty(self);
 
@@ -121,6 +131,8 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
         self.pressed_handle = target_handle;
         self.notifyPressWatchers();
         self.press_overlay_owner = press_owner;
+        self.outside_press_armed = true;
+        self.outside_press_mark = press_mark;
         self.last_mouse_down_target = self.pressed_node;
         self.last_mouse_down_handle = target_handle;
         self.has_new_mouse_down = true;
@@ -163,9 +175,11 @@ pub fn handleMouseUp(self: *Cx, x: f32, y: f32) void {
 }
 
 pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers: Modifiers) void {
+    cx_hover.notePointerAt(self, x, y);
     self.mouse_x = x;
     self.mouse_y = y;
     self.cursor_state.pointer_valid = true;
+    self.hover_sync.pointer_over_content = true;
     defer cx_cursor.updateCursorShape(self);
     self.needs_redraw = true;
     // Feed gesture_arena (primary button only)
@@ -176,6 +190,7 @@ pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers
         if (swallowed == button) {
             self.swallowed_press_button = null;
             if (button == .left) self.gesture_arena.reset();
+            self.overlay_stack.commitConsumedPress();
             return;
         }
     }
@@ -192,6 +207,20 @@ pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers
         const target = resolveInteractionTarget(raw_target);
         self.dispatcher.dispatchMouseUpButton(x, y, target, button, modifiers);
         rebuildRuntimeIndexesIfCurrentRootDirty(self);
+        // Overlays the press began outside of close now (render phase), after this click's own
+        // handlers ran: a click that navigates away unmounts them with their page.
+        if (button == .left and self.outside_press_armed) {
+            self.outside_press_armed = false;
+            self.has_new_press_release = true;
+            const record: core.PressRelease = .{ .press_handle = self.last_mouse_down_handle, .press_owner = self.press_overlay_owner, .press_mark = self.outside_press_mark };
+            if (self.press_release_count == self.press_releases.len) {
+                // Full batch: keep the newest; the oldest clicks were already superseded.
+                std.mem.copyForwards(core.PressRelease, self.press_releases[0 .. self.press_releases.len - 1], self.press_releases[1..]);
+                self.press_release_count -= 1;
+            }
+            self.press_releases[self.press_release_count] = record;
+            self.press_release_count += 1;
+        }
         if (button == .left and had_pointer_capture) {
             self.resyncPointerAfterCaptureRelease(x, y, target_handle);
         }
@@ -205,7 +234,7 @@ pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers
 
 pub fn resyncPointerAfterCaptureRelease(self: *Cx, x: f32, y: f32, fallback_handle: ?NodeHandle) void {
     var synced_target: ?*Node = null;
-    if (self.root != null) {
+    if (self.root != null and !self.hover_sync.pointer_from_touch) {
         cx_render.ensureHitTestSceneFresh(self);
         const synced_hit = self.hitTestQuery(.{
             .kind = .pointer,
@@ -215,6 +244,7 @@ pub fn resyncPointerAfterCaptureRelease(self: *Cx, x: f32, y: f32, fallback_hand
         const synced_handle = if (synced_hit) |result| result.handle else fallback_handle;
         const synced_raw_target = self.node_registry.resolve(synced_handle, &self.perf);
         synced_target = resolveInteractionTarget(synced_raw_target);
+        cx_hover.noteResolved(self);
     }
     self.hovered_node = self.dispatcher.syncHover(synced_target);
     self.hovered_handle = if (self.hovered_node) |n| self.node_registry.handleFor(n) else null;
@@ -254,22 +284,31 @@ pub fn handleMouseMove(self: *Cx, x: f32, y: f32) void {
 }
 
 pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
+    handlePointerMove(self, x, y, modifiers, false);
+}
+
+pub fn handlePointerMove(self: *Cx, x: f32, y: f32, modifiers: Modifiers, from_touch: bool) void {
     // R4a: mark dirty only when mouse actually moves, hover hit changes with cursor position, needs
     // frame to re-dispatch; stationary move events shouldn't wake new frame (idle frame-gating
     // depends on this).
+    self.input_perf.in_pointer_moves += 1;
     cx_render.ensureHitTestSceneFresh(self);
     if (x != self.mouse_x or y != self.mouse_y) {
         self.needs_redraw = true;
     }
+    // A move away from where an AnchorTransition landed content under the pointer ends that hold.
+    cx_hover.notePointerAt(self, x, y);
     self.mouse_x = x;
     self.mouse_y = y;
     // feed gesture_arena
     self.cursor_state.pointer_valid = true;
+    self.hover_sync.pointer_over_content = true;
+    self.hover_sync.pointer_from_touch = from_touch;
     self.gesture_arena.onTouchMove(x, y, @import("zenit_time").nanoTimestamp(self.io));
     if (self.root != null) {
         const hit_tests_before = self.perf.hit_test_count;
         const has_capture = self.dispatcher.hasPointerCapture();
-        const hit = if (has_capture)
+        const hit = if (has_capture or from_touch)
             null
         else
             self.hitTestQuery(.{
@@ -278,38 +317,26 @@ pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
                 .world_y = y,
             });
         self.interaction_index.setHoveredResult(hit);
-        var raw_hovered = if (hit) |result| self.node_registry.resolve(result.handle, &self.perf) else null;
-        // Hover hysteresis: partial interaction rebuild has gaps in collecting new nodes between
-        // subtree rebuilds (hit in several apps), so queries during motion intermittently MISS at
-        // valid coordinates. On MISS, if the previous hovered node is still alive and geometrically
-        // still contains the pointer, keep hover; otherwise the cursor flickers between pointer and
-        // default (seen near file-tab close buttons, where the hover state machine is busiest and
-        // every event marks dirty). On a real leave the old node's rect no longer contains the
-        // pointer and hover is cleared as usual.
-        if (raw_hovered == null and !has_capture) {
-            if (self.hovered_handle) |h| {
-                if (self.node_registry.resolve(h, &self.perf)) |prev| {
-                    const r = prev.rectFromWorldOrFallback();
-                    if (r.w > 0 and r.h > 0 and r.contains(x, y)) raw_hovered = prev;
-                }
-            }
-        }
+        // Hysteresis on MISS lives in hoverTargetForHit (shared with stationary re-resolution).
+        const hovered = if (has_capture or from_touch) null else cx_hover.hoverTargetForHit(self, hit, x, y);
+        // Hover below is resolved against this committed scene; under capture it is not
+        // resolved at all and stays stale, so release re-resolves (cx_hover.reconcile).
+        if (!has_capture) cx_hover.noteResolved(self);
         if (hitSceneDebugEnabled()) {
             if (hit) |h| {
                 const proxy = self.interaction_index.proxies.items[h.proxy_id];
                 std.debug.print("[hit-move] ({d:.0},{d:.0}) -> id={d} comp={s} aabb=({d:.1},{d:.1},{d:.1},{d:.1})\n", .{
-                    x,                                y,
-                    if (raw_hovered) |n| n.id else 0, if (raw_hovered) |n| (n.meta.ownership.meta.component_name orelse "-") else "-",
-                    proxy.true_aabb.x,                proxy.true_aabb.y,
-                    proxy.true_aabb.w,                proxy.true_aabb.h,
+                    x,                            y,
+                    if (hovered) |n| n.id else 0, if (hovered) |n| (n.meta.ownership.meta.component_name orelse "-") else "-",
+                    proxy.true_aabb.x,            proxy.true_aabb.y,
+                    proxy.true_aabb.w,            proxy.true_aabb.h,
                 });
-            } else if (raw_hovered) |kept| {
+            } else if (hovered) |kept| {
                 std.debug.print("[hit-move] ({d:.0},{d:.0}) -> MISS (hover 滞回保持 id={d})\n", .{ x, y, kept.id });
             } else {
                 std.debug.print("[hit-move] ({d:.0},{d:.0}) -> MISS\n", .{ x, y });
             }
         }
-        const hovered = resolveInteractionTarget(raw_hovered);
         self.perf.mouse_move_hit_test_count += 1;
         // Count this move's lookup before dispatching callbacks. Starting or
         // cancelling a drag may legitimately release capture and resync hover,
@@ -328,7 +355,10 @@ pub fn cancelPointerInteractions(self: *Cx, reason: interaction_drag.CancelReaso
     // Press swallowed by consume becomes invalid with interaction: its release won't come again (or
     // shouldn't), flag left standing would swallow next normal click's release.
     self.swallowed_press_button = null;
-    self.dispatcher.cancelClickSynthesisForActivePointer();
+    // A cancelled press is not a click: it dismisses nothing on a later release.
+    self.outside_press_armed = false;
+    self.overlay_stack.consumed_press_layer = null;
+    self.dispatcher.cancelActivePress();
     self.dispatcher.releasePointerCapture();
     self.cursor_state.leases.clearRetainingCapacity();
     self.cursor_override = null;
@@ -416,9 +446,13 @@ fn findActionContextNode(node: *Node, context: []const u8) ?*Node {
     return null;
 }
 
-pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
+/// Returns whether anything consumed the key (a web host leaves unconsumed keys,
+/// e.g. browser shortcuts, to the browser).
+pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) bool {
     switch (key) {
-        .left_shift, .right_shift, .left_ctrl, .right_ctrl, .left_alt, .right_alt, .left_super, .right_super, .unknown => {},
+        // Escape only dismisses the current interaction. Treating it as a
+        // modality change could open a focus tooltip before Escape is routed.
+        .escape, .left_shift, .right_shift, .left_ctrl, .right_ctrl, .left_alt, .right_alt, .left_super, .right_super, .unknown => {},
         else => self.focus_manager.noteInputModality(.keyboard),
     }
     self.needs_redraw = true;
@@ -431,10 +465,14 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         self.inspector.enabled = false;
         self.inspector.pick_mode = false;
         self.inspector.clearSelection();
-        return;
+        return true;
     }
-    if (routeKeyDown(self, key, modifiers)) return;
-    if (inspector_key) self.inspector.enabled = true;
+    if (routeKeyDown(self, key, modifiers)) return true;
+    if (inspector_key) {
+        self.inspector.enabled = true;
+        return true;
+    }
+    return false;
 }
 
 /// Delivers a key press; true when something consumed it.
@@ -443,23 +481,52 @@ fn routeKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) bool {
     // cancels the drag and dismisses the top overlay). Pending is silently cleaned, active emits
     // cancel; both swallow this Escape.
     if (key == .escape and self.drag_manager.handleEscape(self)) return true;
+    // A key routed while the focused text input composes (IME preedit) belongs to the input
+    // method: it reaches the input (`KeyEvent.composing`) and nothing else acts on it -- no action
+    // binding, no overlay / tooltip Escape, no Tab focus traversal, no click synthesized for
+    // Space / Enter (the click would land on the input and bubble to whatever row or button holds
+    // it). The state is read once, before any handler runs: an Escape that cancels the preedit
+    // still belongs to it. A Cmd / Ctrl chord is a shortcut, not text: it is routed as an
+    // ordinary key (as the Windows bridge reports the real key for VK_PROCESSKEY with Ctrl / Alt).
+    if (imeOwnsKey(self, modifiers)) {
+        if (self.focus_manager.getFocused()) |focused| {
+            _ = self.dispatcher.dispatchKeyDown(focused, .{ .key = key, .modifiers = modifiers, .composing = true });
+        }
+        return true;
+    }
     if (key == .escape) {
         if (self.focus_manager.getFocused()) |focused| {
             if (focused.behavior.interaction.text_input_client) |client| {
-                if (client.is_composing) |composing| if (composing(client.context)) {
-                    _ = self.dispatcher.dispatchKeyDown(focused, .{ .key = key, .modifiers = modifiers });
+                // An edited field reverts before Escape can dismiss an enclosing overlay
+                // (`Cx.input_escape`).
+                if (self.input_escape == .revert_to_focus_value) if (client.escape_revert) |revert| if (revert(client.context)) {
+                    self.needs_redraw = true;
                     return true;
                 };
             }
+        }
+    }
+    // A tooltip takes Escape only when no overlay that handles Escape sits above its trigger;
+    // otherwise the overlay stack goes first (a confirmation opened over a hovered tab closes on
+    // the first Escape, the hint stays until the pointer leaves).
+    if (key == .escape and !self.overlay_stack.topTooltipCovered()) {
+        if (self.tooltip_state.dismiss) |dismiss| {
+            dismiss.invoke();
+            return true;
         }
     }
     // OverlayStack: Escape only closes topmost overlay
     if (key == .escape and self.overlay_stack.handleEscape()) return true;
 
     if (key == .tab) {
-        // Dispatch to focused node first (editors need to intercept Tab for indent)
-        if (self.focus_manager.getFocused()) |focused| {
-            const result = self.dispatcher.dispatchKeyDown(focused, .{
+        // Dispatch to focused node first (editors need to intercept Tab for indent).
+        // With nothing focused the application root gets the same first refusal,
+        // as for every other key: app-level chords such as Ctrl+Tab (next
+        // document) must not turn into focus traversal just because the last
+        // click landed on non-focusable chrome or a menu.
+        const tab_target = self.focus_manager.getFocused() orelse unfocusedKeyTarget(self);
+        if (tab_target) |target| {
+            const result = self.dispatcher.dispatchKeyDown(target, .{
                 .key = key,
                 .modifiers = modifiers,
             });
@@ -537,19 +604,36 @@ fn resolveKeyboardTarget(self: *Cx, identity: ?NodeHandle) ?*Node {
 
 pub fn handleKeyUp(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
     self.needs_redraw = true;
+    const composing = imeOwnsKey(self, modifiers);
     if (self.focus_manager.getFocused()) |focused| {
         self.focused_node = focused;
         self.focused_handle = self.node_registry.handleFor(focused);
         _ = self.dispatcher.dispatchKeyUp(focused, .{
             .key = key,
             .modifiers = modifiers,
+            .composing = composing,
         });
     } else if (unfocusedKeyTarget(self)) |root| {
         _ = self.dispatcher.dispatchKeyUp(root, .{
             .key = key,
             .modifiers = modifiers,
+            .composing = composing,
         });
     }
+}
+
+/// Whether a key pressed now with `modifiers` belongs to the input method: the focused text input
+/// is composing and the key is not a Cmd / Ctrl shortcut chord.
+fn imeOwnsKey(self: *Cx, modifiers: Modifiers) bool {
+    return !modifiers.super and !modifiers.ctrl and focusedComposing(self);
+}
+
+/// Whether the focused text input is composing (IME preedit) right now.
+fn focusedComposing(self: *Cx) bool {
+    const focused = self.focus_manager.getFocused() orelse return false;
+    const client = focused.behavior.interaction.text_input_client orelse return false;
+    const query = client.is_composing orelse return false;
+    return query(client.context);
 }
 
 /// Return the focused node only when it publishes the live text-input
@@ -637,14 +721,70 @@ pub fn scrollEventFromSdk(wheel: system_sdk_mod.events.MouseWheel) events_mod.Sc
     };
 }
 
-pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
+/// Returns whether the scroll had an effect (some handler moved something). A web host
+/// leaves a wheel nothing used to the browser.
+pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) bool {
+    self.focus_manager.noteUserInput();
     // During pinch suppress trackpad scroll dispatch (pinch and two-finger pan share source,
     // dispatch both causes screen jump during zoom), same gesture session doesn't receive
     // pan/scroll simultaneously.
-    if (self.magnify_target_handle != null and scroll.isTrackpad()) return;
-    self.needs_redraw = true;
+    if (self.magnify_target_handle != null and scroll.isTrackpad()) return true;
+    self.input_perf.in_scroll_events += 1;
+    // A scroll event requests a frame only through what its handlers changed: a handler that
+    // moved content marks it dirty, and the redraw below covers every handler that does not
+    // declare the event inert (event_dispatcher.scroll_effect). A wheel against a pinned end, or
+    // over content that cannot scroll, changes nothing and renders nothing.
+    const scroll_accounting = core.scroll_effect.begin();
+    const contained = dispatchScroll(self, scroll);
+    const effect = core.scroll_effect.finish(scroll_accounting);
+    if (effect) self.needs_redraw = true;
+    // A wheel an overlay layer contained, or the dropped rest of a gesture, was aimed at the
+    // window: it is used (a web host must not scroll the page behind the canvas with it).
+    return effect or contained;
+}
+
+/// Returns true when the event was contained by an overlay layer or dropped (used, nothing moved).
+fn dispatchScroll(self: *Cx, scroll: events_mod.ScrollEvent) bool {
+    // The rest of a gesture ended below because a layer blocked its owner.
+    if (self.dispatcher.dropScrollEvent(scroll)) return true;
+    // A latched trackpad gesture (or its momentum) whose owner a layer shown since it latched now
+    // blocks (a modal made it inert, a barrier covers it): end it for its owner and drop the rest.
+    // A layer that does not block the owner (a non-modal panel elsewhere, a tooltip) leaves the
+    // gesture alone, as platform scroll latching does.
+    // A wheel transaction whose owner such a layer blocks just ends: the notch is hit-tested below
+    // and contained by the layer the pointer is over.
+    const wheel = !scroll.isMomentum() and scroll.phase == .none;
+    if (self.dispatcher.latchedScrollOwner(scroll)) |owner| {
+        if (self.overlay_stack.blocksSince(if (wheel) self.wheel_latch_mark else self.scroll_latch_mark, owner)) {
+            if (wheel) self.dispatcher.endWheelTransaction() else {
+                self.dispatcher.cancelScrollGestureDroppingRest();
+                return true;
+            }
+        } else if (self.overlay_stack.isNodeInClosedLayer(owner)) {
+            // The owner's layer has closed (suspended or exiting): what was scrolled is gone from
+            // under the pointer. End the latch for it — the gesture / momentum gets its end
+            // notification, the wheel transaction ends — and route this event afresh (nothing is
+            // dropped: the fingers are now over whatever the closed layer uncovered).
+            if (wheel) self.dispatcher.endWheelTransaction() else self.dispatcher.cancelScrollGesture();
+        }
+    }
     // Finish previous gesture that lost ended, then run hit-test
     self.dispatcher.beginScrollEvent(scroll);
+    if (!scroll.isMomentum() and (scroll.phase == .may_begin or scroll.phase == .began or
+        (scroll.phase == .changed and self.dispatcher.latchedScrollOwner(scroll) == null)))
+        self.scroll_latch_mark = self.overlay_stack.activationMark();
+    // A latched gesture or its momentum goes to its owner whatever is under the pointer: no hit
+    // test (hover under the moved content is re-resolved at the next frame, cx_hover). The handler
+    // still reads committed layout, so pending layout is committed first, as for a hit test.
+    if (self.root != null and !self.dispatcher.scrollNeedsHitTarget(scroll) and !devtoolsHitDebugEnabled()) {
+        self.input_perf.in_scroll_latched += 1;
+        const r = self.root.?;
+        if (r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout) {
+            cx_render.ensureHitTestSceneFresh(self);
+        }
+        if (self.root != null) _ = self.dispatcher.dispatchScroll(scroll, null);
+        return false;
+    }
     cx_render.ensureHitTestSceneFresh(self);
     if (self.root != null) {
         const scroll_hit = self.hitTestQuery(.{
@@ -652,10 +792,26 @@ pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
             .world_x = scroll.x,
             .world_y = scroll.y,
         });
-        const pointer_hit = self.hitTestQuery(.{
+        var pointer_hit = self.hitTestQuery(.{
             .kind = .pointer,
             .world_x = scroll.x,
             .world_y = scroll.y,
+        });
+        // The leaf under the pointer as hit, before wheel-transparent nodes are looked through
+        // (the wheel transaction tells motion from a routing change by the route, see
+        // EventDispatcher.latchedWheelTarget).
+        const pointer_leaf = if (pointer_hit) |result| self.node_registry.resolve(result.handle, &self.perf) else null;
+        // A wheel over a wheel-transparent node (a resize strip over a list) routes as if the node
+        // were not there: the pointer target is what lies under it.
+        const over_transparent = if (pointer_hit) |result|
+            if (self.node_registry.resolve(result.handle, &self.perf)) |n| interaction_semantics.nodeWheelTransparent(n) else false
+        else
+            false;
+        if (over_transparent) pointer_hit = self.hitTestQuery(.{
+            .kind = .pointer,
+            .world_x = scroll.x,
+            .world_y = scroll.y,
+            .skip_wheel_transparent = true,
         });
         const raw_pointer_target = if (pointer_hit) |result|
             self.node_registry.resolve(result.handle, &self.perf)
@@ -667,7 +823,34 @@ pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
             self.node_registry.resolve(result.handle, &self.perf)
         else
             null;
-        const hit_target = preferred_target orelse event_dispatcher_mod.nearestCompatibleScrollOwner(scroll_target, scroll.dx, scroll.dy);
+        const fallback_target = event_dispatcher_mod.nearestCompatibleScrollOwner(scroll_target, scroll.dx, scroll.dy);
+        var hit_target = preferred_target orelse fallback_target;
+        // An overlay layer contains the wheel aimed at it: over its content or its barrier, the
+        // wheel goes to a scroll owner inside that layer (the preferred owner, else the scroll-role
+        // fallback) or to nothing — never to what lies below (a scroller behind the panel, or an
+        // ancestor of an in-tree layer). Either way the wheel was aimed at the layer, so it is
+        // reported as used even when the scroller inside moved nothing (pinned at its end): a web
+        // host must not scroll the page behind the canvas. Layers whose content is not
+        // hit-testable are never the pointer target, so they let the wheel through.
+        var contained = false;
+        // Route origin (b5g §4.1): the node the owner search started from.
+        var origin = if (preferred_target != null) pointer_target else scroll_target;
+        // The raw geometric hit decides the layer (an interaction delegate could point elsewhere).
+        if (raw_pointer_target) |target| if (self.overlay_stack.findLayerForNode(target)) |layer| {
+            contained = true;
+            const inside = struct {
+                fn of(l: *const @TypeOf(layer.*), n: ?*Node) ?*Node {
+                    const node = n orelse return null;
+                    return if (l.contains(node)) node else null;
+                }
+            };
+            if (inside.of(layer, preferred_target)) |owner| {
+                hit_target = owner;
+            } else {
+                hit_target = inside.of(layer, fallback_target);
+                origin = scroll_target;
+            }
+        };
 
         if (devtoolsHitDebugEnabled()) {
             ensureDevtoolsHitDebugBanner();
@@ -686,8 +869,18 @@ pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
         } else {
             self.interaction_index.setScrollSessionOwner(scroll_hit);
         }
-        _ = self.dispatcher.dispatchScroll(scroll, hit_target);
+        // Taken before dispatch, like the gesture's: a layer the starting notch's own handler opens
+        // counts as shown since the transaction started.
+        const wheel_mark = self.overlay_stack.activationMark();
+        _ = self.dispatcher.dispatchScrollRouted(scroll, hit_target, .{
+            .leaf = pointer_leaf,
+            .leaf_wheel_transparent = over_transparent,
+            .origin = origin,
+        });
+        if (self.dispatcher.takeWheelTransactionStarted()) self.wheel_latch_mark = wheel_mark;
+        return contained;
     }
+    return false;
 }
 
 pub fn handleMagnify(self: *Cx, magnification: f32, x: f32, y: f32, phase: events_mod.GesturePhase) void {
@@ -731,6 +924,10 @@ fn handleDragPayload(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8, pay
     // value is a checked panic (verify_interop_probe.sh: releasing a drag-out aborted the whole
     // app).
     if (kind > @backingInt(events_mod.DragEvent.Kind.dropped)) return;
+    // The OS owns the pointer during a drag session and sends no motion: the last pointer
+    // position is stale for stationary hover until the session leaves or drops.
+    self.hover_sync.platform_drag_active = kind == @backingInt(events_mod.DragEvent.Kind.entered) or
+        kind == @backingInt(events_mod.DragEvent.Kind.updated);
     // Take sequence number before any step that can run user code (hit refresh runs before_render
     // hooks): if drag-drop event re-enters during refresh, this event is replaced by it (see
     // re-entry semantics below).

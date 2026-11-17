@@ -21,6 +21,7 @@ const Padding = core.Padding;
 const reactive = @import("../../reactive.zig");
 const Scope = reactive.Scope;
 const Model = reactive.Model;
+const Source = reactive.Source;
 const Handler = core.Handler;
 const Event = @import("../../events.zig").Event;
 const EventResult = @import("../../events.zig").EventResult;
@@ -83,9 +84,13 @@ const tab_glass_bleed: f32 = 8;
 /// Button width over the even share of the platter interior (100.7 / 94, measured for 3 tabs).
 pub const tab_button_overlap: f32 = 100.7 / 94.0;
 /// UIButton.Configuration.glass (system_controls_*): 34.33 tall capsule, 12 pt side padding,
-/// 17 pt title; an image-only button is a 34.33 pt circle.
+/// 17 pt title. An image-only button is a 48 pt circle around its 24 pt image, 12 pt all round
+/// (system_controls_*, system_buttonsizes_*: buttonSize .mini / .small 44, .medium 48, .large 64);
+/// it clears the HIG's 44 x 44 pt hit region and matches the bottom toolbar's 48 pt platters.
 pub const button_height: f32 = 34.33;
 pub const button_padding: f32 = 12;
+pub const button_image_diameter: f32 = 48;
+pub const button_image_size: f32 = 24;
 
 /// Ink over bar glass, per material family (captures: icons 21 over 205 light, 247 over 89 dark;
 /// titles pure black / white; inline subtitle 72 light / 194 dark).
@@ -217,8 +222,15 @@ const Item = struct {
     tab_index: usize = 0,
     on_click: ?Handler(void) = null,
     pressed: bool = false,
+    /// Caller ink (GlassButton `ink`): replaces the ink that follows the glass.
+    ink_override: ?Color = null,
+    /// GlassButton `on_drag`: a press that travels `drag_slop` becomes a drag (no click).
+    on_drag: ?Handler(ButtonDrag) = null,
+    down: [2]f32 = .{ 0, 0 },
+    dragging: bool = false,
 
     fn ink(self: *const Item, comptime f: fn (*const Item, *const Ink) Color) Color {
+        if (self.ink_override) |c| return c;
         return glass_box.familyInk(self.glass, f(self, &light_ink), f(self, &dark_ink));
     }
     // Tab items are hit targets only; their drawn copies are inked by the runtime (refresh).
@@ -546,8 +558,11 @@ pub const BarRuntime = struct {
     items: std.ArrayListUnmanaged(*Item) = .empty,
     texts: std.ArrayListUnmanaged(InkText) = .empty,
     tabs: ?*Tabs = null,
+    /// GlassButton: its followed state (tint, ink, label, symbol effect, lift).
+    button: ?*ButtonState = null,
 
     fn refresh(self: *BarRuntime) void {
+        if (self.button) |b| b.sync();
         for (self.items.items) |it| {
             if (it.icon) |n| if (n.setTint(it.ink(Item.iconInk))) n.markRenderDirty();
             if (it.label) |n| n.setTextColor(it.ink(Item.labelInk));
@@ -577,6 +592,7 @@ pub const BarRuntime = struct {
         self.items.deinit(alloc);
         self.texts.deinit(alloc);
         if (self.tabs) |t| t.destroy(alloc);
+        if (self.button) |b| alloc.destroy(b);
         alloc.destroy(self);
     }
 };
@@ -614,10 +630,22 @@ fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
             cx.setPointerCapture(it.node);
             if (!ownsCapture(cx, it.node)) return .stop;
             it.pressed = true;
+            it.down = .{ e.x, e.y };
+            it.dragging = false;
             if (it.role == .tab) if (it.bar.tabs) |t| t.press(it.tab_index, e.x);
             return .stop;
         },
         .mouse_move => |e| {
+            if (it.pressed and it.role != .tab) if (it.on_drag) |h| {
+                const dx = e.x - it.down[0];
+                const dy = e.y - it.down[1];
+                if (!it.dragging and @sqrt(dx * dx + dy * dy) < drag_slop) return .stop;
+                const phase: ButtonDrag.Phase = if (it.dragging) .move else .start;
+                it.dragging = true;
+                cx.needs_redraw = true;
+                h.call(.{ .phase = phase, .x = e.x, .y = e.y, .dx = dx, .dy = dy });
+                return .stop;
+            };
             if (!it.pressed or it.role != .tab) return .ignored;
             if (it.bar.tabs) |t| t.dragTo(e.x);
             return .stop;
@@ -633,6 +661,13 @@ fn itemEvent(event: Event, context: ?*anyopaque) EventResult {
                 const t = it.bar.tabs orelse return .stop;
                 // Last step: the callback may destroy the bar
                 if (t.release(it.tab_index, inside)) |to| t.select(to);
+                return .stop;
+            }
+            if (it.dragging) {
+                it.dragging = false;
+                cx.needs_redraw = true;
+                // Last step: the callback may destroy the bar
+                if (it.on_drag) |h| h.call(.{ .phase = .end, .x = e.x, .y = e.y, .dx = e.x - it.down[0], .dy = e.y - it.down[1] });
                 return .stop;
             }
             if (!inside) return .stop;
@@ -651,6 +686,10 @@ fn itemCaptureLost(node: *Node) void {
     if (!it.pressed) return;
     it.pressed = false;
     if (it.role == .tab) if (it.bar.tabs) |t| t.cancel();
+    if (it.dragging) {
+        it.dragging = false;
+        if (it.on_drag) |h| h.call(.{ .phase = .cancel, .x = it.down[0], .y = it.down[1], .dx = 0, .dy = 0 });
+    }
 }
 
 /// Register an interactive item; once appended it belongs to the runtime's cleanup.
@@ -773,7 +812,15 @@ fn mountGroups(scope: *Scope, cx: *Cx, rt: *BarRuntime, row: *Node, groups: []co
     for (groups) |g| try mountGroup(scope, cx, rt, row, g, m, idiom);
 }
 
-pub const BarResult = struct { root: *Node, runtime: *BarRuntime };
+pub const BarResult = struct {
+    root: *Node,
+    runtime: *BarRuntime,
+
+    /// `ui.view` / Yix `<W.GlassButton>`: the root is the element.
+    pub fn viewParts(self: BarResult) core.ViewParts {
+        return .{ .root = self.root };
+    }
+};
 
 // ============================================================================
 // Navigation bar
@@ -1075,7 +1122,7 @@ pub const GlassTabBarBuilder = struct {
         }
         // The clear lens over the plain tabs and the platter. The accent copies go above it (native
         // _UILiquidLensView: the portal sits over the glass layers with its own displacement):
-        // the lens's rim samples 20-40 pt deep (tab_lens_sample_depth) and must find the platter
+        // the lens's rim samples 20-40 pt deep (glass.metal tab_lens_field) and must find the platter
         // there, not the accent glyphs.
         const lens = try glass_box.GlassBox(.{
             .width = btn_w,
@@ -1165,17 +1212,98 @@ pub const GlassTabBarBuilder = struct {
 /// UIButton.Configuration: .glass(), .prominentGlass(), .clearGlass(), .prominentClearGlass().
 pub const GlassButtonStyle = enum { glass, prominent_glass, clear_glass, prominent_clear_glass };
 
+/// A GlassButton drag step (window points; `dx`, `dy` = travel since the press).
+pub const ButtonDrag = struct {
+    pub const Phase = enum { start, move, end, cancel };
+    phase: Phase,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+};
+
+/// SF Symbols effect on the image of a GlassButton.
+pub const SymbolEffect = enum {
+    none,
+    /// `.symbolEffect(.pulse)`: the image's opacity breathes 100% <-> 45% on a 1.6 s cycle while
+    /// selected (an activity in progress). Off while the system asks for reduced motion.
+    pulse,
+};
+
+/// Image opacity range and cycle of `SymbolEffect.pulse`.
+pub const symbol_pulse = @import("../../animation/presets.zig").BreatheOpts{ .min_opacity = 0.45, .period = 1.6 };
+
 pub const GlassButtonProps = struct {
     title: []const u8 = "",
-    /// Image-only when title is empty: a 34.33 pt circle
+    /// Image-only when title is empty: a 48 pt circle (24 pt image)
     icon: ?svg_assets.Asset = null,
-    /// Accessibility name for an image-only button
-    label: []const u8 = "",
+    /// Accessibility name for an image-only button; followed when a source.
+    label: Source([]const u8) = .{ .value = "" },
     style: GlassButtonStyle = .glass,
     tint: Color = prominent_tint,
+    /// Tint of a `.glass` / `.clear_glass` platter (`NSGlassEffectView.tintColor`: alpha is the
+    /// amount); null = untinted. Followed when a source. Prominent styles keep `tint`.
+    glass_tint: Source(?Color) = .{ .value = null },
+    /// Image / title ink; null = the ink that follows the glass. Followed when a source.
+    ink: Source(?Color) = .{ .value = null },
+    /// Effect on the image (image-only buttons). Followed when a source.
+    symbol_effect: Source(SymbolEffect) = .{ .value = .none },
+    /// Lifted while the caller drags the button: the deeper shadow of a held platter. Followed.
+    lifted: Source(bool) = .{ .value = false },
     on_click: ?Handler(void) = null,
+    /// Dragging the button: a press that travels 4 pt becomes a drag and is not a click.
+    /// `start` / `move` / `end` carry the pointer and its travel from the press; `cancel` when
+    /// the capture is lost. The caller moves the button (and may call it `lifted`).
+    on_drag: ?Handler(ButtonDrag) = null,
     idiom: GlassIdiom = .ios,
     test_id: ?[]const u8 = null,
+};
+
+/// A GlassButton's followed props, applied in the bar's per-frame refresh; an effect wakes a
+/// frame when a dynamic one changes.
+const ButtonState = struct {
+    rt: *BarRuntime,
+    item: *Item,
+    prominent: bool,
+    label: Source([]const u8),
+    glass_tint: Source(?Color),
+    ink: Source(?Color),
+    symbol_effect: Source(SymbolEffect),
+    lifted: Source(bool),
+    pulsing: bool = false,
+
+    fn sync(self: *ButtonState) void {
+        const it = self.item;
+        if (!self.prominent) {
+            const next = glass_box.effectiveTintColor(self.glass_tint.peek());
+            if (!std.meta.eql(next, it.glass.tint_override)) {
+                it.glass.tint_override = next;
+                it.node.markRenderDirty();
+            }
+        }
+        it.ink_override = self.ink.peek();
+        if (it.node.behavior.interaction.a11y) |*a| if (it.label == null) {
+            a.label = self.label.peek();
+        };
+        glass_box.glassSetShadowScale(it.glass, if (self.lifted.peek()) 1 + tab_press_shadow else 1);
+        const icon = it.icon orelse return;
+        const want = self.symbol_effect.peek() == .pulse and !self.rt.cx.reduced_motion;
+        if (want == self.pulsing) return;
+        self.pulsing = want;
+        const presets = @import("../../animation/presets.zig");
+        if (want) presets.breathe(icon, self.rt.cx.allocator, symbol_pulse) else presets.breatheStop(icon, self.rt.cx.allocator);
+        self.rt.cx.needs_redraw = true;
+    }
+
+    fn watch(self: *ButtonState) void {
+        _ = self.label.get();
+        _ = self.glass_tint.get();
+        _ = self.ink.get();
+        _ = self.symbol_effect.get();
+        _ = self.lifted.get();
+        self.rt.cx.needs_redraw = true;
+        self.rt.root.markRenderDirty();
+    }
 };
 
 /// prominentClearGlass reads 144 over gray 128 in both appearances (clear alone: 152): clear glass
@@ -1209,8 +1337,8 @@ pub const GlassButtonBuilder = struct {
             else => null,
         };
         const g = try glass_box.GlassBox(.{
-            .width = if (icon_only) button_height else null,
-            .height = button_height,
+            .width = if (icon_only) button_image_diameter else null,
+            .height = if (icon_only) button_image_diameter else button_height,
             .shape = if (icon_only) @as(glass_box.GlassBoxShape, .circle) else .capsule,
             .idiom = p.idiom,
             .glass_style = if (clear) glass_box.GlassEffectStyle.clear else .regular,
@@ -1223,14 +1351,19 @@ pub const GlassButtonBuilder = struct {
         g.body.style.align_items = .center;
         g.body.style.justify = .center;
         g.body.style.height = .{ .grow = .{} };
-        g.box.behavior.interaction.a11y = .{ .role = .button, .label = if (icon_only) p.label else p.title };
-        var item: Item = .{ .bar = rt, .glass = g.state, .node = g.box, .role = if (p.style == .prominent_glass) .prominent else .plain, .on_click = p.on_click };
+        g.box.behavior.interaction.a11y = .{ .role = .button, .label = if (icon_only) p.label.peek() else p.title };
+        var item: Item = .{ .bar = rt, .glass = g.state, .node = g.box, .role = if (p.style == .prominent_glass) .prominent else .plain, .on_click = p.on_click, .on_drag = p.on_drag };
         if (icon_only) {
-            if (p.icon) |ic| item.icon = try iconNode(cx, g.body, ic, 20);
+            if (p.icon) |ic| item.icon = try iconNode(cx, g.body, ic, button_image_size);
         } else {
             item.label = try textNode(cx, g.body, p.title, 17, 400, p.idiom);
         }
-        _ = try addItem(my_scope, rt, item);
+        const added = try addItem(my_scope, rt, item);
+        const st = try my_scope.allocator.create(ButtonState);
+        st.* = .{ .rt = rt, .item = added, .prominent = tint != null, .label = p.label, .glass_tint = p.glass_tint, .ink = p.ink, .symbol_effect = p.symbol_effect, .lifted = p.lifted };
+        rt.button = st;
+        if (!(p.label.isStatic() and p.glass_tint.isStatic() and p.ink.isStatic() and p.symbol_effect.isStatic() and p.lifted.isStatic()))
+            try my_scope.createEffect(st, ButtonState.watch);
         rt.refresh();
         return .{ .root = root, .runtime = rt };
     }
@@ -1516,9 +1649,122 @@ test "GlassBottomToolbar and GlassButton: measured sizes and styles" {
     const prom = tb.runtime.items.items[2].node.globalRect();
     try std.testing.expectApproxEqAbs(@as(f32, 402 - 28 - 48), prom.x, 0.5);
     try std.testing.expectApproxEqAbs(@as(f32, 48), prom.w, 0.01);
-    // buttons: 34.33 tall; clear style is clear glass; image-only is a circle
+    // buttons: 34.33 tall; clear style is clear glass; image-only is a 48 pt circle (native
+    // system_controls_*: UIButton 48 x 48, image 24 x 24 at 12, 12)
     try std.testing.expectApproxEqAbs(button_height, glass.runtime.items.items[0].node.globalRect().h, 0.01);
     try std.testing.expectEqual(glass_box.GlassEffectStyle.clear, clear.runtime.items.items[0].glass.variant);
     const h = heart.runtime.items.items[0].node.globalRect();
-    try std.testing.expectApproxEqAbs(button_height, h.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 48), h.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 48), h.h, 0.01);
+    const hi = heart.runtime.items.items[0].icon.?.globalRect();
+    try std.testing.expectApproxEqAbs(@as(f32, 12), hi.x - h.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), hi.w, 0.01);
+}
+
+test "GlassButton: followed glass tint, ink, label, symbol pulse and lift" {
+    var ctx = try testCx();
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const icons = @import("zenit_system_icons");
+    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    ctx.root = root;
+    const tint = try scope.createSignal(?Color, null);
+    const ink = try scope.createSignal(?Color, null);
+    const label = try scope.createSignal([]const u8, "AI");
+    const effect = try scope.createSignal(SymbolEffect, .none);
+    const lifted = try scope.createSignal(bool, false);
+    const b = try GlassButton(.{ .icon = icons.heart, .label = label, .glass_tint = tint, .ink = ink, .symbol_effect = effect, .lifted = lifted, .test_id = "fab" }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, b.root);
+    ctx.layout();
+    const it = b.runtime.items.items[0];
+    // Defaults: untinted glass, family ink, label, no effect.
+    try std.testing.expect(it.glass.tint_override == null);
+    try std.testing.expectEqualStrings("AI", it.node.behavior.interaction.a11y.?.label.?);
+    try std.testing.expect(Color.eql(it.icon.?.getIcon().?.tint, glass_box.familyInk(it.glass, light_ink.icon, dark_ink.icon)));
+    const warn = Color.rgba(255, 170, 0, 64);
+    const warn_ink = Color.rgba(200, 120, 0, 255);
+    tint.set(warn);
+    ink.set(warn_ink);
+    label.set("AI, 2 waiting");
+    lifted.set(true);
+    try std.testing.expect(ctx.needs_redraw);
+    b.runtime.refresh();
+    try std.testing.expect(Color.eql(it.glass.tint_override.?, warn));
+    try std.testing.expect(Color.eql(it.icon.?.getIcon().?.tint, warn_ink));
+    try std.testing.expectEqualStrings("AI, 2 waiting", it.node.behavior.interaction.a11y.?.label.?);
+    // Pulse: the image breathes; reduced motion stops it.
+    effect.set(.pulse);
+    b.runtime.refresh();
+    try std.testing.expect(b.runtime.button.?.pulsing);
+    try std.testing.expect(it.icon.?.frame_state.frame_local.runtime.commands != null);
+    ctx.reduced_motion = true;
+    b.runtime.refresh();
+    try std.testing.expect(!b.runtime.button.?.pulsing);
+    ctx.reduced_motion = false;
+    effect.set(.none);
+    tint.set(null);
+    ink.set(null);
+    b.runtime.refresh();
+    try std.testing.expect(!b.runtime.button.?.pulsing);
+    try std.testing.expect(it.glass.tint_override == null);
+    try std.testing.expect(Color.eql(it.icon.?.getIcon().?.tint, glass_box.familyInk(it.glass, light_ink.icon, dark_ink.icon)));
+    // Static props keep the old tree: no effect, no tint.
+    const plain = try GlassButton(.{ .icon = icons.heart, .label = "x" }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, plain.root);
+    try std.testing.expect(plain.runtime.items.items[0].glass.tint_override == null);
+    try std.testing.expectEqual(plain.root, plain.viewParts().root.?);
+}
+
+test "GlassButton: a press that travels 4 pt is a drag, not a click" {
+    var ctx = try testCx();
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const icons = @import("zenit_system_icons");
+    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    ctx.root = root;
+    const Rec = struct {
+        clicks: u32 = 0,
+        phases: [8]ButtonDrag.Phase = undefined,
+        n: usize = 0,
+        last: ButtonDrag = undefined,
+        fn click(self: *@This()) void {
+            self.clicks += 1;
+        }
+        fn drag(self: *@This(), d: ButtonDrag) void {
+            self.phases[self.n] = d.phase;
+            self.n += 1;
+            self.last = d;
+        }
+    };
+    var rec: Rec = .{};
+    const b = try GlassButton(.{ .icon = icons.heart, .on_click = ctx.on(Rec, &rec, Rec.click), .on_drag = ctx.on(Rec, &rec, Rec.drag) }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, b.root);
+    ctx.layout();
+    const it = b.runtime.items.items[0];
+    // Small wobble: still a click.
+    _ = itemEvent(.{ .mouse_down = .{ .x = 20, .y = 20, .button = .left } }, it);
+    _ = itemEvent(.{ .mouse_move = .{ .x = 22, .y = 21 } }, it);
+    _ = itemEvent(.{ .mouse_up = .{ .x = 22, .y = 21, .button = .left } }, it);
+    try std.testing.expectEqual(@as(u32, 1), rec.clicks);
+    try std.testing.expectEqual(@as(usize, 0), rec.n);
+    // Travel past the slop: start, move, end, and no click.
+    _ = itemEvent(.{ .mouse_down = .{ .x = 20, .y = 20, .button = .left } }, it);
+    _ = itemEvent(.{ .mouse_move = .{ .x = 26, .y = 20 } }, it);
+    _ = itemEvent(.{ .mouse_move = .{ .x = 80, .y = 90 } }, it);
+    _ = itemEvent(.{ .mouse_up = .{ .x = 80, .y = 90, .button = .left } }, it);
+    try std.testing.expectEqual(@as(u32, 1), rec.clicks);
+    try std.testing.expectEqual(@as(usize, 3), rec.n);
+    try std.testing.expectEqual(ButtonDrag.Phase.start, rec.phases[0]);
+    try std.testing.expectEqual(ButtonDrag.Phase.move, rec.phases[1]);
+    try std.testing.expectEqual(ButtonDrag.Phase.end, rec.phases[2]);
+    try std.testing.expectEqual(@as(f32, 60), rec.last.dx);
+    try std.testing.expectEqual(@as(f32, 70), rec.last.dy);
+    // A lost capture mid-drag cancels.
+    _ = itemEvent(.{ .mouse_down = .{ .x = 20, .y = 20, .button = .left } }, it);
+    _ = itemEvent(.{ .mouse_move = .{ .x = 40, .y = 20 } }, it);
+    itemCaptureLost(it.node);
+    try std.testing.expectEqual(ButtonDrag.Phase.cancel, rec.phases[rec.n - 1]);
+    try std.testing.expectEqual(@as(u32, 1), rec.clicks);
 }

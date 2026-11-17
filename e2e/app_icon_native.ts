@@ -1,4 +1,6 @@
 /** Isolated native settings, persisted icon selection and restart restoration. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {settingsNav} from './settings_nav.ts';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,mkdir,readFile,writeFile,realpath,open} from 'node:fs/promises';
@@ -14,7 +16,7 @@ async function launch(round:number,run:()=>Promise<void>){
  const log=await open(join(output,'app-'+round+'.log'),'w');
  const app=spawn(binary,[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_ISOLATE_POINTER:'1',ZENIT_E2E_BACKGROUND:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});
  const ended=new Promise(r=>app.once('close',r));
- try {await h.waitForServerReady();await h.resizeWindow(1000,700);await click('toolbar.settings');await click('settings.nav.appearance');await run();}
+ try {await h.waitForServerReady();await h.resizeWindow(1000,700);/* two-level settings: 外观与主题 › 主题 holds the app icon (settings_nav.ts) */const nav=settingsNav();await nav.open();await nav.toSub('appearance','theme');await nav.reveal('settings.option.icon_background.transparent');await run();}
  finally{if(app.exitCode===null)app.kill('SIGTERM');await ended;await log.close();}
 }
 async function node(id:string){return h.waitFor(async()=> (await h.query(id)).find(n=>n.visible!==false&&n.hidden!==true&&n.rect.w>0&&n.rect.h>0&&(n.effective_opacity??1)>0)??null)}

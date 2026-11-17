@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {openSidebarHostMenu} from './sidebar_host_menu.ts';
 /** Frozen real App acceptance with canonical disposable instance storage.
  * Isolated 0600 reference persistence, same-App native credential reuse, VM/Grok consumption,
@@ -12,6 +13,7 @@ import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {request,waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep,mouseMove,scrollAt} from '../vendor/zenit/e2e/client.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
+import {aiToggleId} from './ai_entry.ts';
 
 const opts:Record<string,string>={};
 for(let i=2;i<process.argv.length;i+=2){
@@ -193,7 +195,7 @@ try{
  await launch('first-restart-same-app-credential-recovery');await persisted();await connect();const ssh=await attach();
  const token='SAVED_VM_'+randomUUID().replaceAll('-','');await shell(`printf '%s\\n' '${token}'`,token);
  report.checks.push('Restart reads the saved password through its native credential store and authenticates the actual VM without password entry.');await capture('02-restart-vm-authenticated');
- await click('toolbar.ai');await vis('ai.prompt');
+ await click(await aiToggleId());await vis('ai.prompt');
  const aiToken='SAVED_GROK_'+randomUUID().replaceAll('-','');await click('ai.prompt');
  await type_('Reply with exactly this token and nothing else. Use no tools: '+aiToken);await click('ai.send');
  await waitFor(async()=>{const raw=await readFile(logPath,'utf8');return !(await query('ai.stop')).some(shown)&&raw.includes('provider_response_finish')||null;},150000);
@@ -204,7 +206,7 @@ try{
  assert(!events.some(e=>e.event==='dynamic_invocation'));
  report.grok={model:ai.model,http_200:true,token_returned:true,tool_invocations:0};
  report.checks.push('One actual Grok request after restart reads the saved API key through its native credential store and returns the nonce.');
- await capture('03-restart-grok-saved-key');await key('escape');if((await query('ai.panel')).some(shown))await click('toolbar.ai');
+ await capture('03-restart-grok-saved-key');await key('escape');if((await query('ai.panel')).some(shown))await click(await aiToggleId());
  await settings();const gate=await vis('settings.data.clear_all');await capture('04-active-session-cleanup-gate');await clickNode(gate);
  assert(!(await query('data.cleanup.modal')).some(shown),'Active session blocks cleanup entry');assert.equal(app.exitCode,null);await persisted();
  await key('escape');await closeTab(ssh.tab);

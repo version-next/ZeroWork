@@ -2,60 +2,39 @@
 
 ## Zenit
 
-- Upstream: https://github.com/version-next/zenit
-- Revision: `9c1ba9bfea58210404e447b04b6ff25b6442f0ff`
-- Package: `zenit` (`dev/zig-0.17.0`, complete source snapshot tracked by ZeroWork)
-- Local patch revision: `2026-11-06-ime-source-context-preservation+floating-shadow-clip` (upstream revision and license unchanged)
-- Minimum Zig: `0.17.0`
-- License: GPL-3.0-only (commercial alternative documented upstream)
-- Canonical source files: `3507` (tracked sources plus declared working-tree additions)
-- Canonical tracked-tree SHA-256: `7e1b424a3c544a3c981066e7cc22eacf22628aede7d43025cf5b3cec5679ee10`
-- Hash algorithm: sort and deduplicate `git ls-files --cached --others --exclude-standard vendor/zenit`; for each path hash big-endian u64 path length, path relative to `vendor/zenit`, big-endian u64 content length, then raw content bytes
+- Source: zenit (private repository `hitengr-biz/zenit`), branch `main`.
+- Snapshot: recorded in `vendor/zenit.lock.json` (commit, file count, SHA-256). `vendor/zenit` is a
+  **pristine** copy of that commit's Zig package files (`build.zig.zon` `.paths`) and is never edited
+  by hand.
+- Update: `python3 scripts/sync_vendor_zenit.py --source <zenit checkout> --ref <branch|commit>`, then
+  build and test. `python3 scripts/verify_vendor_zenit.py [--source <zenit checkout>]` verifies the tree
+  against the lock (and optionally re-derives it from the commit).
+- Minimum Zig: `0.17.0`. License: GPL-3.0-only (commercial alternative documented upstream).
 - Project decision: GPL-3.0-only use authorized for current development; distribution obligations remain active.
 
-The upstream `LICENSE`, `LICENSING.md`, source, and package metadata are retained under `vendor/zenit/`. Do not update this tree without recording a new fixed revision and reviewing its license and build contract.
+### How ZeroWork customizations attach
 
-The floating-shadow patch keeps glass surfaces’ outer shadows outside their own overflow clip, while clipping descendants at the rounded panel boundary. It covers plain and composited glass panels, including retained rendering. The public API, upstream revision, license and toolchain are unchanged.
+ZeroWork no longer patches zenit. Its product behavior mounts through public, default-off
+extension points on zenit `main`:
 
-The latest IME patch retains the native input context and first responder when the keyboard input source changes, including before the first composing key. Native input-pump regressions cover early and delayed source publication. Upstream revision, license and toolchain are unchanged.
+| ZeroWork need | zenit extension point | ZeroWork side |
+|---|---|---|
+| Secure secret panel owns keyboard events | `macos_add/remove_native_event_filter` (`native/macos/zenit_native_event_filter.h`) | `src/platform/macos_host_secret.m` |
+| Traffic lights in the sidebar header | `MacOSWindow.setTrafficLightsLayout(x, y, ?diameter)` | `src/main.zig`, `shell_styles.traffic_light_*` |
+| Theme = zenit default + ZeroWork tokens | `generateThemeLayers` + `defaultThemePath` (overlay, explicit `$override`) | `src/ui/theme/zerowork.tokens.json` (`zw_*`), `build.zig` |
+| Component role colors | none: role tokens (`button_*`, `checkbox_*`, `switch_*`, `range_*`, `progress_*`) and focus (`bg_focus`, `border_focus`, `focus_ring`) are zenit defaults | — |
+| Select panel material / scope | `SelectProps.panel_style`, `SelectResult.scope`, `virtualize`, `option_style` | `src/plugins/bmc_ikvm/select_surface.zig`, settings/transfer pickers |
+| Accordion parts and app motion | `accordion.stateOf`, `AccordionItemProps.builtin_motion` | `src/config/settings_accordion.zig` |
+| Field frame states | `Input/TextareaProps.field_state_style`, `invalid` signal | settings fields (`invalid` signal) |
+| Glass sampling a composited preview | `GlassParams.capture_source = .current_surface` | `src/ui/background_layers.zig` |
+| Window-scoped structure revision | `World.structure_revision`, `Node.ownedTreeStructureRevision/invalidateTreeStructure` | `src/ui/layer_materials.zig` |
+| Exact variable font weights | `FontRegistry.setExactWeight`, `coretext_font_weight_range/value` | `src/config/appearance_font.zig` |
+| Checkbox size, progress sweep, virtual list ownership | `CheckboxProps.size/label_font_size`, `ProgressProps.sweep`, `VirtualListProps.translate_content` | call sites |
 
-The idle-canvas adaptation skips animated canvas repaint hooks while the node or an ancestor is `display:none`. Retained loading indicators resume when shown; completed or failed operations no longer keep hidden spinners repainting. This local guard changes neither the public API nor the upstream license/build contract.
-
-The latest local patch adds an explicit macOS window hide API and restores those retained windows on Dock reopen when no window is visible. Hiding preserves the native window and application state; committed close and application quit keep their existing teardown. Upstream revision, license and toolchain are unchanged.
-
-The preceding local patch preserves an active IME composition when AppKit publishes the changed input-source identifier after its first marked-text callback. A native input-pump regression covers retaining the first letter and input context across the next key. Upstream revision, license and toolchain are unchanged.
-
-The preceding local patch adds an explicit `SelectProps.virtualize` option, allowing the font picker to use a scrollable virtual viewport below the automatic 200-option threshold. Upstream revision, license and toolchain are unchanged.
-
-Streaming texture uploads now advance a content revision used by retained layer and damage fingerprints; unversioned external textures conservatively disable enclosing retained caches. This keeps KVM frames current without changing the upstream revision, toolchain or license.
-
-Latest local patch adds `Node.setTextFixedBounds` for absolute, fixed-pixel, single-line leaf text: content still invalidates shaping/paint while unchanged bounds avoid layout and hit-index rebuilding. Other sizing modes retain ordinary invalidation. Settled hidden branches skip repeated layout/paint work, with dirty and tree-structure changes invalidating that shortcut. Select replaces its 64-option selection mask with dynamic storage, virtualizes more than 200 options, and exposes reactive `option_style` for eager and reused rows; keyboard, accessibility, controlled selection and allocation-failure cleanup are covered by targeted regressions. No toolchain or license changes.
-
-Interaction dirty generation now advances only when the relevant bit actually changes. Repeated marks and clean hidden/runtime clears preserve the existing observation memo across windows, while real geometry, event semantics, reveal and membership changes still invalidate it. No new cross-frame cache or skipped registry update is introduced.
-
-The preceding local patch exposes the existing monotonic node-tree structure revision through `Node.treeStructureRevision()`. ZeroWork uses it to invalidate its retained material-surface index after append/detach/reorder without scanning the entire tree every frame. It does not change node lifetime, layout, rendering or toolchain semantics.
-
-The preceding local patch gives both ScrollArea scrollbar thumbs a grab cursor and capture-scoped grabbing cursor, including when the pointer leaves the thumb. Capture release restores the cursor of the underlying target. No API, toolchain or license changes.
-
-The preceding local patch maps diagonal resize shapes to public AppKit frame resize cursors on macOS 15 and later, with cached rotated system resize artwork on macOS 14. Native cursor coverage checks both diagonal images, centered hotspots, drag hands, axis resizing and reset. No API, toolchain or license changes.
-
-The preceding local patch handles titlebar blank-area double clicks in the shared native event pump with AppKit zoom/restore. Published control hits and native buttons retain ownership, action gaps use live hit testing, and fullscreen/transition states cannot zoom or drag. Native regression coverage verifies restore geometry and sibling-window isolation. No API, toolchain or license changes.
-
-The preceding local patch gives an explicitly registered native panel ownership of this application's keyboard events until submit, cancel or expiry. Only the opt-in panel receives AppKit responder delivery; other windows retain the existing Metal dispatcher. The panel is weakly held, a second live claimant is rejected, and releasing an old panel cannot clear another owner. The real secure collector keeps SecureEventInput and NSWindowSharingNone. No toolchain or license changes.
-
-The preceding local patch adds `Cx.trimIdleRenderCapacity` for idle windows: it releases spare display-item capacity, defers arena shrinking until the normal frame boundary, and preserves live replay payloads and reusable font/GPU caches. Frame and display-list scratch use page-backed allocation. Opt-in frame profiling also attributes after-layout callbacks and renderer setup/text warming; formal builds retain the existing automation boundary.
-
-The preceding local patch drains continuous native mouse-drag motion in the same bounded event batch as hover motion, preventing one rendered frame per queued drag position. Button, key and text boundaries retain native order. No API, toolchain or license changes.
-
-The preceding local patch synchronizes single-line input caret, selection and hit testing with the inherited font size and weight used by rendering, including explicitly selected font families, monospace and italic faces. Multiline editable rows pin the font size, weight and line height used by caret measurement; wrapping and virtual row pitch follow programmatic metric changes. No API, toolchain or license changes.
-
-The previous local patch keeps placeholders visually neutral for required-but-empty inputs; existing mouse-move hit-count accounting before drag callbacks is retained. No API, toolchain or license changes.
-
-Local adaptations are included in the canonical hash: optional independent Select dropdown width and positioning (existing defaults preserved), bounded/wrapping Tooltip content through public optional properties (defaults preserve the existing API and behavior), native close confirmation/commit/completion and IME handling, scoped theme replay for detached retained panels, rendering and hit-test fixes, idle interaction-geometry drainage, material subtree cache ranges, safe focus cleanup, legacy hidden-control window configuration, fixed ASCII grid positioning for explicitly configured terminal faces, and the compile-time automation boundary that removes all process environment overrides from formal macOS App builds. The upstream repository metadata is not required for building this snapshot. The local timer cleanup adaptation retains timer storage until scope, node, and state owners have released their callbacks. Run `python3 scripts/verify_vendor_zenit.py` to verify the exact vendored tree.
-
-Terminal acceptance additionally extends only the compile-time test Harness: mouse requests can specify left/middle/right buttons and key names resolve the existing KeyCode enum, allowing F1–F12 and editing keys through the production dispatcher. No VT injection or screen-state override is added; formal builds retain their existing automation boundary. No toolchain or license changes.
-
-The resource-scheduling patch combines frame-local z-order/cache-boundary preparation and promoted-layer descendant synchronization, and removes repeated subtree searches when advancing hidden animations. Popover/Tooltip register an overlay layer only while open or exiting; closing releases the registration while preserving reusable content and Scope. Display-list buffers consistently use their owning allocator, including BulkQuad insertions. These changes preserve rendering, focus, animation, lifetime and public API contracts; no cross-frame cache or UI worker-thread access is introduced.
+Generic fixes found during the switch are included in zenit `main` (IME
+Return/Escape ownership, Select highlight across rebuilds, retained-menu tooltip reopen, theme
+transitions on the publishing window's clock, hooks at a frozen frame clock, explicit cross-axis
+fill under `no_cross_stretch`), each with regression tests.
 
 ## Ghostty VT
 

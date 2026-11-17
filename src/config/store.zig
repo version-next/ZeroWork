@@ -1,4 +1,5 @@
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const config = @import("config.zig");
 pub const credentials = @import("credential_store.zig");
 pub const plugin_credential_references = @import("plugin_credential_references.zig");
@@ -16,7 +17,7 @@ pub const CredentialOptions = struct {
 pub const SavedConfig = struct { value: config.Config, cleanup: CleanupStatus };
 
 pub const max_config_bytes = 256 * 1024;
-pub const private_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
+pub const private_permissions: std.Io.File.Permissions = persist.private_file;
 
 /// Writes a complete configuration snapshot and atomically replaces the old file.
 /// The temporary and final file are owner read/write only, independent of umask.
@@ -91,19 +92,8 @@ pub fn saveWithCredentialRefsWithOptions(io: std.Io, dir: std.Io.Dir, sub_path: 
     defer std.heap.page_allocator.free(encoded_buffer);
     const encoded = try disk.format(encoded_buffer);
 
-    var atomic_buffer: [16 * 1024]u8 = undefined;
-    var atomic = try dir.createFileAtomic(io, sub_path, .{
-        .permissions = private_permissions,
-        .make_path = true,
-        .replace = true,
-    });
-    defer atomic.deinit(io);
-
-    var writer = atomic.file.writer(io, &atomic_buffer);
-    try writer.interface.writeAll(encoded);
-    try writer.interface.flush();
-    try atomic.file.sync(io);
-    try atomic.replace(io);
+    // 目录 fsync：替换后的 config.toml 本身（rename）也要落盘。
+    try persist.writeAtomic(io, dir, sub_path, encoded, .{ .make_path = true, .sync_dir = true });
     tx.commit();
     return .{ .value = disk, .cleanup = cleanup };
 }
@@ -185,10 +175,7 @@ const HostBaseline = struct { hash: ?config.hosts.Digest };
 /// inode. Participating writers serialize; non-cooperating external edits are
 /// detected by exact-byte hashes before staging and immediately before rename.
 fn lockHosts(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !std.Io.File {
-    if (std.fs.path.dirname(sub_path)) |parent| try dir.createDirPath(io, parent);
-    const path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.lock", .{sub_path});
-    defer std.heap.page_allocator.free(path);
-    return dir.createFile(io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true, .permissions = private_permissions });
+    return persist.acquireLock(io, dir, sub_path);
 }
 
 fn checkHostsBaseline(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, expected: HostBaseline) !void {
@@ -202,20 +189,13 @@ fn checkHostsBaseline(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, expecte
 
 fn writeHostsEncoded(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, encoded: []const u8, expected: ?HostBaseline) !void {
     if (expected) |baseline| try checkHostsBaseline(io, dir, sub_path, baseline);
-    var atomic_buffer: [16 * 1024]u8 = undefined;
-    var atomic = try dir.createFileAtomic(io, sub_path, .{
-        .permissions = private_permissions,
-        .make_path = true,
-        .replace = true,
-    });
-    defer atomic.deinit(io);
-
-    var file_writer = atomic.file.writer(io, &atomic_buffer);
-    try file_writer.interface.writeAll(encoded);
-    try file_writer.flush();
-    try atomic.file.sync(io);
+    var atomic = try persist.AtomicWriter.begin(io, dir, sub_path, .{ .make_path = true, .sync_dir = true });
+    defer atomic.deinit();
+    try atomic.file().writePositionalAll(io, encoded, 0);
+    // 落盘后、发布前再核对一次磁盘上的旧内容（外部改动检测）。
+    try atomic.syncData();
     if (expected) |baseline| try checkHostsBaseline(io, dir, sub_path, baseline);
-    try atomic.replace(io);
+    try atomic.commit();
 }
 
 /// An owned candidate of the existing Registry, not a second asset store.

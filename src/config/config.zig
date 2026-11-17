@@ -1,9 +1,11 @@
 const std = @import("std");
+const shared_retry = @import("../shared/base/retry.zig");
 pub const keybindings = @import("keybindings.zig");
 pub const hosts = @import("hosts.zig");
 pub const store = @import("store.zig");
 pub const ai_extensions = @import("ai_extensions.zig");
 pub const material = @import("background_asset.zig");
+pub const unknown = @import("config_unknown.zig");
 
 pub const Config = struct {
     /// Persisted monotonic identity of the committed global configuration.
@@ -20,6 +22,9 @@ pub const Config = struct {
     updates: Updates = .{},
     keys: keybindings.Map = .{},
     plugin_preferences: []const PluginPreference = &.{},
+    /// Keys and sections this version does not understand, kept as opaque
+    /// validated text and written back where they were read (config_unknown.zig).
+    unknown: unknown.Unknown = .{},
 
     pub fn agentPolicyRevision(self: Config) u64 {
         return self.agent_policy_revision orelse self.config_revision;
@@ -35,11 +40,22 @@ pub const Config = struct {
         var provider_index: ?usize = null;
         var model_index: ?usize = null;
         var preference_index: ?usize = null;
+        var collector: unknown.Collector = .{ .allocator = allocator };
+        // Inside an unknown section; `anchor` is the last known section seen.
+        var in_unknown = false;
+        var anchor: []const u8 = "";
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw| {
+            const whole = trim(raw);
+            if (in_unknown and whole.len != 0 and whole[0] == '#') {
+                try collector.blockComment(whole);
+                continue;
+            }
             const line = trim(stripComment(raw));
             if (line.len == 0) continue;
             if (eq(line, "[[plugin_preferences]]")) {
+                in_unknown = false;
+                anchor = "plugin_preferences";
                 const a = allocator orelse return error.RequiresAllocator;
                 if (result.plugin_preferences.len == 1024) return error.OutOfRange;
                 const next = a.alloc(PluginPreference, result.plugin_preferences.len + 1) catch return error.OutOfMemory;
@@ -55,6 +71,8 @@ pub const Config = struct {
             if (eq(line, "[[ai.providers]]") or eq(line, "[[ai.providers.models]]")) {
                 const a = allocator orelse return error.RequiresAllocator;
                 section = .ai;
+                in_unknown = false;
+                anchor = "ai";
                 preference_index = null;
                 if (eq(line, "[[ai.providers]]")) {
                     const i = if (provider_index) |index| index + 1 else 0;
@@ -86,28 +104,72 @@ pub const Config = struct {
                 preference_index = null;
                 provider_index = null;
                 model_index = null;
-                section = try parseSection(line);
+                if (parseSection(line)) |known| {
+                    section = known;
+                    in_unknown = false;
+                    anchor = @tagName(known);
+                } else |err| {
+                    // A well-formed header naming no known table is skipped as
+                    // an opaque block; reusing a known table name stays an error.
+                    if (line.len < 2 or line[line.len - 1] != ']') return err;
+                    if (unknown.headerName(line)) |name| if (knownTableName(name)) return err;
+                    try collector.beginBlock(anchor, line);
+                    in_unknown = true;
+                }
                 continue;
             }
-            if (section == .keys) continue;
             var remaining = line;
             while (nextAssignment(&remaining)) |raw_pair| {
                 const pair = trim(raw_pair);
                 if (pair.len == 0) continue;
-                const separator = std.mem.indexOfScalar(u8, pair, '=') orelse return error.InvalidAssignment;
+                const separator = std.mem.indexOfScalar(u8, pair, '=') orelse {
+                    // keybindings.Map.parse reports malformed [keys] lines.
+                    if (!in_unknown and section == .keys) continue;
+                    return error.InvalidAssignment;
+                };
                 const key = trim(pair[0..separator]);
                 const value = trim(pair[separator + 1 ..]);
-                if (preference_index) |i| {
+                if (in_unknown) {
+                    try collector.blockLine(key, value);
+                    continue;
+                }
+                var placement: unknown.Placement = .{ .section = if (section == .none) "" else @tagName(section) };
+                const applied: ParseError!void = if (preference_index) |i| blk: {
+                    placement = .{ .preference = i };
                     const preference = &@constCast(result.plugin_preferences)[i];
-                    if (eq(key, "plugin_id")) preference.plugin_id = try parseOwnedString(allocator, value) else if (eq(key, "key")) preference.key = try parseOwnedString(allocator, value) else if (eq(key, "value")) preference.value = try parseOwnedString(allocator, value) else return error.UnknownKey;
-                } else if (provider_index) |i| {
+                    if (eq(key, "plugin_id")) preference.plugin_id = try parseOwnedString(allocator, value) else if (eq(key, "key")) preference.key = try parseOwnedString(allocator, value) else if (eq(key, "value")) preference.value = try parseOwnedString(allocator, value) else break :blk error.UnknownKey;
+                } else if (provider_index) |i| blk: {
+                    placement = if (model_index) |j| .{ .model = .{ .provider = i, .model = j } } else .{ .provider = i };
                     var key_buffer: [128]u8 = undefined;
                     const field = if (eq(key, "name") and model_index != null) "id" else if (eq(key, "id") and model_index == null) "name" else key;
-                    const flat = if (model_index) |j| std.fmt.bufPrint(&key_buffer, "provider_{d}_model_{d}_{s}", .{ i, j, field }) catch return error.InvalidValue else std.fmt.bufPrint(&key_buffer, "provider_{d}_{s}", .{ i, field }) catch return error.InvalidValue;
-                    try result.applyProvider(allocator, flat, value);
-                } else try result.apply(allocator, section, key, value);
+                    const flat = if (model_index) |j| std.fmt.bufPrint(&key_buffer, "provider_{d}_model_{d}_{s}", .{ i, j, field }) catch break :blk error.UnknownKey else std.fmt.bufPrint(&key_buffer, "provider_{d}_{s}", .{ i, field }) catch break :blk error.UnknownKey;
+                    break :blk result.applyProvider(allocator, flat, value);
+                } else if (section == .none)
+                    error.UnknownKey
+                else if (section == .keys)
+                    (if (std.meta.stringToEnum(keybindings.Action, key) == null) error.UnknownKey else {})
+                else
+                    result.apply(allocator, section, key, value);
+                applied catch |err| switch (err) {
+                    error.UnknownKey => try collector.key(placement, key, value),
+                    else => return err,
+                };
             }
         }
+        // Array-table owners are known only once the whole file is read.
+        for (collector.list.items) |*entry| switch (entry.table) {
+            .section => {},
+            .provider, .model => if (entry.index < result.ai.providers.len) {
+                const provider = result.ai.providers[entry.index];
+                entry.owner = provider.name;
+                if (entry.table == .model and entry.sub_index < provider.models.len) entry.owner_b = provider.models[entry.sub_index].id;
+            },
+            .preference => if (entry.index < result.plugin_preferences.len) {
+                entry.owner = result.plugin_preferences[entry.index].plugin_id;
+                entry.owner_b = result.plugin_preferences[entry.index].key;
+            },
+        };
+        result.unknown = collector.finish();
         // Retire only untouched protocol placeholders left by older versions.
         if (allocator != null and result.ai.provider_count > 0) {
             var count: usize = 0;
@@ -126,18 +188,32 @@ pub const Config = struct {
 
     pub fn format(self: Config, buffer: []u8) ![]const u8 {
         var writer = std.Io.Writer.fixed(buffer);
+        const extra = self.unknown;
+        // Opaque text is rechecked before any byte is written (config_unknown.zig).
+        extra.validate() catch return error.InvalidUnknownEntry;
+        try extra.writeTrailer(&writer, "");
         try writer.print("[meta]\nconfig_revision = {d}\n\n", .{self.config_revision});
-        try writer.print("[ui]\nicon_background = \"{s}\"\ntheme = \"{s}\"\nfont_family = \"{s}\"\nfont_size = {d}\nfont_weight = \"{s}\"\nline_height = {d}\ncursor_style = \"{s}\"\nsidebar_collapsed = {}\ninput_line_highlight = {}\ntimestamp_gutter = {}\ncommand_info = {}\nscrollback_limit = {d}\n\n", .{ @tagName(self.ui.icon_background), self.ui.theme, self.ui.font_family, self.ui.font_size, self.ui.font_weight, self.ui.line_height, self.ui.cursor_style, self.ui.sidebar_collapsed, self.ui.input_line_highlight, self.ui.timestamp_gutter, self.ui.command_info, self.ui.scrollback_limit });
+        try extra.writeTrailer(&writer, "meta");
+        try writer.print("[ui]\nicon_background = \"{s}\"\ntheme = \"{s}\"\nfont_family = \"{s}\"\nfont_size = {d}\nfont_weight = \"{s}\"\nline_height = {d}\ncursor_style = \"{s}\"\nsidebar_collapsed = {}\ninput_line_highlight = {}\ntimestamp_gutter = {}\ncommand_info = {}\nscrollback_limit = {d}\nterminal_right_click = \"{s}\"\nfloat_card_transition = \"{s}\"\n\n", .{ @tagName(self.ui.icon_background), self.ui.theme, self.ui.font_family, self.ui.font_size, self.ui.font_weight, self.ui.line_height, self.ui.cursor_style, self.ui.sidebar_collapsed, self.ui.input_line_highlight, self.ui.timestamp_gutter, self.ui.command_info, self.ui.scrollback_limit, @tagName(self.ui.terminal_right_click), @tagName(self.ui.float_card_transition) });
         if (self.ui.sidebar_width) |width| try writer.print("sidebar_width = {d}\n\n", .{width});
+        if (self.ui.ai_launcher_corner) |corner| try writer.print("ai_launcher_corner = \"{s}\"\n\n", .{@tagName(corner)});
+        try extra.writeTrailer(&writer, "ui");
         const background = self.ui.materials.background;
-        try writer.print("[ui.materials]\nblur_px = {d}\n\n[ui.materials.background]\nenabled = {}\npath = ", .{ self.ui.materials.blur_px, background.enabled });
+        try writer.print("[ui.materials]\nblur_px = {d}\n\n", .{self.ui.materials.blur_px});
+        try extra.writeTrailer(&writer, "ui.materials");
+        try writer.print("[ui.materials.background]\nenabled = {}\npath = ", .{background.enabled});
         try std.json.Stringify.value(background.path, .{}, &writer);
         try writer.print("\nsource = \"{s}\"\norder = \"{s}\"\ninterval_minutes = {d}", .{ @tagName(background.source), @tagName(background.order), background.interval_minutes });
         try writer.print("\nfit = \"{s}\"\nalignment_x = \"{s}\"\nalignment_y = \"{s}\"\ntransparency = {d}\n\n", .{ @tagName(background.fit), @tagName(background.alignment_x), @tagName(background.alignment_y), background.transparency });
+        try extra.writeTrailer(&writer, "ui.materials.background");
         try writer.print("[updates]\nauto_check = {}\n\n", .{self.updates.auto_check});
+        try extra.writeTrailer(&writer, "updates");
         try writer.print("[completion]\nenabled = {}\n\n", .{self.completion.enabled});
+        try extra.writeTrailer(&writer, "completion");
         try writer.print("[transfer]\ndedicated_connection = {}\nwindow_chunks = {d}\nchunk_kb = {d}\ndownload_dir = \"{s}\"\nverify_md5 = {}\nshared_pacing_kbps = {d}\nresume = {}\nmax_tasks = {d}\nconflict_policy = \"{s}\"\n\n", .{ self.transfer.dedicated_connection, self.transfer.window_chunks, self.transfer.chunk_kb, self.transfer.download_dir, self.transfer.verify_md5, self.transfer.shared_pacing_kbps, self.transfer.@"resume", self.transfer.max_tasks, self.transfer.conflict_policy });
+        try extra.writeTrailer(&writer, "transfer");
         try writer.print("[ssh]\nkeepalive_sec = {d}\nreconnect_max = {d}\nreconnect_backoff = [{d},{d},{d},{d},{d}]\nconnect_timeout_sec = {d}\nterm = \"{s}\"\ncompression = {}\nauto_shell_integration = {}\nauto_reconnect = {}\nbuffer_input = {}\nsocks_port = {d}\nsocks_bind = \"{s}\"\notp_modal = {}\ntotp_autofill = {}\n\n", .{ self.ssh.keepalive_sec, self.ssh.reconnect_max, self.ssh.reconnect_backoff[0], self.ssh.reconnect_backoff[1], self.ssh.reconnect_backoff[2], self.ssh.reconnect_backoff[3], self.ssh.reconnect_backoff[4], self.ssh.connect_timeout_sec, self.ssh.term, self.ssh.compression, self.ssh.auto_shell_integration, self.ssh.auto_reconnect, self.ssh.buffer_input, self.ssh.socks_port, self.ssh.socks_bind, self.ssh.otp_modal, self.ssh.totp_autofill });
+        try extra.writeTrailer(&writer, "ssh");
         try writer.print("[ai]\ndefault_provider = \"{s}\"\npermission_mode = \"{s}\"\nexecution_mode = \"{s}\"\nsession_retention = \"{s}\"\nfollow_up_mode = \"{s}\"\nstep_display = \"{s}\"\nredact_ip = {}\nerror_hint = {}\nprovider_count = {d}\n", .{ self.ai.default_provider, @tagName(self.ai.permission_mode), @tagName(self.ai.execution_mode), @tagName(self.ai.session_retention), @tagName(self.ai.follow_up_mode), @tagName(self.ai.step_display), self.ai.redact_ip, self.ai.error_hint, self.ai.provider_count });
         try writer.print("child_context_mode = \"{s}\"\nchild_reuse_policy = \"{s}\"\n", .{ @tagName(self.ai.child_context_mode), @tagName(self.ai.child_reuse_policy) });
         if (self.ai.extensions.skills.len != 0 or self.ai.extensions.servers.len != 0) {
@@ -148,6 +224,7 @@ pub const Config = struct {
             try std.json.Stringify.value(encoded, .{}, &writer);
             try writer.writeAll("\n");
         }
+        _ = try extra.writeKeys(&writer, .section, "ai", "", "");
         var has_provider = false;
         for (self.ai.providers) |p| if (p.endpoint.len > 0 or p.api_key.len > 0 or p.api_key_ref != null or p.name.len > 0 or p.model_count > 0 or p.enabled) {
             has_provider = true;
@@ -166,6 +243,7 @@ pub const Config = struct {
                 try writer.writeByte('\n');
             }
             try writer.print("enabled = {}\n", .{p.enabled});
+            _ = try extra.writeKeys(&writer, .provider, "", p.name, "");
             for (p.models[0..p.model_count]) |m| {
                 try writer.print("[[ai.providers.models]]\nname = \"{s}\"\ncontext_window = {d}\ndefault = {}\nreasoning = {}\nvision = {}\nefforts = [", .{ m.id, m.context_window, m.default, m.reasoning, m.vision });
                 const names = [_][]const u8{ "low", "medium", "high", "xhigh", "max", "none", "ultra" };
@@ -179,13 +257,19 @@ pub const Config = struct {
                 if (m.image_token_reservation) |reservation| try writer.print("image_token_reservation = {d}\n", .{reservation});
                 if (m.image_token_max_width) |value| try writer.print("image_token_max_width = {d}\n", .{value});
                 if (m.image_token_max_height) |value| try writer.print("image_token_max_height = {d}\n", .{value});
+                _ = try extra.writeKeys(&writer, .model, "", p.name, m.id);
             }
         };
         try writer.writeAll("\n");
+        try extra.writeBlocks(&writer, "ai");
         try writer.print("[log]\nring_mb = {d}\ncheckpoint_sec = {d}\nretention_days = {d}\nexport_format = \"{s}\"\n\n", .{ self.log.ring_mb, self.log.checkpoint_sec, self.log.retention_days, self.log.export_format });
+        try extra.writeTrailer(&writer, "log");
         try writer.print("[notify]\ntransfer_done = {}\nreconnect = {}\nai_ready = {}\nbell = {}\ntab_dot = {}\nquiet_hours = \"{s}\"\n\n", .{ self.notify.transfer_done, self.notify.reconnect, self.notify.ai_ready, self.notify.bell, self.notify.tab_dot, self.notify.quiet_hours });
+        try extra.writeTrailer(&writer, "notify");
         var key_buffer: [4096]u8 = undefined;
         try writer.writeAll(try self.keys.format(&key_buffer));
+        if (try extra.writeKeys(&writer, .section, "keys", "", "") != 0 or hasBlocks(extra, "keys")) try writer.writeByte('\n');
+        try extra.writeBlocks(&writer, "keys");
         for (self.plugin_preferences) |preference| {
             try writer.writeAll("\n[[plugin_preferences]]\nplugin_id = ");
             try std.json.Stringify.value(preference.plugin_id, .{}, &writer);
@@ -194,7 +278,10 @@ pub const Config = struct {
             try writer.writeAll("\nvalue = ");
             try std.json.Stringify.value(preference.value, .{}, &writer);
             try writer.writeAll("\n");
+            _ = try extra.writeKeys(&writer, .preference, "", preference.plugin_id, preference.key);
         }
+        if (hasBlocks(extra, "plugin_preferences")) try writer.writeByte('\n');
+        try extra.writeBlocks(&writer, "plugin_preferences");
         return writer.buffered();
     }
 
@@ -215,13 +302,27 @@ pub const Config = struct {
         self.plugin_preferences = next;
     }
 
+    /// 删除一条偏好（Q5：重新启用插件时删除 `host.enabled` 条目，而不是写成 `"true"`）。没有这一条时不变。
+    pub fn removePluginPreference(self: *Config, allocator: std.mem.Allocator, plugin_id: []const u8, key: []const u8) !void {
+        var index: ?usize = null;
+        for (self.plugin_preferences, 0..) |preference, i| if (eq(plugin_id, preference.plugin_id) and eq(key, preference.key)) {
+            index = i;
+            break;
+        };
+        const found = index orelse return;
+        const next = try allocator.alloc(PluginPreference, self.plugin_preferences.len - 1);
+        @memcpy(next[0..found], self.plugin_preferences[0..found]);
+        @memcpy(next[found..], self.plugin_preferences[found + 1 ..]);
+        self.plugin_preferences = next;
+    }
+
     fn apply(self: *Config, allocator: ?std.mem.Allocator, section: Section, key: []const u8, value: []const u8) ParseError!void {
         switch (section) {
             .meta => {
                 if (eq(key, "config_revision")) self.config_revision = try parseInt(u64, value) else return error.UnknownKey;
             },
             .ui => {
-                if (eq(key, "scrollback_limit")) self.ui.scrollback_limit = try parseInt(u32, value) else if (eq(key, "icon_background")) self.ui.icon_background = std.meta.stringToEnum(IconBackground, try parseString(value)) orelse return error.InvalidValue else if (eq(key, "theme")) self.ui.theme = try parseString(value) else if (eq(key, "font_family")) self.ui.font_family = try parseString(value) else if (eq(key, "font_size")) self.ui.font_size = try parseInt(u8, value) else if (eq(key, "font_weight")) self.ui.font_weight = try parseString(value) else if (eq(key, "line_height")) self.ui.line_height = try parseFloat(value) else if (eq(key, "cursor_style")) self.ui.cursor_style = try parseString(value) else if (eq(key, "sidebar_collapsed")) self.ui.sidebar_collapsed = try parseBool(value) else if (eq(key, "sidebar_width")) self.ui.sidebar_width = try parseFloat(value) else if (eq(key, "input_line_highlight")) self.ui.input_line_highlight = try parseBool(value) else if (eq(key, "timestamp_gutter")) self.ui.timestamp_gutter = try parseBool(value) else if (eq(key, "command_info")) self.ui.command_info = try parseBool(value) else return error.UnknownKey;
+                if (eq(key, "scrollback_limit")) self.ui.scrollback_limit = try parseInt(u32, value) else if (eq(key, "terminal_right_click")) self.ui.terminal_right_click = std.meta.stringToEnum(TerminalRightClick, try parseString(value)) orelse return error.InvalidValue else if (eq(key, "float_card_transition")) self.ui.float_card_transition = std.meta.stringToEnum(FloatCardTransition, try parseString(value)) orelse return error.InvalidValue else if (eq(key, "icon_background")) self.ui.icon_background = std.meta.stringToEnum(IconBackground, try parseString(value)) orelse return error.InvalidValue else if (eq(key, "theme")) self.ui.theme = try parseString(value) else if (eq(key, "font_family")) self.ui.font_family = try parseString(value) else if (eq(key, "font_size")) self.ui.font_size = try parseInt(u8, value) else if (eq(key, "font_weight")) self.ui.font_weight = try parseString(value) else if (eq(key, "line_height")) self.ui.line_height = try parseFloat(value) else if (eq(key, "cursor_style")) self.ui.cursor_style = try parseString(value) else if (eq(key, "sidebar_collapsed")) self.ui.sidebar_collapsed = try parseBool(value) else if (eq(key, "sidebar_width")) self.ui.sidebar_width = try parseFloat(value) else if (eq(key, "ai_launcher_corner")) self.ui.ai_launcher_corner = std.meta.stringToEnum(LauncherCorner, try parseString(value)) orelse return error.InvalidValue else if (eq(key, "input_line_highlight")) self.ui.input_line_highlight = try parseBool(value) else if (eq(key, "timestamp_gutter")) self.ui.timestamp_gutter = try parseBool(value) else if (eq(key, "command_info")) self.ui.command_info = try parseBool(value) else return error.UnknownKey;
             },
             .@"ui.materials" => {
                 if (eq(key, "blur_px")) self.ui.materials.blur_px = try parseInt(u8, value) else return error.UnknownKey;
@@ -265,6 +366,7 @@ pub const Config = struct {
         if (!std.mem.startsWith(u8, key, "provider_")) return error.UnknownKey;
         const rest = key[9..];
         const sep = std.mem.indexOfScalar(u8, rest, '_') orelse return error.UnknownKey;
+        if (!allDigits(rest[0..sep]) or !knownProviderField(rest[sep + 1 ..])) return error.UnknownKey;
         const i = try parseInt(usize, rest[0..sep]);
         const a = allocator orelse return error.RequiresAllocator;
         if (i >= self.ai.providers.len) {
@@ -330,6 +432,7 @@ pub const Config = struct {
             for (self.plugin_preferences[0..i]) |previous| if (eq(preference.plugin_id, previous.plugin_id) and eq(preference.key, previous.key)) return error.InvalidValue;
         }
         if (self.config_revision == 0) return error.OutOfRange;
+        try self.unknown.validate();
         self.ai.extensions.validate() catch return error.InvalidValue;
         if (self.ai.provider_count > self.ai.providers.len) return error.OutOfRange;
         for (self.ai.providers[0..self.ai.provider_count]) |p| {
@@ -371,10 +474,25 @@ fn validPreferenceId(value: []const u8) bool {
 }
 
 pub const IconBackground = enum { transparent, light, dark };
-pub const Ui = struct { scrollback_limit: u32 = 25000, icon_background: IconBackground = .transparent, theme: []const u8 = "dark", font_family: []const u8 = "Monaco", font_size: u8 = 14, font_weight: []const u8 = "regular", line_height: f32 = 1.5, cursor_style: []const u8 = "bar", sidebar_collapsed: bool = false, sidebar_width: ?f32 = null, input_line_highlight: bool = true, timestamp_gutter: bool = false, command_info: bool = true, materials: material.Materials = .{} };
+/// Corner the per-tab AI launcher rests in (shared by every tab; set by dragging it).
+pub const LauncherCorner = enum { bottom_right, bottom_left, top_right, top_left };
+/// 终端区右键（设置 › 外观与主题 › 终端与工作区 ›“右键行为”，design-r3 B1）：`menu` 在指针处弹出原生菜单（默认），
+/// `paste` 直接粘贴剪贴板（PuTTY 习惯，旧行为）。中键始终打开完整终端菜单，不受影响。
+pub const TerminalRightClick = enum { menu, paste };
+/// 浮动卡片（AI 面板等）切换 tab / 打开收起时的动画（设置 › 外观与主题 › 终端与工作区 ›“浮动卡片切换动画”，Z12b）：
+/// `anchor` 收向所属锚点（tab / 图标）再从锚点展开（默认，zenit Z12）；`fade` 原地淡出并轻微缩小、入场反向（zenit Z12b
+/// `fade_scale`）。“减少动态效果”开启时两者都只淡入淡出。浮动层通过 `floatTransitionMode` 读取，保存后下一次过渡即生效。
+pub const FloatCardTransition = enum { anchor, fade };
+pub const Ui = struct { scrollback_limit: u32 = 25000, terminal_right_click: TerminalRightClick = .menu, float_card_transition: FloatCardTransition = .anchor, icon_background: IconBackground = .transparent, theme: []const u8 = "dark", font_family: []const u8 = "Monaco", font_size: u8 = 14, font_weight: []const u8 = "regular", line_height: f32 = 1.5, cursor_style: []const u8 = "bar", sidebar_collapsed: bool = false, sidebar_width: ?f32 = null, ai_launcher_corner: ?LauncherCorner = null, input_line_highlight: bool = true, timestamp_gutter: bool = false, command_info: bool = true, materials: material.Materials = .{} };
+/// 浮动层查询“浮动卡片切换动画”（`ui.float_card_transition`）。传入进程共享的 `RuntimeConfig.value`（保存后原地更新），
+/// 每次开始过渡时调用即可做到“保存后立即生效”；没有配置时为默认 `anchor`。
+pub fn floatTransitionMode(value: ?*const Config) FloatCardTransition {
+    const v = value orelse return .anchor;
+    return v.ui.float_card_transition;
+}
 pub fn resetDefaults() Config {
     var value: Config = .{};
-    value.ui.theme = "sauber";
+    value.ui.theme = "light"; // Island B v3 design default
     return value;
 }
 pub fn validFontWeight(value: []const u8) bool {
@@ -385,7 +503,7 @@ pub fn validCursorStyle(value: []const u8) bool {
 }
 pub const Completion = struct { enabled: bool = true };
 pub const Transfer = struct { dedicated_connection: bool = true, window_chunks: u8 = 16, chunk_kb: u16 = 64, download_dir: []const u8 = "~/Downloads", verify_md5: bool = false, shared_pacing_kbps: u32 = 2048, @"resume": bool = true, max_tasks: u8 = 3, conflict_policy: []const u8 = "ask" };
-pub const Ssh = struct { keepalive_sec: u16 = 30, reconnect_max: u8 = 5, reconnect_backoff: [5]u8 = .{ 1, 2, 4, 8, 16 }, connect_timeout_sec: u16 = 15, term: []const u8 = "xterm-256color", compression: bool = false, auto_shell_integration: bool = true, auto_reconnect: bool = true, buffer_input: bool = true, socks_port: u16 = 1080, socks_bind: []const u8 = "127.0.0.1", otp_modal: bool = true, totp_autofill: bool = false };
+pub const Ssh = struct { keepalive_sec: u16 = 30, reconnect_max: u8 = shared_retry.ssh_reconnect_max, reconnect_backoff: [5]u8 = shared_retry.ssh_reconnect_seconds, connect_timeout_sec: u16 = shared_retry.ssh_connect_timeout_sec, term: []const u8 = "xterm-256color", compression: bool = false, auto_shell_integration: bool = true, auto_reconnect: bool = true, buffer_input: bool = true, socks_port: u16 = 1080, socks_bind: []const u8 = "127.0.0.1", otp_modal: bool = true, totp_autofill: bool = false };
 pub const PermissionMode = enum { confirm, auto };
 /// Command routing is independent of the existing permission approval policy.
 pub const ExecutionMode = enum { auto, ask, isolated_exec, attached_pty, new_pty };
@@ -479,7 +597,34 @@ pub const ParseError = error{ InvalidSection, InvalidAssignment, InvalidValue, I
 
 fn parseSection(line: []const u8) ParseError!Section {
     if (line.len < 3 or line[line.len - 1] != ']') return error.InvalidSection;
-    return std.meta.stringToEnum(Section, line[1 .. line.len - 1]) orelse error.InvalidSection;
+    const section = std.meta.stringToEnum(Section, line[1 .. line.len - 1]) orelse return error.InvalidSection;
+    return if (section == .none) error.InvalidSection else section;
+}
+/// Names an unknown header may not reuse: redefining a known table is an error.
+fn knownTableName(name: []const u8) bool {
+    if (eq(name, "ai.providers") or eq(name, "ai.providers.models")) return true;
+    const section = std.meta.stringToEnum(Section, name) orelse return false;
+    return section != .none;
+}
+fn hasBlocks(extra: unknown.Unknown, anchor: []const u8) bool {
+    for (extra.entries) |entry| if (entry.kind == .header and eq(entry.section, anchor)) return true;
+    return false;
+}
+fn allDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+/// Flat provider suffixes applyProvider understands; checked before any slot
+/// is allocated so an unknown key never creates a phantom provider or model.
+fn knownProviderField(suffix: []const u8) bool {
+    for ([_][]const u8{ "name", "kind", "endpoint", "api_key", "api_key_ref", "enabled", "model_count" }) |name| if (eq(suffix, name)) return true;
+    if (!std.mem.startsWith(u8, suffix, "model_")) return false;
+    const fields = suffix[6..];
+    const split = std.mem.indexOfScalar(u8, fields, '_') orelse return false;
+    if (!allDigits(fields[0..split])) return false;
+    for ([_][]const u8{ "id", "context_window", "default", "reasoning", "vision", "image_token_reservation", "image_token_max_width", "image_token_max_height", "efforts" }) |name| if (eq(fields[split + 1 ..], name)) return true;
+    return false;
 }
 fn stripComment(line: []const u8) []const u8 {
     var quoted = false;
@@ -579,8 +724,9 @@ test "config parses and round trips the documented subset" {
     try std.testing.expectEqual(first.ai.permission_mode, second.ai.permission_mode);
 }
 
-test "unknown configuration is rejected instead of silently guessed" {
-    try std.testing.expectError(error.UnknownKey, Config.parse("[ui]\nmade_up = true\n"));
+test "unknown configuration is skipped while known invalid values still fail" {
+    const skipped = try Config.parse("[ui]\nmade_up = true\n");
+    try std.testing.expectEqual(@as(u32, 1), skipped.unknown.skipped);
     try std.testing.expectError(error.OutOfRange, Config.parse("[ui]\nfont_size = 2\n"));
 }
 
@@ -738,6 +884,44 @@ test "app icon background defaults and persisted choice" {
     const restored = try Config.parse(try parsed.format(&buffer));
     try std.testing.expectEqual(IconBackground.light, restored.ui.icon_background);
     try std.testing.expectError(error.InvalidValue, Config.parse("[ui]\nicon_background = \"invalid\"\n"));
+}
+
+test "AI launcher corner is absent by default and persists the dragged corner" {
+    try std.testing.expect((try Config.parse("[ui]\ntheme = \"dark\"\n")).ui.ai_launcher_corner == null);
+    var buffer: [32768]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, try (Config{}).format(&buffer), "ai_launcher_corner") == null);
+    const parsed = try Config.parse("[ui]\nai_launcher_corner = \"top_left\"\n");
+    try std.testing.expectEqual(LauncherCorner.top_left, parsed.ui.ai_launcher_corner.?);
+    const restored = try Config.parse(try parsed.format(&buffer));
+    try std.testing.expectEqual(LauncherCorner.top_left, restored.ui.ai_launcher_corner.?);
+    try std.testing.expectError(error.InvalidValue, Config.parse("[ui]\nai_launcher_corner = \"middle\"\n"));
+}
+
+test "terminal right click defaults to the menu and round-trips the paste choice" {
+    try std.testing.expectEqual(TerminalRightClick.menu, (Config{}).ui.terminal_right_click);
+    try std.testing.expectEqual(TerminalRightClick.menu, (try Config.parse("[ui]\ntheme = \"dark\"\n")).ui.terminal_right_click);
+    const parsed = try Config.parse("[ui]\nterminal_right_click = \"paste\"\n");
+    try std.testing.expectEqual(TerminalRightClick.paste, parsed.ui.terminal_right_click);
+    var buffer: [32768]u8 = undefined;
+    const written = try parsed.format(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, written, "terminal_right_click = \"paste\"") != null);
+    try std.testing.expectEqual(TerminalRightClick.paste, (try Config.parse(written)).ui.terminal_right_click);
+    try std.testing.expectError(error.InvalidValue, Config.parse("[ui]\nterminal_right_click = \"copy\"\n"));
+}
+
+test "float card transition defaults to anchor and round-trips the fade choice" {
+    try std.testing.expectEqual(FloatCardTransition.anchor, (Config{}).ui.float_card_transition);
+    try std.testing.expectEqual(FloatCardTransition.anchor, (try Config.parse("[ui]\ntheme = \"dark\"\n")).ui.float_card_transition);
+    try std.testing.expectEqual(FloatCardTransition.anchor, floatTransitionMode(null));
+    var buffer: [32768]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, try (Config{}).format(&buffer), "float_card_transition = \"anchor\"\n") != null);
+    const parsed = try Config.parse("[ui]\nfloat_card_transition = \"fade\"\n");
+    try std.testing.expectEqual(FloatCardTransition.fade, parsed.ui.float_card_transition);
+    try std.testing.expectEqual(FloatCardTransition.fade, floatTransitionMode(&parsed));
+    const written = try parsed.format(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, written, "float_card_transition = \"fade\"\n") != null);
+    try std.testing.expectEqual(FloatCardTransition.fade, (try Config.parse(written)).ui.float_card_transition);
+    try std.testing.expectError(error.InvalidValue, Config.parse("[ui]\nfloat_card_transition = \"genie\"\n"));
 }
 
 test "terminal scrollback default and unlimited survive config serialization" {

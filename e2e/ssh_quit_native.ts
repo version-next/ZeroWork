@@ -1,4 +1,6 @@
 /** Real native Quit with independent and reused SSH sessions on an owned peer. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -114,13 +116,13 @@ try {
   report.quit_elapsed_ms = Date.now() - started;
   await h.waitFor(async () => (await peerFiles('closed-')).length === 3 || null, 10000);
   if (scenario === 'held-close') assert((await peerFiles('held-close-')).length > 0, 'Peer actually withheld a close reply');
-  const live = new Set(execFileSync('/bin/ps', ['-axo', 'pid='], {encoding: 'utf8'}).trim().split(/\s+/).map(Number));
+  const live = new Set(psCompat(['-axo', 'pid=']).trim().split(/\s+/).map(Number));
   assert(shells.every(s => !live.has(s.pid)), 'All original remote fixture shell processes exited');
   report.checks.push('Normal application Quit returned exit code 0; all three transports and five original shells closed.');
   report.status = 'passed';
 } catch (error) {
   if (app && app.exitCode === null && app.signalCode === null) {
-    try {await capture('failure'); await writeFile(join(out, 'failure.tree.json'), JSON.stringify(await h.tree(), null, 2));} catch {}
+    try {await capture('failure'); await writeFile(join(out, 'failure.tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }), null, 2));} catch {}
   }
   report.error = String(error); report.stack = (error as Error).stack; report.status = 'failed'; process.exitCode = 1;
 } finally {

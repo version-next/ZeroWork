@@ -1,10 +1,13 @@
 /** Persist composer defaults without changing another connection's live agent. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,readFile,realpath,rm,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const h=await import(join(prefix,'share/zenit/harness/client.ts'));
 const out=resolve(process.argv[2]??'/tmp/zw-ai-composer-defaults');await mkdir(out,{recursive:true});
@@ -17,7 +20,7 @@ const frame=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\
 let held:any=null;const continuations:any[]=[];
 const server=createServer(async(req,res)=>{
  if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'defaults-fixture'}]}));return;}
- let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);
+ let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);if(isTitleRequest(body))return skipTitle(res);
  res.writeHead(200,{'content-type':'text/event-stream'});
  if(body.messages.some((m:any)=>m.role==='tool')){continuations.push(body);res.end(frame({content:'Existing agent continued successfully.'})+'data: [DONE]\n\n');return;}
  if(body.messages[0]?.content?.startsWith('将用户的问题概括')){res.end(frame({content:'Default isolation test'})+'data: [DONE]\n\n');return;}
@@ -49,30 +52,41 @@ const flat=(n:any):any[]=>Array.isArray(n)?n.flatMap(flat):n?[n,...(n.children??
 const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);
 const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok,id);};
 const text=async(id:string)=>flat(await visible(id)).map(n=>n.text??'').join('');
-const expectControls=async(permission:string,mode:string)=>{assert((await text('ai.composer.permission')).includes(permission));assert((await text('ai.composer.execution')).includes(mode));};
-const newLocal=async()=>{if((await h.query('ai.panel')).some(shown))await click('ai.collapse');await click('toolbar.new_session');await click('session.menu.local');await visible('terminal.surface');await click('toolbar.ai');};
+// 3f2f07f2: on a narrow tool row (the default 420 float) permission, then run mode, give way to a native icon button
+// `ai.composer.<kind>.compact` whose native Tooltip reads "名称 · 当前值" (ai_composer_controls.yix Compact,
+// ai_composer_controls_view.zig chipShown / compactText). Read / open whichever form is on screen; exactly one is.
+const controlForm=async(kind:string)=>h.waitFor(async()=>{const forms=(await Promise.all(['ai.composer.'+kind,'ai.composer.'+kind+'.compact'].map(async id=>(await h.query(id)).some(shown)?id:null))).filter(Boolean) as string[];assert(forms.length<=1,'one form of the '+kind+' control at a time: '+forms.join(','));return forms[0]??null;},15000);
+const controlText=async(kind:string,prefix:string)=>{
+ const id=await controlForm(kind);if(!id.endsWith('.compact'))return text(id);
+ const b=(await visible(id)).rect;await h.mouseMove(b.x+b.w/2,b.y+b.h/2);const tip=await text(id+'.tooltip');
+ assert(tip.startsWith(prefix+' · '),`${id} tooltip names the control and its value: ${tip}`);
+ await h.mouseMove(20,300);await h.waitFor(async()=>!(await h.query(id+'.tooltip')).some(shown)||null,5000);return tip.slice(prefix.length+3);
+};
+const openControl=async(kind:string)=>click(await controlForm(kind));
+const expectControls=async(permission:string,mode:string)=>{const p=await controlText('permission','执行权限');assert(p.includes(permission),`permission ${p}`);const m=await controlText('execution','当前对话运行方式');assert(m.includes(mode),`run mode ${m}`);};
+const newLocal=async()=>{if((await h.query('ai.panel')).some(shown))await click('ai.collapse');await click('toolbar.new_session');await click('session.menu.local');await visible('terminal.surface');await click(await aiToggleId());};
 const capture=async(name:string)=>{assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.query('ai.panel'),null,2));};
 const report:any={status:'running',checks:[]};
 try{
- await launch();await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await expectControls('确认后执行','自行判断');
+ await launch();await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await expectControls('确认后执行','自行判断');
  const firstTab=flat(await h.query('tabs.strip')).find(n=>/^tabs\.tab\.\d+$/.test(n.test_id??'')).test_id;
  await click('ai.prompt');await h.type_('验证默认值隔离');await click('ai.send');await h.waitFor(()=>held||null,15000);
  await newLocal();await expectControls('确认后执行','自行判断');
- await click('ai.composer.permission');await click('ai.permission.auto');
- await click('ai.composer.execution');await click('ai.execution.new_pty');await expectControls('自动执行','新建 PTY');
+ await openControl('permission');await click('ai.permission.auto');
+ await openControl('execution');await click('ai.execution.new_pty');await expectControls('自动执行','新建 PTY');
  const saved=await readFile(configPath,'utf8');assert(/permission_mode\s*=\s*"auto"/.test(saved));assert(/execution_mode\s*=\s*"new_pty"/.test(saved));
  report.checks.push('With a directory background restored at startup, composer choices immediately persist both defaults to the global config');await capture('01-saved-defaults');
- await click('ai.collapse');await click(firstTab);await click('toolbar.ai');await expectControls('确认后执行','自行判断');await visible('ai.stop');
+ await click('ai.collapse');await click(firstTab);await click(await aiToggleId());await expectControls('确认后执行','自行判断');await visible('ai.stop');
  held.end(frame({tool_calls:[{index:0,id:'defaults-context',type:'function',function:{name:'host__get_ucurrent_ucontext',arguments:'{}'}}]})+'data: [DONE]\n\n');held=null;
  await h.waitFor(()=>continuations.length>0||null,15000);await visible('ai.turn.complete');await expectControls('确认后执行','自行判断');
  const result=continuations[0].messages.find((m:any)=>m.role==='tool');assert(result);const feedback=JSON.parse(result.content);assert.equal(feedback.status,'succeeded');const context=JSON.parse(feedback.content.find((item:any)=>item.type==='structured').text);assert.equal(context.execution_mode,'auto');assert.equal(context.permission_mode,'confirm');
  report.checks.push('The other running agent retains confirm/auto and successfully executes a context tool after defaults change');await capture('02-existing-agent-unchanged');
  await newLocal();await expectControls('自动执行','新建 PTY');report.checks.push('A new connection initializes from the saved defaults');
  await quit();await launch();
- if((await h.query('workspace.empty.local')).some(shown)){await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');}else await newLocal();
+ if((await h.query('workspace.empty.local')).some(shown)){await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());}else await newLocal();
  await expectControls('自动执行','新建 PTY');
- await click('ai.composer.permission');await click('ai.permission.confirm');
- await click('ai.composer.execution');await click('ai.execution.ask');await expectControls('确认后执行','每次询问');
+ await openControl('permission');await click('ai.permission.confirm');
+ await openControl('execution');await click('ai.execution.ask');await expectControls('确认后执行','每次询问');
  const restartedSaved=await readFile(configPath,'utf8');assert(/permission_mode\s*=\s*"confirm"/.test(restartedSaved));assert(/execution_mode\s*=\s*"ask"/.test(restartedSaved));
  report.checks.push('After restart, the restored directory background allows both controls to save again');await capture('03-restarted-defaults');report.checks.push('Restarting the application restores both defaults');await quit();report.status='passed';
 }catch(error){report.status='failed';report.error=String(error);process.exitCode=1;await capture('failure').catch(()=>{});}

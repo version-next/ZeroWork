@@ -334,14 +334,9 @@ pub const RequestTable = struct {
     }
     pub fn parse(self: *const RequestTable, allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) !ParsedCall {
         const entry = self.lookup(name) orelse return error.ToolNotInRequest;
-        if (arguments.len > entry.definition.max_argument_bytes) return error.InvalidToolArguments;
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{ .allocate = .alloc_always });
+        // 统一流水线第 1、2 步（tool_pipeline.zig），所有来源共用这一份实现。
+        var parsed = try @import("tool_pipeline.zig").parseArguments(allocator, entry.definition.schema, entry.definition.max_argument_bytes, entry.definition.validate, arguments);
         errdefer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidToolArguments;
-        const schema = try std.json.parseFromSlice(std.json.Value, allocator, entry.definition.schema, .{});
-        defer schema.deinit();
-        try validateValue(schema.value, parsed.value, 0);
-        if (entry.definition.validate) |validator| try validator(parsed.value);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(arguments, &hash, .{});
         if (entry.authority != .session_targets) {
@@ -496,7 +491,7 @@ pub fn preflight(table: *const RequestTable, call: ParsedCall, live_scope: scope
 /// changed parameters, expiry, reconnect and revocation all remain zero dispatch.
 pub fn authorize(table: *const RequestTable, call: ParsedCall, live_scope: scope.Scope, members: []const Member, policy: Policy, ticket: ?*ApprovalTicket, now_ms: i64) !void {
     try preflight(table, call, live_scope, members);
-    if (!try callNeedsApproval(call, policy, table.captured_scope.owner == .group)) return;
+    if (!try callNeedsApproval(call, policy, table.captured_scope.contentOf() == .group)) return;
     const approved = ticket orelse return error.ToolApprovalRequired;
     if (approved.used) return error.ToolApprovalAlreadyUsed;
     if (!approved.approved) return error.ToolApprovalRequired;
@@ -748,7 +743,7 @@ pub const Runtime = struct {
         }
         var waited = false;
         while (true) {
-            if (try callNeedsApproval(parsed, self.current_policy(self.context), invocation.table.captured_scope.owner == .group)) {
+            if (try callNeedsApproval(parsed, self.current_policy(self.context), invocation.table.captured_scope.contentOf() == .group)) {
                 ticket = try ApprovalTicket.waiting(invocation.table, parsed);
                 if (!waited) for (parsed.targets.slice()) |id| {
                     const owner = entryTarget(parsed.entry, id).?.owner;

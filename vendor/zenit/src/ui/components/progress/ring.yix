@@ -1,0 +1,23 @@
+//! ProgressRing view: a determinate progress as a ring (a measurement glyph next to a figure, e.g. a
+//! context-usage badge). Styles and drawing in styles.yss, shared types and tests in mod.zig.
+const std = @import("std");
+const ui = @import("../../ui.zig");
+const mod = @import("mod.zig");
+const S = @import("styles.yss");
+const ProgressStatus = mod.ProgressStatus;
+
+fn a11yOf(percent: f32) ui.A11yProps {
+    return .{ .role = .progressbar, .value_min = 0, .value_max = 100, .value_now = percent, .value_range = .{ .now = percent, .min = 0, .max = 100 } };
+}
+
+/// Ring progress: `W.ProgressRing(.{ .value = 23, .size = 12 })`. A `size` square: the full circle
+/// in progress-track, the share (value 0-100, clamped) clockwise from 12 o'clock in the status
+/// color, `thickness` wide. value / status can be signals; the ring repaints when they change.
+pub fn ProgressRing(value: f32 = 0, status: ProgressStatus = .normal, size: f32 = 16, thickness: f32 = 2) View {
+    const percent = computed(std.math.clamp(value, 0, 100));
+    const ring = computed(S.Ring{ .percent = percent, .status = status, .thickness = thickness });
+    const semantics = computed(a11yOf(percent));
+    return (
+        <canvas style={S.ring.of(.{ .size = size })} draw={S.drawRing} data={ring} a11y={semantics} />
+    );
+}

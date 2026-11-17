@@ -1,6 +1,16 @@
 const std = @import("std");
 const Tap = @import("raw_stream_tap.zig").Tap;
 const Scheduler = @import("checkpoint_scheduler.zig").Scheduler;
+const persist = @import("../shared/base/persist.zig");
+
+/// Test-only order probe: how many persist data fsyncs (the checkpoint's own) had happened
+/// when the raw file was last synced. `null` = no raw sync observed since `reset`.
+pub const testing = struct {
+    pub threadlocal var raw_synced_after_data_syncs: ?usize = null;
+    pub fn reset() void {
+        raw_synced_after_data_syncs = null;
+    }
+};
 
 /// Owns periodic checkpoint policy for one raw stream.
 pub const Controller = struct {
@@ -38,8 +48,13 @@ pub const Controller = struct {
         try self.appendRaw(bytes);
         if (!self.scheduler.due(timestamp_ms)) return false;
         self.tap.markCheckpoint(timestamp_ms);
+        // Same order as Local recording: the raw bytes a checkpoint refers to reach the disk
+        // before the checkpoint is published, so a crash never leaves a checkpoint ahead of its stream.
+        if (self.raw_file) |file| {
+            try file.sync(self.io);
+            if (@import("builtin").is_test) testing.raw_synced_after_data_syncs = persist.testing.data_syncs;
+        }
         try self.tap.saveCheckpoint(self.io, self.dir, self.checkpoint_path);
-        if (self.raw_file) |file| try file.sync(self.io);
         self.scheduler.checkpointed(timestamp_ms);
         return true;
     }
@@ -139,6 +154,23 @@ test "checkpoint controller persists only when interval is due" {
     try std.testing.expectEqual(@as(u64, 2), checkpoint.sequence);
     try std.testing.expectEqual(@as(i64, 11_000), checkpoint.timestamp_ms);
     try std.testing.expectError(error.InvalidCheckpointPath, Controller.init(std.testing.allocator, 32, 10, 1_000, std.testing.io, tmp.dir, "../escape.bin"));
+}
+
+test "raw stream file is synced before its checkpoint is published (same order as Local recording)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var controller = try Controller.init(std.testing.allocator, 8, 10, 0, std.testing.io, tmp.dir, "s/checkpoint.bin");
+    defer controller.deinit();
+    try controller.enableRawFile("s/output.raw");
+    persist.testing.reset();
+    testing.reset();
+    try std.testing.expect(try controller.append("abc", 10_000));
+    // The raw fsync happened while the checkpoint's data fsync count was still 0.
+    try std.testing.expectEqual(@as(?usize, 0), testing.raw_synced_after_data_syncs);
+    // Cost per checkpoint is unchanged: one raw fsync + one checkpoint data fsync, only reordered.
+    try std.testing.expectEqual(@as(usize, 1), persist.testing.data_syncs);
+    const checkpoint = try Tap.loadCheckpoint(std.testing.io, tmp.dir, std.testing.allocator, "s/checkpoint.bin");
+    try std.testing.expectEqual(@as(u64, 3), checkpoint.sequence);
 }
 
 test "raw disk ring stays bounded and recovers chronology after wrap" {

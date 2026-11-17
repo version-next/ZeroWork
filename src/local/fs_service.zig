@@ -401,10 +401,8 @@ const Context = struct {
         const before = try std.Io.Dir.cwd().statFile(self.io, resolved, .{ .follow_symlinks = false });
         if (before.kind != .file) return error.NotRegularFile;
         try self.check();
-        var file = try std.Io.Dir.openFileAbsolute(self.io, resolved, .{ .allow_directory = false, .follow_symlinks = false });
+        const file = try openSnapshot(self.io, resolved, before);
         defer file.close(self.io);
-        const opened = try file.stat(self.io);
-        if (opened.kind != .file or changed(before, opened)) return error.SourceChanged;
         const bytes = try result.arena.allocator().alloc(u8, max_bytes + 1);
         var used: usize = 0;
         var eof = false;
@@ -423,7 +421,7 @@ const Context = struct {
             error.FileNotFound, error.NotDir => return error.SourceChanged,
             else => return err,
         };
-        if (changed(opened, after) or changed(before, path_after)) return error.SourceChanged;
+        if (changed(before, after) or changed(before, path_after)) return error.SourceChanged;
         const truncated = used > max_bytes;
         result.value.body = .{ .text = .{
             .text = try validateText(bytes[0..used], max_bytes, truncated and !eof),
@@ -434,6 +432,28 @@ const Context = struct {
         } };
     }
 };
+
+/// The checked name may have been replaced between lstat and open. In
+/// particular, opening a FIFO without O_NONBLOCK waits for a writer and
+/// prevents the worker from observing its deadline or a close request.
+fn openSnapshot(io: std.Io, path: []const u8, expected: std.Io.File.Stat) !std.Io.File {
+    const native_path = try std.posix.toPosixPath(path);
+    const fd = while (true) {
+        const rc = std.c.open(&native_path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOFOLLOW = true, .NOCTTY = true, .CLOEXEC = true });
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break rc,
+            .INTR => continue,
+            .NOENT, .NOTDIR, .LOOP => return error.SourceChanged,
+            .ACCES, .PERM => return error.AccessDenied,
+            .NAMETOOLONG => return error.NameTooLong,
+            else => return error.Unexpected,
+        }
+    };
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    errdefer file.close(io);
+    if (changed(expected, try file.stat(io))) return error.SourceChanged;
+    return file;
+}
 
 fn validateEndpoint(endpoint: EndpointRef) !void {
     if (endpoint.binding_id == 0 or endpoint.binding_generation == 0) return error.InvalidBinding;
@@ -690,6 +710,26 @@ test "local fs cancellation and shutdown close actual backpressured directory ha
     try std.testing.expectEqual(@as(usize, 2), finals);
     const late = try journal.begin(.app, null);
     try std.testing.expectError(error.Closing, service.submit(late, list));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "local fs rejects a FIFO substituted after stat without waiting for a writer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "snapshot", .data = "original" });
+    const expected = try temporary.dir.statFile(io, "snapshot", .{ .follow_symlinks = false });
+    const path = try temporary.dir.realPathFileAlloc(io, "snapshot", allocator);
+    defer allocator.free(path);
+    const file = try openSnapshot(io, path, expected);
+    file.close(io);
+
+    try temporary.dir.deleteFile(io, "snapshot");
+    const native_path = try std.posix.toPosixPath(path);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(&native_path, 0o600));
+    try std.testing.expectError(error.SourceChanged, openSnapshot(io, path, expected));
 }
 
 test "local fs display keeps invalid raw bytes separate and metadata detects replacement" {

@@ -1,37 +1,129 @@
-//! Automation-only process inputs. Formal App builds use framework defaults.
+//! Automation-only process inputs: diagnostic flags and overrides.
+//! Formal App builds use framework defaults: every lookup reads as unset
+//! unless the build enables `automation_options` (-Dtest-mode, -Ddev-preview,
+//! Debug, or -Dautomation-env=true). Tests always accept the environment.
+//! OS and tool configuration (TEMP, PATH, YIX_*) uses getSystemOwned.
 //! Values returned by getOwned are copied; Windows uses the Unicode Win32 API.
 const std = @import("std");
 const builtin = @import("builtin");
-const enabled = @import("automation_options").test_mode or builtin.is_test;
+const automation_options = @import("automation_options");
 
-/// Raw compatibility accessor for diagnostics migrated from direct libc calls.
-pub fn getRaw(name: [:0]const u8) ?[*:0]const u8 {
-    if (!enabled) return null;
-    const value = std.c.getenv(name.ptr) orelse return null;
-    return value;
+/// Hosts without a process environment: freestanding, and wasm (the Web DOM host is
+/// wasm32-wasi; its imports carry no environment). Every lookup reads as unset.
+const no_process_env = builtin.os.tag == .freestanding or builtin.cpu.arch.isWasm();
+
+/// Whether this build accepts process-environment overrides.
+pub const enabled = automation_options.enabled or (builtin.is_test and !automation_options.formal_probe);
+
+/// Raw POSIX-compatible lookup for diagnostic flags. Freestanding hosts have
+/// no process environment; all lookups are uniformly absent.
+pub fn getRaw(name: [*:0]const u8) ?[*:0]const u8 {
+    if (!enabled or no_process_env) return null;
+    return std.c.getenv(name);
 }
 
+/// Former name of `getRaw`, kept for existing callers.
+pub const getNative = getRaw;
+
 pub fn has(comptime name: [:0]const u8) bool {
-    if (!enabled) return false;
+    if (!enabled or no_process_env) return false;
     if (builtin.target.os.tag == .windows) {
         const environ: std.process.Environ = .{ .block = .global };
         return environ.getWindows(std.unicode.utf8ToUtf16LeStringLiteral(name)) != null;
     }
-    return std.c.getenv(name) != null;
+    return getRaw(name) != null;
+}
+
+/// `has`, read once per process and cached (one cache per name). For switches
+/// consulted on per-frame or per-item paths: a getenv scans the whole
+/// environment block each call. The process environment is fixed after
+/// launch for these flags; tests that mutate it use `has`.
+pub fn flag(comptime name: [:0]const u8) bool {
+    return FlagCache(name).get();
+}
+
+fn FlagCache(comptime name: [:0]const u8) type {
+    return struct {
+        // Depends on `name`, so each name gets its own storage.
+        const key = name;
+        var cached: ?bool = null;
+
+        fn get() bool {
+            return cached orelse blk: {
+                const v = has(key);
+                cached = v;
+                break :blk v;
+            };
+        }
+    };
+}
+
+/// Sets (or, with null, clears) a switch read through `flag` and keeps that
+/// cache in step, for contract probes that flip a renderer switch between
+/// checks. Mutating the environment directly is not observed by `flag` once
+/// the name has been read. This is an in-process override set by code, not a
+/// process input, so `flag` honors it in formal builds too.
+pub fn setFlag(comptime name: [:0]const u8, value: ?[:0]const u8) error{EnvironmentMutationFailed}!void {
+    if (no_process_env) return error.EnvironmentMutationFailed;
+    if (builtin.os.tag == .windows) {
+        var buf: [64:0]u16 = undefined;
+        const wide: ?[*:0]const u16 = if (value) |v| blk: {
+            if (v.len > buf.len) return error.EnvironmentMutationFailed;
+            const n = std.unicode.wtf8ToWtf16Le(&buf, v) catch return error.EnvironmentMutationFailed;
+            buf[n] = 0;
+            break :blk buf[0..n :0].ptr;
+        } else null;
+        if (SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral(name), wide) == 0) return error.EnvironmentMutationFailed;
+    } else {
+        const result = if (value) |v| setenv(name.ptr, v.ptr, 1) else unsetenv(name.ptr);
+        if (result != 0) return error.EnvironmentMutationFailed;
+    }
+    FlagCache(name).cached = value != null;
 }
 
 /// Borrowing matches the native POSIX getenv lifetime: environment mutation
 /// may invalidate the result. Call getOwned when the value must be retained.
 pub fn getBorrowed(comptime name: [:0]const u8) ?[:0]const u8 {
-    if (!enabled) return null;
     if (builtin.target.os.tag == .windows) @compileError("use getOwned on Windows");
-    const value = std.c.getenv(name) orelse return null;
+    if (!enabled or no_process_env) return null;
+    const value = getRaw(name) orelse return null;
     return std.mem.span(value);
+}
+
+/// Short flag values on every platform: copies the value into `buf` (Windows
+/// converts from WTF-16 through `buf`, so leave room). Null when unset or too long.
+pub fn getInto(comptime name: [:0]const u8, buf: []u8) ?[]const u8 {
+    if (!enabled or no_process_env) return null;
+    if (builtin.target.os.tag == .windows) {
+        // `buf` holds the value only: the key is a comptime UTF-16 literal.
+        // (A FixedBufferAllocator over `buf` used to hold the UTF-16 key too,
+        // so any name longer than about half of `buf` read as unset.)
+        const environ: std.process.Environ = .{ .block = .global };
+        const value_w = environ.getWindows(std.unicode.utf8ToUtf16LeStringLiteral(name)) orelse return null;
+        if (std.unicode.calcWtf8Len(value_w) > buf.len) return null;
+        return buf[0..std.unicode.wtf16LeToWtf8(buf, value_w)];
+    }
+    const value = getBorrowed(name) orelse return null;
+    if (value.len > buf.len) return null;
+    @memcpy(buf[0..value.len], value);
+    return buf[0..value.len];
 }
 
 pub const GetError = error{ OutOfMemory, EnvironmentVariableNotFound, InvalidWtf8, Unexpected };
 pub fn getOwned(allocator: std.mem.Allocator, name: []const u8) GetError![]u8 {
     if (!enabled) return error.EnvironmentVariableNotFound;
+    return readOwned(allocator, name);
+}
+
+/// Operating-system and tool configuration (TEMP, PATH, editor tooling such
+/// as YIX_*), read in every build. Not for framework or App overrides: those
+/// go through the gated accessors above so formal builds keep their defaults.
+pub fn getSystemOwned(allocator: std.mem.Allocator, name: []const u8) GetError![]u8 {
+    return readOwned(allocator, name);
+}
+
+fn readOwned(allocator: std.mem.Allocator, name: []const u8) GetError![]u8 {
+    if (no_process_env) return error.EnvironmentVariableNotFound;
     if (builtin.target.os.tag == .windows) {
         const windows = std.os.windows;
         const name_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, name);
@@ -72,6 +164,7 @@ test "missing process environment values stay missing" {
 }
 
 test "process environment preserves empty and Unicode values and owns copies" {
+    if (!enabled) return error.SkipZigTest;
     const name = "ZENIT_ENVIRONMENT_COPY_TEST_F493EC17";
     if (has(name)) return error.TestEnvironmentAlreadySet;
     defer setTestValue(name, null) catch unreachable;
@@ -93,6 +186,24 @@ test "process environment preserves empty and Unicode values and owns copies" {
     try std.testing.expectError(error.EnvironmentVariableNotFound, getOwned(std.testing.allocator, name));
 }
 
+test "getInto reads a long name into a buffer sized for its value" {
+    if (!enabled) return error.SkipZigTest;
+    // The buffer is sized for the value, never for the name (every caller
+    // passes a few bytes): a long name must not read as unset.
+    const name = "ZENIT_ENVIRONMENT_GET_INTO_LONG_NAME_TEST_5B21C0DE";
+    if (has(name)) return error.TestEnvironmentAlreadySet;
+    defer setTestValue(name, null) catch unreachable;
+    var small: [2]u8 = undefined;
+    try std.testing.expect(getInto(name, &small) == null);
+    try setTestValue(name, "1");
+    try std.testing.expectEqualStrings("1", getInto(name, &small).?);
+    try setTestValue(name, "é");
+    try std.testing.expectEqualStrings("é", getInto(name, &small).?);
+    // Too long for the buffer: unset, not truncated.
+    try setTestValue(name, "123");
+    try std.testing.expect(getInto(name, &small) == null);
+}
+
 fn setTestValue(comptime name: [:0]const u8, value: ?[:0]const u8) !void {
     if (builtin.os.tag == .windows) {
         const wide = if (value) |v| try std.unicode.wtf8ToWtf16LeAllocZ(std.testing.allocator, v) else null;
@@ -108,3 +219,55 @@ fn setTestValue(comptime name: [:0]const u8, value: ?[:0]const u8) !void {
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
+
+test "setFlag updates a switch already read through flag" {
+    if (!enabled) return error.SkipZigTest;
+    const name = "ZENIT_TEST_SET_FLAG_51C2";
+    try std.testing.expect(!flag(name));
+    try setFlag(name, "1");
+    defer setFlag(name, null) catch {};
+    try std.testing.expect(flag(name));
+    try std.testing.expect(has(name));
+    try setFlag(name, null);
+    try std.testing.expect(!flag(name));
+    try std.testing.expect(!has(name));
+}
+
+test "flag reads each name once and keeps names apart" {
+    if (!enabled) return error.SkipZigTest;
+    const absent = "ZENIT_TEST_FLAG_ABSENT_7F3A";
+    const present = "ZENIT_TEST_FLAG_PRESENT_7F3A";
+    try setTestValue(present, "1");
+    defer setTestValue(present, null) catch {};
+    // An absent name read first must not leak its value into another name's cache.
+    try std.testing.expect(!flag(absent));
+    try std.testing.expect(flag(present));
+    // Cached: later environment changes are not observed (has still is).
+    try setTestValue(present, null);
+    try std.testing.expect(flag(present));
+    try std.testing.expect(!has(present));
+}
+
+test "formal builds ignore process environment overrides" {
+    if (enabled) return error.SkipZigTest;
+    const name = "ZENIT_ENVIRONMENT_FORMAL_TEST_3C8E21A4";
+    try setTestValue(name, "1");
+    defer setTestValue(name, null) catch {};
+    try std.testing.expect(getRaw(name) == null);
+    try std.testing.expect(getNative(name) == null);
+    try std.testing.expect(!has(name));
+    try std.testing.expect(!flag(name));
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(getInto(name, &buf) == null);
+    if (builtin.os.tag != .windows) try std.testing.expect(getBorrowed(name) == null);
+    try std.testing.expectError(error.EnvironmentVariableNotFound, getOwned(std.testing.allocator, name));
+    // System and tool configuration stays readable.
+    const system = try getSystemOwned(std.testing.allocator, name);
+    defer std.testing.allocator.free(system);
+    try std.testing.expectEqualStrings("1", system);
+}
+
+test "test builds accept process environment overrides" {
+    if (automation_options.formal_probe) return error.SkipZigTest;
+    try std.testing.expect(enabled);
+}

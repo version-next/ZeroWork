@@ -18,6 +18,7 @@ const node_mod = @import("node.zig");
 const types = @import("types.zig");
 const focus_mod = @import("../focus.zig");
 const svg_path = @import("svg_path.zig");
+const nlo = @import("node_layout_output.zig");
 const render_engine = @import("render_engine/mod.zig");
 
 const Node = node_mod.Node;
@@ -44,6 +45,19 @@ pub fn setFocusable(self: *Node, focusable: bool) void {
     if (self.behavior.interaction.focusable == focusable) return;
     self.behavior.interaction.focusable = focusable;
     self.markOrderDirty();
+}
+
+/// `NodeInteraction.inert`: the subtree leaves keyboard traversal and the a11y tree.
+pub fn setInert(self: *Node, inert: bool) void {
+    if (self.behavior.interaction.inert == inert) return;
+    self.behavior.interaction.inert = inert;
+    self.markInteractionDirty();
+}
+
+/// `NodeInteraction.wheel_transparent`: wheel routing looks through the subtree. Read when a
+/// wheel arrives (no hit-index rebuild).
+pub fn setWheelTransparent(self: *Node, transparent: bool) void {
+    self.behavior.interaction.wheel_transparent = transparent;
 }
 
 pub fn setInteractionDelegate(self: *Node, delegate: ?*Node) void {
@@ -150,6 +164,35 @@ pub fn setClonedPathGeometry(self: *Node, allocator: Allocator, geometry: PathGe
     self.markInteractionDirty();
 }
 
+/// Make the box's paint shape `fill` (its background fills it, its border strokes `border` or
+/// `fill`, an `.auto` hit shape follows `fill`). Both are cloned before anything is published, so
+/// a failure leaves the previous shape intact. Marks paint and interaction dirty.
+pub fn setShapePath(self: *Node, allocator: Allocator, fill: PathGeometry, border: ?PathGeometry) !void {
+    const lo = self.layoutOutputPtr() orelse return error.LayoutOutputUnavailable;
+    var fill_copy = try clonePathGeometry(allocator, fill);
+    errdefer freePathGeometry(allocator, &fill_copy);
+    var border_copy: ?PathGeometry = if (border) |b| try clonePathGeometry(allocator, b) else null;
+    errdefer if (border_copy) |*b| freePathGeometry(allocator, b);
+    const shape = lo.vector.shape orelse try allocator.create(nlo.NodeShape);
+    if (lo.vector.shape) |old| {
+        freePathGeometry(allocator, &old.fill);
+        if (old.border) |*b| freePathGeometry(allocator, b);
+    }
+    shape.* = .{ .fill = fill_copy, .border = border_copy };
+    lo.vector.shape = shape;
+    self.markRenderDirty();
+    self.markInteractionDirty();
+}
+
+/// Back to the box's rounded rectangle.
+pub fn clearShapePath(self: *Node, allocator: Allocator) void {
+    const lo = self.layoutOutputPtr() orelse return;
+    if (lo.vector.shape == null) return;
+    self.releaseShapeGeometry(allocator);
+    self.markRenderDirty();
+    self.markInteractionDirty();
+}
+
 pub fn setCustomClipGeometryForNode(self: *Node, allocator: Allocator, commands: []const PathCommand, fill_rule: PathFillRule) !void {
     const lo = self.layoutOutputPtr() orelse return error.LayoutOutputUnavailable;
     try replaceGeometry(allocator, &lo.vector.fill.custom_clip, .{
@@ -235,6 +278,30 @@ pub fn markSubtreeBeforeRenderHook(self: *Node) void {
     while (p) |parent| {
         if (parent.frame_state.state_bits.flags.has_before_render_subtree) break;
         parent.frame_state.state_bits.flags.has_before_render_subtree = true;
+        p = parent.parent;
+    }
+}
+
+/// Drop the before-render tick's quiet-subtree stamp (NodeRuntime.tick_quiet_epoch) on this node
+/// and its ancestors: tick work was added here (hook registered, animation started, linger
+/// requested) through a path that does not necessarily mark anything dirty.
+pub fn invalidateTickQuietChain(self: *Node) void {
+    var cur: ?*Node = self;
+    while (cur) |n| : (cur = n.parent) n.frame_state.frame_local.runtime.tick_quiet_epoch = 0;
+    // The same state (hooks, animations, linger) feeds the retained build outside the dirty bits.
+    @import("render_engine/retained_memo.zig").dropMemoChain(self);
+}
+
+/// Bubble-mark has_untrusted_before_render_subtree: a before_render hook in this subtree is not
+/// known to write only through dirty-marking entries (see Node.beforeRenderHooksCacheTrusted).
+/// Conservative like has_before_render_subtree: never cleared.
+pub fn markSubtreeUntrustedBeforeRenderHook(self: *Node) void {
+    if (self.frame_state.state_bits.flags.has_untrusted_before_render_subtree) return;
+    self.frame_state.state_bits.flags.has_untrusted_before_render_subtree = true;
+    var p = self.parent;
+    while (p) |parent| {
+        if (parent.frame_state.state_bits.flags.has_untrusted_before_render_subtree) break;
+        parent.frame_state.state_bits.flags.has_untrusted_before_render_subtree = true;
         p = parent.parent;
     }
 }

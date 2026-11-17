@@ -8,13 +8,18 @@ const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
 const ProgressStatus = @import("mod.zig").ProgressStatus;
+const ProgressSweep = @import("mod.zig").ProgressSweep;
+const ProgressTone = @import("mod.zig").ProgressTone;
 
+const white = Color.rgba(255, 255, 255, 255);
+const black = Color.rgba(0, 0, 0, 255);
 
-/// Theme owns each fill/track pair; widgets do not derive local colors.
+/// State -> fill color: the progress-* role tokens (defaults alias accent / success / warning / danger).
 pub fn statusColor(s: ProgressStatus, t: *const theme.ThemeTokens) Color {
     return switch (s) {
-        .normal => t.tokens.color.range_fill,
+        .normal => t.tokens.color.progress_fill,
         .success => t.tokens.color.progress_success,
+        .warning => t.tokens.color.progress_warning,
         .@"error" => t.tokens.color.progress_error,
     };
 }
@@ -26,15 +31,15 @@ style container($width: ?f32) { width: $width ?? grow; height: fit; direction: r
 style track($height: f32) {
   width: grow;
   height: $height;
-  background: range-track;
-  corner-radius: {$height / 2};
+  background: progress-track;
+  corner-radius: md;
   overflow-hidden: true;
 }
 
 /// Determined mode fill: capsule per percentage width; color see fillGradient
-style fill($percent: f32, $height: f32) { width: {.{ .percent = $percent }}; height: $height; corner-radius: {$height / 2}; }
+style fill($percent: f32, $height: f32) { width: {.{ .percent = $percent }}; height: $height; corner-radius: md; }
 
-/// Preserve the renderer shape while using the theme fill at every stop.
+/// Determinate fill stays flat at the semantic state color.
 pub fn fillGradient(status: ProgressStatus, t: *const theme.ThemeTokens) ui.BoxStyle {
     const c = statusColor(status, t);
     const stops = [_]core.GradientStop{
@@ -55,7 +60,7 @@ style percent_text { color: fg-secondary; font-size: sm; }
 /// One sweep duration (seconds)
 pub const cycle_seconds: f32 = 2.0;
 
-pub const Bar = struct { status: ProgressStatus, height: f32 };
+pub const Bar = struct { status: ProgressStatus, height: f32, sweep: ProgressSweep = .gloss };
 
 /// Quintic smoothstep (approx cubic-bezier(0.65, 0, 0.35, 1): mid fast, ends slow)
 fn ease(t: f32) f32 {
@@ -78,7 +83,8 @@ pub fn barAt(now_ms: f64) Edges {
     };
 }
 
-/// Moving bar uses the same contrast-checked fill as determined progress.
+/// Gloss bar: horizontal three-stop gradient, peak (white mix 35%) left-biased, right decays to
+/// dark (black mix 15%). `.flat` sweep paints all three stops in the state color.
 pub fn drawBar(ctx: ui.DrawContext, b: Bar, frame: ui.view.Frame) anyerror!void {
     const e = barAt(frame.now_ms);
     const left = e.left * ctx.render_w;
@@ -89,9 +95,10 @@ pub fn drawBar(ctx: ui.DrawContext, b: Bar, frame: ui.view.Frame) anyerror!void 
     const c = statusColor(b.status, frame.tokens);
     var colors = @as([16]Color, @splat(Color.rgba(0, 0, 0, 0)));
     var positions = @as([16]f32, @splat(0));
-    colors[0] = c;
+    const gloss = b.sweep == .gloss;
+    colors[0] = if (gloss) Color.lerp(c, white, 0.35) else c;
     colors[1] = c;
-    colors[2] = c;
+    colors[2] = if (gloss) Color.lerp(c, black, 0.15) else c;
     positions[1] = 0.55;
     positions[2] = 1.0;
     const r = b.height / 2;
@@ -107,4 +114,57 @@ pub fn drawBar(ctx: ui.DrawContext, b: Bar, frame: ui.view.Frame) anyerror!void 
         .stop_positions = positions,
         .stop_count = 3,
     } });
+}
+
+// -- Ring (ring.yix) --
+
+/// Ring square
+style ring($size: f32) { width: $size; height: $size; flex-shrink: 0; }
+
+pub const Ring = struct { percent: f32, status: ProgressStatus, thickness: f32 };
+
+/// Full circle in progress-track, then the share clockwise from 12 o'clock in the status color.
+pub fn drawRing(ctx: ui.DrawContext, r: Ring, frame: ui.view.Frame) anyerror!void {
+    const dl = ctx.display_list orelse return;
+    const header = ctx.display_header orelse return;
+    const radius = @min(ctx.render_w, ctx.local_h) / 2;
+    if (radius <= 0) return;
+    const stroke = @min(r.thickness, radius);
+    try dl.append(.{ .arc = .{ .header = header, .cx = ctx.render_w / 2, .cy = ctx.local_h / 2, .outer_radius = radius, .stroke_width = stroke, .start_angle = 0, .end_angle = math.tau, .color = frame.tokens.tokens.color.progress_track } });
+    if (r.percent <= 0) return;
+    const start = -math.pi / 2.0;
+    try dl.append(.{ .arc = .{ .header = header, .cx = ctx.render_w / 2, .cy = ctx.local_h / 2, .outer_radius = radius, .stroke_width = stroke, .start_angle = start, .end_angle = start + math.tau * r.percent / 100, .color = statusColor(r.status, frame.tokens) } });
+}
+
+// -- Segments (segments.yix) --
+
+/// Bar: parts in a row, round ends clip the first / last part
+style segments($width: ?f32, $height: f32, $gap: f32) {
+  width: $width ?? grow;
+  height: $height;
+  direction: row;
+  gap: $gap;
+  corner-radius: {$height / 2};
+  overflow-hidden: true;
+}
+
+/// One part: its share of the bar (shrinks with the others so the gaps fit), in its tone
+style segment($percent: f32, $tone: ProgressTone, $height: f32) {
+  width: {.{ .percent = $percent }};
+  height: $height;
+  flex-shrink: 1;
+  min-width: 0;
+  when $tone = neutral { background: fg-tertiary; }
+  when $tone = accent { background: progress-fill; }
+  when $tone = success { background: progress-success; }
+  when $tone = warning { background: progress-warning; }
+  when $tone = danger { background: progress-error; }
+}
+
+/// Remainder: the unused share in the track color
+style segment_rest($height: f32) {
+  width: grow;
+  height: $height;
+  min-width: 0;
+  background: progress-track;
 }

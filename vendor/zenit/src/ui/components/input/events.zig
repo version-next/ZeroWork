@@ -8,9 +8,68 @@ const state_mod = @import("state.zig");
 const TextInputState = state_mod.TextInputState;
 const editable_block = @import("../editable_block/mod.zig");
 
+fn escapeReverts(state: *const TextInputState) bool {
+    const cx = state.cx_ref orelse return false;
+    return cx.input_escape == .revert_to_focus_value;
+}
+
+/// Window-level Escape routing (a host that handles Escape before the focused field sees it):
+/// under `Cx.input_escape = .revert_to_focus_value`, revert the focused field to its focus-time
+/// text. True when it reverted (Escape is then used up).
+pub fn revertFocused(cx: *core_ui.Cx) bool {
+    if (cx.input_escape != .revert_to_focus_value) return false;
+    const focused = cx.focus_manager.getFocused() orelse return false;
+    const edit = @import("mod.zig").editStateOf(focused) orelse return false;
+    return switch (edit) {
+        .input => |input| revertState(input),
+        else => false,
+    };
+}
+
+/// `revertFocused` for one field (also its `TextInputClient.escape_revert`).
+pub fn revertState(state: *TextInputState) bool {
+    if (!escapeReverts(state)) return false;
+    if (state.imeIsComposing() or state.readonly or state.disabled) return false;
+    state.beginUserEdit();
+    defer state.endUserEdit();
+    if (!state.revertToFocusValue()) return false;
+    state.updateScrollX();
+    fireOnChange(state);
+    return true;
+}
+
 /// Trigger on_change callback on text change
 pub inline fn fireOnChange(state: *TextInputState) void {
     if (state.on_change) |h| h.invokeWithStr(state.getText());
+}
+
+/// Single-line Input field (ControlShell root): focus / blur update editing state here, as
+/// events, never by replacing the node's on_focus / on_blur (the shell's :focus hooks live there).
+/// Blur clears even while disabled (disable revokes focus), then runs as an edit transaction.
+pub fn inputFieldEventHandler(event: Event, context: ?*anyopaque) EventResult {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return .ignored));
+    switch (event) {
+        .focus => state.focused = true,
+        .blur => {
+            state.focused = false;
+            state.cancelImeComposition();
+            state.selection_anchor = null;
+            state.syncDocFromCursor();
+            state.is_dragging = false;
+            state.drag_pointer = null;
+            state.suspend_drag_until_mouse_up = false;
+            state.consecutive_mouse_downs = 0;
+            state.last_mouse_down_instant = null;
+            // A field that lost focus shows the start of its value (platform text fields;
+            // a browser <input> rewinds on blur too). Focus scrolls back to the caret.
+            if (!state.multiline) {
+                state.scroll_x = 0;
+                state.markVisualDirty();
+            }
+        },
+        else => {},
+    }
+    return inputEventHandler(event, context);
 }
 
 /// Input event handler
@@ -45,6 +104,13 @@ fn handleEvent(state: *TextInputState, event: Event) EventResult {
 
     switch (event) {
         .key_down, .mouse_down, .focus, .blur => state.endImePendingCommit(),
+        else => {},
+    }
+    switch (event) {
+        .focus => state.noteFocusValue(),
+        .blur => state.clearFocusValue(),
+        .text_input, .ime_preedit, .ime_commit, .ime_delete_surrounding, .mouse_down => state.takeFocusValue(),
+        .key_down => |e| if (e.key != .escape) state.takeFocusValue(),
         else => {},
     }
 
@@ -199,6 +265,11 @@ fn handleEvent(state: *TextInputState, event: Event) EventResult {
                 return .handled;
             }
 
+            if (e.key == .escape and escapeReverts(state) and state.revertToFocusValue()) {
+                state.updateScrollX();
+                fireOnChange(state);
+                return .stop;
+            }
             const len_before = if (state.textarea_doc) |d| d.totalLength() else state.buffer_len;
             const undo_before = if (state.textarea_doc != null) state.ta_undo_count else state.undo_count;
             const redo_before = if (state.textarea_doc != null) state.ta_redo_count else state.redo_count;

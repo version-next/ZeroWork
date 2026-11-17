@@ -1,4 +1,5 @@
 /** Product wiring regression: selecting a saved host must never create a session. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
@@ -35,11 +36,12 @@ try{
   assert.equal(connections,0,'row selection must not open a transport');
  }
  await h.screenshot(join(out,'selected-without-connection.png'));
+ // design-r3 A2: the selected row shows the native “连接” button (the hover ▶ is for unselected rows).
  const row=await visible('sidebar.host');await h.mouseMove(row.rect.x+20,row.rect.y+18);
- await visible('sidebar.host.connect');assert((await h.clickTestId('sidebar.host.connect')).ok);
+ await visible('sidebar.host.connect_button');assert((await h.clickTestId('sidebar.host.connect_button')).ok);
  await h.waitFor(async()=>connections>0&&(await tabs()).length===1||null);
  await h.screenshot(join(out,'explicit-connection.png'));
- await writeFile(join(out,'report.json'),JSON.stringify({status:'passed',checks:['single/repeated/double row clicks create no Tab and no TCP connection','explicit connect button creates one Tab and opens loopback transport']},null,2));
+ await writeFile(join(out,'report.json'),JSON.stringify({status:'passed',checks:['single/repeated/double row clicks create no Tab and no TCP connection','explicit 连接 button on the selected row creates one Tab and opens loopback transport']},null,2));
  console.log('passed: '+out);
 }finally{
  if(app.exitCode===null&&app.signalCode===null)app.kill('SIGTERM');

@@ -14,7 +14,6 @@ const OverlayStack = @FieldType(ui.Cx, "overlay_stack");
 /// the guard also stops queryByTestId/findByTestId silently, so keep it far
 /// above realistic depth. Output size is bounded separately (TreeTooLarge).
 const MAX_DEPTH = 64;
-const MAX_QUERY_DEPTH = 64;
 
 // -- zenit v0.5 field access helpers --
 
@@ -72,13 +71,124 @@ pub fn queryByTestId(root: *Node, overlays: ?*const OverlayStack, test_id: []con
     return jw.getWritten();
 }
 
+/// A scoped / filtered `/tree` read (POST /tree): start at the first node with `root_test_id`
+/// (null = the whole tree) and, with `visible_only`, leave out every subtree that cannot show —
+/// see `childShown`. Unfiltered output is byte-identical to `serializeTree` / a `/query` match.
+pub const TreeQuery = struct {
+    root_test_id: ?[]const u8 = null,
+    visible_only: bool = false,
+};
+
+pub fn serializeTreeQuery(root: *Node, overlays: ?*const OverlayStack, query: TreeQuery, buf: []u8) error{ TreeTooLarge, NotFound }![]const u8 {
+    const start = if (query.root_test_id) |id| findQueryRoot(root, overlays, id, query.visible_only) orelse return error.NotFound else root;
+    var jw = JsonWriter.init(buf);
+    serializeNodeFiltered(&jw, start, overlays, 0, false, if (query.visible_only) narrowClip(start, ancestorClip(root, start)) else null);
+    if (jw.hasOverflowed()) return error.TreeTooLarge;
+    return jw.getWritten();
+}
+
+/// First node with the test id; a visible-only read prefers the first one that shows.
+fn findQueryRoot(root: *Node, overlays: ?*const OverlayStack, test_id: []const u8, visible_only: bool) ?*Node {
+    const first = findByTestId(root, test_id) orelse return null;
+    if (!visible_only or effectiveOpacity(first, overlays) > 0) return first;
+    return findShownByTestId(root, overlays, test_id, 0) orelse first;
+}
+
+fn findShownByTestId(node: *Node, overlays: ?*const OverlayStack, test_id: []const u8, depth: usize) ?*Node {
+    if (depth > MAX_DEPTH) return null;
+    if (nodeTestId(node)) |tid| {
+        if (std.mem.eql(u8, tid, test_id) and effectiveOpacity(node, overlays) > 0) return node;
+    }
+    for (node.children.items) |child| if (findShownByTestId(child, overlays, test_id, depth + 1)) |found| return found;
+    return null;
+}
+
+/// Window-space rectangle a subtree can paint into.
+pub const Clip = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+
+    fn of(r: ComputedRect) Clip {
+        return .{ .x = r.x, .y = r.y, .w = @max(0, r.w), .h = @max(0, r.h) };
+    }
+    fn intersect(a: Clip, b: Clip) Clip {
+        const x0 = @max(a.x, b.x);
+        const y0 = @max(a.y, b.y);
+        const x1 = @min(a.x + a.w, b.x + b.w);
+        const y1 = @min(a.y + a.h, b.y + b.h);
+        return .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
+    }
+    fn overlaps(a: Clip, r: ComputedRect) bool {
+        return r.x < a.x + a.w and r.x + r.w > a.x and r.y < a.y + a.h and r.y + r.h > a.y;
+    }
+};
+
+/// The clip in force at `node` (exclusive): the tree root's box narrowed by every clipping
+/// ancestor between them.
+fn ancestorClip(root: *Node, node: *Node) Clip {
+    var clip = Clip.of(root.globalRect());
+    var chain: [MAX_DEPTH + 2]*Node = undefined;
+    var n: usize = 0;
+    var cur = node.parent;
+    while (cur) |p| : (cur = p.parent) {
+        if (n == chain.len) break;
+        chain[n] = p;
+        n += 1;
+    }
+    while (n > 0) {
+        n -= 1;
+        clip = narrowClip(chain[n], clip);
+    }
+    return clip;
+}
+
+/// The clip for a node's children: its own box when it clips (overflow hidden).
+fn narrowClip(node: *Node, clip: Clip) Clip {
+    if (!node.style.overflow_hidden) return clip;
+    return clip.intersect(Clip.of(node.globalRect()));
+}
+
+/// Whether a child (and so its subtree) can show in a visible-only read. Left out: display none;
+/// opacity 0; inside a suspended overlay layer; a clipping box collapsed to 0 (the render engine
+/// skips those subtrees); an empty box without children; a box lying wholly outside the clip with
+/// nothing inside it that reaches back into the clip (scrolled-away rows, closed panels).
+fn childShown(node: *Node, overlays: ?*const OverlayStack, clip: Clip) bool {
+    if (node.style.display == .none) return false;
+    if (node.getOpacity() == 0) return false;
+    if (overlays) |stack| if (stack.isNodeInSuspendedLayer(node)) return false;
+    const r = node.globalRect();
+    const empty = r.w <= 0.1 or r.h <= 0.1;
+    if (node.style.overflow_hidden and empty) return false;
+    if (empty and node.children.items.len == 0) return false;
+    if (!empty and clip.overlaps(r)) return true;
+    if (node.style.overflow_hidden) return false;
+    return reachesClip(node, clip, 0);
+}
+
+/// Some descendant of a non-clipping box paints inside the clip (an absolute child escaping an
+/// off-screen or empty parent).
+fn reachesClip(node: *Node, clip: Clip, depth: usize) bool {
+    if (depth > MAX_DEPTH) return false;
+    for (node.children.items) |child| {
+        if (child.style.display == .none or child.getOpacity() == 0) continue;
+        const r = child.globalRect();
+        const empty = r.w <= 0.1 or r.h <= 0.1;
+        if (!empty and clip.overlaps(r)) return true;
+        if (child.style.overflow_hidden) continue;
+        if (reachesClip(child, clip, depth + 1)) return true;
+    }
+    return false;
+}
+
 /// Find single node by test_id; return pointer.
 pub fn findByTestId(root: *Node, test_id: []const u8) ?*Node {
     return findByTestIdRecursive(root, test_id, 0);
 }
 
 fn findByTestIdRecursive(node: *Node, test_id: []const u8, depth: usize) ?*Node {
-    if (depth > MAX_QUERY_DEPTH) return null;
+    if (depth > MAX_DEPTH) return null;
     if (nodeTestId(node)) |tid| {
         if (std.mem.eql(u8, tid, test_id)) return node;
     }
@@ -92,7 +202,7 @@ fn findByTestIdRecursive(node: *Node, test_id: []const u8, depth: usize) ?*Node 
 }
 
 fn queryByTestIdRecursive(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, test_id: []const u8, depth: usize) void {
-    if (depth > MAX_QUERY_DEPTH) return;
+    if (depth > MAX_DEPTH) return;
     if (nodeTestId(node)) |tid| {
         if (std.mem.eql(u8, tid, test_id)) {
             serializeNode(jw, node, overlays, 0, false);
@@ -231,6 +341,12 @@ pub fn effectiveOpacity(node: *Node, overlays: ?*const OverlayStack) f32 {
 }
 
 fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, depth: usize, all_effective: bool) void {
+    serializeNodeFiltered(jw, node, overlays, depth, all_effective, null);
+}
+
+/// `clip`: when set (a visible-only read), children that cannot show are left out (see
+/// `childShown`) and each child gets the clip narrowed by its clipping ancestors.
+fn serializeNodeFiltered(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, depth: usize, all_effective: bool, clip: ?Clip) void {
     if (depth > MAX_DEPTH) {
         jw.null_();
         return;
@@ -298,6 +414,25 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
         }
     }
 
+    // Paint facts a test compares across widgets (one look): own background, text size / colour,
+    // icon tint. Only written when present, so plain boxes stay as small as before.
+    if (node.getBackground().a > 0) {
+        jw.key("bg_rgba");
+        writeColorRgba(jw, node.getBackground());
+    }
+    if (nodeText(node)) |t| {
+        if (t.content.len > 0) {
+            jw.key("font_size");
+            jw.floatValue(t.font_size);
+            jw.key("text_rgba");
+            writeColorRgba(jw, t.color);
+        }
+    }
+    if (node.getIcon()) |icon| {
+        jw.key("icon_rgba");
+        writeColorRgba(jw, icon.tint);
+    }
+
     if (node.getOpacity() != 1.0) {
         jw.key("opacity");
         jw.floatValue(node.getOpacity());
@@ -339,7 +474,10 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
         // never handled truncated flag, silently lost). Caller buffers size; overflow errors
         // explicitly.
         for (children) |child| {
-            serializeNode(jw, child, overlays, depth + 1, all_effective);
+            if (clip) |c| {
+                if (!childShown(child, overlays, c)) continue;
+                serializeNodeFiltered(jw, child, overlays, depth + 1, all_effective, narrowClip(child, c));
+            } else serializeNode(jw, child, overlays, depth + 1, all_effective);
         }
         jw.endArray();
     }
@@ -374,27 +512,6 @@ fn pumpFrames(ctx: *ui.Cx, n: usize) void {
     }
 }
 
-test "selectors reach nested controls beyond the full tree dump depth" {
-    const allocator = testing.allocator;
-    const root = try Node.create(allocator, 1, .box, .{});
-    defer root.destroy(allocator);
-    var tail = root;
-    for (0..28) |index| {
-        const child = try Node.create(allocator, @intCast(index + 2), .box, .{});
-        try tail.appendChild(allocator, child);
-        tail = child;
-    }
-    tail.meta.ownership.meta.test_id = "settings.nested.endpoint";
-    try testing.expect(findByTestId(root, "settings.nested.endpoint") == tail);
-    var buffer: [8192]u8 = undefined;
-    const result = try queryByTestId(root, null, "settings.nested.endpoint", &buffer);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
-    defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-    try testing.expectEqualStrings("settings.nested.endpoint", parsed.value.array.items[0].object.get("test_id").?.string);
-    try testing.expect(findByTestId(root, "settings.missing") == null);
-}
-
 test "effective_opacity: 关闭的 Modal 内容计 0，打开后计 1，关回去再计 0" {
     const allocator = testing.allocator;
     var ctx = try ui.Cx.init(allocator, std.testing.io);
@@ -424,7 +541,8 @@ test "effective_opacity: 关闭的 Modal 内容计 0，打开后计 1，关回�
 
 test "effective_opacity: 挂起层里的节点计 0（与几何无关）" {
     const allocator = testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const content = try Node.create(allocator, 901, .box, .{ .width = .{ .px = 120 }, .height = .{ .px = 60 } });
     defer content.destroy(allocator);
@@ -503,4 +621,131 @@ test "deep trees: nodes 30 levels down are serialized and found by test id" {
     const json = try serializeTree(root, null, buf);
     try testing.expect(std.mem.indexOf(u8, json, "null") == null);
     try testing.expect(std.mem.indexOf(u8, json, "probe.deep") != null);
+}
+
+test "query nodes report their paint facts: background, text size and colour, icon tint" {
+    const allocator = testing.allocator;
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 300);
+    const root = try ui.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const row = try ui.box(ctx, .{ .width = .{ .px = 120 }, .height = .{ .px = 28 }, .background = ui.Color.hex(0x112233) }, .{});
+    row.meta.ownership.meta.test_id = "probe.row";
+    try root.appendChild(allocator, row);
+    const label = try ui.text(ctx, "Copy", .{ .font_size = 13, .color = ui.Color.hex(0xaabbcc) });
+    try row.appendChild(allocator, label);
+    const plain = try ui.box(ctx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
+    plain.meta.ownership.meta.test_id = "probe.plain";
+    try root.appendChild(allocator, plain);
+    pumpFrames(ctx, 1);
+    const buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(buf);
+    const json = try queryByTestId(root, null, "probe.row", buf);
+    try testing.expect(std.mem.indexOf(u8, json, "\"bg_rgba\":\"17,34,51,255\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"font_size\":13") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"text_rgba\":\"170,187,204,255\"") != null);
+    const bare = try queryByTestId(root, null, "probe.plain", buf);
+    try testing.expect(std.mem.indexOf(u8, bare, "bg_rgba") == null);
+}
+
+test "tree query: a subtree by test id, unfiltered = the /query match, unknown root = NotFound" {
+    const allocator = testing.allocator;
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 300);
+    const root = try ui.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const panel = try ui.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+    panel.meta.ownership.meta.test_id = "probe.panel";
+    try root.appendChild(allocator, panel);
+    try panel.appendChild(allocator, try ui.text(ctx, "inside", .{}));
+    const other = try ui.text(ctx, "outside", .{});
+    try root.appendChild(allocator, other);
+    pumpFrames(ctx, 1);
+    const buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(buf);
+    const qbuf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(qbuf);
+    const json = try serializeTreeQuery(root, null, .{ .root_test_id = "probe.panel" }, buf);
+    try testing.expect(std.mem.indexOf(u8, json, "inside") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "outside") == null);
+    const matched = try queryByTestId(root, null, "probe.panel", qbuf);
+    // `/query` wraps its matches in an array: same object inside.
+    try testing.expectEqualStrings(matched[1 .. matched.len - 1], json);
+    // Whole tree unfiltered = GET /tree.
+    const whole = try serializeTreeQuery(root, null, .{}, buf);
+    try testing.expectEqualStrings(try serializeTree(root, null, qbuf), whole);
+    try testing.expectError(error.NotFound, serializeTreeQuery(root, null, .{ .root_test_id = "probe.none" }, buf));
+}
+
+test "tree query visible_only: hidden, transparent, collapsed, empty and scrolled-away subtrees are left out" {
+    const allocator = testing.allocator;
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 300);
+    const root = try ui.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = .column }, .{});
+    ctx.root = root;
+    const scope = try ui.Scope.init(allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const shown = try ui.text(ctx, "shown", .{});
+    try root.appendChild(allocator, shown);
+    const hidden = try ui.text(ctx, "hidden-display", .{});
+    hidden.setDisplay(.none);
+    try root.appendChild(allocator, hidden);
+    const faded = try ui.box(ctx, .{ .width = .{ .px = 50 }, .height = .{ .px = 20 }, .opacity = 0 }, .{});
+    try faded.appendChild(allocator, try ui.text(ctx, "faded", .{}));
+    try root.appendChild(allocator, faded);
+    const collapsed = try ui.box(ctx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{});
+    collapsed.style.overflow_hidden = true;
+    try collapsed.appendChild(allocator, try ui.text(ctx, "collapsed", .{}));
+    try root.appendChild(allocator, collapsed);
+    try root.appendChild(allocator, try ui.box(ctx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{}));
+    // A zero-size non-clipping box keeps a child that still paints (absolute escape).
+    const holder = try ui.box(ctx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{});
+    const escaped = try ui.box(ctx, .{ .position = .absolute, .width = .{ .px = 40 }, .height = .{ .px = 20 } }, .{});
+    escaped.meta.ownership.meta.test_id = "probe.escaped";
+    try holder.appendChild(allocator, escaped);
+    try root.appendChild(allocator, holder);
+    // A 100-tall list of ten 40-tall rows (label in each row's top half) scrolled to 150: row 3
+    // shows only its empty bottom half, so the labels in view are rows 4..6.
+    const list = try ui.widgets.ScrollArea(.{ .height = 100, .width = 200 }).mount(scope, ctx);
+    list.container.meta.ownership.meta.test_id = "probe.list";
+    try root.appendChild(allocator, list.container);
+    var names: [10][8]u8 = undefined;
+    for (0..10) |i| {
+        const row = try ui.box(ctx, .{ .width = .{ .grow = .{} }, .height = .{ .px = 40 } }, .{});
+        try row.appendChild(allocator, try ui.text(ctx, try std.fmt.bufPrint(&names[i], "row-{d}", .{i}), .{}));
+        try list.content.appendChild(allocator, row);
+    }
+    pumpFrames(ctx, 2);
+    ui.widgets.setScrollY(list.state, list.content, 150);
+    list.content.style.translate_y = -150;
+    pumpFrames(ctx, 2);
+
+    const buf = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(buf);
+    const all = try serializeTreeQuery(root, &ctx.overlay_stack, .{}, buf);
+    for ([_][]const u8{ "shown", "hidden-display", "faded", "collapsed", "row-0", "row-9" }) |word| try testing.expect(std.mem.indexOf(u8, all, word) != null);
+    const full_len = all.len;
+    const vis = try serializeTreeQuery(root, &ctx.overlay_stack, .{ .visible_only = true }, buf);
+    try testing.expect(vis.len < full_len);
+    for ([_][]const u8{ "shown", "probe.escaped", "row-4", "row-5", "row-6" }) |word| {
+        if (std.mem.indexOf(u8, vis, word) == null) {
+            std.debug.print("missing {s}\n", .{word});
+            return error.TestUnexpectedResult;
+        }
+    }
+    for ([_][]const u8{ "hidden-display", "faded", "collapsed", "row-0", "row-1", "row-2", "row-3", "row-7", "row-8", "row-9" }) |word| {
+        if (std.mem.indexOf(u8, vis, word) != null) {
+            std.debug.print("unexpected {s}\n", .{word});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Scoped + visible: only the list's rows in view.
+    const scoped = try serializeTreeQuery(root, &ctx.overlay_stack, .{ .root_test_id = "probe.list", .visible_only = true }, buf);
+    try testing.expect(std.mem.indexOf(u8, scoped, "shown") == null);
+    try testing.expect(std.mem.indexOf(u8, scoped, "row-4") != null);
+    try testing.expect(std.mem.indexOf(u8, scoped, "row-0") == null);
 }

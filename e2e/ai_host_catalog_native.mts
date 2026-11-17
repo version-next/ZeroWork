@@ -3,12 +3,16 @@
  * Uses a deterministic loopback provider and one real Local Tab. No SSH
  * connection is requested and no production host/configuration is read.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, writeFile, readFile, open, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? '/private/tmp/zw-current-tab-scope-build');
 const out = resolve(process.argv[2] ?? '/private/tmp/zw-host-catalog-native');
@@ -27,12 +31,12 @@ const payload = (envelope: any) => {
 };
 const createArgs = { request_key: 'catalog-save-once', name: 'catalog-created', host: '192.0.2.42', port: 2222, user: 'fixture', auth_mode: 'password' };
 const requests: any[] = [], observed: Record<string, any> = {};
-let fixtureFailure: string | null = null, approvalPhase = '', baseline = '';
+let fixtureFailure: string | null = null, approvalPhase = '', baseline = '', observationRounds = 0;
 const server = createServer(async (req, res) => {
   try {
-    let raw = ''; for await (const chunk of req) raw += chunk;
+    const raw = await readRequestText(req);
     if (!raw) return res.end('{"data":[{"id":"catalog-fixture"}]}');
-    const body = JSON.parse(raw); requests.push(body);
+    const body = JSON.parse(raw); if (isTitleRequest(body)) return skipTitle(res); requests.push(body);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     const results = new Map(body.messages.filter((m: any) => m.role === 'tool').map((m: any) => [m.tool_call_id, payload(JSON.parse(m.content))]));
     for (const [id, value] of results) observed[String(id)] = value;
@@ -41,7 +45,12 @@ const server = createServer(async (req, res) => {
       res.end(frame({ tool_calls: calls.map((call, index) => ({ index, id: call.id, type: 'function', function: { name: wireName(call.name), arguments: JSON.stringify(call.args) } })) }) + 'data: [DONE]\n\n');
     };
     const defs = new Set((body.tools ?? []).map((tool: any) => tool.function.name));
-    for (const name of ['host.list_hosts', 'host.get_host', 'host.create_host']) assert(defs.has(wireName(name)), name + ' must be advertised');
+    // After the duplicate-name create returns outcome_unknown, the tool loop continues the same turn in
+    // host-observation-only mode and advertises only read-state tools (tool_loop.zig nextRequest/host_observation_only).
+    const observationOnly = results.has('catalog-name-conflict') && body.messages.at(-1)?.role === 'tool';
+    if (observationOnly) observationRounds++;
+    for (const name of ['host.list_hosts', 'host.get_host']) assert(defs.has(wireName(name)), name + ' must be advertised');
+    assert.equal(defs.has(wireName('host.create_host')), !observationOnly, observationOnly ? 'host.create_host must not be advertised after an unknown outcome' : 'host.create_host must be advertised');
     for (const name of ['host.update_host', 'host.delete_host']) assert(!defs.has(wireName(name)), name + ' must not be advertised');
     if (!results.has('catalog-list-initial')) return emit([{ id: 'catalog-list-initial', name: 'host.list_hosts', args: {} }]);
     const initial: any = results.get('catalog-list-initial');
@@ -102,7 +111,7 @@ const server = createServer(async (req, res) => {
     assert.equal((disk.match(/\[\[hosts\]\]/g) ?? []).length, 2);
     assert(!disk.includes('192.0.2.99')); assert(!disk.includes('password_ref'));
     await writeFile(join(out, 'saved-hosts.toml'), disk);
-    await writeFile(join(out, 'lifecycle.json'), await readFile(join(data, 'ai/lifecycle.json')));
+    await writeFile(join(out, 'lifecycle.json'), await readFile(join(data, 'ai/lifecycle.v4.json')));
     res.end(frame({ content: 'CATALOG_NATIVE_FINISHED' }) + 'data: [DONE]\n\n');
   } catch (error) {
     fixtureFailure = String(error);
@@ -126,15 +135,17 @@ try {
   await h.waitForServerReady(60000); await h.resizeWindow(1200, 900);
   await click('workspace.empty.local'); await visible('terminal.surface');
   baseline = await readFile(join(data, 'hosts.toml'), 'utf8');
-  await click('toolbar.ai'); await click('ai.prompt'); await h.type_('CATALOG_NATIVE_ACCEPTANCE'); await click('ai.send');
+  await click(await aiToggleId()); await click('ai.prompt'); await h.type_('CATALOG_NATIVE_ACCEPTANCE'); await click('ai.send');
   const handled = new Set<string>();
-  let followupSent = false;
   await h.waitFor(async () => {
     assert.equal(fixtureFailure, null);
-    if ((await h.query('ai.host_approval')).some(shown) && approvalPhase && !handled.has(approvalPhase)) {
-      assert.equal(text(await h.query('ai.host_approval.title')), '保存新主机');
-      assert.equal(text(await h.query('ai.host_approval.target')), createArgs.name);
-      const summary = text(await h.query('ai.host_approval.summary'));
+    // Approval moved into the composer interaction card (ai_composer_interaction_view.zig); lifecycle subjects are titled
+    // 确认会话操作 (ai_host.zig updateComposerInteraction) with target host.create_host and the exact config as detail (host_catalog.zig Prepared.subject).
+    if ((await h.query('ai.interaction.panel')).some(shown) && approvalPhase && !handled.has(approvalPhase)) {
+      assert.equal(text(await h.query('ai.interaction.title')), '确认会话操作');
+      assert.equal(text(await h.query('ai.interaction.target')), 'host.create_host');
+      assert.match(text(await h.query('ai.interaction.impact')), /将此 SSH 主机保存到主机列表/);
+      const summary = text(await h.query('ai.interaction.command'));
       const config = JSON.parse(summary);
       assert.equal(config.name, createArgs.name); assert.equal(config.host, approvalPhase === 'collision' ? '192.0.2.99' : createArgs.host);
       assert(!summary.includes('request_key')); assert(!summary.includes('c1:'));
@@ -142,26 +153,23 @@ try {
       await h.screenshot(join(out, 'approval-' + approvalPhase + '.png'));
       report.approvals.push({ phase: approvalPhase, decision: approvalPhase === 'reject' ? 'reject' : 'approve', detail: config });
       handled.add(approvalPhase);
-      await click(approvalPhase === 'reject' ? 'ai.host_approval.reject' : 'ai.host_approval.accept');
+      await click(approvalPhase === 'reject' ? 'ai.interaction.reject' : 'ai.interaction.approve');
     }
-    // A journaled dispatch that later refuses the duplicate is conservatively
-    // unknown. The host stops that tool round; explicitly request a new
-    // read-only observation to verify the saved catalog without replaying it.
-    if (handled.has('collision') && !followupSent && !(await h.query('ai.stop')).some(shown)) {
-      followupSent = true;
-      await click('ai.prompt'); await h.type_('CATALOG_NATIVE_AFTER_CONFLICT_READ_ONLY'); await click('ai.send');
-    }
+    // A journaled dispatch that later refuses the duplicate is conservatively unknown. The host no longer stops
+    // the round: it continues the same turn with read-only tools, which the fixture uses to verify the saved
+    // catalog without replaying anything (no follow-up prompt is needed any more).
     return text(await h.query('ai.panel')).includes('CATALOG_NATIVE_FINISHED') && !(await h.query('ai.stop')).some(shown) || null;
   }, 60000);
   assert.deepEqual([...handled], ['reject', 'save', 'collision']);
+  assert.equal(observationRounds, 2, 'the final catalog reads and the closing answer must both be observation-only continuations of the same turn');
   await h.screenshot(join(out, 'catalog-final.png'));
   await writeFile(join(out, 'final-tree.json'), JSON.stringify(await h.query('ai.panel'), null, 2));
   report.status = 'passed';
-  report.checks = ['list/get expose only six static fields and stable c1 refs', 'unknown update/delete tools are not advertised and return ToolNotInRequest', 'native rejection leaves host file unchanged', 'exact native approval saves one host through HostsTransaction without connecting', 'same request_key under a new call ID returns original operation and asset without another approval/save', 'changed arguments with same key return IdempotencyConflict', 'same name with a fresh key cannot overwrite the saved host', 'final catalog reads exactly the original and newly saved host'];
+  report.checks = ['list/get expose only six static fields and stable c1 refs', 'unknown update/delete tools are not advertised and return ToolNotInRequest', 'native rejection leaves host file unchanged', 'exact native approval saves one host through HostsTransaction without connecting', 'same request_key under a new call ID returns original operation and asset without another approval/save', 'changed arguments with same key return IdempotencyConflict', 'same name with a fresh key cannot overwrite the saved host', 'after the unknown outcome the same turn continues with read-only tools only (create_host withdrawn)', 'final catalog reads exactly the original and newly saved host'];
 } catch (error) {
   report.status = 'failed'; report.error = String(error); report.fixture_failure = fixtureFailure; process.exitCode = 1;
   await h.screenshot(join(out, 'failure.png')).catch(() => {});
-  await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree(), null, 2)).catch(() => {});
+  await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }), null, 2)).catch(() => {});
 } finally {
   try {
     if (app.exitCode === null && app.signalCode === null) {

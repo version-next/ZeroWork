@@ -10,6 +10,31 @@ const physics = @import("../../physics.zig");
 const debug = @import("debug.zig");
 const logScroll = debug.logScroll;
 
+/// Refresh the stored viewport / content extents from the finished layout: the viewport is the
+/// parent content box, which excludes any scroller gutter. The content node spans its full extent
+/// in each direction. An unlaid-out or hidden container leaves stored extents alone. A laid-out
+/// container may have a zero-sized viewport when its gutter and padding consume all the space.
+/// Host-managed extents (`external_content_*`) are never overwritten.
+pub fn refreshExtents(state: *ScrollState, container: *const Node, content: *const Node) void {
+    const viewport = content.parent orelse return;
+    const cr_container = container.rectFromWorldOrFallback();
+    const pr = viewport.rectFromWorldOrFallback();
+    const insets = viewport.style.contentInsets();
+    if (cr_container.h > 0) state.viewport_height = @max(0, pr.h - insets.vertical());
+    if (cr_container.w > 0) state.viewport_width = @max(0, pr.w - insets.horizontal());
+    const cr = content.rectFromWorldOrFallback();
+    if (!state.external_content_height and cr.h > 0) state.content_height = cr.h;
+    if (!state.external_content_width and cr.w > 0) state.content_width = cr.w;
+}
+
+/// How far `content` extends past `viewport`, or 0. A difference within f32 layout rounding is no
+/// overflow: a content box laid out to fill the viewport can come back an ulp wider, and that ulp
+/// must not become a scroll range or a scrollbar.
+pub fn overflowPast(content: f32, viewport: f32) f32 {
+    const d = content - viewport;
+    return if (d > core.layout_engine.layoutRoundingSlack(@max(@abs(content), @abs(viewport)))) d else 0;
+}
+
 /// Scroll direction
 pub const ScrollDirection = enum(u8) {
     vertical,
@@ -17,13 +42,68 @@ pub const ScrollDirection = enum(u8) {
     both,
 };
 
+/// What a nested ScrollArea does with input that would carry it past an edge on one axis
+/// (`ScrollAreaProps.overscroll_y` / `overscroll_x`). Named after CSS `overscroll-behavior`; note
+/// that elsewhere in zenit "overscroll" also names the rubber-band displacement itself. Mapping:
+///   CSS auto    -> .auto
+///   CSS contain -> .contain
+///   CSS none    -> .contain with `rubber_band_y` / `rubber_band_x` = false
+/// Unlike CSS, `.contain` only applies while the area has a range on that axis (SwiftUI
+/// `.basedOnSize`): a contained box with nothing to scroll never traps the enclosing page.
+/// Chaining reaches enclosing ScrollAreas (and components built on one: VirtualList, Grid) only;
+/// a custom scroll handler higher up is not a chaining target. Cross-axis passthrough is unchanged:
+/// a vertical area lets horizontal-dominant input through whole, including its small vertical part.
+/// Read at mount. Not mapped to the web DOM host yet (the browser scrolls natively there).
+pub const OverscrollBehavior = enum(u8) {
+    /// Scroll chaining: at the edge the input goes on to the nearest enclosing ScrollArea that
+    /// scrolls on that axis (a wheel at once; a trackpad gesture only if it started there — once
+    /// this area handles a gesture it keeps it to the end and rubber-bands).
+    auto,
+    /// The input stays here at either edge (a wheel stops at the edge, a gesture and its momentum
+    /// rubber-band here) and never moves an enclosing area. Only while this area actually has a
+    /// range on that axis: with nothing to scroll the input still reaches the enclosing area, so a
+    /// short contained box never traps the page's scrolling. A gesture an enclosing area already
+    /// holds (finger down there first) stays with it.
+    contain,
+};
+
+/// Whether the content keeps out of the overlay scroller's interaction band
+/// (`ScrollAreaProps.scrollbar_gutter`; CSS `scrollbar-gutter`).
+pub const ScrollbarGutter = enum(u8) {
+    /// Content runs under the overlay scroller (the default: the scroller is drawn over it).
+    none,
+    /// Reserve the scroller's interaction band (right for vertical, bottom for horizontal), even
+    /// with no overflow. Content in the scrollport remains clear of the overlay thumbs.
+    /// Read at mount. The browser scrollport is unchanged on the Web DOM host.
+    stable,
+};
+
+/// When the scrollbar thumbs show (`ScrollAreaProps.scrollbars`). Read at mount. Not mapped to the
+/// web DOM host yet.
+pub const ScrollbarVisibility = enum(u8) {
+    /// The platform's overlay scrollers: shown while scrolling, dragging or hovering the bar, then
+    /// faded out.
+    auto,
+    /// Also at rest: an axis whose content overflows keeps its thumb at the idle look (fades back
+    /// to it after hover / drag instead of out). No thumb when nothing overflows, no space
+    /// reserved (macOS "Show scroll bars: Always", still overlaid).
+    always,
+};
+
 pub const ScrollbarVisual = struct {
-    // macOS overlay scrollbar thumb: 6px fixed width
-    pub const idle_thickness: f32 = 6;
+    // Design Scrollbar: rest 4, hover 6, track 10, inset 2, minimum thumb 24.
+    pub const idle_thickness: f32 = 4;
+    pub const track_thickness: f32 = 10;
+    pub const min_length: f32 = 24;
     pub const active_thickness: f32 = 6;
-    // Outer container edge, thumb effectively inset 3px left/right or top/bottom
-    pub const edge_inset: f32 = 3;
+    // Thumb inset from the outer edge (design zenit.scrollbar.inset).
+    pub const edge_inset: f32 = 2;
     pub const hover_slop: f32 = 6;
+    /// Width of the band along the scrolling edge where the overlay scroller takes the pointer once
+    /// it is approached (hover widens the thumb, the slop grows its hit area): inset + active
+    /// thickness + slop. Content that must stay clickable next to the scroller keeps out of it
+    /// (`ScrollAreaProps.scrollbar_gutter = .stable` reserves it).
+    pub const interaction_band: f32 = edge_inset + active_thickness + hover_slop;
     pub const cross_axis_clearance: f32 = 12;
     pub const idle_alpha: f32 = @as(f32, 0xA0) / 255.0;
     pub const hover_alpha: f32 = @as(f32, 0xA0) / 255.0;
@@ -107,7 +187,8 @@ pub const ScrollState = struct {
 
     // Vertical scrollbar drag
     scrollbar_dragging: bool = false,
-    scrollbar_last_mouse_y: f32 = 0, // previous frame mouse Y, used for delta calculation
+    scrollbar_last_mouse_y: f32 = 0, // mouse Y where the thumb drag began (grab point)
+    scrollbar_grab_scroll_y: f32 = 0, // scroll_y when the thumb drag began
 
     // Horizontal scrollbar animation
     scrollbar_fade_h: physics.FadeIndicator = .{},
@@ -115,7 +196,8 @@ pub const ScrollState = struct {
 
     // Horizontal scrollbar drag
     scrollbar_dragging_h: bool = false,
-    scrollbar_last_mouse_x: f32 = 0, // previous frame mouse X, used for delta calculation
+    scrollbar_last_mouse_x: f32 = 0, // mouse X where the thumb drag began (grab point)
+    scrollbar_grab_scroll_x: f32 = 0, // scroll_x when the thumb drag began
 
     /// Screen physical pixel ratio (Retina=2, standard=1).
     /// translate_y/x quantized to physical pixel grid, eliminates text scroll jitter.
@@ -144,13 +226,32 @@ pub const ScrollState = struct {
     pub var scroll_tuning = ScrollTuningT{};
 
     pub fn maxScrollY(self: *const ScrollState) f32 {
-        const max = self.content_height - self.viewport_height;
-        return if (max > 0) max else 0;
+        return overflowPast(self.content_height, self.viewport_height);
     }
 
     pub fn maxScrollX(self: *const ScrollState) f32 {
-        const max = self.content_width - self.viewport_width;
-        return if (max > 0) max else 0;
+        return overflowPast(self.content_width, self.viewport_width);
+    }
+
+    /// Pull the offsets back into [0, max] after the extents shrank (a resize, content removed),
+    /// moving the content with them. Returns whether anything moved.
+    pub fn clampOffsets(self: *ScrollState, content: *Node) bool {
+        var moved = false;
+        const max_y = self.maxScrollY();
+        if (self.scroll_y > max_y) {
+            self.scroll_y = max_y;
+            content.style.translate_y = self.contentTranslateY();
+            content.markHitLayerMotionPropDirty();
+            moved = true;
+        }
+        const max_x = self.maxScrollX();
+        if (self.scroll_x > max_x) {
+            self.scroll_x = max_x;
+            content.style.translate_x = self.contentTranslateX();
+            content.markHitLayerMotionPropDirty();
+            moved = true;
+        }
+        return moved;
     }
 
     /// Is user scrolling: finger on trackpad, momentum in progress, or dragging scrollbar.
@@ -319,14 +420,14 @@ pub const ScrollState = struct {
 
     /// Content overflows viewport
     pub fn needsScrollbar(self: *const ScrollState) bool {
-        return self.content_height > self.viewport_height and self.viewport_height > 0;
+        return self.viewport_height > 0 and overflowPast(self.content_height, self.viewport_height) > 0;
     }
 
-    /// Scrollbar height (min 30px)
+    /// Scrollbar height (min 24px)
     pub fn scrollbarHeight(self: *const ScrollState) f32 {
-        if (self.content_height <= 0) return 30;
+        if (self.content_height <= 0) return ScrollbarVisual.min_length;
         const ratio = self.viewport_height / self.content_height;
-        return @max(30, ratio * self.viewport_height);
+        return @max(ScrollbarVisual.min_length, ratio * self.viewport_height);
     }
 
     /// Scrollbar Y position
@@ -340,14 +441,14 @@ pub const ScrollState = struct {
 
     /// Horizontal content overflows viewport
     pub fn needsHScrollbar(self: *const ScrollState) bool {
-        return self.content_width > self.viewport_width and self.viewport_width > 0;
+        return self.viewport_width > 0 and overflowPast(self.content_width, self.viewport_width) > 0;
     }
 
-    /// Horizontal scrollbar width (min 30px)
+    /// Horizontal scrollbar width (min 24px)
     pub fn hScrollbarWidth(self: *const ScrollState) f32 {
-        if (self.content_width <= 0) return 30;
+        if (self.content_width <= 0) return ScrollbarVisual.min_length;
         const ratio = self.viewport_width / self.content_width;
-        return @max(30, ratio * self.viewport_width);
+        return @max(ScrollbarVisual.min_length, ratio * self.viewport_width);
     }
 
     pub fn onScrollActivity(self: *ScrollState) void {
@@ -410,15 +511,23 @@ pub const ScrollTuningT = struct {
 /// callback later writes freed memory at freeNode -> SIGSEGV.
 /// So callbacks target this cell, **exclusively held by Cx** (Cx.scroll_ctx_cells): ctx release
 /// only
-/// nulls its `ctx` slot, the cell lives until Cx.deinit, stale nodes see ctx==null (safe no-op).
-/// Cost: one 8-byte cell per ScrollArea mount until Cx closes; accepted so no release order can
-/// UAF.
+/// nulls its `ctx` slot; stale nodes see ctx==null (safe no-op). Each installed
+/// node callback owns one reference, released on invocation or explicit detach.
+/// A later mount may reclaim a cell only when ctx==null and references==0;
+/// Cx.deinit remains the fallback for escaped nodes. Neither callback frees it.
 pub const ScrollCtxCell = struct {
     /// scope dispose of ScrollEventCtx nulls this.
     ctx: ?*ScrollEventCtx = null,
+    references: usize = 0,
+
+    pub fn release(self: *ScrollCtxCell) void {
+        std.debug.assert(self.references != 0);
+        self.references -= 1;
+    }
 };
 
 pub const ScrollEventCtx = struct {
+    persist_key: ?[]const u8 = null,
     state: *ScrollState = undefined,
     /// Node pointer cleared by Node.ownership.hooks.on_cleanup when associated ScrollArea node
     /// freeNode.
@@ -428,10 +537,20 @@ pub const ScrollEventCtx = struct {
     container: ?*Node = null,
     scrollbar: ?*Node = null,
     scrollbar_h: ?*Node = null,
+    track_v: ?*Node = null,
+    track_h: ?*Node = null,
     /// Node on_cleanup actually writes to this intermediate cell (see ScrollCtxCell).
     cell: ?*ScrollCtxCell = null,
     cx: *Cx = undefined,
     scroll_speed: f32 = 1,
     direction: ScrollDirection = .vertical,
+    /// `ScrollAreaProps.overscroll_y` / `overscroll_x`.
+    overscroll_y: OverscrollBehavior = .auto,
+    overscroll_x: OverscrollBehavior = .auto,
     scrollbar_thumb: Color = Color.hex(0xffffff),
+    /// `scroll_y` / `scroll_x` binding (null: uncontrolled with no initial offset or handler).
+    offset_binding: ?*@import("offset_binding.zig").OffsetBinding = null,
+    /// `cx.frame_count` of the last frame whose render tick ran the before-render hook (the area was
+    /// visited, not culled). The offset binding's after-layout pass settles only unvisited areas.
+    hook_frame: u64 = std.math.maxInt(u64),
 };

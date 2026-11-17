@@ -40,6 +40,7 @@ pub const ChallengeBridge = struct {
     deadline: u64 = 0,
     offered: bool = false,
     management_policy: svc.ManagementPolicy = .read_only,
+    wake: ?*const @import("presentation_wake.zig").Wake = null,
 
     pub fn init(a: std.mem.Allocator, owner: svc.identity.SessionHandle, operation: svc.OperationKey, host: ?*challenges.Host) ChallengeBridge {
         return .{ .allocator = a, .owner = owner, .operation = operation, .host = host };
@@ -60,6 +61,12 @@ pub const ChallengeBridge = struct {
     pub fn deinit(self: *ChallengeBridge) void {
         self.cancel();
     }
+    /// A request is waiting for the host's answer (its deadline and the answer are both drained by `poll`).
+    pub fn busy(self: *ChallengeBridge) bool {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        return self.state == .pending or self.state == .answered;
+    }
     pub fn poll(self: *ChallengeBridge) !bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -78,7 +85,7 @@ pub const ChallengeBridge = struct {
         if (!self.offered) {
             const request = self.request.?;
             switch (request) {
-                .password => try host.offer(self.owner, self.request_id, self.owner.generation, .secret_input, .{ .title = "BMC · 本次连接密码", .detail = "密码仅用于本次 BMC 认证，不写入连接配置。", .source_name = "BMC · iKVM" }, self.deadline),
+                .password => try host.offer(self.owner, self.request_id, self.owner.generation, .secret_input, .{ .title = "BMC · 本次连接密码", .detail = "密码仅用于本次 BMC 认证，不写入主机配置。", .source_name = "BMC · iKVM" }, self.deadline),
                 .trust => |challenge| {
                     const material = try trustMaterial(self.allocator, challenge);
                     defer self.allocator.free(material);
@@ -144,6 +151,8 @@ pub const ChallengeBridge = struct {
         self.deadline = monotonicMs() + 300_000;
         self.state = .pending;
         self.mutex.unlock();
+        // The main-thread drain offers this request to the challenge host on the frame this wakes.
+        @import("presentation_wake.zig").notify(self.wake);
         while (true) {
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             if (self.stopped or cancel_value.load(.acquire) or self.state == .cancelled or monotonicMs() >= self.deadline) {
@@ -279,7 +288,11 @@ pub const Runtime = struct {
     remote_kvm_logout: native.RemoteRelease = .not_created,
     remote_logout_diagnostics: ?native.LogoutDiagnostics = null,
     last_progress_revision: u64 = 0,
-    last_progress_second: u64 = 0,
+    /// The presentation pulse (console_service.Pulse): what a renderer compares instead of
+    /// re-reading snapshots on a timer. Refreshed by `poll` and by every main-thread mutator.
+    pulse: console.Pulse = .{ .state = 0 },
+    /// Advances when the locally held management review changes.
+    review_revision: u64 = 0,
 
     /// Submission failure is fully retired through discardPrepared, without
     /// native cleanup/join on the configuration thread.
@@ -347,6 +360,8 @@ pub const Runtime = struct {
         errdefer a.destroy(self);
         self.* = .{ .allocator = a, .owner = request.handle, .operation = request.key, .context = context, .name = name, .target = target, .route_summary = route_summary, .controller = control, .ai_control = ai.Service.init(request.handle, &control.framebuffer, &control.remote_input), .bridge = ChallengeBridge.init(a, request.handle, request.key, context.challenges), .management_policy = policy };
         self.bridge.management_policy = policy;
+        self.bridge.wake = &control.wake;
+        self.ai_control.wake = &control.wake;
         self.ai_control.refresh = .{ .context = self, .request = requestAiRefresh };
         self.ai_control.asynchronous_encoding = true;
         self.ai_control.on_stop = .{ .context = self, .revoke_lease = revokeAiLease };
@@ -413,10 +428,8 @@ pub const Runtime = struct {
         changed = (try self.pollManagement()) or changed;
         changed = (try self.ai_control.poll()) or changed;
         const state = self.controller.poll();
-        const progress_second = state.progress.elapsed_ms / 1000;
-        if (state.progress.revision != self.last_progress_revision or progress_second != self.last_progress_second) {
+        if (state.progress.revision != self.last_progress_revision) {
             self.last_progress_revision = state.progress.revision;
-            self.last_progress_second = progress_second;
             changed = true;
         }
         if (!self.stopping) {
@@ -450,7 +463,39 @@ pub const Runtime = struct {
             self.last_receipt = current;
             changed = true;
         }
-        return changed;
+        // Whatever the worker publishes after `state` was read wakes the presentation again, so
+        // this pump's read is a consistent base for the pulse.
+        if (self.observe(&state)) changed = true;
+        // `true` asks the host for another pump on its own cadence. Steady streaming needs none:
+        // from there on the protocol worker wakes the presentation when it publishes.
+        return changed or self.transient(&state, current);
+    }
+    /// Recompute the presentation pulse; true when a token moved.
+    fn observe(self: *Runtime, state: *const controller.Snapshot) bool {
+        var review: u64 = self.review_revision;
+        if (self.management_review) |value| review +%= (@as(u64, @backingInt(value.result.phase)) << 8) +% @as(u64, @intFromBool(value.delegated));
+        const next: console.Pulse = .{
+            .state = console.stateToken(self.project(state)),
+            .management = self.controller.manager.publications.load(.acquire) *% 0x9e3779b97f4a7c15 +% review,
+            .decoded_frames = state.published_frames,
+        };
+        const moved = next.state != self.pulse.state or next.management != self.pulse.management;
+        self.pulse = next;
+        return moved;
+    }
+    /// Work that completes by the passage of time or by a later main-thread drain, so no worker
+    /// publication will announce it: connecting / cleaning up, a pending challenge or management
+    /// review, an AI lease or observation window, queued input.
+    fn transient(self: *Runtime, state: *const controller.Snapshot, current: sessions.CloseReceipt) bool {
+        // Released (or stuck unknown) with the worker gone: nothing further arrives by itself.
+        if (state.worker_exited and current != .awaiting) return false;
+        if (self.stopping or self.retry_requested or self.cancel_requested or !self.published) return true;
+        if (state.route != .connected or state.video != .streaming or state.cleanup != .not_started or state.failure != null) return true;
+        if (self.bridge.busy()) return true;
+        if (self.management_review) |review| if (!review.result.terminal()) return true;
+        if (state.input.queued != 0 or state.input.automation_queued != 0) return true;
+        if (self.context.presentation.input) |input_context| if (input_context.automation != null) return true;
+        return self.ai_control.busy();
     }
     pub fn bindings(self: *Runtime, factory_context: *anyopaque, factory: *const sessions.Adapter.VTable) [7]typed.Binding {
         return .{
@@ -479,6 +524,11 @@ pub const Runtime = struct {
         const self = from(raw);
         if (!self.published or self.stale or self.stopping) return error.StaleBinding;
         try self.controller.requestFullRefresh();
+    }
+    fn aiActivity(self: *Runtime, input_state: @import("remote_input.zig").Snapshot) console.AiActivity {
+        if (input_state.automation_queued != 0) return .operating;
+        if (self.context.presentation.input) |input_context| if (input_context.automation != null) return .operating;
+        return if (self.ai_control.observing()) .observing else .none;
     }
     fn revokeAiLease(raw: *anyopaque) void {
         if (from(raw).context.presentation.input) |input_context| input_context.takeHumanControl();
@@ -519,7 +569,27 @@ pub const Runtime = struct {
     }
     pub fn snapshot(self: *Runtime, a: std.mem.Allocator) !console.OwnedSnapshot {
         const state = self.controller.poll();
-        return console.OwnedSnapshot.init(a, .{ .owner = self.owner, .operation = self.operation, .name = self.name, .target = self.target, .route_summary = self.route_summary, .route = @fromBackingInt(@intCast(@backingInt(state.route))), .video = @fromBackingInt(@intCast(@backingInt(state.video))), .management = @fromBackingInt(@intCast(@backingInt(state.management))), .cleanup = @fromBackingInt(@intCast(@backingInt(state.cleanup))), .input = state.input, .control = @fromBackingInt(@intCast(@backingInt(state.control))), .control_request = state.control_request, .failure_stage = if (state.failure) |err| failureStage(err) else null, .failure_code = if (state.failure) |err| @errorName(err) else null, .progress = state.progress, .width = self.last_width, .height = self.last_height, .stride = @as(usize, self.last_width) * 4, .frame_sequence = self.last_sequence, .decoded_frames = state.published_frames, .frame_generation = self.last_generation, .rfb_ready = state.rfb_ready, .read_only_requested = self.controller.config.value.display.read_only_requested, .remote_web_logout = @fromBackingInt(@intCast(@backingInt(self.remote_web_logout))), .remote_kvm_logout = @fromBackingInt(@intCast(@backingInt(self.remote_kvm_logout))) });
+        return console.OwnedSnapshot.init(a, self.project(&state));
+    }
+    /// The console snapshot as a borrowed value (strings point into this runtime / static names).
+    fn project(self: *Runtime, state: *const controller.Snapshot) console.Snapshot {
+        return .{ .owner = self.owner, .operation = self.operation, .name = self.name, .target = self.target, .route_summary = self.route_summary, .route = @fromBackingInt(@intCast(@backingInt(state.route))), .video = @fromBackingInt(@intCast(@backingInt(state.video))), .management = @fromBackingInt(@intCast(@backingInt(state.management))), .cleanup = @fromBackingInt(@intCast(@backingInt(state.cleanup))), .input = state.input, .control = @fromBackingInt(@intCast(@backingInt(state.control))), .control_request = state.control_request, .failure_stage = if (state.failure) |err| failureStage(err) else null, .failure_code = if (state.failure) |err| @errorName(err) else null, .progress = state.progress, .width = self.last_width, .height = self.last_height, .stride = @as(usize, self.last_width) * 4, .frame_sequence = self.last_sequence, .decoded_frames = state.published_frames, .frame_generation = self.last_generation, .rfb_ready = state.rfb_ready, .read_only_requested = self.controller.config.value.display.read_only_requested, .ai = self.aiActivity(state.input), .remote_web_logout = @fromBackingInt(@intCast(@backingInt(self.remote_web_logout))), .remote_kvm_logout = @fromBackingInt(@intCast(@backingInt(self.remote_kvm_logout))) };
+    }
+    fn bindPresentation(raw: *anyopaque, binding: typed.Binding, target: u64, shown: bool) !void {
+        const self = from(raw);
+        try self.validate(binding);
+        if (shown) self.controller.wake.bind(target) else self.controller.wake.unbind(target);
+    }
+    fn pulseFrom(raw: *anyopaque, binding: typed.Binding) !console.Pulse {
+        const self = from(raw);
+        try self.validate(binding);
+        return self.pulse;
+    }
+    /// A main-thread call changed (or may have changed) what the renderer shows: publish now,
+    /// without waiting for the next pump.
+    fn touch(self: *Runtime) void {
+        const state = self.controller.poll();
+        _ = self.observe(&state);
     }
     fn snapshotFrom(raw: *anyopaque, binding: typed.Binding, a: std.mem.Allocator) !console.OwnedSnapshot {
         const self = from(raw);
@@ -554,6 +624,7 @@ pub const Runtime = struct {
         if (self.stopping and focused) return error.OwnerClosed;
         if (focused) if (self.context.presentation.input) |input_context| input_context.takeHumanControl();
         self.controller.remote_input.setFocus(focused);
+        self.touch();
     }
     fn retry(raw: *anyopaque, binding: typed.Binding) !void {
         const self = from(raw);
@@ -643,6 +714,8 @@ pub const Runtime = struct {
         }
         const copy = svc.Owned(svc.ManagementRequest).init(self.allocator, request) catch return .{ .rejected = .unavailable };
         self.management_review = .{ .request = copy, .fingerprint = fingerprint, .result = .{ .operation = execution.operation, .phase = .awaiting_approval }, .deadline_ms = monotonicMs() +| 120_000 };
+        self.review_revision +%= 1;
+        self.touch();
         return .{ .accepted = execution.operation };
     }
     fn retireManagementReview(self: *Runtime) void {
@@ -656,8 +729,14 @@ pub const Runtime = struct {
             review.result.phase = .cancelled_unsent;
             review.result.reason = .cancelled;
         }
+        self.review_revision +%= 1;
     }
     fn pollManagement(self: *Runtime) !bool {
+        const changed = try self.pollReview();
+        if (changed) self.review_revision +%= 1;
+        return changed;
+    }
+    fn pollReview(self: *Runtime) !bool {
         const review = if (self.management_review) |*value| value else return false;
         if (review.delegated) {
             const binding = self.controller.powerBinding();
@@ -723,6 +802,7 @@ pub const Runtime = struct {
         if (self.management_review) |review| if (review.result.operation.eql(key) and !review.delegated) {
             if (review.result.terminal()) return .already_terminal;
             self.retireManagementReview();
+            self.touch();
             return .cancelled_unsent;
         };
         const binding = self.controller.powerBinding();
@@ -744,7 +824,7 @@ pub const Runtime = struct {
         const table = try binding.borrow(svc.PowerService, svc.power_key, self.owner);
         try (table.query orelse return error.QueryUnavailable)(binding.context, call, key);
     }
-    const console_vtable: console.Interface = .{ .snapshot = snapshotFrom, .request_control = requestControl, .reply_control = replyControl, .refresh = refresh, .set_focus = setFocus, .retry = retry, .cancel = cancelConnection, .request_management = requestManagement };
+    const console_vtable: console.Interface = .{ .snapshot = snapshotFrom, .pulse = pulseFrom, .bind_presentation = bindPresentation, .request_control = requestControl, .reply_control = replyControl, .refresh = refresh, .set_focus = setFocus, .retry = retry, .cancel = cancelConnection, .request_management = requestManagement };
     const power_vtable: svc.PowerService = .{ .snapshot = powerSnapshot, .request = denyPower, .cancel = cancelWrite, .result = result, .query = query };
     const boot_vtable: svc.BootService = .{ .snapshot = bootSnapshot, .apply = denyBoot, .cancel = cancelWrite, .result = result, .query = query };
 };

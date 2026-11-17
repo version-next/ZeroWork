@@ -258,7 +258,7 @@ fn paintContentHash(node: *const Node, rect: ComputedRect) u64 {
         h = std.hash.Wyhash.hash(h, &text_bytes);
         // Length-prefixed by the seed chain: content moving between text and the
         // fixed fields cannot alias.
-        h = std.hash.Wyhash.hash(h ^ t.content.len, t.content);
+        h = @import("trace").work_counters.hashText(h ^ t.content.len, t.content);
     }
     if (node.getImage()) |im| {
         const image_bytes = std.mem.toBytes(im.texture_id) ++ std.mem.toBytes(im.tint);

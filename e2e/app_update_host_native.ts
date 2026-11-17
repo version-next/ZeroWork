@@ -1,5 +1,7 @@
 /** Real app host integration; package injection only supplies presentation state.
  * Exercises two real PTYs, cancellation/adoption, config Save and live themes. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {isolatedHome} from './regression/home_guard.mjs';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,mkdir,copyFile,writeFile,readFile,open,rm,realpath} from 'node:fs/promises';
@@ -15,7 +17,7 @@ for(const name of ['zw_ipc.so','zw_execution.so','zw_secret_consume.so','zw_exec
 await writeFile(join(data,'config.toml'),'[updates]\nauto_check = true\n');
 await writeFile(join(bundle,'Contents/Info.plist'),`<?xml version="1.0"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.zerowork.app</string><key>CFBundleName</key><string>ZeroWork Update Check</string><key>CFBundleExecutable</key><string>ZeroWork</string><key>CFBundlePackageType</key><string>APPL</string><key>ZeroWorkReleaseVersion</key><string>0.3.0-rc1</string></dict></plist>`);
 const identity=execFileSync('python3',['scripts/macos_signing.py','identity'],{encoding:'utf8'}).trim();execFileSync('/usr/bin/codesign',['--force','--deep','--sign',identity,'--identifier','com.zerowork.app',bundle]);
-const root=join(process.env.HOME!,'Library/Application Support/com.zerowork.updater',createHash('sha256').update(bundle+'\n'+data).digest('hex').slice(0,32));
+const root=join(isolatedHome(),'Library/Application Support/com.zerowork.updater',createHash('sha256').update(bundle+'\n'+data).digest('hex').slice(0,32));
 await mkdir(root,{recursive:true,mode:0o700});await writeFile(join(root,'check.json'),JSON.stringify({time:Date.now()/1000}));
 const log=await open(join(out,'app.log'),'w');process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const app=spawn(join(mac,'ZeroWork'),[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});
@@ -49,7 +51,7 @@ try{
  for(const theme of ['dark','light','sauber']){
   await route('theme',{theme_name:theme});await h.sleep(150);
   const panel=await visible('update.modal'),primary=await visible('update.primary'),cancel=await visible('update.cancel');
-  assert(Math.abs(panel.rect.w-520)<1);assert(primary.rect.h>=31);assert(primary.rect.w>=100);const primaryText=flat([primary]).filter(n=>n.text).map(n=>n.text).join('');assert(primaryText.includes('结束任务并安装'));assert(cancel.rect.y+cancel.rect.h<=panel.rect.y+panel.rect.h);
+  assert(Math.abs(panel.rect.w-520)<1);assert(primary.rect.h>=31);assert(primary.rect.w>=100);const primaryText=flat([primary]).filter(n=>n.text).map(n=>n.text).join('');assert(primaryText.includes('安装更新'));assert(cancel.rect.y+cancel.rect.h<=panel.rect.y+panel.rect.h);
   await h.mouseMove(1,1);await h.screenshot(join(out,theme+'-confirm.png'));measures.push({theme,panel:panel.rect,primary:primary.rect,cancel:cancel.rect,detail:(await visible('update.detail')).rect,summary:(await visible('update.summary')).rect,message:(await visible('update.message')).rect,state:await route()});
  }
  checks.push('same native modal follows dark/light/Sauber while preserving confirmation state');

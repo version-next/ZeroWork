@@ -1,0 +1,31 @@
+old_path	new_path	layer	mixed	note
+src/file_application_host_tests.zig	src/features/files/tests/file_application_host_tests.zig	tests	no	import ui
+src/file_authentication_tests.zig	src/features/files/tests/file_authentication_tests.zig	tests	no	不 import ui；测 file_authentication（该文件建议下沉 core）
+src/file_mkdir_view_tests.zig	src/features/files/tests/file_mkdir_view_tests.zig	tests	no	import ui
+src/file_workspace_controller_tests.zig	src/features/files/tests/file_workspace_controller_tests.zig	tests	no	测 host/file_workspace_controller.zig 且 import ui；按名称归 files
+src/file_workspace_native_fixture.zig	src/features/files/preview/file_workspace_native_fixture.zig	preview	no	build.zig:357 file-workspace-preview 硬编码此路径；import ui、zenit_app
+src/file_workspace_presentation_tests.zig	src/features/files/tests/file_workspace_presentation_tests.zig	tests	no	import ui
+src/file_workspace_view_tests.zig	src/features/files/tests/file_workspace_view_tests.zig	tests	no	import ui；依赖根目录 ui_theme_test_support.zig
+src/ui/file_actions_styles.zig	src/features/files/view/file_actions_styles.zig	view	no	import ui；跟随 file_actions_view
+src/ui/file_actions_view.zig	src/features/files/view/file_actions_view.zig	view	no	import ui；未被 core import
+src/ui/file_application_host.zig	src/features/files/host/file_application_host.zig	host	no	不 import ui，7 行兼容 shim 转发 plugins/sftp/provider_host；被 main.zig、ai_local_tools_tests、totp_autofill_tests、ui/ai_{file,group,ssh}_tools、ui/ai_tools import（ai 包需改路径）；未被 core import
+src/ui/file_authentication.zig	src/host/file_authentication.zig	core	no	不 import ui；被 core import: src/host/application_task_domain.zig、src/plugins/sftp/provider_host.zig；自身依赖 ui/host_key_confirmation.zig 与 ui/session_lifecycle.zig（后者按 §5.2 下沉 host/；host_key_confirmation 属 connections 包，需主 agent 确认）
+src/ui/file_copy_styles.zig	src/features/files/view/file_copy_styles.zig	view	no	import ui；跟随 file_copy_view
+src/ui/file_copy_view.zig	src/features/files/view/file_copy_view.zig	view	no	import ui；被 plugin import: src/plugins/sftp/provider_host.zig（Options 类型，2 处）；建议主 agent 裁决
+src/ui/file_mkdir_styles.zig	src/features/files/view/file_mkdir_styles.zig	view	no	import ui；跟随 file_mkdir_view
+src/ui/file_mkdir_view.zig	src/features/files/view/file_mkdir_view.zig	view	no	import ui；未被 core import
+src/ui/file_workspace_icons.zig	src/features/files/view/file_workspace_icons.zig	view	no	import ui；未被 core import
+src/ui/file_workspace_icons_assets.zig	src/features/files/model/file_workspace_icons_assets.zig	model	no	不 import ui（仅 icon_ir）；1390 行图标数据；专属 files，不进 shared/ui
+src/ui/file_workspace_presentation.zig	src/features/files/view/file_workspace_presentation.zig	view	yes	import ui；625 行含宿主逻辑（file_promises 等）；被 plugin import: src/plugins/sftp/provider_host.zig；建议主 agent 裁决是否下沉
+src/ui/file_workspace_styles.zig	src/features/files/view/file_workspace_styles.zig	view	no	import ui；import files/_styles.yss.zig，搬后改为同目录 _styles.yss.zig
+src/ui/file_workspace_title_icons.zig	src/features/files/model/file_workspace_title_icons.zig	model	no	不 import ui（仅 icon_ir）图标数据
+src/ui/file_workspace_view.zig	src/features/files/view/file_workspace_view.zig	view	yes	import ui；1712 行；被 core import: src/host/file_workspace_controller.zig:10（pub const View，已知）；严格下沉会连带 styles/icons，建议主 agent 裁决
+src/ui/files/_styles.yss.zig	src/features/files/view/_styles.yss.zig	view	no	styles.yss 生成孪生，须与 styles.yss 同目录；被 file_workspace_styles import
+src/ui/files/styles.yss	src/features/files/view/styles.yss	view	no	yss 源；仅 files 使用
+# CONTESTED src/file_binding_host_runner.zig root-core 只 import host/proto/platform，不 import src/ui（本包未认领，供主 agent 核对归属）
+# E2E build.zig 引用了 src/file_workspace_native_fixture.zig
+# E2E docs/ui-revamp/ARCHITECTURE_PLAN.md 引用了 src/ui/files/styles.yss
+# E2E docs/ui-revamp/PENCIL_MAP.md 引用了 src/ui/files/styles.yss
+# E2E docs/ui-revamp/YIX_SPIKE.md 引用了 src/ui/files/styles.yss
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/ui/files/styles.yss
+# TESTID files

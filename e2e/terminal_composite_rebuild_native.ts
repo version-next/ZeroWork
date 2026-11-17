@@ -1,4 +1,7 @@
 /** Native large-history rebuild lifecycle. Profilers run outside frame samples. */
+import { closeWorkspaceTab } from './workspace_tab_actions.ts';
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,realpath,mkdir,open,writeFile,readFile,rm} from 'node:fs/promises';
@@ -6,7 +9,8 @@ import {tmpdir} from 'node:os';
 import {resolve,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
-const {waitForServerReady,query,clickTestId,type_,key,waitFor,screenshot,resizeWindow,stats,resetTiming,request}=await import(process.env.ZEROWORK_HARNESS_CLIENT??new URL('../zig-out/share/zenit/harness/client.ts',import.meta.url).href);
+const harness=await import(process.env.ZEROWORK_HARNESS_CLIENT??new URL('../zig-out/share/zenit/harness/client.ts',import.meta.url).href);
+const {waitForServerReady,query,clickTestId,type_,key,waitFor,screenshot,resizeWindow,stats,resetTiming,request}=harness;
 const [binaryArg,outArg]=process.argv.slice(2);assert(binaryArg&&outArg);
 const captureVisuals=process.env.ZEROWORK_REBUILD_SCREENSHOTS!=='0';
 const binary=resolve(binaryArg),out=resolve(outArg),temp=await realpath(await mkdtemp(join(tmpdir(),'zw-rebuild-')));
@@ -25,7 +29,7 @@ async function metrics(){return request('POST','/zerowork/terminal',{action:'met
 async function command(value:string,token:string){await type_(value);await key('enter');await waitFor(async()=>(await tail()).includes(token)||null,45000,10);}
 let iteration=0;
 const label=(name:string)=>iteration===0?name:`reopen${iteration}_${name}`;
-function rss(){return Number(execFileSync('/bin/ps',['-p',String(child.pid),'-o','rss='],{encoding:'utf8'}).trim());}
+function rss(){return Number(psCompat(['-p',String(child.pid),'-o','rss=']).trim());}
 async function phase(name:string,action?:()=>Promise<void>,heap=false){
  name=label(name);
  await log.write(`PHASE_START ${name}\n`);
@@ -95,7 +99,7 @@ try{
  }
  if(captureVisuals)await screenshot(join(out,label('cleared')+'.png'));
  await phase('ended',async()=>{await type_('exit');await key('enter');await waitFor(async()=>(await query('local.ended.close')).some(shown)||null,45000);});
- await phase('tab_closed',async()=>{await clickTestId(`tabs.close.${iteration+1}`);await waitFor(async()=>(await query('workspace.empty.local')).some(shown)||null,15000);},true);
+ await phase('tab_closed',async()=>{await closeWorkspaceTab(harness, `tabs.tab.${iteration+1}`);await waitFor(async()=>(await query('workspace.empty.local')).some(shown)||null,15000);},true);
  if(captureVisuals)await screenshot(join(out,label('closed')+'.png'));assert.equal(report.phases[label('tab_closed')].terminal.error,'TabMissing');
  if(report.phases[label('tab_closed')].memory?.background_search_tasks!==undefined)assert.equal(report.phases[label('tab_closed')].memory.background_search_tasks,0);
  if(process.env.ZEROWORK_REBUILD_IDLE&&!(process.env.ZEROWORK_REBUILD_IDLE==='mixed'&&iteration===0)){

@@ -16,6 +16,7 @@ const node_state = @import("node_state.zig");
 const text_utils = @import("text_utils.zig");
 const style_render = @import("node_style_render.zig");
 const text_trace = @import("trace").text_flicker;
+const grapheme = @import("text_core").grapheme;
 const INVALID_ID = @import("../property_tree.zig").INVALID_ID;
 
 const RenderContext = render_context_mod.RenderContext;
@@ -133,7 +134,6 @@ pub fn appendTextBlobForNode(
             .max_lines = t.max_lines,
         },
         .content_hash = text_hashes.content_hash,
-        .content = t.content,
         .spans_hash = layout_spans_hash,
         .line_count = 1,
         .total_height = t.font_size * t.line_height,
@@ -141,15 +141,17 @@ pub fn appendTextBlobForNode(
         .wrap_width = wrap_width,
     };
 
+    var single_line: [1]text_blob_mod.LineInfo = undefined;
+    var blob_lines: []const text_blob_mod.LineInfo = &single_line;
     if (tl) |layout| {
-        blob.lines = layout.lines;
+        blob_lines = layout.lines();
         blob.line_count = layout.line_count;
         blob.total_height = layout.total_height;
         blob.max_line_width = layout.max_line_width;
         blob.wrap_width = if (wrap_width > 0) wrap_width else layout.cached_available_width;
     } else {
         const width = text_utils.measureSegmentWidthCtx(cx, t.content, t.font_size, t.font_weight, t.use_italic_font, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
-        blob.lines[0] = .{
+        single_line[0] = .{
             .byte_start = 0,
             .byte_end = @intCast(t.content.len),
             .width = width,
@@ -157,7 +159,7 @@ pub fn appendTextBlobForNode(
         blob.max_line_width = width;
     }
 
-    const result = try cx.text_blob_store.appendOrReuseTracked(blob);
+    const result = try cx.text_blob_store.appendOrReuseTracked(blob, blob_lines);
     if (!result.reused and t.content.len > 0 and (raster_policy != .static_crisp or blob.line_count > 4)) {
         text_trace.log(
             cx.scene_runtime.frame_epoch,
@@ -254,15 +256,40 @@ test "single-line text blob retains measurement fallback without a drawn width" 
     try std.testing.expectEqual(@as(u16, 19), blob.style_key.font_family);
 }
 
+test "explicit ASCII cell grid survives font-neutral spans without the global monospace face" {
+    const core = @import("../../core.zig");
+    const spans = [_]types.TextSpan{.{ .start = 0, .end = 3, .bg_color = types.Color.rgba(255, 220, 80, 120) }};
+    for ([_]f32{ 0, 8.25 }) |cell| {
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+        defer cx.deinit();
+        cx.setViewport(200, 40);
+        cx.root = try core.box(cx, .{ .width = .fill(), .height = .fill() }, .{});
+        const label = try core.text(cx, "abc def", .{ .font_family = 7, .font_size = 14, .monospace_char_width = cell });
+        var props = label.getText().?;
+        props.spans = spans[0..];
+        label.setText(props);
+        try cx.root.?.appendChild(cx.allocator, label);
+        cx.layout();
+        _ = cx.render();
+        var runs: usize = 0;
+        for (cx.display_list.items.items) |item| switch (item) {
+            .text_run => |run| {
+                runs += 1;
+                try std.testing.expect(!run.use_monospace_font);
+                try std.testing.expectEqual(cell, run.monospace_char_width);
+            },
+            else => {},
+        };
+        try std.testing.expect(runs > 0);
+    }
+}
+
 /// Fallback text for blob-backed text_run.
 ///
-/// Normal path reads bytes indirectly via blob_id (saves a copy); but blob_id is frame-local,
-/// and items surviving across frames (replay/cache) may land on blobs created by other controls.
-/// resolveTextRunContent detects the mismatch via content_hash and falls back here.
-/// Empty fallback means the text cannot be rendered even after detection (terminal renders blank).
-///
-/// Slice points to the node's own text buffer, no extra allocation; empty only on overflow.
-fn blobFallbackSlice(content: []const u8, start: u32, end: u32) []const u8 {
+/// The bytes of a run. The display list copies them into its payload arena on append, so the
+/// item owns what it shows; the blob the run was laid out in holds no bytes (see text_blob.zig).
+/// Empty when the range lies outside the content.
+fn runBytes(content: []const u8, start: u32, end: u32) []const u8 {
     if (start >= end or end > content.len) return "";
     return content[start..end];
 }
@@ -325,10 +352,13 @@ pub fn appendUnderline(
             }
         },
         .dotted => {
+            // Round dots of diameter `th`, one diameter apart (VS Code's hint
+            // underline: r = 1 dots every 4px). Only whole dots are drawn.
             const th = if (thickness > 0) thickness else 1.5;
+            const r = th * 0.5;
             var dx: f32 = 0;
-            while (dx < width) : (dx += 4) {
-                try appendDisplayRect(cx, header, x + dx, y, @min(1.5, width - dx), th, color, .{ 1, 1, 1, 1 });
+            while (dx + th <= width + 0.01) : (dx += th * 2) {
+                try appendDisplayRect(cx, header, x + dx, y, th, th, color, .{ r, r, r, r });
             }
         },
         .wavy => {
@@ -339,11 +369,11 @@ pub fn appendUnderline(
     }
 }
 
-/// Wavy line waveform (derived from font size). Magnitude aligned with VS Code / JetBrains: at 14px
-/// font size,
-/// period ≈ 4.2px, centerline peak-to-peak ≈ 1.5px, line width 1px, total height ≈ 2.5px: thin and
-/// clear.
-/// (Old params: peak-to-peak ≈ 3.9px + line width ≈ 2px, ~6px total, looked thick and coarse.)
+/// Wavy line waveform (derived from font size), VS Code's squiggle geometry: its 6×3 px SVG tile
+/// (`editorError.foreground` polygons, repeat-x along the bottom of the line box) is one period of
+/// 6px, 3px tall overall with a ~1px stroke, measured 12px → 6px period / 6 device px tall at 2x.
+/// At 13px that is period 6, centerline peak-to-peak 2, line width 1 (total height 3); it scales
+/// with the font size and never drops below a visible 4px period / 1.5px peak-to-peak.
 pub const WavyParams = struct {
     period: f32,
     /// Centerline amplitude (half peak-to-peak)
@@ -353,8 +383,8 @@ pub const WavyParams = struct {
 
     pub fn forFontSize(font_size: f32) WavyParams {
         return .{
-            .period = @max(@as(f32, 3.5), font_size * 0.3),
-            .amplitude = @max(@as(f32, 0.6), font_size * 0.055),
+            .period = @max(@as(f32, 4.0), font_size * (6.0 / 13.0)),
+            .amplitude = @max(@as(f32, 0.75), font_size / 13.0),
             .thickness = @max(@as(f32, 1.0), font_size * 0.07),
         };
     }
@@ -412,11 +442,13 @@ fn appendWavyUnderline(
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-test "WavyParams: 14px diagnostic squiggle is thin and small (mainstream editors' scale)" {
-    const p = WavyParams.forFontSize(14);
-    try std.testing.expect(p.totalHeight(p.thickness) <= 3.0);
-    try std.testing.expect(p.thickness >= 1.0); // No thinner than visible
-    try std.testing.expect(p.period >= 3.5 and p.period <= 5.0);
+test "WavyParams: 13px diagnostic squiggle has VS Code's 6x3 tile geometry" {
+    const p = WavyParams.forFontSize(13);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), p.period, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), p.totalHeight(p.thickness), 1e-4);
+    try std.testing.expectEqual(@as(f32, 1.0), p.thickness); // No thinner than visible
+    const tiny = WavyParams.forFontSize(6);
+    try std.testing.expect(tiny.period >= 4.0 and tiny.amplitude >= 0.75);
     const big = WavyParams.forFontSize(32);
     try std.testing.expect(big.period > p.period and big.amplitude > p.amplitude);
 }
@@ -471,13 +503,6 @@ pub fn appendDisplayLineWithSpans(
     var shape_measure_guard = layout_engine.beginExternalShapeMeasure(cx.shaping_cache, cx.font_system);
     defer shape_measure_guard.end();
 
-    // blob_id is frame-local; cross-frame items may land on other controls' blobs.
-    // Carries content_hash for resolveTextRunContent to verify the id still points to the same
-    // text.
-    const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
-        bl.content_hash
-    else
-        0;
     const spans = t.spans;
     const content = t.content;
     const font_size = t.font_size;
@@ -487,7 +512,8 @@ pub fn appendDisplayLineWithSpans(
     // a bidi line into logical-order chunks. Build geometry from the shared
     // visual caret model, paint every disjoint visual rectangle, then emit one
     // whole-line text run so CoreText keeps its original run order/ligatures.
-    var visual_only_spans = !t.use_monospace_font and t.monospace_char_width <= 0;
+    // An explicit ASCII cell grid needs per-chunk positioning like the monospace face.
+    var visual_only_spans = !t.use_monospace_font and !(t.monospace_char_width > 0);
     for (spans) |span| {
         if (span.font_weight != null or span.use_italic_font or span.use_monospace_font or text_layout.spanHasInlineBox(span)) {
             visual_only_spans = false;
@@ -539,7 +565,7 @@ pub fn appendDisplayLineWithSpans(
                     .header = header,
                     .x = text_x,
                     .y = baseline_y,
-                    .content = blobFallbackSlice(content, line_byte_start, line_byte_end),
+                    .content = runBytes(content, line_byte_start, line_byte_end),
                     .blob_byte_start = line_byte_start,
                     .blob_byte_end = line_byte_end,
                     .color = base_text_color,
@@ -553,7 +579,6 @@ pub fn appendDisplayLineWithSpans(
                     .use_italic_font = t.use_italic_font,
                     .spans = local_spans[0..local_span_count],
                     .blob_id = blob_id,
-                    .blob_content_hash = blob_content_hash,
                     .raster_policy = raster_policy,
                 },
             });
@@ -897,7 +922,7 @@ pub fn appendDisplayLineWithSpans(
                 .header = header,
                 .x = run_x,
                 .y = baseline_y,
-                .content = blobFallbackSlice(content, run_byte_start, run_byte_end),
+                .content = runBytes(content, run_byte_start, run_byte_end),
                 .blob_byte_start = run_byte_start,
                 .blob_byte_end = run_byte_end,
                 .color = base_text_color,
@@ -911,7 +936,6 @@ pub fn appendDisplayLineWithSpans(
                 .use_italic_font = head.use_italic,
                 .spans = run_spans[0..span_count],
                 .blob_id = blob_id,
-                .blob_content_hash = blob_content_hash,
                 .raster_policy = raster_policy,
             },
         });
@@ -919,10 +943,19 @@ pub fn appendDisplayLineWithSpans(
         run_start = run_end;
     }
 
-    // Step 2: underline / strikethrough still drawn per chunk individually
-    // (independent of text_run emit; position determined by chunk.text_x / chunk.text_width)
+    // Step 2: strikethrough per chunk; underline per run. Chunks split where
+    // the text color changes (syntax tokens), but one decoration span across
+    // them is one line: a wavy underline drawn per chunk restarts its phase
+    // at every token boundary and, when a chunk is a whole number of
+    // half-periods wide, paints the boundary dot twice. Adjacent chunks with
+    // the same underline (style, color, offset, thickness) are drawn as one.
+    var ul_run: ?UnderlineRun = null;
     for (chunks[0..chunk_count]) |chunk| {
-        if (chunk.kind != .span) continue;
+        if (chunk.kind != .span) {
+            if (ul_run) |run| try run.emit(cx, header, font_size);
+            ul_run = null;
+            continue;
+        }
         const span = spans[chunk.span_index];
         const seg_color = span.color orelse base_text_color;
         if (bracketRenderDebugEnabled() and span.bg_color != null and
@@ -943,23 +976,52 @@ pub fn appendDisplayLineWithSpans(
         if (span.strikethrough) {
             try appendDisplayRect(cx, header, chunk.text_x, line_y + line_h * 0.5, chunk.text_width, 1, seg_color, .{ 0, 0, 0, 0 });
         }
-        if (span.underline) {
-            const ul_color = span.underline_color orelse seg_color;
-            const ul_y = line_y + line_h - 2 + span.underline_offset;
-            try appendUnderline(
-                cx,
-                header,
-                chunk.text_x,
-                ul_y,
-                chunk.text_width,
-                font_size,
-                span.underline_style,
-                span.underline_thickness,
-                ul_color,
-            );
+        if (!span.underline) {
+            if (ul_run) |run| try run.emit(cx, header, font_size);
+            ul_run = null;
+            continue;
         }
+        const next: UnderlineRun = .{
+            .x = chunk.text_x,
+            .width = chunk.text_width,
+            .y = line_y + line_h - 2 + span.underline_offset,
+            .style = span.underline_style,
+            .thickness = span.underline_thickness,
+            .color = span.underline_color orelse seg_color,
+        };
+        if (ul_run) |*run| {
+            if (run.continuedBy(next)) {
+                run.width = next.x + next.width - run.x;
+                continue;
+            }
+            try run.emit(cx, header, font_size);
+        }
+        ul_run = next;
     }
+    if (ul_run) |run| try run.emit(cx, header, font_size);
 }
+
+/// One underline drawn across adjacent chunks (see Step 2 above).
+const UnderlineRun = struct {
+    x: f32,
+    width: f32,
+    y: f32,
+    style: types.UnderlineStyle,
+    thickness: f32,
+    color: Color,
+
+    fn continuedBy(self: UnderlineRun, next: UnderlineRun) bool {
+        return @abs(self.x + self.width - next.x) < 0.01 and self.y == next.y and self.style == next.style and
+            self.thickness == next.thickness and std.meta.eql(self.color, next.color);
+    }
+
+    fn emit(self: UnderlineRun, cx: *RenderContext, header: display_list_mod.ItemHeader, font_size: f32) !void {
+        try appendUnderline(cx, header, self.x, self.y, self.width, font_size, self.style, self.thickness, self.color);
+    }
+};
+
+/// Overflow below this (px) is float noise between layout and shaping widths, not truncation.
+const ellipsis_overflow_epsilon: f32 = @import("../layout_engine.zig").text_overflow_epsilon;
 
 pub fn appendDisplayEllipsisText(
     cx: *RenderContext,
@@ -972,12 +1034,62 @@ pub fn appendDisplayEllipsisText(
     avail_w: f32,
     raster_policy: text_blob_mod.TextRasterPolicy,
 ) !void {
-    // blob_id is frame-local; cross-frame items may land on other controls' blobs.
-    // Carries content_hash for resolveTextRunContent to verify identity.
-    const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
-        bl.content_hash
-    else
-        0;
+    const line_h = t.font_size * t.line_height;
+    _ = try appendEllipsizedRange(cx, header, content_version, t, blob_id, .{
+        .start = 0,
+        .end = @intCast(t.content.len),
+        .suffix_end = if (t.text_overflow == .ellipsis_smart) @intCast(t.content.len) else null,
+    }, text_x, baseline_y - @import("../layout_engine.zig").firstTextBaseline(t), baseline_y, line_h, avail_w, raster_policy);
+}
+
+/// What an ellipsized run draws: `content[start..end]` cut to fit, the ellipsis, and for
+/// `ellipsis_smart` the extension of `content[start..suffix_end]` (the text being cut: a line, or
+/// for the last line of line-truncated text, everything after its start).
+const EllipsisRange = struct {
+    start: u32,
+    end: u32,
+    /// Keep the extension (from the last `.` after `start`) of `content[start..suffix_end]`.
+    suffix_end: ?u32 = null,
+    /// Drop the spaces that hang at the cut before the ellipsis (lines of multi-line text).
+    trim_hanging_spaces: bool = false,
+};
+
+/// Spans that only paint (colour, background, decoration) and never change glyph advances: the
+/// cut can be measured without them and the drawn prefix keeps them.
+pub fn spansKeepMetrics(spans: []const types.TextSpan) bool {
+    for (spans) |span| {
+        if (span.font_weight != null or span.use_italic_font or span.use_monospace_font or text_layout.spanHasInlineBox(span)) return false;
+    }
+    return true;
+}
+
+/// The colour a span gives the byte at `at` (the ellipsis takes the colour of the text it follows).
+fn colorAt(t: *const types.TextProps, at: u32) Color {
+    var color = t.color;
+    for (t.spans) |span| {
+        if (span.start <= at and at < span.end) if (span.color) |c| {
+            color = c;
+        };
+    }
+    return color;
+}
+
+/// `range` cut to fit `avail_w` with an ellipsis (and kept extension) at `text_x`; returns the drawn
+/// width (the strikethrough spans it). Metric-neutral spans keep painting the drawn prefix.
+fn appendEllipsizedRange(
+    cx: *RenderContext,
+    header: display_list_mod.ItemHeader,
+    content_version: u32,
+    t: *const types.TextProps,
+    blob_id: u32,
+    range: EllipsisRange,
+    text_x: f32,
+    line_y: f32,
+    baseline_y: f32,
+    line_h: f32,
+    avail_w: f32,
+    raster_policy: text_blob_mod.TextRasterPolicy,
+) !f32 {
     const content = t.content;
     const font_size = t.font_size;
     const font_weight = t.font_weight;
@@ -985,42 +1097,46 @@ pub fn appendDisplayEllipsisText(
     const ellipsis = "\xe2\x80\xa6";
     const ellipsis_w = text_utils.measureSegmentWidthCtx(cx, ellipsis, font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
 
-    var suffix: []const u8 = "";
-    var suffix_start: u32 = @intCast(content.len);
+    // Extension to keep (ellipsis_smart): after the last '.' past the range start, on one line.
+    var suffix_start: u32 = range.end;
+    var suffix_stop: u32 = range.end;
     var suffix_w: f32 = 0;
-    if (t.text_overflow == .ellipsis_smart) {
-        var dot_pos: ?usize = null;
-        var i: usize = content.len;
-        while (i > 0) {
+    if (range.suffix_end) |stop| {
+        var i: usize = stop;
+        while (i > range.start) {
             i -= 1;
+            if (content[i] == '\n') break;
             if (content[i] == '.') {
-                if (i > 0) dot_pos = i;
+                if (i > range.start) {
+                    suffix_start = @intCast(i);
+                    suffix_stop = stop;
+                }
                 break;
             }
         }
-        if (dot_pos) |dp| {
-            suffix = content[dp..];
-            suffix_start = @intCast(dp);
-            suffix_w = text_utils.measureSegmentWidthCtx(cx, suffix, font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
-        }
+        if (suffix_stop > suffix_start) suffix_w = text_utils.measureSegmentWidthCtx(cx, content[suffix_start..suffix_stop], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
     }
 
     var prefix_budget = avail_w - ellipsis_w - suffix_w;
     if (prefix_budget < 0) {
-        suffix = "";
-        suffix_start = @intCast(content.len);
+        suffix_start = range.end;
+        suffix_stop = range.end;
         suffix_w = 0;
         prefix_budget = avail_w - ellipsis_w;
     }
-    const prefix_range_end = suffix_start;
+    const prefix_range_end = @min(range.end, suffix_start);
 
-    var prefix_end: usize = 0;
+    var prefix_end: usize = range.start;
     var prefix_w: f32 = 0;
-    if (text_layout.floorPrefixBoundaryByWidthCached(
+    // The interaction prefix cache measures without the family / monospace face / cell width
+    // the run is drawn with, so for those its widths are narrower than the drawn prefix and the
+    // ellipsis lands past the box. Measure such text with the drawn-width path below.
+    const prefix_cache_ok = !t.use_monospace_font and t.font_family == 0 and t.monospace_char_width == 0;
+    if (if (prefix_cache_ok) text_layout.floorPrefixBoundaryByWidthCached(
         header.node_id,
         content_version,
-        content,
-        0,
+        content[0..prefix_range_end],
+        range.start,
         prefix_range_end,
         prefix_budget,
         font_size,
@@ -1028,17 +1144,18 @@ pub fn appendDisplayEllipsisText(
         use_italic,
         t.use_monospace_font,
         &.{},
-    )) |cached_prefix| {
+    ) else null) |cached_prefix| {
         prefix_end = cached_prefix.byte_end;
         prefix_w = cached_prefix.width;
     } else {
         const frame_allocator = cx.frame_allocator;
-        const boundaries = try frame_allocator.alloc(u32, @as(usize, prefix_range_end) + 1);
+        const boundaries = try frame_allocator.alloc(u32, @as(usize, prefix_range_end - range.start) + 1);
         var boundary_count: usize = 1;
-        boundaries[0] = 0;
-        var cursor: usize = 0;
+        boundaries[0] = range.start;
+        var cursor: usize = range.start;
+        var clusters = grapheme.BoundaryCursor.init(content[0..prefix_range_end]);
         while (cursor < prefix_range_end) {
-            const next = text_utils.nextUtf8Boundary(content, cursor);
+            const next = clusters.next(cursor);
             if (next <= cursor) break;
             boundaries[boundary_count] = @intCast(next);
             boundary_count += 1;
@@ -1050,48 +1167,36 @@ pub fn appendDisplayEllipsisText(
         while (lo < hi) {
             const mid = lo + ((hi - lo + 1) / 2);
             const candidate_end: usize = boundaries[mid];
-            const w = text_utils.measureSegmentWidthCtx(cx, content[0..candidate_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
+            const w = text_utils.measureSegmentWidthCtx(cx, content[range.start..candidate_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
             if (w <= prefix_budget) {
                 lo = mid;
-            } else if (mid == 0) {
-                break;
             } else {
                 hi = mid - 1;
             }
         }
         prefix_end = boundaries[lo];
-        prefix_w = text_utils.measureSegmentWidthCtx(cx, content[0..prefix_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
+        prefix_w = text_utils.measureSegmentWidthCtx(cx, content[range.start..prefix_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
     }
-    if (prefix_end == 0 and prefix_range_end > 0 and content.len > 0) {
-        prefix_end = @min(text_utils.nextUtf8Boundary(content, 0), prefix_range_end);
-        prefix_w = text_utils.measureSegmentWidthCtx(cx, content[0..prefix_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
+    // If even the first grapheme does not fit, show only the ellipsis. Forcing
+    // one scalar here breaks skin-tone / ZWJ emoji and combining sequences.
+
+    if (range.trim_hanging_spaces) {
+        var trimmed = prefix_end;
+        while (trimmed > range.start) {
+            var cp_start = trimmed - 1;
+            while (cp_start > range.start and (content[cp_start] & 0xC0) == 0x80) cp_start -= 1;
+            if (!text_layout.isLineEndHangingSpace(text_layout.decodeUtf8(content[cp_start..trimmed]))) break;
+            trimmed = cp_start;
+        }
+        if (trimmed != prefix_end) {
+            prefix_end = trimmed;
+            prefix_w = text_utils.measureSegmentWidthCtx(cx, content[range.start..prefix_end], font_size, font_weight, use_italic, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
+        }
     }
 
-    const prefix = content[0..prefix_end];
     var cur_x = text_x;
-    if (prefix.len > 0) {
-        try cx.display_list.append(.{
-            .text_run = .{
-                .header = header,
-                .x = cur_x,
-                .y = baseline_y,
-                .content = blobFallbackSlice(content, 0, @intCast(prefix_end)),
-                .blob_byte_start = 0,
-                .blob_byte_end = @intCast(prefix_end),
-                .color = t.color,
-                .font_size = font_size,
-                .font_weight = font_weight,
-                .font_family = t.font_family,
-                .use_symbols_font = t.use_symbols_font,
-                .font_smoothing = t.font_smoothing,
-                .use_monospace_font = t.use_monospace_font,
-                .monospace_char_width = t.monospace_char_width,
-                .use_italic_font = use_italic,
-                .blob_id = blob_id,
-                .blob_content_hash = blob_content_hash,
-                .raster_policy = raster_policy,
-            },
-        });
+    if (prefix_end > range.start) {
+        try appendPlainOrSpanned(cx, header, content_version, t, blob_id, range.start, @intCast(prefix_end), cur_x, line_y, baseline_y, line_h, raster_policy);
         cur_x += prefix_w;
     }
 
@@ -1101,7 +1206,7 @@ pub fn appendDisplayEllipsisText(
             .x = cur_x,
             .y = baseline_y,
             .content = ellipsis,
-            .color = t.color,
+            .color = colorAt(t, if (prefix_end > range.start) @intCast(prefix_end - 1) else range.start),
             .font_size = font_size,
             .font_weight = font_weight,
             .use_symbols_font = false,
@@ -1115,30 +1220,55 @@ pub fn appendDisplayEllipsisText(
     });
     cur_x += ellipsis_w;
 
-    if (suffix.len > 0) {
-        try cx.display_list.append(.{
-            .text_run = .{
-                .header = header,
-                .x = cur_x,
-                .y = baseline_y,
-                .content = blobFallbackSlice(content, @intCast(t.content.len - suffix.len), @intCast(t.content.len)),
-                .blob_byte_start = @intCast(t.content.len - suffix.len),
-                .blob_byte_end = @intCast(t.content.len),
-                .color = t.color,
-                .font_size = font_size,
-                .font_weight = font_weight,
-                .font_family = t.font_family,
-                .use_symbols_font = t.use_symbols_font,
-                .font_smoothing = t.font_smoothing,
-                .use_monospace_font = t.use_monospace_font,
-                .monospace_char_width = t.monospace_char_width,
-                .use_italic_font = use_italic,
-                .blob_id = blob_id,
-                .blob_content_hash = blob_content_hash,
-                .raster_policy = raster_policy,
-            },
-        });
+    if (suffix_stop > suffix_start) {
+        // A kept extension beyond the range (the last line of line-truncated text) was never laid
+        // out on a visible line: it is shaped on its own, not taken from the line blob.
+        const suffix_blob = if (suffix_start < range.end) blob_id else INVALID_ID;
+        try appendPlainOrSpanned(cx, header, content_version, t, suffix_blob, suffix_start, suffix_stop, cur_x, line_y, baseline_y, line_h, raster_policy);
     }
+    return cur_x + suffix_w - text_x;
+}
+
+/// `content[start..end]` as one run, or through the span painter when the text has spans.
+fn appendPlainOrSpanned(
+    cx: *RenderContext,
+    header: display_list_mod.ItemHeader,
+    content_version: u32,
+    t: *const types.TextProps,
+    blob_id: u32,
+    start: u32,
+    end: u32,
+    x: f32,
+    line_y: f32,
+    baseline_y: f32,
+    line_h: f32,
+    raster_policy: text_blob_mod.TextRasterPolicy,
+) !void {
+    if (t.spans.len > 0) {
+        try appendDisplayLineWithSpans(cx, header, content_version, t, blob_id, start, end, x, line_y, baseline_y, line_h, t.color, raster_policy);
+        return;
+    }
+    try cx.display_list.append(.{
+        .text_run = .{
+            .header = header,
+            .x = x,
+            .y = baseline_y,
+            .content = runBytes(t.content, start, end),
+            .blob_byte_start = start,
+            .blob_byte_end = end,
+            .color = t.color,
+            .font_size = t.font_size,
+            .font_weight = t.font_weight,
+            .font_family = t.font_family,
+            .use_symbols_font = t.use_symbols_font,
+            .font_smoothing = t.font_smoothing,
+            .use_monospace_font = t.use_monospace_font,
+            .monospace_char_width = t.monospace_char_width,
+            .use_italic_font = t.use_italic_font,
+            .blob_id = blob_id,
+            .raster_policy = raster_policy,
+        },
+    });
 }
 
 pub fn appendDisplayTextItem(
@@ -1167,20 +1297,37 @@ pub fn appendDisplayTextItemBorrowed(
         .static_crisp;
     const wrap_width = @max(0, exec_state.render_w - exec_state.pad_left - exec_state.pad_right);
     const blob_id = try appendTextBlobForNode(cx, node, t, tl, wrap_width, raster_policy);
-    // Passed with blob_id so resolveTextRunContent can verify the id still points to the same text.
-    const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
-        bl.content_hash
-    else
-        0;
+    @import("trace").work_counters.add(.text_paint_lines, if (tl) |layout| layout.line_count else 1);
     const line_h = t.font_size * t.line_height;
-    const bl_ratio = if (t.baseline_ratio > 0) t.baseline_ratio else 0.75;
+    const first_baseline = @import("../layout_engine.zig").firstTextBaseline(t);
 
     // Per-visual-line alignment (TextProps.text_align): only shifts draw start; uses same formula
     // as host cursor conversion.
     const align_avail_w = @max(0, exec_state.render_w - exec_state.pad_left - exec_state.pad_right);
     if (tl) |layout| {
-        var line_y = exec_state.pad_top;
-        for (layout.lines[0..layout.line_count]) |line| {
+        // text_overflow on multi-line text: a line wider than the box ends in an ellipsis (as the
+        // single line does), and so does the last line of text that max_lines cut short. Spans
+        // that change metrics keep the plain cut.
+        const marks_overflow = t.text_overflow != .clip and t.content.len > 0 and spansKeepMetrics(t.spans);
+        for (layout.lines(), 0..) |line, line_index| {
+            // Line i sits at i line heights, the same product layout's total_height uses. An
+            // accumulated sum drifts from it by float rounding: tens of pixels over tens of
+            // thousands of lines at a non-binary line height (13 x 1.35).
+            const line_y = exec_state.pad_top + @as(f32, @floatFromInt(line_index)) * line_h;
+            const cut_last = layout.lines_truncated and line_index + 1 == layout.line_count;
+            if (marks_overflow and line.byte_end <= t.content.len and (cut_last or line.width - align_avail_w > ellipsis_overflow_epsilon)) {
+                // Aligned by the laid-out line width, as carets and hit testing place it; the cut
+                // keeps the drawn part inside the box.
+                const offset = text_layout.alignLineOffset(t.text_align, align_avail_w, line.width);
+                const drawn = try appendEllipsizedRange(cx, header, exec_state.retained_runtime.content_version, t, blob_id, .{
+                    .start = line.byte_start,
+                    .end = @max(line.byte_start, line.byte_end),
+                    .suffix_end = if (t.text_overflow != .ellipsis_smart) null else if (cut_last) @intCast(t.content.len) else line.byte_end,
+                    .trim_hanging_spaces = true,
+                }, exec_state.pad_left + offset, line_y, line_y + first_baseline, line_h, align_avail_w - offset, raster_policy);
+                if (t.strikethrough) try appendDisplayRect(cx, header, exec_state.pad_left + offset, line_y + line_h * 0.5, drawn, 1, t.color, .{ 0, 0, 0, 0 });
+                continue;
+            }
             if (line.byte_start < line.byte_end and line.byte_end <= t.content.len) {
                 const line_x = exec_state.pad_left + text_layout.alignLineOffset(t.text_align, align_avail_w, line.width);
                 if (t.spans.len > 0) {
@@ -1194,20 +1341,19 @@ pub fn appendDisplayTextItemBorrowed(
                         line.byte_end,
                         line_x,
                         line_y,
-                        line_y + line_h * bl_ratio,
+                        line_y + first_baseline,
                         line_h,
                         t.color,
                         raster_policy,
                     );
-                    line_y += line_h;
                     continue;
                 }
                 try cx.display_list.append(.{
                     .text_run = .{
                         .header = header,
                         .x = line_x,
-                        .y = line_y + line_h * bl_ratio,
-                        .content = blobFallbackSlice(t.content, line.byte_start, line.byte_end),
+                        .y = line_y + first_baseline,
+                        .content = runBytes(t.content, line.byte_start, line.byte_end),
                         .blob_byte_start = line.byte_start,
                         .blob_byte_end = line.byte_end,
                         .color = t.color,
@@ -1221,7 +1367,6 @@ pub fn appendDisplayTextItemBorrowed(
                         .use_italic_font = t.use_italic_font,
                         .spans = if (t.spans.len > 0) t.spans else null,
                         .blob_id = blob_id,
-                        .blob_content_hash = blob_content_hash,
                         .raster_policy = raster_policy,
                     },
                 });
@@ -1229,33 +1374,28 @@ pub fn appendDisplayTextItemBorrowed(
                     try appendDisplayRect(cx, header, line_x, line_y + line_h * 0.5, line.width, 1, t.color, .{ 0, 0, 0, 0 });
                 }
             }
-            line_y += line_h;
         }
         return;
     }
 
-    const content_h = exec_state.render_h - exec_state.pad_top - exec_state.pad_bottom;
     const text_h = line_h;
-    const text_y = if (content_h > text_h)
-        exec_state.pad_top + (content_h - text_h) / 2.0
-    else
-        exec_state.pad_top;
+    // A CSS text block starts its first line at the content top. Vertical
+    // centering belongs to the containing flex box, not a hidden text offset.
+    const text_y = exec_state.pad_top;
     const avail_w = exec_state.render_w - exec_state.pad_left - exec_state.pad_right;
-    const need_ellipsis = t.text_overflow != .clip and t.content.len > 0 and t.spans.len == 0;
+    const need_ellipsis = t.text_overflow != .clip and t.content.len > 0 and spansKeepMetrics(t.spans);
     if (need_ellipsis) {
         const full_w = if (cx.text_blob_store.get(blob_id)) |blob| blob.max_line_width else text_utils.measureSegmentWidthCtx(cx, t.content, t.font_size, t.font_weight, t.use_italic_font, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
-        if (full_w > avail_w) {
-            try appendDisplayEllipsisText(
-                cx,
-                header,
-                exec_state.retained_runtime.content_version,
-                t,
-                blob_id,
-                exec_state.pad_left,
-                text_y + text_h * bl_ratio,
-                avail_w,
-                raster_policy,
-            );
+        // Layout sizes a fit text node to its measured width through f32 sums, so render_w can
+        // land an ulp under full_w; only a real overflow may ellipsize.
+        if (full_w - avail_w > ellipsis_overflow_epsilon) {
+            const drawn = try appendEllipsizedRange(cx, header, exec_state.retained_runtime.content_version, t, blob_id, .{
+                .start = 0,
+                .end = @intCast(t.content.len),
+                .suffix_end = if (t.text_overflow == .ellipsis_smart) @intCast(t.content.len) else null,
+            }, exec_state.pad_left, text_y, text_y + first_baseline, text_h, avail_w, raster_policy);
+            // The strikethrough runs under what is drawn (prefix, ellipsis, kept suffix).
+            if (t.strikethrough) try appendDisplayRect(cx, header, exec_state.pad_left, text_y + text_h * 0.5, drawn, 1, t.color, .{ 0, 0, 0, 0 });
             return;
         }
     }
@@ -1276,7 +1416,7 @@ pub fn appendDisplayTextItemBorrowed(
             @intCast(t.content.len),
             single_x,
             text_y,
-            text_y + text_h * bl_ratio,
+            text_y + first_baseline,
             text_h,
             t.color,
             raster_policy,
@@ -1288,8 +1428,8 @@ pub fn appendDisplayTextItemBorrowed(
         .text_run = .{
             .header = header,
             .x = single_x,
-            .y = text_y + text_h * bl_ratio,
-            .content = blobFallbackSlice(t.content, 0, @intCast(t.content.len)),
+            .y = text_y + first_baseline,
+            .content = runBytes(t.content, 0, @intCast(t.content.len)),
             .blob_byte_start = 0,
             .blob_byte_end = @intCast(t.content.len),
             .color = t.color,
@@ -1302,7 +1442,6 @@ pub fn appendDisplayTextItemBorrowed(
             .monospace_char_width = t.monospace_char_width,
             .use_italic_font = t.use_italic_font,
             .blob_id = blob_id,
-            .blob_content_hash = blob_content_hash,
             .raster_policy = raster_policy,
             // Right fade mask: window anchor at **available width** end (relative to run start).
             .fade_dx0 = if (t.fade_right > 0) @max(0, avail_w - t.fade_right) else 0,
@@ -1313,4 +1452,23 @@ pub fn appendDisplayTextItemBorrowed(
         const strike_w = exec_state.render_w - exec_state.pad_left - exec_state.pad_right;
         try appendDisplayRect(cx, header, exec_state.pad_left, text_y + text_h * 0.5, strike_w, 1, t.color, .{ 0, 0, 0, 0 });
     }
+}
+
+test "UnderlineRun: adjacent chunks with the same decoration join into one line" {
+    const c0 = std.mem.zeroes(Color);
+    var c1 = c0;
+    c1.r = 1;
+    const a: UnderlineRun = .{ .x = 10, .width = 7.8, .y = 20, .style = .wavy, .thickness = 1, .color = c0 };
+    var b = a;
+    b.x = 17.8;
+    try std.testing.expect(a.continuedBy(b));
+    var gap = b;
+    gap.x = 19;
+    try std.testing.expect(!a.continuedBy(gap));
+    var other_color = b;
+    other_color.color = c1;
+    try std.testing.expect(!a.continuedBy(other_color));
+    var other_style = b;
+    other_style.style = .solid;
+    try std.testing.expect(!a.continuedBy(other_style));
 }

@@ -105,7 +105,17 @@ If you want to see (or customize) the manual wiring, read `attach` /
 helper replaces.
 
 The forwarded Harness options default to disabled and do not affect production
-builds. `installHarnessClient` puts the optional TypeScript controller at a
+builds.
+
+Zenit's `ZENIT_*` diagnostic and test overrides are read from the process
+environment only in automation builds: `-Dtest-mode=true`, `-Ddev-preview=true`
+or a Debug build of the dependency. Release Apps compile those reads out on the
+Zig side and in the native bridges, so a launched App cannot be reconfigured
+through its environment. Forward `.optimize` to `b.dependency("zenit", ...)` as
+above; an omitted `optimize` leaves the dependency in Debug, which keeps the
+overrides. Pass `.@"automation-env" = true` (or `false`) to the dependency to
+choose explicitly, for example to keep diagnostics in a Release acceptance
+build. `installHarnessClient` puts the optional TypeScript controller at a
 stable path under `zig-out`; see [`HARNESS.md`](HARNESS.md) for automated input,
 virtual cursor, screenshot, and application-surface recording examples.
 
@@ -358,7 +368,7 @@ Each of the four examples is wired in `build.zig` with **only** `ui` and
 |---|---|
 | Black window / no text | Default font fallback chain (Helvetica Neue -> Arial -> Helvetica -> Inter -> Menlo) missed. Override via `App.init(.{ .font = .{ .fallback_families = &.{"YourFont"} } })`. |
 | Layout looks wrong / element in unexpected position | Use the inspector overlay (see "Inspecting your UI" above). The dashed rect + dimension label nearly always reveals the issue. |
-| Click goes to the wrong node | Same: hover overlay shows you the actual hit-test target. If a transparent ancestor is capturing clicks, set `hit_behavior = .pass_through` on it via `style.ensureExt(allocator).hit_behavior`. |
+| Click goes to the wrong node | Same: hover overlay shows you the actual hit-test target. If a transparent ancestor is capturing clicks, set `.hit_behavior = .pass_through` in its style (`.style = .{ .hit_behavior = .pass_through }`, a `BoxStyle` field); on a raw node, `(try node.style.ensureExtFallible(allocator)).hit_behavior = .pass_through`. |
 | Hover/pressed state never resets | Make sure you're calling `app.processEvents()` each frame (or using `app.run()` / `app.runWith()`, which does it for you). |
 | Text appears clipped to a wrong line count | `text(...)` defaults to single-line. Pass `.wrap = .word` and an explicit `width` (or grow). |
 | Frame rate drops on large lists | Use `ui.widgets.VirtualList`. Plain `box` with thousands of children layouts every node every frame. |

@@ -65,7 +65,7 @@ pub fn run(io: std.Io) !void {
     const before = Window.liveWindowCount();
     const foreground = GetForegroundWindow();
     const alloc = std.heap.page_allocator;
-    const temp = try @import("zenit_environment").getOwned(alloc, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(alloc, "TEMP");
     defer alloc.free(temp);
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}\\zenit-ascii-{x}.bmp", .{ temp, randomId(io) }, 0);
     defer alloc.free(path);

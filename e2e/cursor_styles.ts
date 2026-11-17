@@ -3,6 +3,8 @@
  * Uses an existing test-mode binary and isolated background Harness/data.
  * No native GUI, OS preference change, build, or test-only production entry.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -11,6 +13,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForServerReady, waitFor, query, clickTestId, key, type_, resizeWindow, screenshot, sleep, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
+import { decodePng } from "../vendor/zenit/e2e/png.ts";
+import { settingsNav, clickLabel } from "./settings_nav.ts";
+const nav = settingsNav();
+// Cursor shape is a native Tabs (settings.field.cursor_style) on 外观与主题 › 字体与排版; its items have no own test id.
+const cursorLabel: Record<string, string> = { block: "方块", bar: "竖线", underline: "下划线" };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -90,7 +97,7 @@ async function click(id: string): Promise<void> {
   assert((await clickTestId(id)).ok, `Click ${id}`);
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -128,15 +135,15 @@ async function geometry(style: Style): Promise<Record<string, unknown>> {
     const glyphs = (row.children ?? []).filter((node) => shown(node) && node.text && node.text.trim().length > 0);
     assert.equal(glyphs.map((node) => node.text).join(""), marker);
     assert(glyphs.length > 0);
-    // TerminalSurface owns this direct leaf (create appends caret, preedit,
-    // message, then rows). This is public application query data, not a walk
-    // into a Zenit widget's private content or a test-only production ID.
-    const caret = surface.children?.[0];
+    const caret = (await query("terminal.surface.caret")).find(shown);
     assert(caret && caret.tag === "box" && (caret.children?.length ?? 0) === 0, "Expected the public Surface caret leaf");
+    assert(caret.rect.x >= surface.rect.x && caret.rect.x + caret.rect.w <= surface.rect.x + surface.rect.w);
     if (!shown(caret)) return null;
     if (caretId === undefined) caretId = caret.id;
     assert.equal(caret.id, caretId, "Saving appearance must retain the Local caret/client node");
-    const cellWidth = glyphs[0].rect.w, rowHeight = row.rect.h;
+    // TerminalSurface may merge adjacent cells with the same styling into one span.
+    const cellWidth = glyphs.reduce((width, glyph) => width + glyph.rect.w, 0) / marker.length;
+    const rowHeight = row.rect.h;
     near(rowHeight, 22, "Actual default row height");
     near(caret.rect.x, glyphs[0].rect.x + marker.length * cellWidth, "Caret column");
     near(caret.rect.y, row.rect.y + (style === "underline" ? rowHeight - 2 : 0), "Caret row/bottom alignment");
@@ -146,8 +153,12 @@ async function geometry(style: Style): Promise<Record<string, unknown>> {
   });
 }
 async function capture(name: string, observed: Record<string, unknown>): Promise<void> {
-  await sleep(150);
-  assert((await screenshot(join(output, `${name}.png`))).ok, `Screenshot ${name}`);
+  const path = join(output, `${name}.png`);
+  const painted = await waitFor(async () => {
+    assert((await screenshot(path)).ok, `Screenshot ${name}`);
+    return caretPixels(path, observed);
+  }, 3000);
+  observed.painted_caret = painted;
   await writeFile(join(output, `${name}.geometry.json`), JSON.stringify(observed, null, 2));
   await writeFile(join(output, `${name}.queries.json`), JSON.stringify({
     surface: await query("terminal.surface"), first_row: await query("terminal.surface.row.0"), tabs: await query("tabs.strip"),
@@ -155,16 +166,35 @@ async function capture(name: string, observed: Record<string, unknown>): Promise
   (report.captures as string[]).push(`${name}.png`);
   (report.geometries as Record<string, unknown>[]).push(observed);
 }
+function caretPixels(path: string, observed: Record<string, unknown>) {
+  const image = decodePng(path), scale = image.width / 1440;
+  const caret = (observed.caret as Node).rect;
+  const row = observed.row as { rect: Node["rect"] };
+  const rgb = (x: number, y: number) => {
+    const offset = (y * image.width + x) * image.channels;
+    return image.pixels.subarray(offset, offset + 3).join(",");
+  };
+  const ink = rgb(Math.floor((caret.x + caret.w / 2) * scale), Math.floor((caret.y + caret.h / 2) * scale));
+  const background = rgb(Math.ceil((caret.x + 12) * scale), Math.floor((caret.y + caret.h / 2) * scale));
+  if (ink === background) return null;
+  const xs: number[] = [], ys: number[] = [];
+  for (let y = Math.floor(row.rect.y * scale); y < Math.ceil((row.rect.y + row.rect.h) * scale); y++) {
+    for (let x = Math.floor(caret.x * scale); x < Math.ceil((caret.x + 12) * scale); x++) {
+      if (rgb(x, y) === ink) { xs.push(x); ys.push(y); }
+    }
+  }
+  const painted = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs) + 1, h: Math.max(...ys) - Math.min(...ys) + 1 };
+  const matches = (["x", "y", "w", "h"] as const).every((axis) => Math.abs(painted[axis] - caret[axis] * scale) <= 2);
+  return matches ? { ...painted, scale } : null;
+}
 let revision = 1;
 async function saveStyle(style: Style): Promise<void> {
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  if (!(await query("settings.field.cursor_style")).some(shown)) await click("settings.appearance.font.header");
-  await click("settings.field.cursor_style");
-  await click(`settings.option.cursor_style.${style}`);
-  await waitFor(async () => (await visible("settings.footer.state")).text === "未保存" || null);
+  await nav.toField("cursor_style");
+  await clickLabel("settings.field.cursor_style", cursorLabel[style]);
+  await waitFor(async () => (await nav.dirty()) || null);
   await click("settings.save");
-  await waitFor(async () => (await visible("settings.footer.state")).text === "已保存" || null);
+  // Saved: the floating Save Bar hides (was the persistent footer state "已保存").
+  await nav.saved();
   const saved = await readFile(configPath, "utf8");
   assert.equal(configValue(saved, "ui", "cursor_style"), style);
   const nextRevision = Number(configValue(saved, "meta", "config_revision"));
@@ -176,8 +206,8 @@ async function saveStyle(style: Style): Promise<void> {
   ] as const) assert.equal(configValue(saved, section, field), expected, `Unrelated ${section}.${field} stays unchanged`);
   near(Number(configValue(saved, "ui", "line_height")), 11 / 7, "Saved line-height precision");
   await writeFile(join(output, `config-${style}.toml`), saved);
-  await click("settings.close");
-  await hidden("settings.close");
+  await nav.close();
+  await hidden("settings.panel");
   await click("terminal.surface");
   await capture(`cursor-${style}`, await geometry(style));
   checks.push(`Production settings saved ${style} at revision ${revision}; actual Local caret geometry matched without rebuilding the node`);
@@ -208,11 +238,13 @@ try {
   await key("enter");
   await waitFor(async () => !descendants().some((process) => process.pid === shell.pid) || null);
   await visible("local.ended.reconnect");
-  await click("tabs.close.1");
+  assert.match(text(await visible("local.notice.detail")), /退出码 0/);
+  await click("local.ended.close");
   await visible("workspace.empty.local");
   assert.equal(descendants().filter((process) => /(^|\/)(zsh|sleep)$/.test(process.command)).length, 0);
   report.local_shell_exit = "normal shell exit; captured original PID absent and closed tab returns to empty workspace";
-  report.status = "functional_checks_passed_visual_review_pending";
+  report.visual_review = "pixel_geometry_verified";
+  report.status = "passed";
 } catch (error) {
   failure = launchError ?? error;
   report.status = "failed";

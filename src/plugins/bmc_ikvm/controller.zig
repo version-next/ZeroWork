@@ -102,6 +102,8 @@ pub const Controller = struct {
     state: Snapshot,
     connection_progress: progress.Tracker = .{},
     control_command: ?QueuedControl = null,
+    /// Where this session's publications wake the presentation (the window showing it).
+    wake: @import("presentation_wake.zig").Wake = .{},
 
     pub fn create(a: std.mem.Allocator, owner: svc.identity.SessionHandle, operation: svc.OperationKey, payload: model.Payload, configs: ?resolver.Resolver, budget: *budgets.Budget, journal: *ledger.Journal, facade: ?actions.Facade) !*Controller {
         return createWithPolicy(a, owner, operation, payload, configs, budget, journal, facade, .user_approved);
@@ -134,12 +136,14 @@ pub const Controller = struct {
         self.initialize(a, owner, operation, config, plan, budget, @intCast(hops.len));
         self.state.input = try self.remote_input.snapshot(self.remote_input.binding());
         try self.manager.initWithPolicy(a, owner, self.config.value.endpoint, journal, facade, if (payload.display.read_only_requested) .read_only else policy);
+        self.manager.wake = &self.wake;
         return self;
     }
     // Keep the large aggregate initializer out of the fallible creation frame.
     fn initialize(self: *Controller, a: std.mem.Allocator, owner: svc.identity.SessionHandle, operation: svc.OperationKey, config: svc.Owned(model.Payload), plan: route.Plan, budget: *budgets.Budget, hops: u8) void {
         self.* = .{ .allocator = a, .config = config, .plan = plan, .owner = owner, .operation = operation, .framebuffer = frames.Service.init(a, owner, budget), .remote_input = input.Service.init(owner), .manager = undefined, .creator_thread = std.Thread.getCurrentId(), .state = .{ .owner = owner, .operation = operation, .input = undefined } };
         self.connection_progress = progress.Tracker.init(hops);
+        self.connection_progress.wake = &self.wake;
     }
     pub fn start(self: *Controller, identity: profile.Identity, driver: Driver) !void {
         const selected = profile.select(identity) catch |err| {
@@ -279,11 +283,15 @@ pub const Controller = struct {
         self.lock();
         self.state.cleanup = .awaiting;
         self.unlock();
+        self.published();
         while (true) {
             const receipt = driver.cleanup(driver.context);
             self.lock();
-            self.state.cleanup = if (receipt == .released) .awaiting else receipt;
+            const next: Cleanup = if (receipt == .released) .awaiting else receipt;
+            const changed = self.state.cleanup != next;
+            self.state.cleanup = next;
             self.unlock();
+            if (changed) self.published();
             if (receipt == .released) break;
             driver.wait(driver.context, 10);
         }
@@ -297,6 +305,9 @@ pub const Controller = struct {
             };
             break;
         }
+        // The cleanup barrier above is complete. Freeze the progress clocks before publishing the
+        // released state: a reader that sees `released` then also reads the final elapsed times.
+        self.connection_progress.finish(self.cancel_requested.load(.acquire));
         self.lock();
         self.state.cleanup = .released;
         self.state.route = .closed;
@@ -306,8 +317,9 @@ pub const Controller = struct {
         if (self.state.video != .failed) self.state.video = .closed;
         self.state.management = .closed;
         self.unlock();
-        self.connection_progress.finish(self.cancel_requested.load(.acquire));
         self.worker_exited.store(true, .release);
+        // The last publication: the owner's poll reads the released receipt on the frame this wakes.
+        self.published();
     }
     fn work(self: *Controller, driver: Driver) !void {
         if (self.cancel_requested.load(.acquire)) return;
@@ -316,6 +328,7 @@ pub const Controller = struct {
         self.state.video = .authenticating;
         self.state.management = .authenticating;
         self.unlock();
+        self.published();
         self.connection_progress.setStage(.route);
         const authenticated = try driver.begin(driver.context, &self.config.value, &self.plan, self.operation, &self.cancel_requested);
         // A successful but stale begin still owns resources; run always cleans
@@ -330,9 +343,11 @@ pub const Controller = struct {
         self.state.video = .negotiating;
         self.state.management = if (authenticated.web_authenticated and (if (driver.management_available) |available| available(driver.context) else true)) .available else .unavailable;
         self.unlock();
+        self.published();
         var bytes: [16 * 1024]u8 = undefined;
         var performance: Performance = .{};
         var active_turns: usize = 0;
+        var presented: ?Presented = null;
         const wire: video.Wire = .{ .context = driver.context, .write = driver.write, .abort = driver.abort };
         while (!self.cancel_requested.load(.acquire)) {
             const written_before = self.pipeline.?.written_bytes;
@@ -409,8 +424,16 @@ pub const Controller = struct {
                 .awaiting_frame => .awaiting_first_frame,
                 else => .rfb_negotiation,
             };
+            var current: Presented = .{ .management = self.state.management, .video = self.state.video, .published_frames = self.state.published_frames, .control = self.state.control, .control_request = self.state.control_request, .rfb_ready = self.state.rfb_ready };
             self.unlock();
             self.connection_progress.setStage(connection_stage);
+            // This loop turns every 2 ms whether or not anything happened. Wake the presentation
+            // only when a value the owner's poll reads has changed since the previous turn.
+            if (self.remote_input.snapshot(self.remote_input.binding())) |value| current.input = Presented.Input.of(value) else |_| {}
+            if (presented == null or !std.meta.eql(presented.?, current)) {
+                presented = current;
+                self.published();
+            }
             // Drain ready TLS records without a sleep per record. Yield after
             // 16 productive turns (at most 256 KiB of video; writes also count).
             // The 2 ms wait applies only when neither read nor write progressed.
@@ -435,6 +458,42 @@ pub const Controller = struct {
             if (self.state.route != .connected) self.state.route = .failed;
         }
         self.unlock();
+        self.published();
+    }
+    /// What the protocol worker publishes for the owner's main-thread poll, reduced to the values
+    /// whose change must reach the screen (the transfer counters in `Performance` and the input
+    /// queue's own sequence numbers move constantly and are read only when something else changed).
+    const Presented = struct {
+        management: ManagementState,
+        video: VideoState,
+        published_frames: u64,
+        control: video.rfb.ControlState,
+        control_request: ?[4]u8,
+        rfb_ready: bool,
+        input: ?Input = null,
+        const Input = struct {
+            input_epoch: u64,
+            explicit_input_epoch: u64,
+            control_generation: u64,
+            transport_generation: u64,
+            connected: bool,
+            controlled: bool,
+            focused: bool,
+            capture_paused: bool,
+            remote_unconfirmed: bool,
+            /// Queue depths: reaching zero is what the AI activity and receipts wait for.
+            queued: usize,
+            automation_queued: usize,
+            geometry_generation: u64,
+            geometry_pending: bool,
+            fn of(value: input.Snapshot) Input {
+                return .{ .input_epoch = value.input_epoch, .explicit_input_epoch = value.explicit_input_epoch, .control_generation = value.control_generation, .transport_generation = value.transport_generation, .connected = value.connected, .controlled = value.controlled, .focused = value.focused, .capture_paused = value.capture_paused, .remote_unconfirmed = value.remote_unconfirmed, .queued = value.queued, .automation_queued = value.automation_queued, .geometry_generation = value.geometry_generation, .geometry_pending = value.geometry_pending };
+            }
+        };
+    };
+    /// A worker publication the owner must drain: wake the main loop (edge-triggered, coalesced).
+    fn published(self: *Controller) void {
+        self.wake.notify();
     }
     fn decoderReady(phase: video.rfb.Phase) bool {
         return switch (phase) {

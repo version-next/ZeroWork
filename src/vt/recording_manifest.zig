@@ -1,6 +1,8 @@
 //! The single durable authority for new terminal recordings. TSV is discovery
 //! compatibility only; raw offsets always refer to received PTY bytes.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
+const schema = persist.SchemaRange.exactly(1);
 pub const execution = @import("../host/terminal_execution.zig");
 pub const SourceKind = enum { local, ssh };
 pub const Coverage = enum { complete, retained, gapped, partial, unavailable };
@@ -137,7 +139,7 @@ pub fn validatePath(path: []const u8) !void {
     while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidRecordingPath;
 }
 pub fn validate(value: Manifest) !void {
-    if (value.schema_version != 1) return error.UnsupportedManifestVersion;
+    if (!schema.accepts(value.schema_version)) return error.UnsupportedManifestVersion;
     if (value.archive_key.len != 32 or value.recording_id.len != 32 or value.manifest_revision == 0) return error.InvalidManifest;
     var id: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&id, value.archive_key) catch return error.InvalidManifest;
@@ -200,11 +202,7 @@ pub fn save(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []c
         parent = child;
         owns_parent = true;
     }
-    var atomic = try parent.createFileAtomic(io, std.fs.path.basename(path), .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(0o600)), .make_path = false, .replace = true });
-    defer atomic.deinit(io);
-    try atomic.file.writePositionalAll(io, bytes, 0);
-    try atomic.file.sync(io);
-    try atomic.replace(io);
+    try persist.writeAtomic(io, parent, std.fs.path.basename(path), bytes, .{});
 }
 pub const SizedManifest = struct { parsed: std.json.Parsed(Manifest), source_length: usize };
 pub fn load(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.json.Parsed(Manifest) {

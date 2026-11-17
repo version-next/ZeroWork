@@ -2,11 +2,15 @@
  * Uses an isolated real Local pair; only the model replies are deterministic.
  * ZW_AI_TEST_PREFIX=$PWD/zig-out node e2e/ai_auto_scope_native.ts /tmp/zw-auto-scope-evidence
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,open,realpath,rm,readdir,access} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleBody,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
 const h=await import(join(prefix,'share/zenit/harness/client.ts'));
@@ -25,7 +29,7 @@ const bodyOf=(result:any)=>{for(const block of result.content??[])try{return JSO
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'auto-scope-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;const request=JSON.parse(raw),results=new Map<string,any>();
+  const raw=await readRequestText(req);if(isTitleBody(raw))return skipTitle(res);const request=JSON.parse(raw),results=new Map<string,any>();
   for(const message of request.messages??[])if(message.role==='tool'){
    const envelope=JSON.parse(message.content),body=bodyOf(envelope);observations.set(message.tool_call_id,{envelope,body});results.set(message.tool_call_id,body);
   }
@@ -46,9 +50,9 @@ const server=createServer(async(req,res)=>{
   if(!results.has('open-session'))return emit('open-session','host.open_session',{group_ref:group.group_ref,source_ref:source.session_ref,connection_policy:'new_only',retention:'keep',request_key:'auto-open-session'});
   const opened=results.get('open-session');assert.equal(opened.ownership,'created_task',JSON.stringify(opened));
   let ready:any=null;
-  for(let i=0;i<4;i++){
+  for(let i=0;;i++){
    const id='ready-'+i,value=results.get(id);
-   if(!value)return emit(id,'host.wait_session_ready',{operation_ref:opened.operation_ref,after_revision:ready?.source_revision??opened.source_revision,wait_ms:30000});
+   if(!value){if(!pollWithin('ready',120000))break;return emit(id,'host.wait_session_ready',{operation_ref:opened.operation_ref,after_revision:ready?.source_revision??opened.source_revision,wait_ms:30000})}
    ready=value;if(ready.state==='ready')break;
   }
   assert.equal(ready.state,'ready');assert.equal(ready.membership_committed,true);
@@ -76,20 +80,22 @@ const visible=(id:string)=>h.waitFor(async()=>{assert.equal(fixtureFailure,null)
 const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
 const capture=async(name:string)=>{
  assert((await h.screenshot(join(out,name+'.png'))).ok);
- await writeFile(join(out,name+'.json'),JSON.stringify({permission:await h.query('ai.composer.permission'),approval:await h.query('ai.host_approval'),group:await h.query('groups.workspace')},null,2));
+ await writeFile(join(out,name+'.json'),JSON.stringify({permission:await h.query('ai.composer.permission'),approval:await h.query('ai.interaction.panel'),group:await h.query('groups.workspace')},null,2));
 };
 try{
  await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  await click('ai.prompt');await h.type_('验证自动模式下当前授权范围内的组写入和工具操作。');await click('ai.send');
- await visible('ai.host_approval');await capture('01-lifecycle-pending');
- await click('ai.composer.permission');await click('ai.permission.auto');
- await h.waitFor(async()=>!(await h.query('ai.host_approval')).some(shown)||null,10000);
+ // 审批卡已移进输入区交互卡（ai_composer_interaction_view.zig）：ai.host_approval / ai.approval.accept → ai.interaction.*
+ await visible('ai.interaction.approve');await capture('01-lifecycle-pending');
+ // 交互卡展开时输入区控件（含权限芯片）隐藏；先“稍后处理”收起交互卡，再在输入区切到自动。
+ await click('ai.interaction.postpone');await click('ai.composer.permission');await click('ai.permission.auto');
+ await h.waitFor(async()=>!(await h.query('ai.interaction.approve')).some(shown)||null,10000);
  report.checks.push('switching a pending lifecycle call to auto resumes its original group creation');
  const started=performance.now();
  while(!finished&&performance.now()-started<120000){
-  assert.equal(fixtureFailure,null);assert(!(await h.query('ai.host_approval')).some(shown),'auto must not display another host permission card');
-  assert(!(await h.query('ai.approval.accept')).some(shown),'auto must not ask for group command approval');
+  assert.equal(fixtureFailure,null);assert(!(await h.query('ai.interaction.panel')).some(shown),'auto must not display another host permission card');
+  assert(!(await h.query('ai.interaction.approve')).some(shown),'auto must not ask for group command approval');
   await h.sleep(100);
  }
  assert.equal(fixtureFailure,null);assert(finished,'fixture did not finish');

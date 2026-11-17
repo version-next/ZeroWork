@@ -62,7 +62,7 @@ pub const Host = struct {
         errdefer dir.close(io.io());
         const root = try self.allocator.dupe(u8, data_root);
         errdefer self.allocator.free(root);
-        self.journal = try Journal.open(self.allocator, io.io(), dir, "ai-sessions.jsonl");
+        self.journal = try Journal.openMigrating(self.allocator, io.io(), dir, @import("session_journal.zig").file_name, @import("session_journal.zig").legacy_file_name);
         errdefer {
             self.journal.?.deinit();
             self.journal = null;
@@ -86,7 +86,7 @@ pub const Host = struct {
             state.ended = true;
             state.historical_environment = true;
             state.listed = record.child == null;
-            state.phase = .stopped;
+            self.presentations.setPhase(state, .stopped);
             state.wire_history = try @import("wire_history.zig").History.copy(self.allocator, record.history.messages, "");
             state.wire_history.usage = record.history.usage;
             if (record.draft) |text| state.draft = try self.allocator.dupe(u8, text);

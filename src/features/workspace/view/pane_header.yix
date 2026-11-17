@@ -1,0 +1,73 @@
+//! 窗格头部（ZW2 / Pane Header QGtx5、tOrT3；W-5 收回，panel-heads）：会话窗格（分屏成员、单会话）与放进分屏的卡片
+//! 共用这一个模板，按事实推出部件——拖动把手（成员 / 卡片）· 类型图标 14 · 标题 12 · 连接状态点 · 弹性空白 ·
+//! 路径与尺寸 · 广播 · 置顶（成员）· 浮动 · 更多。高 30、内边距 0 4 0 12、间距 6（与面板头部同一规格）。
+//!
+//! - 按钮、提示、菜单全是原生默认外观：ghost sm 图标按钮（14）+ 原生 `W.Tooltip`；广播 / 置顶开启时换成
+//!   `secondary`（只换 variant，不覆盖样式）；“更多”是原生 `W.Menu`，经菜单唯一入口挂载（`PaneMore`，
+//!   菜单声明与动作由 workspace 给）。
+//! - 拖动：把手与标题挂 zenit 拖动绑定，绑定占用节点事件槽、要行自己的 scope，模板写不出——用手写组件
+//!   `PaneDrag`（`pane_header_view.zig`，YIX_EXCEPTIONS W-5 最小例外，同 TabCell 的写法）当标签用。
+//! 事实与动作都在 `pane_header_view.zig` 的 `Vm`；每次分屏呈现时 workspace 重建 Vm 与头部。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("pane_header_view.zig");
+const S = @import("pane_header.yss");
+
+fn keep(vm: *m.Vm, root: *ui.view.Ref(*ui.Node), more: *ui.view.Ref(*ui.Node), float: *ui.view.Ref(*ui.Node)) void {
+    vm.root = root.get();
+    vm.more_node = more.get();
+    // 浮动 only changes where the pane's content is shown: a pointer press on it leaves keyboard
+    // focus in the content (`surface_migration.placementButton`).
+    if (float.get()) |node| @import("../../../shared/ui/surface/surface_migration.zig").placementButton(node);
+}
+fn toggleVariant(on: bool) W.ButtonVariant {
+    return if (on) .secondary else .ghost;
+}
+
+pub fn PaneHeader(vm: *m.Vm) View {
+    const root = ref();
+    const more = ref();
+    const float = ref();
+    const dot = computed(vm.dotColor());
+    onMount(keep(vm, root, more, float));
+    return (
+        <row ref={root} testId={vm.ids.header} style={S.header} focusable={true} onFocus={vm.focusContent()}>
+            {if (vm.drag != null) <m.PaneDrag vm={vm} grip={true}><icon style={S.grip_icon} src={ui.icons.grip_vertical} /></m.PaneDrag>}
+            <icon testId={vm.ids.type_icon} style={S.Type.of(.{ .accent = vm.accentShown() })} src={vm.icon} />
+            {if (vm.drag != null)
+                <m.PaneDrag vm={vm} grip={false}><text testId={vm.ids.title} style={S.Title.of(.{ .focused = vm.titleEmphasized() })} box={S.title_box}>{vm.titleText()}</text></m.PaneDrag>
+            else
+                <box style={S.title_slot}><text testId={vm.ids.title} style={S.Title.of(.{ .focused = vm.titleEmphasized() })} box={S.title_box}>{vm.titleText()}</text></box>
+            }
+            {if (vm.dot != null) <box testId={vm.ids.status_dot} style={ui.view.styleBy(dot, S.dot)} />}
+            <box style={S.spacer} />
+            {if (vm.has_meta) <text testId={vm.ids.status} style={S.meta}>{vm.metaText()}</text>}
+            {if (vm.broadcast) |b|
+                <box style={S.action}>
+                    <W.Tooltip text={b.tooltip} position={.bottom}>
+                        <W.Button testId={b.test_id} variant={toggleVariant(b.on)} size={.sm} iconOnly={true} iconAsset={ui.icons.radio} iconSize={14} disabled={b.disabled} a11yLabel={b.label} onClick={vm.pressBroadcast()} />
+                    </W.Tooltip>
+                </box>
+            }
+            {if (vm.pin) |p|
+                <box style={S.action}>
+                    <W.Tooltip text={p.tooltip} position={.bottom}>
+                        <W.Button testId={p.test_id} variant={toggleVariant(p.on)} size={.sm} iconOnly={true} iconAsset={ui.icons.pin} iconSize={14} a11yLabel={p.label} onClick={vm.pressPin()} />
+                    </W.Tooltip>
+                </box>
+            }
+            <box style={S.action}>
+                <W.Tooltip text={vm.floatTooltip()} position={.bottom} parts={.{ .content = vm.ids.float_tooltip }}>
+                    <W.Button ref={float} testId={vm.ids.float} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.picture_in_picture_2} iconSize={14} disabled={vm.float_refusal != null} a11yLabel="浮动" onClick={vm.pressFloat()} />
+                </W.Tooltip>
+            </box>
+            <box style={S.action}>
+                <m.PaneMore vm={vm}>
+                    <W.Tooltip text={vm.more_label} position={.bottom}>
+                        <W.Button ref={more} testId={vm.ids.more} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.ellipsis} iconSize={14} a11yLabel={vm.more_label} />
+                    </W.Tooltip>
+                </m.PaneMore>
+            </box>
+        </row>
+    );
+}

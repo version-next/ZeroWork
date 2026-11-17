@@ -1,6 +1,7 @@
 /** Native production conflict View, with explicit synthetic frozen snapshots.
  * No Manager, SFTP, local file transfer, network request or IO success receipt.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -28,7 +29,12 @@ function shown(node: any): boolean { return !!node?.rect && node.visible !== fal
 async function visible(id: string): Promise<any> { return waitFor(async () => (await query(id)).find(shown) ?? null, 10000); }
 async function click(id: string): Promise<void> { await visible(id); assert((await clickTestId(id)).ok, `click ${id}`); }
 const epsilon = 0.6;
-async function scene(kind: string, body: (current: any, capture: (name: string, w: number, h: number) => Promise<any>) => Promise<void>): Promise<void> {
+// Island B v3（e1372d88，transfer_conflict_styles.zig，Pencil R028P）：冲突对话框宽 480（窗口更窄时让出两侧各 8），
+// 高度随内容、不超过窗口减 16；旧版是 620 / 460 宽的固定高度卡片。
+const DIALOG_WIDTH = 480;
+let win = { w: 0, h: 0 };
+async function resize(w: number, h: number) { win = { w, h }; return resizeWindow(w, h); }
+async function scene(kind: string, body: (current: any, capture: (name: string) => Promise<any>) => Promise<void>): Promise<void> {
   const isolated = await mkdtemp(join(tmpdir(), `zerowork-conflict-${kind}-`)), rpc = join(isolated, "rpc"), destination = join(output, kind);
   await Promise.all([mkdir(rpc), mkdir(destination)]);
   process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
@@ -37,10 +43,11 @@ async function scene(kind: string, body: (current: any, capture: (name: string, 
   const ended = new Promise<void>(done => child.once("close", () => done()));
   const current: any = { scene: kind, pid: child.pid, isolated, status: "running", stages: [] };
   report.scenes.push(current);
-  async function capture(name: string, w: number, h: number): Promise<any> {
+  async function capture(name: string): Promise<any> {
     const dialog = await waitFor(async () => {
       const node = (await query("transfer.conflict")).find(shown);
-      return node && Math.abs(node.rect.w - w) <= epsilon && node.rect.h <= h + epsilon ? node : null;
+      const want = Math.min(DIALOG_WIDTH, win.w - 16);
+      return node && Math.abs(node.rect.w - want) <= epsilon && node.rect.x >= 8 - epsilon && node.rect.y >= 8 - epsilon && node.rect.x + node.rect.w <= win.w - 8 + epsilon && node.rect.y + node.rect.h <= win.h - 8 + epsilon ? node : null;
     }, 10000);
     await mouseMove(1, 1);
     // Observational queries must not demand new frames from an already idle
@@ -60,7 +67,7 @@ async function scene(kind: string, body: (current: any, capture: (name: string, 
     const path = join(destination, `${name}.png`);
     assert((await screenshot(path)).ok);
     const after = await stats();
-    const stage = { name, screenshot: path, measured_at: measuredAt, screenshot_at: new Date().toISOString(), query_screenshot_atomic: false, expected_card: { w, h }, dialog: dialog.rect, nodes, frames: { before: before.frame_count, after: after.frame_count } };
+    const stage = { name, screenshot: path, measured_at: measuredAt, screenshot_at: new Date().toISOString(), query_screenshot_atomic: false, expected_card: { w: Math.min(DIALOG_WIDTH, win.w - 16), max_h: win.h - 16 }, dialog: dialog.rect, nodes, frames: { before: before.frame_count, after: after.frame_count } };
     current.stages.push(stage);
     console.log(`[conflict-native] ${kind}/${name}`);
     return stage;
@@ -90,56 +97,61 @@ async function scene(kind: string, body: (current: any, capture: (name: string, 
 let failure: unknown;
 try {
   await scene("choice", async (current, capture) => {
-    assert((await resizeWindow(636, 425)).ok);
-    const initial = await capture("00-no-default-selection", 620, 381);
+    assert((await resize(636, 425)).ok);
+    const initial = await capture("00-no-default-selection");
+    let previous: any = null;
     for (const id of ["skip", "save_as", "keep_both", "overwrite"]) {
-      const row = initial.nodes[`transfer.conflict.${id}`][0];
-      assert.equal(row.rect.w, 596); assert.equal(row.rect.h, 34);
+      // 四个选项是原生 RadioGroup 的选项：都显示、都在正文区内、自上而下互不重叠（不断言宽高：原生选项宽度随内容，带说明的“覆盖”更高）。
+      const row = initial.nodes[`transfer.conflict.${id}`][0], body = initial.nodes["transfer.conflict.viewport"][0];
+      assert(row, `choice ${id} is shown`);
+      assert(row.rect.x >= body.rect.x - epsilon && row.rect.x + row.rect.w <= body.rect.x + body.rect.w + epsilon, `choice ${id} stays inside the body`);
+      if (previous) assert(row.rect.y >= previous.rect.y + previous.rect.h - epsilon, `choice ${id} is below the previous one`);
+      previous = row;
     }
     await click("transfer.conflict.apply");
     assert(!/CONFLICT_UI_FIXTURE event=/.test(await readFile(join(output, "choice/app.log"), "utf8")), "No default approval");
     await click("transfer.conflict.save_as");
-    assert((await resizeWindow(636, 439)).ok);
+    assert((await resize(636, 439)).ok);
     await click("transfer.conflict.name");
     assert((await key("a", { cmd: true })).ok);
     assert((await type_("release-final.tar.gz")).ok);
     assert.equal((await inputState("transfer.conflict.name")).buffer, "release-final.tar.gz");
-    await capture("01-rename-draft", 620, 395);
+    await capture("01-rename-draft");
     await click("transfer.conflict.keep_both");
-    assert((await resizeWindow(636, 425)).ok);
-    await capture("02-keep-both", 620, 381);
+    assert((await resize(636, 425)).ok);
+    await capture("02-keep-both");
     await click("transfer.conflict.save_as");
     assert.equal((await inputState("transfer.conflict.name")).buffer, "release-final.tar.gz", "Choice switches retain exact draft");
     await click("transfer.conflict.overwrite");
-    await capture("03-overwrite-selected", 620, 381);
+    await capture("03-overwrite-selected");
     await click("transfer.conflict.close");
     await waitFor(async () => /event=pause_request_only job=42 attempt=1 session=101 generation=9/.test(await readFile(join(output, "choice/app.log"), "utf8")) ? true : null);
     current.checks = ["No default Apply dispatch", "Real pointer four-choice state", "Real Input typing retains exact rename across choices", "Choice close requests pause only for original captured key"];
   });
   await scene("remote", async (current, capture) => {
-    assert((await resizeWindow(476, 292)).ok);
-    await capture("00-remote-overwrite", 460, 256);
+    assert((await resize(476, 292)).ok);
+    await capture("00-remote-overwrite");
     await click("transfer.conflict.back");
     await waitFor(async () => /event=return_to_choice job=42 attempt=1 intent=501 session=101 generation=9 revision=1/.test(await readFile(join(output, "remote/app.log"), "utf8")) ? true : null);
     assert(!/event=pause_request_only|event=confirm_overwrite/.test(await readFile(join(output, "remote/app.log"), "utf8")));
-    current.checks = ["Exact 460×276 remote confirmation", "Back emits original return-to-choice identity only"];
+    current.checks = ["Remote confirmation dialog inside the window (480 wide, 460 in a 476 window)", "Back emits original return-to-choice identity only"];
   });
   await scene("local", async (current, capture) => {
-    assert((await resizeWindow(496, 244)).ok);
-    await capture("00-local-overwrite", 480, 199);
+    assert((await resize(496, 244)).ok);
+    await capture("00-local-overwrite");
     await click("transfer.conflict.apply");
     await waitFor(async () => /event=confirm_overwrite job=42 attempt=1 intent=501 session=101 generation=9 revision=1/.test(await readFile(join(output, "local/app.log"), "utf8")) ? true : null);
-    current.checks = ["Exact 480×228 local confirmation", "Explicit confirm emits original captured identity without claiming IO"];
+    current.checks = ["Local confirmation dialog inside the window (480 wide)", "Explicit confirm emits original captured identity without claiming IO"];
   });
   await scene("batch", async (current, capture) => {
-    assert((await resizeWindow(860, 480)).ok);
-    const before = await capture("00-batch-top-fixed-footer", 480, 464);
+    assert((await resize(860, 480)).ok);
+    const before = await capture("00-batch-top-fixed-footer");
     const viewport = before.nodes["transfer.conflict.viewport"][0].rect;
     const beforePaths = before.nodes["transfer.conflict.confirm.paths"][0].rect;
     assert(beforePaths.h > viewport.h, "Actual batch paths overflow the actual body viewport");
     assert((await scrollAt(viewport.x + 40, viewport.y + 30, 0, -600)).ok);
     await waitFor(async () => (await visible("transfer.conflict.confirm.paths")).rect.y < beforePaths.y - 50 ? true : null);
-    const after = await capture("01-batch-scrolled-fixed-footer", 480, 464);
+    const after = await capture("01-batch-scrolled-fixed-footer");
     assert.deepEqual(after.nodes["transfer.conflict.footer"][0].rect, before.nodes["transfer.conflict.footer"][0].rect, "Footer stays outside scrolling body");
     assert((await key("escape")).ok);
     await waitFor(async () => /event=return_to_choice job=42/.test(await readFile(join(output, "batch/app.log"), "utf8")) ? true : null);

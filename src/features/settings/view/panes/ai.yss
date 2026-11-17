@@ -1,0 +1,118 @@
+//! “AI 辅助”面板正文（F-set-ai，人工验收反馈第 10 条后半）的样式：服务提供方列表行（`GV8pb` › `lxZqv`）、
+//! 提供方详情、模型行、模型编辑器与删除确认的正文布局、技能与 MCP 的条目。
+//! 控件全是原生组件（Button / Input / Select / Switch / Checkbox / Tag / Badge / Tooltip / Menu / Modal / Textarea），
+//! 这里只给布局盒子与 `W.Pressable` 根（它没有自己的外观）定外观；颜色全是 token。
+const ui = @import("ui");
+
+/// 提供方列表行（`bCylr`）：`W.Pressable` 根，头像 + 行内，gap 12。悬停 / 按下只降不透明度（同概览行），保存中不响应。
+recipe AiProviderRow {
+  base {
+    width: fill; height: fit; flex-shrink: 0; direction: row; align-items: center; gap: 12; padding: 0; corner-radius: 0;
+    background: transparent; color: fg-primary;
+    :hover { opacity: 0.82; }
+    :active { opacity: 0.65; }
+  }
+  flag locked { color: fg-disabled; :hover { opacity: 1; } :active { opacity: 1; } }
+}
+/// 行内（`FtJpK`）：padding [9, 0]，gap 8；除最后一行外底部一条发丝线（同设置行分隔线，人工验收反馈 6）。
+recipe AiProviderInner {
+  base { width: fill; flex: 1; min-width: 0; direction: row; align-items: center; gap: 8; padding: 9 0; }
+  flag last { } else { border: 0 border; border-bottom-width: 1; }
+}
+/// 头像（`W:y0dYR` 的位置；zenit 没有 Avatar 组件，缺口 G46）：28 圆、文字 11 / 600。
+style ai_avatar { width: 28; height: 28; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 14; background: bg-active; }
+style ai_avatar_text { font-size: 11; font-weight: 600; line-height: {14.0 / 11.0}; color: fg-secondary; }
+/// 名称 13 / 400、摘要 11.5 次要墨色（`l2nChT` / `S4NvBu`），单行省略。
+style ai_copy { width: fill; flex: 1; min-width: 0; direction: column; align-items: start; gap: 1; }
+style ai_row_title { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; wrap: none; text-overflow: ellipsis; }
+style ai_row_summary { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+style ai_row_title_box { width: fill; min-width: 0; }
+/// 状态文字（`qOqrZ`“未启用”）。
+style ai_row_state { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: none; }
+style ai_chevron { width: 16; height: 16; flex-shrink: 0; icon-color: zw-fg-faint; }
+/// 列表下的动作行（`N3X9H`）：右对齐，上 2。
+style ai_actions { width: fill; flex-shrink: 0; direction: row; justify: end; align-items: center; gap: 8; padding: 2 0 0 0; }
+/// 列表为空：图标、标题、说明、按钮，居中。
+/// 提供方级提示（`settings.ai.provider_error`）。
+style ai_error { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: danger; wrap: word; }
+style ai_error_box { width: fill; }
+
+/// 详情页：输入框的列（输入框 + 显示 / 隐藏 API Key）。
+style ai_control { flex-shrink: 0; direction: row; align-items: center; gap: 4; }
+/// 面板页头右侧的动作（获取模型清单 / 添加模型）。
+style ai_header_actions { flex-shrink: 0; direction: row; align-items: center; gap: 4; }
+/// 模型清单状态（获取中 / 已获取 / 失败）：卡片内第一行。
+style ai_note { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: word; }
+style ai_note_box { width: fill; padding: 10 0 0 0; }
+/// 模型行（`ZN8NK`）：名称、上下文、能力标签、默认徽标，右侧星标 / 编辑 / 删除。
+style ai_model_name { min-width: 0; flex-shrink: 1; direction: row; align-items: center; }
+style ai_model_text { font-size: 12.5; font-weight: 400; line-height: {18.0 / 12.5}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+style ai_model_meta { flex-shrink: 0; direction: row; align-items: center; gap: 6; }
+style ai_model_context { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; wrap: none; }
+style ai_model_actions { flex-shrink: 0; direction: row; align-items: center; gap: 2; }
+/// 模型名的 `W.Pressable` 根（点开编辑器）：只给最小外观，悬停降不透明度。
+recipe AiModelName {
+  base { min-width: 0; flex-shrink: 1; direction: row; align-items: center; corner-radius: 4; background: transparent; :hover { opacity: 0.75; } :active { opacity: 0.6; } }
+}
+/// 没有模型时的空态行。
+style ai_label { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; color: fg-primary; }
+style ai_hint { font-size: 11.5; font-weight: 400; line-height: 1.4; color: zw-fg-supporting; wrap: word; }
+/// 详情页底部的删除 / 取消新增：右对齐。
+style ai_danger_row { width: fill; flex-shrink: 0; direction: row; justify: end; align-items: center; }
+
+/// 模型编辑器 / 删除确认（原生 `W.Modal` 的正文；面板、遮罩、标题栏都是 Modal 默认）。
+style ai_dialog { width: fill; direction: column; gap: 14; }
+/// 模型编辑器的表单区：原生 `W.ScrollArea`，高度随内容、最多 280（原生 `W.Modal` 的高度上限在挂载时固定、正文不滚动——
+/// 缺口 G40；表单放进滚动区，紧凑窗口（高 480）里页脚按钮仍在窗口内）。
+style ai_dialog_scroll { width: fill; height: {.{ .fit = .{ .max = 280 } }}; flex-shrink: 1; min-height: 0; }
+style ai_dialog_scroll_body { width: fill; direction: column; gap: 14; padding: 0 4 0 0; }
+style ai_dialog_sub { font-size: 12; font-weight: 400; line-height: 1.5; color: zw-fg-supporting; }
+style ai_field { width: fill; direction: column; gap: 6; }
+style ai_field_heading { width: fill; direction: row; align-items: center; gap: 6; }
+style ai_field_label { font-size: 12.5; font-weight: 500; line-height: {18.0 / 12.5}; color: fg-primary; }
+style ai_catalog_row { width: fill; direction: row; align-items: center; gap: 8; }
+style ai_catalog_status { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: word; }
+style ai_catalog_status_box { width: fill; flex: 1; min-width: 0; }
+style ai_capability { width: fill; direction: row; align-items: center; gap: 8; }
+style ai_capability_label { width: fill; flex: 1; min-width: 0; direction: row; align-items: center; gap: 6; }
+/// 能力来源的小图标（接口已返回 / 手动设置 / 未返回）：原生 Tooltip 说明。
+recipe AiSource {
+  base { width: 14; height: 14; flex-shrink: 0; icon-color: fg-secondary; }
+  variant tone = manual {
+    manual { icon-color: fg-secondary; }
+    api { icon-color: success; }
+    missing { icon-color: warning; }
+  }
+}
+style ai_source_slot { width: 18; height: 18; flex-shrink: 0; direction: row; align-items: center; justify: center; }
+style ai_efforts { width: fill; direction: column; gap: 6; padding: 0 0 0 2; }
+style ai_efforts_grid { width: fill; direction: row; flex-wrap: wrap; gap: 10; }
+style ai_test_row { width: fill; direction: row; align-items: center; gap: 12; padding: 10 12; corner-radius: 8; background: bg-secondary; }
+style ai_test_status { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-primary; wrap: word; }
+style ai_test_status_box { width: fill; flex: 1; min-width: 0; }
+style ai_dialog_error { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: danger; wrap: word; }
+style ai_dialog_actions { width: fill; direction: row; align-items: center; justify: end; gap: 8; padding: 4 0 0 0; }
+style ai_dialog_message { font-size: 13; font-weight: 400; line-height: 1.5; color: fg-primary; wrap: word; }
+style ai_dialog_text_box { width: fill; }
+style ai_dialog_anchor { position: absolute; width: 0; height: 0; }
+
+/// 技能 / MCP 条目（旧 `settings_mcp_styles.service` 的布局）：一行身份 + 开关 + 动作，下面可展开详情。
+style ai_ext_toolbar { width: fill; flex-shrink: 0; direction: row; align-items: center; gap: 12; padding: 10 0; }
+style ai_ext_summary { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: none; }
+style ai_ext_summary_box { width: fill; flex: 1; min-width: 0; }
+recipe AiExtRow {
+  base { width: fill; flex-shrink: 0; direction: column; gap: 6; padding: 10 0; min-width: 0; }
+  flag last { } else { border: 0 border; border-bottom-width: 1; }
+}
+style ai_ext_line { width: fill; direction: row; align-items: center; gap: 10; min-width: 0; }
+style ai_ext_icon_tile { width: 28; height: 28; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 14; background: bg-active; }
+style ai_ext_icon { width: 16; height: 16; icon-color: fg-secondary; }
+style ai_ext_identity { width: fill; flex: 1; min-width: 0; direction: column; gap: 3; }
+style ai_ext_title { font-size: 12.5; font-weight: 600; line-height: {18.0 / 12.5}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+style ai_ext_meta { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+style ai_ext_text_box { width: fill; min-width: 0; }
+style ai_ext_failure { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: danger; wrap: word; }
+style ai_ext_failure_box { width: fill; min-width: 0; padding: 0 0 0 38; }
+style ai_ext_form { width: fill; direction: column; gap: 10; padding: 10 0; }
+style ai_ext_buttons { width: fill; direction: row; align-items: center; gap: 6; }
+style ai_ext_job { width: fill; direction: row; align-items: center; gap: 8; }

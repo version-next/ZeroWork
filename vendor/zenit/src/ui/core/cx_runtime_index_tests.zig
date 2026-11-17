@@ -202,3 +202,28 @@ test "interaction dirty hotpath: append and detach invalidate warmed interaction
     try t.expect(cx.node_registry.resolve(handle, null) == null);
     try t.expect(!index.subtreeHasLooseInteractionDirty(cx, cx.root.?));
 }
+
+test "interaction dirty hotpath: partial rebuild below a non-hit ancestor keeps the subtree cut" {
+    const t = std.testing;
+    const cx = try scene();
+    defer cx.deinit();
+    const card = try core.box(cx, .{ .position = .absolute, .width = .{ .px = 80 }, .height = .{ .px = 60 } }, .{});
+    const target = try core.box(cx, .{ .position = .absolute, .width = .{ .px = 20 }, .height = .{ .px = 20 } }, .{});
+    target.setFocusable(true);
+    try card.appendChild(cx.allocator, target);
+    try cx.root.?.appendChild(cx.allocator, card);
+    frame(cx);
+    try t.expect(cx.hitTest(5, 5) == target);
+    card.setHitTestVisible(false);
+    frame(cx);
+    try t.expect(cx.hitTest(5, 5) != target);
+    // An interaction-only invalidation below the cut must not revive it.
+    const partial = cx.perf.interaction_partial_rebuild_count;
+    target.markHitSemanticsDirty();
+    frame(cx);
+    try t.expect(cx.perf.interaction_partial_rebuild_count > partial);
+    try t.expect(cx.hitTest(5, 5) != target);
+    card.setHitTestVisible(true);
+    frame(cx);
+    try t.expect(cx.hitTest(5, 5) == target);
+}

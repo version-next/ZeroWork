@@ -1,4 +1,6 @@
 /** Targeted final-candidate Local registered-create and normal-exit regression. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -19,7 +21,7 @@ async function visible(id:string){return waitFor(async()=>(await query(id)).find
 async function absent(id:string){return waitFor(async()=>!(await query(id)).some(shown)||null,15000);}
 async function click(id:string){const n=await visible(id);assert((await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok);await sleep(100);}
 function ptys(){return execFileSync('/usr/sbin/lsof',['-nP','-a','-p',String(app.pid),'-Ffn'],{encoding:'utf8'}).split('\n').filter(s=>/^n\/dev\/(ptmx|pty|ttys)/.test(s));}
-function shellPid(){return execFileSync('/bin/ps',['-axo','pid=,ppid=,comm='],{encoding:'utf8'}).split('\n').map(s=>s.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).find(m=>m&&Number(m[2])===app.pid&&m[3].endsWith('/zsh'))?.[1];}
+function shellPid(){return psCompat(['-axo','pid=,ppid=,comm=']).split('\n').map(s=>s.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).find(m=>m&&Number(m[2])===app.pid&&m[3].endsWith('/zsh'))?.[1];}
 async function capture(name:string){await sleep(250);const ids=['tabs.strip','local.ended.close','local.statusbar','local.status.identity','workspace.empty.local'];await writeFile(join(out,name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(ids.map(async id=>[id,await query(id)]))),null,2));assert((await screenshot(join(out,name+'.png'))).ok);}
 let failure:any;
 try{
@@ -27,7 +29,7 @@ try{
  await click('workspace.empty.local');await visible('terminal.surface');await visible('tabs.tab.1');report.shell_pid=Number(await waitFor(async()=>shellPid()??null,15000));const active=ptys();assert(active.length>before.length);
  assert((await type_("printf 'V02_LOCAL_QUICK_%s\\n' READY")).ok);await key('return');await waitFor(async()=>text(await visible('terminal.surface')).includes('V02_LOCAL_QUICK_READY')||null,15000);await capture('00-local-real-pty');
  await type_('exit 0');await key('return');await visible('local.ended.close');await waitFor(async()=>{try{process.kill(report.shell_pid,0);return null;}catch(e:any){if(e.code==='ESRCH')return true;throw e;}},15000);
- await waitFor(async()=>text(await visible('local.status.identity')).includes('已退出')||null,15000);assert.deepEqual(ptys(),before);await capture('01-local-exited-readonly');
+ await waitFor(async()=>text(await visible('tabs.tab.1')).includes('已退出')||null,15000);assert.deepEqual(ptys(),before);await capture('01-local-exited-readonly');
  await click('local.ended.close');await absent('tabs.tab.1');await visible('workspace.empty.local');assert(app.exitCode===null&&app.signalCode===null);await capture('02-ended-tab-closed');
  report.pty_descriptors={before,active,after:ptys()};report.checks.push('Registered Local quick action creates a real app-owned zsh PTY','Real command output reaches the terminal projection','Shell exit 0 removes the actual process and returns PTY descriptors to baseline while retaining the readonly tombstone','Closing the ended tab returns the same live App to its empty workspace');report.status='passed';
 }catch(e){failure=e;report.status='failed';report.error=String(e);try{await capture('failure-live');}catch{}}

@@ -1,4 +1,5 @@
 /** Native terminal scrollback, settings persistence, and independent page cards. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,readFile,writeFile,open} from 'node:fs/promises';
@@ -36,6 +37,6 @@ try{
  await click('toolbar.settings');await click('settings.nav.appearance');await click('settings.search');await h.type_('最大显示行数');await h.sleep(200);await click('settings.appearance.aids.header');await edit('settings.field.scrollback_limit','128');await click('settings.save');await h.waitFor(async()=>/scrollback_limit\s*=\s*128/.test(await readFile(data+'/config.toml','utf8'))||null,10000);await click('settings.close');await h.sleep(800);
  assert((await scrollTop('terminal.input')).includes('SSH-ROW-0000'),'explicit unlimited SSH keeps existing history');await capture('04-override-after');report.checks.push('Explicit SSH unlimited setting is unchanged by reducing global limit to 128');
  await selectTab('Inherited SSH');assert(!(await scrollTop('terminal.input')).includes('SSH-ROW-0000'),'inherited SSH prunes existing buffer');await capture('05-inherited-after');report.checks.push('Already-open inherited SSH applies the reduced global line limit without reconnecting');
- await selectTab('Local Terminal');assert(!(await scrollTop('terminal.surface')).includes('LOCAL-ROW-0000'),'local terminal prunes existing buffer');await capture('06-local-after');report.checks.push('Already-open local terminal applies the reduced global line limit without reopening');
+ await selectTab('本地终端');assert(!(await scrollTop('terminal.surface')).includes('LOCAL-ROW-0000'),'local terminal prunes existing buffer');await capture('06-local-after');report.checks.push('Already-open local terminal applies the reduced global line limit without reopening');
  report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);process.exitCode=1;await capture('failure').catch(()=>{});}finally{if(app){app.kill('SIGTERM');await appEnd;await appLog.close();}peer.kill('SIGTERM');await peerEnd;await peerLog.close();await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));}

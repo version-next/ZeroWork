@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PIL import Image, ImageFilter
 
-DEST = Path(__file__).resolve().parents[1] / "src/ui/assets/host-os"
+DEST = Path(__file__).resolve().parents[1] / "src/shared/ui/assets/host-os"
 TREATMENTS = {
     "alpine": "ice-blue mountain negative space",
     "bclinux": "cream penguin negative space",

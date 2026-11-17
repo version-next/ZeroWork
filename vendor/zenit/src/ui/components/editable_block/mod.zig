@@ -169,7 +169,8 @@ fn skipEscapeSequence(input: []const u8, idx: usize) usize {
 fn isZeroWidthSeq(text: []const u8, idx: usize) usize {
     if (idx + 2 < text.len and text[idx] == 0xE2 and text[idx + 1] == 0x80) {
         const last = text[idx + 2];
-        // Join controls are part of emoji and script graphemes.
+        // U+200C/U+200D join controls are part of emoji and script graphemes
+        // (ZWJ emoji sequences, Indic conjuncts); only U+200B is dropped.
         if (last == 0x8B) {
             return 3; // U+200B
         }

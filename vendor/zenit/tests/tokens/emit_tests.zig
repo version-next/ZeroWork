@@ -20,3 +20,21 @@ test "invalid documents cannot generate" {
     defer doc.deinit();
     try std.testing.expectError(error.InvalidDocument, emit.generate(std.testing.allocator, &doc));
 }
+
+test "layered documents name the declaring file in metadata pointers; single files stay bare" {
+    const resolver = @import("token_resolver");
+    var single = try resolver.parse(std.testing.allocator, "{\"$version\":1,\"tokens\":{\"color\":{\"a\":\"#000\"}}}");
+    defer single.deinit();
+    const one = try emit.generate(std.testing.allocator, &single);
+    defer std.testing.allocator.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, ".pointer = \"/tokens/color/a\"") != null);
+    var doc = try resolver.parseLayers(std.testing.allocator, &.{
+        .{ .name = "base.json", .source = "{\"$version\":1,\"tokens\":{\"color\":{\"a\":\"#000\"}}}" },
+        .{ .name = "src/app.tokens.json", .source = "{\"$version\":1,\"semantic\":{\"color\":{\"b\":\"{tokens.color.a}\"}}}" },
+    });
+    defer doc.deinit();
+    const two = try emit.generate(std.testing.allocator, &doc);
+    defer std.testing.allocator.free(two);
+    try std.testing.expect(std.mem.indexOf(u8, two, ".pointer = \"base.json#/tokens/color/a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two, ".pointer = \"src/app.tokens.json#/semantic/color/b\"") != null);
+}

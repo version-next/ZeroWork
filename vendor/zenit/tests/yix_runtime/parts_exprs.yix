@@ -1,0 +1,65 @@
+//! Runtime fixture for expressions inside `parts={…}` (ZeroWork G24): a part's `.style`, its
+//! `.test_id`, and the shorthand forms (`.content = <test id>` / `.content = <recipe>`) are
+//! ordinary attribute expressions — calls over the view model and recipe dimensions that read it
+//! are lifted (derive / memo / call probe) like the same values on an element. Also `state=` /
+//! `a11y=` field values, which are lifted the same way.
+//! Lives outside tests/yix so it is not an LP3 equivalence input (those need reviewed goldens).
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub const Vm = struct {
+    overview: *ui.Signal(bool),
+    id: []const u8 = "vm.content",
+};
+
+const Content = ui.cva(.{
+    .base = .{ .gap = .space100 },
+    .variants = .{ .overview = .{ .false = .{}, .true = .{ .gap = .space300 } } },
+    .defaults = .{ .overview = false },
+});
+
+pub const marked = ui.css(.{ ._selected = .{ .gap = .space300 } });
+
+fn overview(vm: *Vm) bool {
+    return vm.overview.get();
+}
+
+fn contentId(vm: *Vm) []const u8 {
+    return vm.id;
+}
+
+fn label(vm: *Vm) []const u8 {
+    return if (vm.overview.get()) "overview" else "body";
+}
+
+/// `.style` and `.test_id` in a part's attribute struct.
+pub fn Attrs(vm: *Vm) View {
+    return (
+        <W.ScrollArea direction={.vertical} parts={.{ .content = .{ .style = Content.of(.{ .overview = overview(vm) }), .test_id = contentId(vm) } }}>
+            <text>a</text>
+        </W.ScrollArea>
+    );
+}
+
+/// The part given a recipe directly, its dimension an expression over a parameter.
+pub fn Shorthand(off: bool = false) View {
+    return (
+        <W.ScrollArea direction={.vertical} parts={.{ .content = Content.of(.{ .overview = !off }) }}>
+            <text>b</text>
+        </W.ScrollArea>
+    );
+}
+
+/// The part given a test id computed from the view model.
+pub fn IdOnly(vm: *Vm) View {
+    return (
+        <W.ScrollArea direction={.vertical} parts={.{ .content = contentId(vm) }}>
+            <text>c</text>
+        </W.ScrollArea>
+    );
+}
+
+/// `state=` / `a11y=` field values that are expressions.
+pub fn States(vm: *Vm, off: bool = false) View {
+    return <box style={marked} state={.{ .selected = !off }} a11y={.{ .role = .button, .label = label(vm) }} />;
+}

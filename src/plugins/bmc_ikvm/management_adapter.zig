@@ -37,6 +37,12 @@ pub const Adapter = struct {
     now_ms: u64 = 0,
     policy: svc.ManagementPolicy = .read_only,
     fixture_preauthorized: bool = false,
+    /// Advances whenever something a reader can observe changes: the cached power / boot
+    /// snapshots or an operation's stored result. Written by the worker and the main thread;
+    /// the owner folds it into its presentation pulse instead of re-reading snapshots on a timer.
+    publications: std.atomic.Value(u64) = .init(1),
+    /// The owning session's wake (set once by its controller before the worker starts).
+    wake: ?*const @import("presentation_wake.zig").Wake = null,
 
     /// Call at the final address; endpoint text and journal outlive Adapter.
     pub fn init(self: *Adapter, a: std.mem.Allocator, owner: svc.identity.SessionHandle, endpoint: model.Endpoint, ledger: *journal.Journal, facade: ?actions.Facade) !void {
@@ -118,7 +124,9 @@ pub const Adapter = struct {
         self.cached_power = pc;
         self.cached_boot = bc;
         self.authenticated = authenticated and !self.closed and !self.revoked;
+        const changed = !svc.sameValue(oldp.value, pc.value) or !svc.sameValue(oldb.value, bc.value);
         self.unlock();
+        if (changed) self.published();
         var mutable_p = oldp;
         mutable_p.deinit();
         var mutable_b = oldb;
@@ -250,17 +258,25 @@ pub const Adapter = struct {
         var copy = try svc.Owned(svc.Result).init(self.allocator, result);
         errdefer copy.deinit();
         self.lock();
-        defer self.unlock();
         for (&self.records) |*slot| if (slot.*) |*record| if (record.key.eql(result.operation)) {
             var old = record.result;
             record.result = copy;
             if (result.terminal()) if (self.active_query) |key| if (key.eql(result.operation)) {
                 self.active_query = null;
             };
+            // The worker republishes the active result every turn; only a real change is news.
+            const changed = !svc.sameValue(old.value, result);
+            self.unlock();
             old.deinit();
+            if (changed) self.published();
             return;
         };
+        self.unlock();
         return error.StaleOperation;
+    }
+    fn published(self: *Adapter) void {
+        _ = self.publications.fetchAdd(1, .acq_rel);
+        @import("presentation_wake.zig").notify(self.wake);
     }
     pub fn powerBinding(self: *Adapter) typed.Binding {
         return typed.Binding.init(svc.PowerService, svc.power_key, self, &power_vtable, self.owner, 1);
@@ -320,6 +336,8 @@ pub const Adapter = struct {
             self.pending = pending;
             self.pending_approval_hash = if (user_approved) fingerprint else null;
             transferred = true;
+            // A new record is readable through `result` from now on (main thread; no wake needed).
+            _ = self.publications.fetchAdd(1, .acq_rel);
             return .{ .accepted = execution.operation };
         };
         return .{ .rejected = .busy };

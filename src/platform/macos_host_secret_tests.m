@@ -1,6 +1,5 @@
 // Explicit synthetic secrets only. No test or report prints the value.
 #import "macos_host_secret.m"
-#include "../../vendor/zenit/native/macos/native_event_window.inc"
 #include <assert.h>
 static NSEvent *key(NSString *text, unsigned short code, NSEventModifierFlags modifiers) {
     return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:modifiers timestamp:0 windowNumber:0 context:nil characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:code];
@@ -19,7 +18,7 @@ int main(int argc, char **argv) {
         // secure key window must own delivery, rather than the Metal fallback.
         NSWindow *other = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,10,10) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
         NSEvent *typed = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:other.windowNumber context:nil characters:@"fixture-only-secret" charactersIgnoringModifiers:@"fixture-only-secret" isARepeat:NO keyCode:0];
-        assert(zenitDispatchNativePanelEvent(typed)); assert(c.field->_length == 19);
+        assert(zw_secret_event_filter((__bridge void *)c, (__bridge void *)typed)); assert(c.field->_length == 19);
         [c.field keyDown:key(@"c",8,NSEventModifierFlagCommand)]; [c.field keyDown:key(@"x",7,NSEventModifierFlagCommand)]; [c.field keyDown:key(@"v",9,NSEventModifierFlagCommand)]; [c.field keyDown:key(@"z",6,NSEventModifierFlagCommand)];
         assert(NSPasteboard.generalPasteboard.changeCount == changes); assert(c.field->_length == 19);
         assert([c.field.accessibilityValue isEqual:@"••••••••"]); assert(![c.field isAccessibilitySelectorAllowed:@selector(setAccessibilityValue:)]); assert(c.field.inputContext == nil);
@@ -30,7 +29,7 @@ int main(int argc, char **argv) {
         unsigned char out[1024] = {0}; size_t length = 0;
         assert(zw_host_secret_poll(raw,out,sizeof out,&length) == 0 && length == 0);
         [c submit:nil]; assert(!IsSecureEventInputEnabled()); assert(!c.panel.isVisible);
-        assert(!zenitDispatchNativePanelEvent(typed));
+        assert(!zw_secret_event_filter((__bridge void *)c, (__bridge void *)typed));
         assert(zw_host_secret_poll(raw,out,sizeof out,&length) == 1 && length == 19);
         assert(memcmp(out,"fixture-only-secret",19) == 0); zw_secret_zero(out,sizeof out);
         assert(c.field->_length == 0); for (size_t i=0;i<4096;i++) assert(c.field->_secret[i] == 0);

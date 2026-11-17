@@ -78,6 +78,15 @@ pub const FadeIndicator = struct {
     fade_speed: f32 = 1.0 / 36.0,
     /// Initial opacity when active.
     active_opacity: f32 = 0.7,
+    /// Persistent indicator: at rest it stays at `active_opacity` (fades back to it after hover /
+    /// activity instead of out). The floor is read live, so a later `active_opacity` change keeps
+    /// rest and active looks equal.
+    persistent: bool = false,
+
+    /// Opacity the fade settles at when idle: `active_opacity` when persistent, else 0.
+    pub fn restOpacity(self: *const FadeIndicator) f32 {
+        return if (self.persistent) self.active_opacity else 0;
+    }
 
     /// Mark active (call on scroll/interaction).
     pub fn onActivity(self: *FadeIndicator) void {
@@ -96,12 +105,14 @@ pub const FadeIndicator = struct {
             return;
         }
 
-        if (self.opacity <= 0) return;
+        const rest = self.restOpacity();
+        if (self.opacity < rest) self.opacity = rest;
+        if (self.opacity <= rest) return;
 
         self.idle_frames +|= 1; // Saturating add prevents overflow.
         if (self.idle_frames > self.fade_delay) {
             self.opacity -= self.fade_speed;
-            if (self.opacity < 0) self.opacity = 0;
+            if (self.opacity < rest) self.opacity = rest;
         }
     }
 
@@ -196,6 +207,26 @@ test "FadeIndicator: fade after delay" {
     for (0..40) |_| fi.tick();
     try std.testing.expectEqual(@as(f32, 0), fi.opacity);
     try std.testing.expect(!fi.isVisible());
+}
+
+test "FadeIndicator: a persistent indicator rests at the active look and fades back to it after hover" {
+    var fi = FadeIndicator{ .persistent = true };
+    fi.tick();
+    try std.testing.expect(fi.isVisible());
+    try std.testing.expectEqual(fi.active_opacity, fi.opacity);
+    for (0..300) |_| fi.tick();
+    try std.testing.expectEqual(fi.active_opacity, fi.opacity);
+    fi.hovered = true;
+    fi.tick();
+    try std.testing.expectEqual(@as(f32, 1.0), fi.opacity);
+    fi.hovered = false;
+    for (0..300) |_| fi.tick();
+    // Back at the active look, not out.
+    try std.testing.expectEqual(fi.active_opacity, fi.opacity);
+    // The floor follows a later active_opacity change.
+    fi.active_opacity = 0.5;
+    for (0..300) |_| fi.tick();
+    try std.testing.expectEqual(@as(f32, 0.5), fi.opacity);
 }
 
 test "FadeIndicator: hover suppresses fade" {

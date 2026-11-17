@@ -1,0 +1,24 @@
+//! Runtime fixture for recipe dimension values that are expressions (YIX_REFERENCE §3.4):
+//! a row variable's field and a call over a parameter, lifted like other attribute values.
+//! Lives outside tests/yix so it is not an LP3 equivalence input (those need reviewed goldens).
+const ui = @import("ui");
+
+pub const Item = struct { id: u32, on: bool };
+
+const Row = ui.cva(.{
+    .base = .{ .gap = .space100 },
+    .variants = .{ .on = .{ .false = .{}, .true = .{ .gap = .space300 } } },
+    .defaults = .{ .on = false },
+});
+
+fn busy(n: i32) bool {
+    return n > 0;
+}
+
+pub fn Rows(items: []const Item = &.{}, n: i32 = 0) View {
+    return (
+        <col style={Row.of(.{ .on = busy(n) })}>
+            {for (items) |x| <box key={x.id} style={Row.of(.{ .on = x.on })} />}
+        </col>
+    );
+}

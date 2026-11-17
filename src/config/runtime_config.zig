@@ -1,7 +1,9 @@
 const std = @import("std");
 const config = @import("config.zig");
 const store = @import("store.zig");
-const settings = @import("settings_values.zig");
+/// The agent policy in the configuration is part of the AI's environment (LIFECYCLE.md §5.2–5.3).
+const environment = @import("../host/environment.zig");
+const settings = @import("../features/settings/model/settings_values.zig");
 pub const schema = @import("settings_schema.zig");
 pub const paths = @import("paths.zig");
 
@@ -77,6 +79,7 @@ pub const Snapshot = struct {
         copy.transfer.conflict_policy = try owned.dupe(u8, value.transfer.conflict_policy);
         copy.notify.quiet_hours = try owned.dupe(u8, value.notify.quiet_hours);
         copy.log.export_format = try owned.dupe(u8, value.log.export_format);
+        copy.unknown = try value.unknown.clone(owned);
         return .{ .arena = arena, .value = copy };
     }
 
@@ -150,6 +153,8 @@ pub const RuntimeConfig = struct {
 
     /// Main-thread commit boundary. A stale prepared request never overwrites a
     /// newer commit; callers may merge and prepare again after the rejection.
+    /// The sole configuration write: a commit that changed any field publishes the environment
+    /// (the agent policy revision moves only with such a commit); a same-value save does not.
     pub fn commitPrepared(self: *RuntimeConfig, io: std.Io, dir: std.Io.Dir, prepared: *Prepared) !void {
         if (prepared.expected_revision != self.value.config_revision) return error.StaleConfigRevision;
         const next = if (prepared.owned) |*owned| owned else return error.AlreadyCommitted;
@@ -166,6 +171,7 @@ pub const RuntimeConfig = struct {
             revision.* = next.value.config_revision;
         };
         prepared.owned = null;
+        if (prepared.changed_fields.count() != 0) environment.publish();
     }
 
     /// Consumers keep their last revision and subscribe only to relevant fields.
@@ -454,4 +460,20 @@ test "full line-height precision survives persistence without rounded writeback"
     try std.testing.expectEqual(exact, loaded.value.ui.line_height);
     try std.testing.expectApproxEqAbs(@as(f32, 22), loaded.value.ui.line_height * 14, 0.00001);
     try std.testing.expectError(error.OutOfRange, runtime.updateSetting(std.testing.io, tmp.dir, "ui", "line_height", .{ .decimal = std.math.inf(f32) }));
+}
+
+test "configuration commits publish the environment only when a field changed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var runtime = try RuntimeConfig.loadOrDefault(std.testing.io, tmp.dir, std.testing.allocator, "config.toml");
+    defer runtime.deinit();
+    const before = environment.revision();
+    const unchanged_revision = runtime.value.config_revision;
+    try runtime.save(std.testing.io, tmp.dir, runtime.value);
+    try std.testing.expect(runtime.value.config_revision > unchanged_revision);
+    try std.testing.expectEqual(before, environment.revision());
+    const policy = runtime.value.agentPolicyRevision();
+    try runtime.updateSetting(std.testing.io, tmp.dir, "ai", "session_retention", .{ .text = "keep" });
+    try std.testing.expect(runtime.value.agentPolicyRevision() != policy);
+    try std.testing.expect(environment.revision() > before);
 }

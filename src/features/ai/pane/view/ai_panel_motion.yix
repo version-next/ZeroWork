@@ -1,0 +1,27 @@
+//! e2e 探针：AI 浮动面板的 Z12 AnchorTransition 状态（PLUGIN_ARCH_PLAN 2.5.7）。
+//!
+//! - `ai.panel.motion` 是一个不可见、不参与命中的框，矩形跟随过渡本帧画出的快照矩形；收起静止时是最后解析到的
+//!   锚点矩形（launcher 或所属 tab），展开静止时是面板本身。
+//! - `ai.panel.motion.phase` 是过渡阶段名（expanded / collapsing / collapsed / expanding），
+//!   `ai.panel.motion.anchor` 是本次锚点（`launcher`、`workspace.tab.<id>` 或 `none`），
+//!   `ai.panel.motion.opacity` 是本帧快照的不透明度（静止展开 1、静止收起 0），逐帧检查空白帧用。
+//! - 只给 e2e 读，不画任何东西；位置、尺寸与文字都由 `AiHost` 每帧写入信号。
+const ui = @import("ui");
+const S = @import("ai_panel_motion.yss");
+
+pub const ids = struct {
+    pub const frame = "ai.panel.motion";
+    pub const phase = "ai.panel.motion.phase";
+    pub const anchor = "ai.panel.motion.anchor";
+    pub const opacity = "ai.panel.motion.opacity";
+};
+
+pub fn Probe(x: f32, y: f32, w: f32, h: f32, phaseName: []const u8, anchorName: []const u8, opacity: f32) View {
+    return (
+        <box testId={ids.frame} style={S.frame.of(.{ .x = x, .y = y, .w = w, .h = h })}>
+            <text testId={ids.phase} style={S.label}>{phaseName}</text>
+            <text testId={ids.anchor} style={S.label}>{anchorName}</text>
+            <text testId={ids.opacity} style={S.label}>{opacity}</text>
+        </box>
+    );
+}

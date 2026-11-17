@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
@@ -13,9 +14,9 @@ await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=
 await writeFile(join(data,'config.toml'),'[ui]\ntheme="dark"\n[ssh]\nconnect_timeout_sec=120\n');
 const log=await open(join(out,'app.log'),'w');const app=spawn(resolve(process.argv[2]??'zig-out/bin/zerowork'),[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',log.fd,log.fd]});
 app.on('exit',(code,signal)=>console.log('app exit',code,signal));app.on('error',e=>console.log('app error',e));
-const shown=(n:any)=>!n.hidden&&n.visible!==false&&n.rect?.w>0&&n.rect?.h>0;
-try {await waitForServerReady();await resizeWindow(1440,900);const row=await waitFor(async()=>(await query('sidebar.host')).find(shown)??null,15000);assert((await clickAt(row.rect.x+60,row.rect.y+row.rect.h/2,1)).ok);assert((await clickTestId('sidebar.host.connect')).ok);await waitFor(async()=>(await query('connection.progress')).find(shown)??null,15000);
-for(const [w,h] of [[1440,900],[860,480]]){await resizeWindow(w,h);await sleep(400);const panel=(await query('connection.progress')).find(shown);const actions=(await query('connection.progress.actions')).find(shown);assert(panel&&actions);assert.equal(actions.rect.h,54);assert(panel.rect.x>=0&&panel.rect.y>=0);assert(panel.rect.w<=w&&panel.rect.h<=h);assert(actions.rect.y+actions.rect.h<=panel.rect.y+panel.rect.h+1);assert((await screenshot(join(out,`progress-${w}.png`))).ok);await writeFile(join(out,`progress-${w}.json`),JSON.stringify(await query('connection.progress'),null,2));}
+const shown=(n:any)=>!n.hidden&&n.visible!==false&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
+try {await waitForServerReady();await resizeWindow(1440,900);const row=await waitFor(async()=>(await query('sidebar.host')).find(shown)??null,15000);assert((await clickAt(row.rect.x+60,row.rect.y+row.rect.h/2,1)).ok);assert((await clickTestId('sidebar.host.connect_button')).ok);await waitFor(async()=>(await query('connection.progress')).find(shown)??null,15000);
+for(const [w,h] of [[1440,900],[860,480]]){await resizeWindow(w,h);await sleep(400);const panel=await waitFor(async()=>(await query('connection.progress')).find(shown)??null);const actions=await waitFor(async()=>(await query('connection.progress.actions')).find(shown)??null);assert.equal(actions.rect.h,46);assert(panel.rect.x>=0&&panel.rect.y>=0);assert(panel.rect.w<=w&&panel.rect.h<=h);assert(actions.rect.y+actions.rect.h<=panel.rect.y+panel.rect.h+1);assert((await screenshot(join(out,`progress-${w}.png`))).ok);await writeFile(join(out,`progress-${w}.json`),JSON.stringify(await query('connection.progress'),null,2));}
 assert((await clickTestId('connection.progress.hop.1')).ok);await sleep(100);assert(JSON.stringify(await query('connection.progress')).includes('第 1 跳'));await sleep(250);assert((await query('connection.progress.logs')).some(shown));assert((await screenshot(join(out,'progress-logs-860.png'))).ok);assert((await clickTestId('connection.progress.cancel')).ok);await sleep(400);await screenshot(join(out,'after-production-cancel.png'));await writeFile(join(out,'after-production-cancel.json'),JSON.stringify(await query('connection.progress'),null,2));await waitFor(async()=>closedSockets===sockets.length&&closedSockets>0||null,20000);await writeFile(join(out,'cancel-release.json'),JSON.stringify({status:'passed',pid:app.pid,accepted_sockets:sockets.length,closed_sockets:closedSockets,proof:'production Cancel released exact accepted TCP socket before runner cleanup'},null,2));await waitFor(async()=>(await query('connection.progress.dismiss')).find(n=>shown(n)&&!n.disabled)??null,20000);
 assert((await clickTestId('connection.progress.dismiss')).ok);
 await waitFor(async()=>!(await query('connection.progress')).some(shown)||null);
@@ -42,5 +43,16 @@ await waitFor(async()=>!(await query('connection.progress')).some(shown)||null);
 await waitFor(async()=>(await query('remote.notice.close')).find(shown)??null);
 assert((await clickTestId('remote.notice.close')).ok);
 await waitFor(async()=>!(await query('remote.notice')).some(shown)||null);
+await waitFor(async()=>(await query('workspace.empty.local')).find(shown)??null);
+await writeFile(join(out,'report.json'),JSON.stringify({
+ status:'passed',
+ checks:[
+  'Progress and the cancelled notice fit 1440×900 and 860×480. Logs expand at the minimum size.',
+  'Production Cancel releases the owned TCP socket.',
+  'Reconnect opens a distinct attempt and close removes the cancelled tab.',
+ ],
+ accepted_sockets:sockets.length,
+ closed_sockets:closedSockets,
+},null,2));
 console.log('PASS: production cancel releases sockets; cancelled notice fits 1440/860; reconnect starts a new attempt; close removes the cancelled tab');
 }finally{await writeFile(join(out,'peer-events.json'),JSON.stringify({accepted:sockets.length,closed:closedSockets,events:peerEvents},null,2));app.kill('SIGTERM');for(const s of sockets)s.destroy();server.close();await new Promise<void>(r=>app.once('exit',()=>r()));await log.close();await rm(temp,{recursive:true,force:true});}

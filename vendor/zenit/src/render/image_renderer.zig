@@ -3,7 +3,11 @@
 /// Usage: (1) init() create renderer, (2) loadTexture() load from RGBA pixel data,
 /// (3) addImage() add instance, (4) render() submit to GPU
 const std = @import("std");
+const idle_storage = @import("idle_storage.zig");
+const SlotBuffer = @import("slot_buffer.zig").SlotBuffer;
 const gpu = @import("gpu");
+const shape_clip_pair = @import("shape_clip_pair.zig");
+const corner_radii_mod = @import("zenit_corner_radii");
 
 const MAX_CLIP_POLYGON_POINTS = 32;
 const MAX_CLIP_POLYGON_CONTOURS = 8;
@@ -20,13 +24,27 @@ const Uniforms = extern struct {
     scale_factor: f32,
     clip_shape_kind: u32 = 0,
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
-    clip_radius: f32 = 0,
+    clip_radii: [4]f32 = .{ 0, 0, 0, 0 },
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
+    /// Keeps the polygon arrays on a 16-byte (cbuffer register) boundary after `clip_radii`.
+    _clip_pad: u32 = 0,
     clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
     clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
+    /// Second shape clip (shape_clip_pair.zig); zero-sized off Metal.
+    clip2: shape_clip_pair.Field = shape_clip_pair.none,
 };
+
+// Shared clip header ABI (Metal struct / HLSL cbuffer / GLSL std140): per-corner radii sit on their own
+// 16-byte register and the polygon arrays start at the next one.
+comptime {
+    std.debug.assert(@offsetOf(Uniforms, "clip_rect") == 16);
+    std.debug.assert(@offsetOf(Uniforms, "clip_radii") == 32);
+    std.debug.assert(@offsetOf(Uniforms, "clip_fill_rule") == 48);
+    std.debug.assert(@offsetOf(Uniforms, "clip_polygon_end_points") == 64);
+    std.debug.assert(@offsetOf(Uniforms, "clip_polygon_points") == 96);
+}
 
 /// Image instance data, aligned with image.metal ImageInstanceData
 pub const ImageInstance = extern struct {
@@ -34,20 +52,25 @@ pub const ImageInstance = extern struct {
     uv_rect: [4]f32, // u0, v0, u1, v1 (texture coordinates)
     tint_color: [4]f32, // RGBA float (1,1,1,1 = no tinting)
     transform_linear: [4]f32 = .{ 1, 0, 0, 1 }, // a, b, c, d
+    /// Rounded mask radii TL, TR, BR, BL (logical pixels): an image's corner radius, or a rounded
+    /// layer's (possibly per-corner) clip when compositing an offscreen surface.
+    corner_radii: [4]f32,
     transform_translation: [2]f32 = .{ 0, 0 }, // tx, ty
-    corner_radius: f32,
     opacity: f32,
     source_premultiplied: f32 = 0,
-    // MSL aligns the trailing float4 to 16 bytes; keep CPU/GPU instance layout identical.
-    _rect_clip_padding: [3]f32 = .{ 0, 0, 0 },
+    /// xy = max sampled UV (0 = unclamped); zw padding. MSL aligns the trailing float4 to 16 bytes.
+    sampling: [4]f32 = .{ 0, 0, 0, 0 },
     rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (logical pixels); negative size = disabled
 
     comptime {
-        if (@offsetOf(ImageInstance, "rect_clip") != 96) {
-            @compileError("ImageInstance.rect_clip must start at byte 96 to match image.metal");
+        if (@offsetOf(ImageInstance, "corner_radii") != 64) {
+            @compileError("ImageInstance.corner_radii must start at byte 64 to match image.metal");
         }
-        if (@sizeOf(ImageInstance) != 112) {
-            @compileError("ImageInstance must be 112 bytes to match image.metal");
+        if (@offsetOf(ImageInstance, "rect_clip") != 112) {
+            @compileError("ImageInstance.rect_clip must start at byte 112 to match image.metal");
+        }
+        if (@sizeOf(ImageInstance) != 128) {
+            @compileError("ImageInstance must be 128 bytes to match image.metal");
         }
     }
 };
@@ -63,6 +86,8 @@ const TextureSlot = struct {
     width: u32,
     height: u32,
     mip_level_count: u32,
+    /// Advances on every in-place stream upload; retained surfaces and damage
+    /// fingerprints hash it because the paint item itself does not change.
     content_revision: u64 = 0,
     atlas_page_index: u16 = 0,
     sampling_max: [2]f32 = .{ 0, 0 },
@@ -71,6 +96,7 @@ const TextureSlot = struct {
 
 const AtlasPage = struct {
     texture: gpu.Backend.Texture,
+    size: u32 = ATLAS_PAGE_SIZE,
     next_x: u32 = 0,
     next_y: u32 = 0,
     shelf_height: u32 = 0,
@@ -84,7 +110,8 @@ const AtlasAllocation = struct {
 };
 
 /// Max instance count
-const MAX_INSTANCES = 4096;
+/// Starting per-slot instance capacity; slots grow with the frame's demand.
+const MIN_INSTANCE_BYTES = @sizeOf(ImageInstance) * 128;
 const MAX_UNIFORM_UPDATES = 256;
 // D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots.
@@ -96,7 +123,12 @@ const BUFFER_COUNT = 3;
 
 /// Max texture count
 const MAX_TEXTURES = 4096;
+/// Atlas pages grow with demand: the first page is small so an app showing a
+/// few icons (or only the 1x1 fallback) does not pay for a 16 MiB page; each
+/// further page doubles up to the maximum.
 const ATLAS_PAGE_SIZE = 2048;
+const ATLAS_MIN_PAGE_SIZE = 512;
+const ATLAS_FIRST_PAGE_MIN = 128;
 const ATLAS_MAX_TEXTURE_SIZE = 256;
 const ATLAS_GUTTER = 1;
 
@@ -115,6 +147,8 @@ const TextureKind = enum {
 /// N draw calls + N texture binds; these verify batch/atlas optimizations work.
 pub var image_draw_calls: u64 = 0;
 pub var image_instances_drawn: u64 = 0;
+/// Mesh cells drawn (genie composites; process-wide, cumulative).
+pub var image_mesh_cells: u64 = 0;
 pub var image_texture_binds: u64 = 0;
 
 /// Texture memory snapshot (app-side LRU eviction budget avoids shadow drift).
@@ -155,11 +189,16 @@ const EXTERNAL_SLOT_BASE = MAX_TEXTURES - EXTERNAL_SLOT_COUNT;
 /// All access is on the render thread. Its owner must drain GPU work before
 /// destruction. A shared instance must outlive all borrowing ImageRenderers.
 pub const ImageTextureStore = struct {
+    const Slot = struct { texture: ?TextureSlot = null, generation: u32 = 0 };
+
     allocator: std.mem.Allocator,
     device: *gpu.Backend.Device,
     namespace: u32,
-    textures: [MAX_TEXTURES]?TextureSlot = @as([MAX_TEXTURES]?TextureSlot, @splat(null)),
-    generations: [MAX_TEXTURES]u32 = @as([MAX_TEXTURES]u32, @splat(0)),
+    /// Persistent slots [0, EXTERNAL_SLOT_BASE), grown on demand (a full
+    /// inline table kept ~430 KiB resident per renderer).
+    persistent: std.ArrayList(Slot) = .empty,
+    /// External (frame-borrowed) slots [EXTERNAL_SLOT_BASE, MAX_TEXTURES).
+    external: [EXTERNAL_SLOT_COUNT]Slot = @splat(.{}),
     texture_count: u32 = 0,
     atlas_pages: std.ArrayList(AtlasPage) = .empty,
     /// Admission limit for resident storage; configure before the first upload.
@@ -169,28 +208,41 @@ pub const ImageTextureStore = struct {
         self.allocator = allocator;
         self.device = device;
         self.namespace = if (shared) SHARED_TEXTURE_BIT else 0;
-        @memset(&self.textures, null);
-        @memset(&self.generations, 0);
+        self.persistent = .empty;
+        self.external = @splat(.{});
         self.texture_count = 0;
         self.atlas_pages = .empty;
         self.memory_budget_bytes = std.math.maxInt(u64);
     }
 
     pub fn deinit(self: *ImageTextureStore) void {
-        for (&self.textures) |*entry| {
-            if (entry.*) |slot| if (slot.owned_texture) |owned| {
+        for ([_][]Slot{ self.persistent.items, &self.external }) |slots| for (slots) |*entry| {
+            if (entry.texture) |slot| if (slot.owned_texture) |owned| {
                 var texture = owned;
                 texture.destroy();
             };
-            entry.* = null;
-        }
+            entry.texture = null;
+        };
+        self.persistent.deinit(self.allocator);
+        self.persistent = .empty;
         for (self.atlas_pages.items) |*page| page.texture.destroy();
         self.atlas_pages.deinit(self.allocator);
         self.atlas_pages = .empty;
     }
 
+    /// Slot storage for an index handed out by this store.
+    fn slotPtr(self: *ImageTextureStore, index: u32) *Slot {
+        return if (index >= EXTERNAL_SLOT_BASE) &self.external[index - EXTERNAL_SLOT_BASE] else &self.persistent.items[index];
+    }
+
+    /// Any index (a stale or foreign handle may name a slot never grown).
+    fn slotAt(self: *const ImageTextureStore, index: u32) Slot {
+        if (index >= EXTERNAL_SLOT_BASE) return self.external[index - EXTERNAL_SLOT_BASE];
+        return if (index < self.persistent.items.len) self.persistent.items[index] else .{};
+    }
+
     fn handle(self: *const ImageTextureStore, index: u32) TextureId {
-        return self.namespace | (self.generations[index] << SLOT_BITS) | index;
+        return self.namespace | (self.slotAt(index).generation << SLOT_BITS) | index;
     }
 
     pub fn getTextureSize(self: *const ImageTextureStore, id: TextureId) ?[2]u32 {
@@ -215,19 +267,20 @@ pub const ImageTextureStore = struct {
                 var old = self.atlas_pages.swapRemove(removed);
                 old.texture.destroy();
                 if (removed < self.atlas_pages.items.len) {
-                    for (&self.textures) |*entry| if (entry.*) |*other| {
+                    for (self.persistent.items) |*entry| if (entry.texture) |*other| {
                         if (other.kind == .atlas_region and other.atlas_page_index == self.atlas_pages.items.len)
                             other.atlas_page_index = @intCast(removed);
                     };
                 }
             }
         }
-        self.textures[index] = null;
+        const entry = self.slotPtr(index);
+        entry.texture = null;
         if (index >= EXTERNAL_SLOT_BASE) {
             // External-only slot: generation wraps (ABA argument in EXTERNAL_SLOT_BASE).
-            self.generations[index] = if (self.generations[index] >= MAX_GENERATION) 0 else self.generations[index] + 1;
+            entry.generation = if (entry.generation >= MAX_GENERATION) 0 else entry.generation + 1;
         } else {
-            self.generations[index] += 1; // exhausted persistent slots are never reused
+            entry.generation += 1; // exhausted persistent slots are never reused
         }
     }
 
@@ -249,7 +302,8 @@ pub const ImageTextureStore = struct {
         _ = pixelLength(width, height) catch return false;
         var additional = textureByteLength(width, height, calcMipLevelCount(width, height));
         if (canAtlasTexture(width, height)) {
-            additional = ATLAS_PAGE_SIZE * ATLAS_PAGE_SIZE * 4;
+            const next = atlasPageSizeFor(self.atlas_pages.items.len, width, height);
+            additional = @as(u64, next) * next * 4;
             for (self.atlas_pages.items) |page| {
                 var candidate = page;
                 if (allocAtlasOnPage(&candidate, width, height) != null) {
@@ -277,6 +331,8 @@ pub const ImageTextureStore = struct {
             .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
+            // Upload-only: no CPU path reads image pixels back.
+            .host_access = .write_only,
         });
         errdefer texture.destroy();
 
@@ -289,7 +345,7 @@ pub const ImageTextureStore = struct {
         }
 
         const id = try self.allocateTextureSlot();
-        self.textures[id] = TextureSlot{
+        self.slotPtr(id).texture = TextureSlot{
             .kind = .standalone,
             .binding = texture.binding(),
             .owned_texture = texture,
@@ -320,14 +376,14 @@ pub const ImageTextureStore = struct {
         );
 
         page.live_entries += 1;
-        self.textures[id] = TextureSlot{
+        self.slotPtr(id).texture = TextureSlot{
             .kind = .atlas_region,
             .binding = page.texture.binding(),
             .width = width,
             .height = height,
             .mip_level_count = 1,
             .atlas_page_index = @intCast(allocation.page_index),
-            .uv_rect = atlasRegionUvRect(allocation.x, allocation.y, width, height, ATLAS_PAGE_SIZE),
+            .uv_rect = atlasRegionUvRect(allocation.x, allocation.y, width, height, page.size),
         };
         self.texture_count = @max(self.texture_count, id + 1);
         return self.handle(id);
@@ -338,7 +394,7 @@ pub const ImageTextureStore = struct {
     /// Handle valid only this encoding (must unregister same frame), see EXTERNAL_SLOT_BASE.
     pub fn registerTextureBinding(self: *ImageTextureStore, binding: gpu.Backend.TextureBinding, width: u32, height: u32) !TextureId {
         const id = try self.allocateExternalSlot();
-        self.textures[id] = TextureSlot{
+        self.slotPtr(id).texture = TextureSlot{
             .kind = .external,
             .binding = binding,
             .width = width,
@@ -367,9 +423,11 @@ pub const ImageTextureStore = struct {
             .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
+            // Upload-only: no CPU path reads image pixels back.
+            .host_access = .write_only,
         });
         errdefer texture.destroy();
-        self.textures[index] = .{ .kind = .stream, .binding = texture.binding(), .owned_texture = texture, .width = width, .height = height, .mip_level_count = 1 };
+        self.slotPtr(index).texture = .{ .kind = .stream, .binding = texture.binding(), .owned_texture = texture, .width = width, .height = height, .mip_level_count = 1 };
         self.texture_count = @max(self.texture_count, index + 1);
         return self.handle(index);
     }
@@ -381,7 +439,7 @@ pub const ImageTextureStore = struct {
         if (rgba.len != expected) return error.InvalidPixelData;
         var texture = slot.owned_texture.?;
         try texture.writeRegion(0, 0, 0, slot.width, slot.height, rgba, slot.width * 4);
-        const stored = &self.textures[id & SLOT_MASK].?;
+        const stored = &self.slotPtr(id & SLOT_MASK).texture.?;
         stored.content_revision +%= 1;
         if (stored.content_revision == 0) stored.content_revision = 1;
     }
@@ -395,8 +453,8 @@ pub const ImageTextureStore = struct {
             .slots_used = 0,
             .slots_total = EXTERNAL_SLOT_BASE,
         };
-        for (self.textures[0..self.texture_count]) |maybe_slot| {
-            const slot = maybe_slot orelse continue;
+        for (self.persistent.items[0..self.texture_count]) |entry| {
+            const slot = entry.texture orelse continue;
             stats.slots_used += 1;
             // atlas slots share page texture; page memory accounted below
             // per-page to avoid duplication.
@@ -404,32 +462,36 @@ pub const ImageTextureStore = struct {
             stats.texture_count += 1;
             stats.estimated_bytes +|= textureByteLength(slot.width, slot.height, slot.mip_level_count);
         }
-        const page_bytes: u64 = @as(u64, ATLAS_PAGE_SIZE) * ATLAS_PAGE_SIZE * 4;
-        stats.estimated_bytes +|= page_bytes * stats.atlas_page_count;
+        for (self.atlas_pages.items) |page| stats.estimated_bytes +|= @as(u64, page.size) * page.size * 4;
         return stats;
     }
 
     fn resolveTextureSlot(self: *const ImageTextureStore, id: TextureId) ?TextureSlot {
         if (id & SHARED_TEXTURE_BIT != self.namespace) return null;
         const index = id & SLOT_MASK;
-        if (self.generations[index] > MAX_GENERATION or self.handle(index) != id) return null;
-        return self.textures[index];
+        const entry = self.slotAt(index);
+        if (entry.generation > MAX_GENERATION or self.handle(index) != id) return null;
+        return entry.texture;
     }
 
     /// Persistent texture slots ([0, EXTERNAL_SLOT_BASE));
     /// slots with exhausted generation are skipped.
     fn allocateTextureSlot(self: *ImageTextureStore) !u32 {
-        for (self.textures[0..EXTERNAL_SLOT_BASE], 0..) |slot, index| {
-            if (slot == null and self.generations[index] <= MAX_GENERATION) return @intCast(index);
+        for (self.persistent.items, 0..) |*entry, index| {
+            if (entry.texture == null and entry.generation <= MAX_GENERATION) return @intCast(index);
         }
-        return error.TooManyTextures;
+        if (self.persistent.items.len >= EXTERNAL_SLOT_BASE) return error.TooManyTextures;
+        try self.persistent.append(self.allocator, .{});
+        return @intCast(self.persistent.items.len - 1);
     }
 
     /// external (frame-borrowed) slots: [EXTERNAL_SLOT_BASE, MAX_TEXTURES);
     /// generation wraps.
     fn allocateExternalSlot(self: *ImageTextureStore) !u32 {
-        for (self.textures[EXTERNAL_SLOT_BASE..], EXTERNAL_SLOT_BASE..) |slot, index| {
-            if (slot == null) return @intCast(index);
+        // Iterate through a pointer: `for (self.external)` copies the 64 KiB array onto the
+        // stack (inlined into the per-command encoder path, it inflated dispatchCommand's frame).
+        for (&self.external, EXTERNAL_SLOT_BASE..) |*entry, index| {
+            if (entry.texture == null) return @intCast(index);
         }
         return error.TooManyTextures;
     }
@@ -441,23 +503,26 @@ pub const ImageTextureStore = struct {
             }
         }
 
-        var texture = try self.createAtlasTexture(self.atlas_pages.items.len);
+        const size = atlasPageSizeFor(self.atlas_pages.items.len, width, height);
+        var texture = try self.createAtlasTexture(self.atlas_pages.items.len, size);
         errdefer texture.destroy();
-        try self.atlas_pages.append(self.allocator, .{ .texture = texture });
+        try self.atlas_pages.append(self.allocator, .{ .texture = texture, .size = size });
         const page = &self.atlas_pages.items[self.atlas_pages.items.len - 1];
         const pos = allocAtlasOnPage(page, width, height) orelse return error.AtlasAllocationFailed;
         return .{ .page_index = self.atlas_pages.items.len - 1, .x = pos[0], .y = pos[1] };
     }
 
-    fn createAtlasTexture(self: *ImageTextureStore, page_index: usize) !gpu.Backend.Texture {
+    fn createAtlasTexture(self: *ImageTextureStore, page_index: usize, size: u32) !gpu.Backend.Texture {
         var label_buf: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "Zenit.Image.Atlas[{d}]", .{page_index});
         return self.device.createTexture(self.allocator, .{
             .label = label,
-            .size = .{ .width = ATLAS_PAGE_SIZE, .height = ATLAS_PAGE_SIZE },
+            .size = .{ .width = size, .height = size },
             .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
+            // Upload-only: no CPU path reads image pixels back.
+            .host_access = .write_only,
         });
     }
 
@@ -511,27 +576,16 @@ pub const ImageRenderer = struct {
     uniform_write_offset: usize = 0,
     /// Single-frame uniform slot overflow count (diagnostic)
     uniform_overflow_count: u64 = 0,
-    /// Triple-buffered instance buffers
-    instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
+    /// Triple-buffered instance storage sized by demand (see SlotBuffer).
+    instance_buffers: SlotBuffer(BUFFER_COUNT) = .init("Zenit.Image.InstanceBuffer", MIN_INSTANCE_BYTES),
     current_buffer: usize = 0,
 
-    /// Overflowed instance buffer (one per frame slot, retained after growth). Growable per frame:
-    /// sufficient capacity is reused, insufficient is rebuilt once, instead of a
-    /// createBuffer+destroy
-    /// per batch once MAX_INSTANCES is exhausted. Slots rotate with current_buffer, so no GPU
-    /// in-flight overwrite. Same retention as sdf_renderer.
     /// Overflowed uniform buffer (one per frame slot, retained). Same as text_renderer: batches are
     /// not dropped when slots are exhausted (otherwise instances stay dirty and the next batch
     /// overflows the old ones, leaving the rest invisible). Grown on demand, retained across
     /// frames.
-    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
-    uniform_overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
+    uniform_overflow: SlotBuffer(BUFFER_COUNT) = .init("Zenit.Image.OverflowUniforms", UNIFORM_STRIDE * 64),
     uniform_overflow_used: usize = 0,
-    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
-    overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
-    /// Frame slot overflow buffer write cursor (bytes);
-    /// ensures multiple batches don't overwrite.
-    overflow_write_offset: usize = 0,
     sampler: ?gpu.Backend.Sampler,
 
     // Texture management
@@ -540,14 +594,17 @@ pub const ImageRenderer = struct {
 
     // Instance grouping (group render by texture ID)
     instances: std.ArrayList(ImageInstance),
+    /// Advances whenever the pending instances are dropped (see TextRenderer.pending_generation).
+    pending_generation: u64 = 0,
     instance_textures: std.ArrayList(struct { binding: gpu.Backend.TextureBinding, view: gpu.Backend.TextureView }),
 
     viewport_width: f32,
     viewport_height: f32,
     scale_factor: f32,
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
-    clip_radius: f32 = 0,
+    clip_radii: [4]f32 = .{ 0, 0, 0, 0 },
     clip_shape_kind: u32 = 0,
+    clip2: shape_clip_pair.Uniform = .{},
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
@@ -566,16 +623,14 @@ pub const ImageRenderer = struct {
         self.uniform_write_offset = 0;
         self.uniform_overflow_count = 0;
         self.current_buffer = 0;
-        @memset(&self.uniform_overflow_buffers, null);
-        @memset(&self.uniform_overflow_capacities, 0);
+        self.uniform_overflow = .init("Zenit.Image.OverflowUniforms", UNIFORM_STRIDE * 64);
         self.uniform_overflow_used = 0;
-        @memset(&self.overflow_buffers, null);
-        @memset(&self.overflow_capacities, 0);
-        self.overflow_write_offset = 0;
+        self.instance_buffers = .init("Zenit.Image.InstanceBuffer", MIN_INSTANCE_BYTES);
         self.shared_texture_store = null;
         self.clip_rect = .{ 0, 0, 0, 0 };
-        self.clip_radius = 0;
+        self.clip_radii = .{ 0, 0, 0, 0 };
         self.clip_shape_kind = 0;
+        self.clip2 = .{};
         self.clip_fill_rule = 0;
         self.clip_point_count = 0;
         self.clip_contour_count = 0;
@@ -637,21 +692,6 @@ pub const ImageRenderer = struct {
             uniform_created += 1;
         }
 
-        // Triple-buffered instance buffers
-        var instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer = undefined;
-        var instance_created: usize = 0;
-        errdefer for (instance_buffers[0..instance_created]) |*ib| ib.destroy();
-        for (&instance_buffers, 0..) |*buf, i| {
-            const label = try std.fmt.allocPrint(allocator, "Zenit.Image.InstanceBuffer[{d}]", .{i});
-            defer allocator.free(label);
-            buf.* = try device.createBuffer(allocator, .{
-                .label = label,
-                .size = @sizeOf(ImageInstance) * MAX_INSTANCES,
-                .usage = .{ .vertex = true, .map_write = true },
-            });
-            instance_created += 1;
-        }
-
         // Create Linear + Mip sampler (reduce flicker when image shrinks)
         const sampler = try device.createSampler(allocator, .{
             .label = "Zenit.Image.LinearMipSampler",
@@ -667,7 +707,6 @@ pub const ImageRenderer = struct {
         self.pipeline = pipeline;
         self.unmasked_pipeline = unmasked_pipeline;
         self.uniform_buffers = uniform_buffers;
-        self.instance_buffers = instance_buffers;
         self.sampler = sampler;
         self.texture_store.init(allocator, device, false);
         self.instances = .empty;
@@ -678,19 +717,28 @@ pub const ImageRenderer = struct {
     }
 
     /// Destruction
+    /// Per-slot scratch storage is rewritten every frame; see idle_storage.
+    pub fn setScratchVolatile(self: *ImageRenderer, make_volatile: bool) void {
+        idle_storage.setBuffersVolatile(&self.uniform_buffers, make_volatile);
+        self.instance_buffers.setVolatile(make_volatile);
+        self.uniform_overflow.setVolatile(make_volatile);
+    }
+
+    /// Drop demand-sized scratch so the next frame regrows it to what it
+    /// draws. Only while no submitted frame is executing.
+    pub fn releaseScratch(self: *ImageRenderer) void {
+        self.instance_buffers.release();
+        self.uniform_overflow.release();
+    }
+
     pub fn deinit(self: *ImageRenderer) void {
         self.clearInstances();
         self.texture_store.deinit();
         if (self.sampler) |*sampler| sampler.destroy();
         self.instances.deinit(self.allocator);
         self.instance_textures.deinit(self.allocator);
-        for (&self.instance_buffers) |*buf| buf.destroy();
-        for (&self.overflow_buffers) |*maybe_buf| {
-            if (maybe_buf.*) |*buf| buf.destroy();
-        }
-        for (&self.uniform_overflow_buffers) |*maybe_buf| {
-            if (maybe_buf.*) |*buf| buf.destroy();
-        }
+        self.instance_buffers.deinit(self.allocator);
+        self.uniform_overflow.deinit(self.allocator);
         for (&self.uniform_buffers) |*ubuf| ubuf.destroy();
         if (self.unmasked_pipeline) |*value| value.deinit();
         self.pipeline.deinit();
@@ -725,7 +773,7 @@ pub const ImageRenderer = struct {
     pub fn setTextureSamplingExtent(self: *ImageRenderer, id: TextureId, width: u32, height: u32) void {
         const slot = self.texture_store.resolveTextureSlot(id) orelse return;
         const index = id & SLOT_MASK;
-        self.texture_store.textures[index].?.sampling_max = .{
+        self.texture_store.slotPtr(index).texture.?.sampling_max = .{
             (@as(f32, @floatFromInt(width)) - 0.5) / @as(f32, @floatFromInt(slot.width)),
             (@as(f32, @floatFromInt(height)) - 0.5) / @as(f32, @floatFromInt(slot.height)),
         };
@@ -736,39 +784,39 @@ pub const ImageRenderer = struct {
         return .{ slot.width, slot.height };
     }
 
-    /// External bindings can change without notifying this store. A missing
-    /// revision means enclosing retained surfaces must not reuse their pixels.
-    pub fn textureContentRevision(self: *const ImageRenderer, id: TextureId) ?u64 {
-        const slot = self.resolveTextureSlot(id) orelse return null;
-        return switch (slot.kind) {
-            .standalone, .atlas_region => 0,
-            .stream => slot.content_revision,
-            .external => null,
-        };
-    }
-
     fn clearInstances(self: *ImageRenderer) void {
         for (self.instance_textures.items) |*entry| entry.view.destroy();
         self.instance_textures.clearRetainingCapacity();
         self.instances.clearRetainingCapacity();
+        self.pending_generation +%= 1;
     }
 
     /// Start new frame
+    /// Start a GPU frame.
     pub fn beginFrame(self: *ImageRenderer, width: f32, height: f32, scale: f32) void {
+        self.beginFrameFor(width, height, scale, true);
+    }
+
+    /// `gpu_frame` false: a CPU patch encode (cpu_flat), which reads only the
+    /// CPU-side batches: the triple-buffered GPU slots keep rotating with GPU
+    /// frames alone, so a slot an in-flight frame reads is never reused.
+    pub fn beginFrameFor(self: *ImageRenderer, width: f32, height: f32, scale: f32, gpu_frame: bool) void {
         self.clearInstances();
         self.buffer_write_offset = 0;
-        self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
+        if (gpu_frame) {
+            self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
+            self.instance_buffers.beginSlot(self.current_buffer);
+            self.uniform_overflow.beginSlot(self.current_buffer);
+        }
         self.uniform_write_offset = 0;
         self.uniform_overflow_used = 0;
-        // New slot's overflow buffer starts fresh
-        // (slot's last use was BUFFER_COUNT frames ago)
-        self.overflow_write_offset = 0;
         self.viewport_width = width * scale;
         self.viewport_height = height * scale;
         self.scale_factor = scale;
         self.clip_rect = .{ 0, 0, 0, 0 };
-        self.clip_radius = 0;
+        self.clip_radii = .{ 0, 0, 0, 0 };
         self.clip_shape_kind = 0;
+        self.clip2 = .{};
         self.clip_fill_rule = 0;
         self.clip_point_count = 0;
         self.clip_contour_count = 0;
@@ -785,10 +833,15 @@ pub const ImageRenderer = struct {
         self.scale_factor = scale;
     }
 
-    pub fn setClipMask(self: *ImageRenderer, shape_kind: u32, rect: ?[4]f32, radius: f32, fill_rule: u32, point_count: u32, contour_count: u32, contour_end_points: [MAX_CLIP_POLYGON_CONTOURS]u8, polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32) void {
+    /// Second shape clip intersected with the primary one (shape_clip_pair.zig).
+    pub fn setPartnerClip(self: *ImageRenderer, clip: shape_clip_pair.Uniform) void {
+        self.clip2 = clip;
+    }
+
+    pub fn setClipMask(self: *ImageRenderer, shape_kind: u32, rect: ?[4]f32, radii: [4]f32, fill_rule: u32, point_count: u32, contour_count: u32, contour_end_points: [MAX_CLIP_POLYGON_CONTOURS]u8, polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32) void {
         if (rect) |mask_rect| {
             self.clip_rect = mask_rect;
-            self.clip_radius = radius;
+            self.clip_radii = radii;
             self.clip_shape_kind = shape_kind;
             self.clip_fill_rule = fill_rule;
             self.clip_point_count = point_count;
@@ -797,8 +850,9 @@ pub const ImageRenderer = struct {
             self.clip_polygon_points = polygon_points;
         } else {
             self.clip_rect = .{ 0, 0, 0, 0 };
-            self.clip_radius = 0;
+            self.clip_radii = .{ 0, 0, 0, 0 };
             self.clip_shape_kind = 0;
+            self.clip2 = .{};
             self.clip_fill_rule = 0;
             self.clip_point_count = 0;
             self.clip_contour_count = 0;
@@ -829,7 +883,7 @@ pub const ImageRenderer = struct {
             h,
             .{ 0, 0, 1, 1 },
             WHITE,
-            corner_radius,
+            @as([4]f32, @splat(corner_radius)),
             opacity,
             transform,
             false,
@@ -857,7 +911,7 @@ pub const ImageRenderer = struct {
             h,
             uv,
             tint,
-            corner_radius,
+            @as([4]f32, @splat(corner_radius)),
             opacity,
             transform,
             false,
@@ -873,7 +927,7 @@ pub const ImageRenderer = struct {
         h: f32,
         uv: [4]f32,
         tint: [4]f32,
-        corner_radius: f32,
+        corner_radii: [4]f32,
         opacity: f32,
         rotate: f32,
     ) !void {
@@ -884,7 +938,7 @@ pub const ImageRenderer = struct {
             h,
             uv,
             tint,
-            corner_radius,
+            corner_radii,
             opacity,
             transform,
             true,
@@ -898,7 +952,7 @@ pub const ImageRenderer = struct {
         h: f32,
         uv: [4]f32,
         tint: [4]f32,
-        corner_radius: f32,
+        corner_radii: [4]f32,
         opacity: f32,
         transform: [6]f32,
         source_premultiplied: bool,
@@ -912,13 +966,45 @@ pub const ImageRenderer = struct {
             .tint_color = tint,
             .transform_linear = .{ transform[0], transform[1], transform[2], transform[3] },
             .transform_translation = .{ transform[4], transform[5] },
-            .corner_radius = corner_radius,
+            // The mask is the instance rect (0, 0, w, h): fit the radii to it like every other
+            // rounded shape, so an offscreen composite traces the same outline as the direct clip.
+            .corner_radii = corner_radii_mod.normalize(corner_radii, w, h),
             .opacity = opacity,
             .source_premultiplied = if (source_premultiplied) 1 else 0,
-            ._rect_clip_padding = .{ slot.sampling_max[0], slot.sampling_max[1], 0 },
+            .sampling = .{ slot.sampling_max[0], slot.sampling_max[1], 0, 0 },
             .rect_clip = self.current_rect_clip,
         });
         self.instance_textures.appendAssumeCapacity(.{ .binding = slot.binding, .view = slot.binding.createView() });
+    }
+
+    /// One cell of a warped texture mesh (Metal only: image.metal reads the four corners when
+    /// `sampling[3]` is 1). Corners TL, TR, BL, BR in logical target coordinates; `uv` is the
+    /// cell's texel rect (u0, v0, u1, v1). The two triangles interpolate the texture affinely,
+    /// and neighbouring cells share their corners exactly, so a grid of cells has no seams.
+    pub fn addImageMeshCell(
+        self: *ImageRenderer,
+        texture_id: TextureId,
+        corners: [4][2]f32,
+        uv: [4]f32,
+        opacity: f32,
+        source_premultiplied: bool,
+    ) !void {
+        const slot = self.resolveTextureSlot(texture_id) orelse return error.UnknownTexture;
+        try self.instances.ensureUnusedCapacity(self.allocator, 1);
+        try self.instance_textures.ensureUnusedCapacity(self.allocator, 1);
+        self.instances.appendAssumeCapacity(.{
+            .rect = .{ corners[0][0], corners[0][1], corners[1][0], corners[1][1] },
+            .uv_rect = composeUvRect(slot.uv_rect, uv),
+            .tint_color = .{ 1, 1, 1, 1 },
+            .transform_linear = .{ corners[2][0], corners[2][1], corners[3][0], corners[3][1] },
+            .corner_radii = .{ 0, 0, 0, 0 },
+            .opacity = opacity,
+            .source_premultiplied = if (source_premultiplied) 1 else 0,
+            .sampling = .{ slot.sampling_max[0], slot.sampling_max[1], 0, 1 },
+            .rect_clip = self.current_rect_clip,
+        });
+        self.instance_textures.appendAssumeCapacity(.{ .binding = slot.binding, .view = slot.binding.createView() });
+        image_mesh_cells += 1;
     }
 
     fn affineTranslation(x: f32, y: f32) [6]f32 {
@@ -947,20 +1033,7 @@ pub const ImageRenderer = struct {
     /// supports buffer_write_offset accumulation).
     /// Ensure frame slot's overflow uniform buffer fits `slots` Uniforms.
     fn ensureUniformOverflowCapacity(self: *ImageRenderer, slots: usize) !*gpu.Backend.Buffer {
-        const needed = slots * UNIFORM_STRIDE;
-        if (self.uniform_overflow_capacities[self.current_buffer] < needed) {
-            var new_capacity = @max(self.uniform_overflow_capacities[self.current_buffer], UNIFORM_STRIDE * 64);
-            while (new_capacity < needed) new_capacity *= 2;
-            const replacement = try self.device.createBuffer(self.allocator, .{
-                .label = "Zenit.Image.OverflowUniforms",
-                .size = new_capacity,
-                .usage = .{ .vertex = true, .map_write = true },
-            });
-            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
-            self.uniform_overflow_buffers[self.current_buffer] = replacement;
-            self.uniform_overflow_capacities[self.current_buffer] = new_capacity;
-        }
-        return &self.uniform_overflow_buffers[self.current_buffer].?;
+        return (try self.uniform_overflow.ensure(self.allocator, self.device, self.current_buffer, slots * UNIFORM_STRIDE)).buffer;
     }
 
     pub fn render(self: *ImageRenderer, render_pass: *gpu.Backend.RenderPass) !void {
@@ -985,8 +1058,9 @@ pub const ImageRenderer = struct {
             .viewport_size = .{ self.viewport_width, self.viewport_height },
             .scale_factor = self.scale_factor,
             .clip_shape_kind = self.clip_shape_kind,
+            .clip2 = shape_clip_pair.field(self.clip2),
             .clip_rect = self.clip_rect,
-            .clip_radius = self.clip_radius,
+            .clip_radii = self.clip_radii,
             .clip_fill_rule = self.clip_fill_rule,
             .clip_point_count = self.clip_point_count,
             .clip_contour_count = self.clip_contour_count,
@@ -997,7 +1071,7 @@ pub const ImageRenderer = struct {
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
 
         // Set pipeline
-        render_pass.setPipeline(if (self.clip_shape_kind == 0 and self.unmasked_pipeline != null) &self.unmasked_pipeline.? else &self.pipeline);
+        render_pass.setPipeline(if (self.clip_shape_kind == 0 and self.clip2.kind == 0 and self.unmasked_pipeline != null) &self.unmasked_pipeline.? else &self.pipeline);
         // One uniform slot, not the rest of the ring: Direct3D snapshots the bound
         // range per draw (constant buffers over 4 KiB are copied into a new buffer).
         gpu.setVertexBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
@@ -1015,43 +1089,15 @@ pub const ImageRenderer = struct {
         // Batch upload, append to buffer (don't overwrite previous flush)
         var global_offset: usize = 0;
         while (global_offset < total) {
-            const remaining_total = total - global_offset;
-            const remaining_capacity = MAX_INSTANCES - self.buffer_write_offset;
-            const chunk_count = if (remaining_capacity == 0)
-                remaining_total
-            else
-                @min(remaining_total, remaining_capacity);
+            const chunk_count = total - global_offset;
             const chunk_size = @sizeOf(ImageInstance) * chunk_count;
-            if (remaining_capacity == 0) {
-                // Reuse frame slot's overflow buffer; rebuild if insufficient
-                // (geometric growth, avoid jitter).
-                const needed = self.overflow_write_offset + chunk_size;
-                if (self.overflow_capacities[self.current_buffer] < needed) {
-                    var new_capacity = @max(self.overflow_capacities[self.current_buffer], chunk_size);
-                    while (new_capacity < needed) new_capacity *= 2;
-                    const replacement = try self.device.createBuffer(self.allocator, .{
-                        .label = "Zenit.Image.OverflowInstanceBuffer",
-                        .size = new_capacity,
-                        .usage = .{ .vertex = true, .map_write = true },
-                    });
-                    if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
-                    self.overflow_buffers[self.current_buffer] = replacement;
-                    self.overflow_capacities[self.current_buffer] = new_capacity;
-                }
-                const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
-                const overflow_data = try overflow_buffer.getMappedRange(self.overflow_write_offset, chunk_size);
-                @memcpy(overflow_data, std.mem.sliceAsBytes(self.instances.items[global_offset .. global_offset + chunk_count]));
-                gpu.setVertexBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(chunk_size));
-                gpu.setFragmentBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(chunk_size));
-                self.overflow_write_offset += chunk_size;
-            } else {
-                const byte_offset = self.buffer_write_offset * @sizeOf(ImageInstance);
-                const chunk_data = try self.instance_buffers[self.current_buffer].getMappedRange(byte_offset, chunk_size);
-                @memcpy(chunk_data, std.mem.sliceAsBytes(self.instances.items[global_offset .. global_offset + chunk_count]));
-                gpu.setVertexBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(chunk_size));
-                gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(chunk_size));
-                self.buffer_write_offset += chunk_count;
-            }
+            const byte_offset = self.buffer_write_offset * @sizeOf(ImageInstance);
+            const storage = try self.instance_buffers.ensure(self.allocator, self.device, self.current_buffer, byte_offset + chunk_size);
+            const chunk_data = try storage.buffer.getMappedRange(byte_offset, chunk_size);
+            @memcpy(chunk_data, std.mem.sliceAsBytes(self.instances.items[global_offset .. global_offset + chunk_count]));
+            gpu.setVertexBufferRange(render_pass, 1, storage.buffer, @intCast(byte_offset), @intCast(chunk_size));
+            gpu.setFragmentBufferRange(render_pass, 1, storage.buffer, @intCast(byte_offset), @intCast(chunk_size));
+            self.buffer_write_offset += chunk_count;
 
             // Group by texture within current chunk
             var i: usize = 0;
@@ -1092,6 +1138,19 @@ pub const ImageRenderer = struct {
         self.shared_texture_store = store;
     }
 
+    /// Content revision of a texture's pixels. Immutable textures report 0 and
+    /// stream textures advance on every upload. External bindings can change
+    /// without notifying this store, so they (and unknown handles) report null:
+    /// enclosing retained surfaces must not reuse their pixels.
+    pub fn textureContentRevision(self: *const ImageRenderer, id: TextureId) ?u64 {
+        const slot = self.resolveTextureSlot(id) orelse return null;
+        return switch (slot.kind) {
+            .standalone, .atlas_region => 0,
+            .stream => slot.content_revision,
+            .external => null,
+        };
+    }
+
     fn resolveTextureSlot(self: *const ImageRenderer, id: TextureId) ?TextureSlot {
         const store = if (id & SHARED_TEXTURE_BIT != 0) self.shared_texture_store orelse return null else &self.texture_store;
         return store.resolveTextureSlot(id);
@@ -1123,6 +1182,19 @@ fn textureByteLength(width: u32, height: u32, levels: u32) u64 {
     return total;
 }
 
+fn atlasPageSizeAfter(existing_pages: usize) u32 {
+    const shift: u5 = @intCast(@min(existing_pages, 2));
+    return @min(ATLAS_PAGE_SIZE, @as(u32, ATLAS_MIN_PAGE_SIZE) << shift);
+}
+
+/// First page: just large enough for the first image (most windows show a
+/// few small images; a 512 px page is 1 MiB resident). Later pages grow.
+fn atlasPageSizeFor(existing_pages: usize, width: u32, height: u32) u32 {
+    if (existing_pages > 0) return atlasPageSizeAfter(existing_pages);
+    const needed = @max(width, height) + ATLAS_GUTTER * 2;
+    return @max(ATLAS_FIRST_PAGE_MIN, std.math.ceilPowerOfTwo(u32, needed) catch ATLAS_PAGE_SIZE);
+}
+
 fn canAtlasTexture(width: u32, height: u32) bool {
     return width <= ATLAS_MAX_TEXTURE_SIZE and height <= ATLAS_MAX_TEXTURE_SIZE;
 }
@@ -1130,14 +1202,14 @@ fn canAtlasTexture(width: u32, height: u32) bool {
 fn allocAtlasOnPage(page: *AtlasPage, width: u32, height: u32) ?[2]u32 {
     const padded_w = width + ATLAS_GUTTER * 2;
     const padded_h = height + ATLAS_GUTTER * 2;
-    if (padded_w > ATLAS_PAGE_SIZE or padded_h > ATLAS_PAGE_SIZE) return null;
+    if (padded_w > page.size or padded_h > page.size) return null;
 
-    if (page.next_x + padded_w > ATLAS_PAGE_SIZE) {
+    if (page.next_x + padded_w > page.size) {
         page.next_x = 0;
         page.next_y += page.shelf_height;
         page.shelf_height = 0;
     }
-    if (page.next_y + padded_h > ATLAS_PAGE_SIZE) return null;
+    if (page.next_y + padded_h > page.size) return null;
 
     const inner_x = page.next_x + ATLAS_GUTTER;
     const inner_y = page.next_y + ATLAS_GUTTER;
@@ -1159,6 +1231,19 @@ fn atlasRegionUvRect(x: u32, y: u32, width: u32, height: u32, page_size: u32) [4
         @as(f32, @floatFromInt(x + width)) * inv,
         @as(f32, @floatFromInt(y + height)) * inv,
     };
+}
+
+test "image atlas pages start small and double up to the maximum page size" {
+    try std.testing.expectEqual(@as(u32, 512), atlasPageSizeAfter(0));
+    try std.testing.expectEqual(@as(u32, 1024), atlasPageSizeAfter(1));
+    try std.testing.expectEqual(@as(u32, 2048), atlasPageSizeAfter(2));
+    try std.testing.expectEqual(@as(u32, 2048), atlasPageSizeAfter(9));
+    try std.testing.expectEqual(@as(u32, 128), atlasPageSizeFor(0, 24, 24));
+    try std.testing.expectEqual(@as(u32, 512), atlasPageSizeFor(0, 256, 200));
+    try std.testing.expectEqual(@as(u32, 1024), atlasPageSizeFor(1, 24, 24));
+    // The largest atlas-eligible image plus its gutter fits the first page.
+    var small = AtlasPage{ .texture = undefined, .size = ATLAS_MIN_PAGE_SIZE };
+    try std.testing.expect(allocAtlasOnPage(&small, ATLAS_MAX_TEXTURE_SIZE, ATLAS_MAX_TEXTURE_SIZE) != null);
 }
 
 test "atlasRegionUvRect maps texel centres to their own positions in the quad" {
@@ -1247,23 +1332,10 @@ fn downsampleRgbaBox(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: 
 //
 // Mip chain generation (uploadMipChain -> downsampleRgbaBox) round-trips every pixel channel;
 // std.math.pow per call stalls the main thread (6016x3384 full-screen: ~68M pow calls,
-// 1195ms ReleaseFast). Forward input is 256 values -> 256-entry LUT, bit-identical to pow,
-// zero precision loss. Reverse input is f32, 12-bit quantized approximation; the mip is a
+// 1195ms ReleaseFast). Forward input is 256 values -> shared 256-entry LUT, using
+// the same single-rounded curve as command encoding. Reverse input is f32, 12-bit quantized approximation; the mip is a
 // thumbnail, max error <1/255 is invisible. ReleaseFast full mip chain: pow 1195ms,
 // forward-only LUT 88ms (13.6x), both LUTs 21ms (57x).
-
-const SRGB_TO_LINEAR_LUT: [256]f32 = blk: {
-    @setEvalBranchQuota(100_000);
-    var table: [256]f32 = undefined;
-    for (&table, 0..) |*e, i| {
-        const c = @as(f32, @floatFromInt(i)) / 255.0;
-        e.* = if (c <= 0.04045)
-            c / 12.92
-        else
-            std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
-    }
-    break :blk table;
-};
 
 /// Inverse table quantization bins (12bit). +1 lets v==1.0 index final
 /// entry, skips clamp branch.
@@ -1284,7 +1356,7 @@ const LINEAR_TO_SRGB_LUT: [LINEAR_TO_SRGB_STEPS + 1]u8 = blk: {
 };
 
 inline fn srgb8ToLinear(v: u8) f32 {
-    return SRGB_TO_LINEAR_LUT[v];
+    return @import("color_conversion.zig").srgbByteToLinear(v);
 }
 
 inline fn linearToSrgb8(v: f32) u8 {
@@ -1307,18 +1379,21 @@ test "deinit texture ownership: standalone and stream own storage (downstream re
     try std.testing.expect(!slotOwnsTexture(.external));
 }
 
-test "srgb8ToLinear LUT is bit-exact vs reference pow implementation" {
-    // Forward input only 256 values; LUT must match direct calculation
-    // bit-for-bit (not approximate).
+test "srgb8ToLinear LUT is bit-exact vs single-rounded f64 reference" {
+    // Require every stored bit, using higher precision for intermediate math.
+    // This is stable across debug/safe builds without a tolerance escape hatch.
     for (0..256) |i| {
         const v: u8 = @intCast(i);
-        const c = @as(f32, @floatFromInt(v)) / 255.0;
-        const reference = if (c <= 0.04045)
+        const c: f64 = @as(f32, @floatFromInt(v)) / 255.0;
+        const reference: f32 = @floatCast(if (c <= 0.04045)
             c / 12.92
         else
-            std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
-        try std.testing.expectEqual(reference, srgb8ToLinear(v));
+            std.math.pow(f64, (c + 0.055) / 1.055, 2.4));
+        try std.testing.expectEqual(@as(u32, @bitCast(reference)), @as(u32, @bitCast(srgb8ToLinear(v))));
     }
+    // Independent fixed values also pin the branch boundary and midrange.
+    for ([_]struct { u8, u32 }{ .{ 0, 0 }, .{ 10, 0x3b46eb61 }, .{ 11, 0x3b5b518e }, .{ 128, 0x3e5d0a8b }, .{ 255, 0x3f800000 } }) |sample|
+        try std.testing.expectEqual(sample[1], @as(u32, @bitCast(srgb8ToLinear(sample[0]))));
 }
 
 test "linearToSrgb8 LUT stays within 1/255 of reference" {
@@ -1381,8 +1456,9 @@ test "makePaddedAtlasPixels duplicates edge texels into gutter" {
 }
 
 test "ImageInstance ABI matches image shader layout" {
-    try std.testing.expectEqual(@as(usize, 96), @offsetOf(ImageInstance, "rect_clip"));
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(ImageInstance));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(ImageInstance, "corner_radii"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ImageInstance, "rect_clip"));
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(ImageInstance));
 }
 
 test "texture namespaces and generations reject released handles and wrong owners" {
@@ -1412,8 +1488,8 @@ test "texture namespaces and generations reject released handles and wrong owner
     shared.unregisterTextureBinding(replacement);
     // Persistent slots: generation exhausted, slot retires (old handle
     // might be cached long-term, can't wrap).
-    shared.textures[0] = .{ .kind = .standalone, .binding = binding, .width = 1, .height = 1, .mip_level_count = 1 };
-    shared.generations[0] = MAX_GENERATION;
+    try std.testing.expectEqual(@as(u32, 0), try shared.allocateTextureSlot());
+    shared.slotPtr(0).* = .{ .texture = .{ .kind = .standalone, .binding = binding, .width = 1, .height = 1, .mip_level_count = 1 }, .generation = MAX_GENERATION };
     const last_persistent = shared.handle(0);
     shared.unloadTexture(last_persistent);
     try std.testing.expect(shared.getTextureSize(last_persistent) == null);
@@ -1434,7 +1510,7 @@ test "external 绑定槽位 generation 回绕：高频 register/unregister 不�
 
     // Push all external slots to generation max: old implementation had
     // them all retire.
-    for (EXTERNAL_SLOT_BASE..MAX_TEXTURES) |i| store.generations[i] = MAX_GENERATION;
+    for (&store.external) |*entry| entry.generation = MAX_GENERATION;
     var i: usize = 0;
     var prev: TextureId = 0;
     while (i < EXTERNAL_SLOT_COUNT * 2) : (i += 1) {
@@ -1449,8 +1525,7 @@ test "external 绑定槽位 generation 回绕：高频 register/unregister 不�
         prev = id;
     }
     // No persistent slot occupied by external
-    for (store.textures[0..EXTERNAL_SLOT_BASE]) |slot| try std.testing.expect(slot == null);
-    try std.testing.expectEqual(@as(u32, 0), store.generations[0]);
+    try std.testing.expectEqual(@as(usize, 0), store.persistent.items.len);
 }
 
 test "image instance preparation failure cannot leave mismatched instance and texture arrays" {

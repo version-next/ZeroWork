@@ -1,4 +1,5 @@
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const record_identity = @import("../host/identity.zig");
 pub const manifest = @import("recording_manifest.zig");
 
@@ -262,7 +263,7 @@ pub const Archive = struct {
         try validateField(entry.user);
         try validatePath(entry.cast_path);
         if (std.fs.path.dirname(self.index_path)) |parent| try self.dir.createDirPath(self.io, parent);
-        const old = self.dir.readFileAlloc(self.io, self.index_path, self.allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        const old = self.dir.readFileAlloc(self.io, self.index_path, self.allocator, .limited(max_index_bytes)) catch |err| switch (err) {
             error.FileNotFound => try self.allocator.dupe(u8, ""),
             else => return err,
         };
@@ -278,16 +279,12 @@ pub const Archive = struct {
             if (entry.source_kind) |kind| @tagName(kind) else "", entry.saved_connection_id orelse 0,
         });
         try line.appendSlice(self.allocator, writer.buffered());
-        var atomic = try self.dir.createFileAtomic(self.io, self.index_path, .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(0o600)), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        try atomic.file.writePositionalAll(self.io, line.items, 0);
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try persist.writeAtomic(self.io, self.dir, self.index_path, line.items, .{ .make_path = true });
     }
 
     /// Loads valid entries, skipping a partial/corrupt trailing line.
     pub fn load(self: *Archive, allocator: std.mem.Allocator) !std.ArrayList(Entry) {
-        return self.loadBounded(allocator, 16 * 1024 * 1024, std.math.maxInt(usize));
+        return self.loadBounded(allocator, max_index_bytes, std.math.maxInt(usize));
     }
     fn loadBounded(self: *Archive, allocator: std.mem.Allocator, byte_limit: usize, entry_limit: usize) !std.ArrayList(Entry) {
         var out: std.ArrayList(Entry) = .empty;
@@ -297,9 +294,9 @@ pub const Archive = struct {
             return err;
         };
         defer allocator.free(data);
-        var lines = std.mem.splitScalar(u8, data, '\n');
+        // 坏行（含写到一半的末行）跳过，其余照常读出。
+        var lines = persist.lines(data);
         while (lines.next()) |line| {
-            if (line.len == 0) continue;
             var fields = std.mem.splitScalar(u8, line, '\t');
             const id = parseU64(fields.next() orelse continue) orelse continue;
             const started = parseI64(fields.next() orelse continue) orelse continue;
@@ -341,8 +338,8 @@ pub const Archive = struct {
             plans.deinit(self.allocator);
         }
         try plans.ensureTotalCapacity(self.allocator, entries.items.len);
-        var atomic = try self.dir.createFileAtomic(self.io, self.index_path, .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(0o600)), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
+        var atomic = try persist.AtomicWriter.begin(self.io, self.dir, self.index_path, .{ .make_path = true });
+        defer atomic.deinit();
         for (entries.items) |entry| {
             if (entry.ended_ms >= cutoff) {
                 kept.appendAssumeCapacity(entry);
@@ -392,11 +389,10 @@ pub const Archive = struct {
         for (plans.items) |*plan| try plan.remove(self.io, self.dir, "RetentionExpired");
         if (plans.items.len != 0) {
             var buffer: [4096]u8 = undefined;
-            var writer = atomic.file.writer(self.io, &buffer);
+            var writer = atomic.writer(&buffer);
             for (kept.items) |entry| try writer.interface.print("{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{ entry.id, entry.started_ms, entry.ended_ms, entry.duration_ms, entry.exit_code orelse -2147483648, entry.host, entry.user, entry.cast_path, if (entry.source_kind) |kind| @tagName(kind) else "", entry.saved_connection_id orelse 0 });
             try writer.interface.flush();
-            try atomic.file.sync(self.io);
-            try atomic.replace(self.io);
+            try atomic.commit();
         }
         return plans.items.len;
     }
@@ -422,7 +418,7 @@ pub const Archive = struct {
     pub fn removeEntries(self: *Archive, keys: []const EntryKey) !void {
         lockIndex();
         defer index_mutex.unlock();
-        const source = self.dir.readFileAlloc(self.io, self.index_path, self.allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        const source = self.dir.readFileAlloc(self.io, self.index_path, self.allocator, .limited(max_index_bytes)) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -449,22 +445,17 @@ pub const Archive = struct {
             if (!removed) try kept.appendSlice(self.allocator, raw);
             cursor = end;
         }
-        var atomic = try self.dir.createFileAtomic(self.io, self.index_path, .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(0o600)), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        try atomic.file.writePositionalAll(self.io, kept.items, 0);
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try persist.writeAtomic(self.io, self.dir, self.index_path, kept.items, .{ .make_path = true });
     }
 
     fn rewrite(self: *Archive, entries: []const Entry) !void {
         var buf: [4096]u8 = undefined;
-        var atomic = try self.dir.createFileAtomic(self.io, self.index_path, .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(@intCast(0o600))), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        var writer = atomic.file.writer(self.io, &buf);
+        var atomic = try persist.AtomicWriter.begin(self.io, self.dir, self.index_path, .{ .make_path = true });
+        defer atomic.deinit();
+        var writer = atomic.writer(&buf);
         for (entries) |entry| try writer.interface.print("{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{ entry.id, entry.started_ms, entry.ended_ms, entry.duration_ms, entry.exit_code orelse -2147483648, sanitize(entry.host), sanitize(entry.user), sanitize(entry.cast_path), if (entry.source_kind) |kind| @tagName(kind) else "", entry.saved_connection_id orelse 0 });
         try writer.interface.flush();
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try atomic.commit();
     }
 
     /// Releases strings and the list returned by `load`.  Callers that retain
@@ -719,7 +710,7 @@ pub fn acquireQueryRecord(archive: Archive, allocator: std.mem.Allocator, manife
         var lease = try acquireLease(allocator, archive.io, archive.dir, file.path);
         errdefer lease.deinit();
         if (lease.stat.size != file.committed_length) return error.RecordingChanged;
-        if (lease.stat.size > 128 * 1024 * 1024) return error.RecordingTooLarge;
+        if (lease.stat.size > max_recording_bytes) return error.RecordingTooLarge;
         if (file.kind == .cast) {
             if (found_cast) return error.UnsupportedRecordingSegments;
             found_cast = true;
@@ -766,6 +757,10 @@ fn descriptorFromManifest(allocator: std.mem.Allocator, path: []const u8, value:
     };
 }
 pub const max_catalog_metadata_bytes: usize = 16 * 1024 * 1024;
+/// History index file read bound (index.tsv).
+pub const max_index_bytes: usize = 16 * 1024 * 1024;
+/// One recording file (cast) read/replay bound.
+pub const max_recording_bytes: usize = 128 * 1024 * 1024;
 fn catalogLoad(archive: *Archive, allocator: std.mem.Allocator) !Catalog {
     return catalogLoadWithActive(archive, allocator, false);
 }

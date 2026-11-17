@@ -56,6 +56,8 @@ pub const Geometry = struct {
 };
 
 pub const Modifiers = struct { shift: bool = false, ctrl: bool = false, alt: bool = false, super: bool = false };
+/// 释放键盘鼠标的组合 ⌃⌥Esc 的提示文字（与 `isReleaseShortcut` 同一个组合；格式化同应用的快捷键路由）。
+pub const release_hint = @import("../../shared/base/shortcut_glyphs.zig").join(.{ .control = true, .option = true }, "Esc");
 pub fn isReleaseShortcut(raw: u16, modifiers: Modifiers) bool {
     return raw == 53 and modifiers.ctrl and modifiers.alt;
 }

@@ -1,18 +1,22 @@
 /** Native session tags, second-line icon actions and compact geometry.
  * Uses an isolated Local session and a loopback model; no external services.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,writeFile,open} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-session-tags-build');
 const out=resolve(process.argv[2]??'/tmp/zw-session-tags-native');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-conversation-ui-'),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');for(const dir of [data,rpc,zdot])await mkdir(dir);
 await writeFile(join(zdot,'.zshrc'),"bindkey -e\nPS1='conversation-ui%# '\n");
 const frame=(content:string)=>'data: '+JSON.stringify({choices:[{index:0,delta:{content}}]})+'\n\n';
 const requests:any[]=[];let held:any=null,holdFirst=true;
-const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"conversation-fixture"}]}');return}let raw='';for await(const bytes of req)raw+=bytes;const body=JSON.parse(raw);requests.push(body);res.writeHead(200,{'content-type':'text/event-stream'});
+const server=createServer(async(req,res)=>{if(req.method!=='POST'){res.end('{"data":[{"id":"conversation-fixture"}]}');return}const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);requests.push(body);res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length){res.end(frame('本地测试会话')+'data: [DONE]\n\n');return}
  const users=body.messages.filter((m:any)=>m.role==='user').map((m:any)=>String(m.content));
  if(holdFirst&&users.some((s:string)=>s.includes('FIRST_TASK'))){holdFirst=false;held=res;res.write(frame('正在处理第一个请求。'));return}
@@ -26,7 +30,13 @@ const shown=(n:any)=>n&&n.hidden!==true&&n.visible!==false&&(n.effective_opacity
 const flat=(n:any):any[]=>Array.isArray(n)?n.flatMap(flat):n?[n,...(n.children??[]).flatMap(flat)]:[];
 const text=(n:any)=>flat(n).map(n=>n.text??'').join(' ');
 const visible=(id:string)=>h.waitFor(async()=>{assert(alive(),'native App must remain alive');return(await h.query(id)).find(shown)??null},20000);
-const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
+const click=async(id:string)=>{report.last_action=id;await visible(id);const r=await h.clickTestId(id);assert(r.ok,id+' '+(r.error??''))};
+// The welcome page's recent list reuses the session row view (src/features/ai/sessions/view/ai_empty_view.zig → ai_session_row.zig),
+// so ai.session.* ids exist twice while the welcome page is shown; popover actions must target the copy inside ai.sessions.menu.
+const clickInMenu=async(id:string)=>{report.last_action='ai.sessions.menu>'+id;const node=await h.waitFor(async()=>{assert(alive(),'native App must remain alive');return (await h.query('ai.sessions.menu')).filter(shown).flatMap(flat).find((n:any)=>n.test_id===id&&shown(n))??null},20000);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id)};
+// The "AI 已停止" toast from the earlier Stop sits above modal surfaces at the compact size and covers ai.history.close;
+// clicking it while a popover/modal is open dismisses that surface, so clear toasts while nothing floats.
+const dismissNotices=async()=>{for(let round=0;round<5;round++){const toast=(await h.query('notifications.toast.0')).find(shown);if(!toast)return;await h.mouseMove(toast.rect.x+toast.rect.w/2,toast.rect.y+toast.rect.h/2);const n=await h.waitFor(async()=>(await h.query('notifications.dismiss.0')).find(shown)??null,3000);report.dismissed_notice=(report.dismissed_notice??0)+1;await h.clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2);await h.sleep(300)}};
 const absent=(id:string)=>h.waitFor(async()=>!(await h.query(id)).some(shown)||null,15000);
 const input=async(value:string)=>{await click('ai.prompt');await h.key('a',{cmd:true});await h.type_(value)};
 const send=async(value:string)=>{await input(value);await click('ai.send')};
@@ -34,13 +44,13 @@ const report:any={status:'running',isolation:{directory:iso,data,rpc},checks:[],
 async function capture(name:string,keepPointer=false){if(!keepPointer)await h.mouseMove(1,1);const ids=['ai.sessions.menu','ai.session.first_line','ai.session.second_line','ai.session.phase_tag','ai.session.bound','ai.session.unbound','ai.history'];const geometry:any={};for(const id of ids){const node=(await h.query(id)).find(shown);if(node)geometry[id]=node.rect}report.geometry[name]=geometry;await writeFile(join(out,name+'.json'),JSON.stringify(geometry,null,2));assert((await h.screenshot(join(out,name+'.png'))).ok);report.screenshots.push(join(out,name+'.png'))}
 
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await send('FIRST_TASK 检查当前服务器的运行状态');await h.waitFor(()=>held||null,15000);
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await send('FIRST_TASK 检查当前服务器的运行状态');await h.waitFor(()=>held||null,15000);
  const inspect=async()=>{
   const rows=(await h.query('ai.sessions.menu')).flatMap(flat).filter((n:any)=>/^ai.session.row.\d+$/.test(n.test_id??'')&&shown(n));
   assert(rows.length>0);
   for(const row of rows){const nodes=flat(row),first=nodes.find(n=>n.test_id==='ai.session.first_line'),second=nodes.find(n=>n.test_id==='ai.session.second_line'),tag=nodes.find(n=>n.test_id==='ai.session.phase_tag'),binding=nodes.find(n=>n.test_id==='ai.session.bound'||n.test_id==='ai.session.unbound');
-   assert.equal(row.rect.h,56);assert(first.rect.y+first.rect.h<=second.rect.y);assert(Math.abs(tag.rect.x+tag.rect.w-first.rect.x-first.rect.w)<1);assert.equal(binding.rect.x,second.rect.x);
-   for(const action of nodes.filter(n=>/^ai.session.(jump|locate|restore|copy_use|delete).\d+$/.test(n.test_id??'')&&shown(n))){assert.equal(action.rect.w,24);assert.equal(action.rect.h,24);assert(action.rect.y>=second.rect.y&&action.rect.y+action.rect.h<=second.rect.y+second.rect.h+.6);assert(action.rect.x+action.rect.w<=second.rect.x+second.rect.w+.6);assert(!flat(action).some(n=>n.text?.trim()),'actions have icons without text')}
+   assert.equal(row.rect.h,63,'O7 row (ai-redesign-c): 8 + 19 + 4 + 24 + 8 (native xs buttons)');assert(first.rect.y+first.rect.h<=second.rect.y);assert(Math.abs(tag.rect.x+tag.rect.w-first.rect.x-first.rect.w)<1);assert.equal(binding.rect.x,second.rect.x);
+   for(const action of nodes.filter(n=>/^ai.session.(jump|locate|restore|copy_use|delete).\d+$/.test(n.test_id??'')&&shown(n))){assert(action.rect.w<=24&&action.rect.h===action.rect.w,'O7: native ghost xs icon buttons (square, zenit size)');assert(action.rect.y>=second.rect.y&&action.rect.y+action.rect.h<=second.rect.y+second.rect.h+.6);assert(action.rect.x+action.rect.w<=second.rect.x+second.rect.w+.6);assert(!flat(action).some(n=>n.text?.trim()),'actions have icons without text')}
   }
   await writeFile(join(out,'session-tree.json'),JSON.stringify(rows,null,2));
  };
@@ -48,13 +58,13 @@ try{
  await click('ai.sessions');await visible('ai.session.status.running');assert(text(await visible('ai.session.phase_tag')).includes('运行中'));await inspect();await capture('01-running-bound');
  const locate=await visible('ai.session.locate.1');await h.mouseMove(locate.rect.x+12,locate.rect.y+12);await h.sleep(700);await capture('02-locate-tooltip',true);
  await click('ai.sessions.close');await click('ai.stop');await absent('ai.stop');await click('ai.sessions');await visible('ai.session.status.stopped');assert(text(await visible('ai.session.phase_tag')).includes('已暂停'));await inspect();await capture('03-paused');
- await click('ai.sessions.close');await send('COMPLETE_TASK 完成状态检查');await absent('ai.stop');await click('ai.sessions');await visible('ai.session.status.done');await inspect();await capture('03b-completed');await click('ai.sessions.close');await click('ai.session.new');await visible('ai.session.close.accept');await click('ai.session.close.accept');await absent('ai.session.close.confirmation');await click('ai.sessions');await visible('ai.session.row.2');await visible('ai.session.unbound');await inspect();await capture('04-two-rows');
+ await click('ai.sessions.close');await send('COMPLETE_TASK 完成状态检查');await absent('ai.stop');await click('ai.sessions');await visible('ai.session.status.done');await inspect();await capture('03b-completed');await click('ai.sessions.close');await click('ai.session.new');await visible('ai.session.close.accept');await click('ai.session.close.accept');await absent('ai.session.close.confirmation');await dismissNotices();await click('ai.sessions');await visible('ai.session.row.2');await visible('ai.session.unbound');await inspect();await capture('04-two-rows');
  await h.resizeWindow(860,480);await inspect();const menu=await visible('ai.sessions.menu');assert(menu.rect.x>=8&&menu.rect.x+menu.rect.w<=852&&menu.rect.y+menu.rect.h<=472);await capture('05-compact');
- await click('ai.session.jump.1');await visible('ai.history');await click('ai.history.close');
- await click('ai.sessions');await click('ai.session.copy_use.1');await absent('ai.sessions.menu');await click('ai.sessions');await visible('ai.session.row.3');await inspect();await capture('06-copy-used');
+ await clickInMenu('ai.session.jump.1');await visible('ai.history');await click('ai.history.close');
+ await click('ai.sessions');await clickInMenu('ai.session.copy_use.1');await absent('ai.sessions.menu');await click('ai.sessions');await visible('ai.session.row.3');await inspect();await capture('06-copy-used');
  report.checks.push('Two-line geometry and icon-only controls at normal and compact sizes; bound/unbound tags; running-to-paused phase updates; read-only view and copy-use clicks');report.status='passed';
 }catch(error){report.error=String(error);report.status='failed';process.exitCode=1;await capture('failure').catch(()=>{});}
 finally{
- if(held){held.destroy();held=null}try{if(alive()){await Promise.race([h.request('POST','/quit'),ended]);const start=performance.now();while(alive()&&performance.now()-start<15000){for(const id of ['settings.close.discard','groups.close.accept','local.close.accept','session.close.accept'])try{if(!alive())break;if((await h.query(id)).some(shown))await h.clickTestId(id)}catch{}await Promise.race([ended,h.sleep(80)])}}}catch(e){report.quit_error=String(e)}
+ if(held){held.destroy();held=null}try{if(alive()){await Promise.race([h.request('POST','/quit'),ended]);const start=performance.now();while(alive()&&performance.now()-start<15000){for(const id of ['settings.confirmation.discard','groups.close.accept','local.close.accept','session.close.accept'])try{if(!alive())break;if((await h.query(id)).some(shown))await h.clickTestId(id)}catch{}await Promise.race([ended,h.sleep(80)])}}}catch(e){report.quit_error=String(e)}
  if(alive()){report.forced=true;app.kill('SIGTERM');await ended}report.exit_code=app.exitCode;report.signal=app.signalCode;if(report.forced||app.exitCode!==0){report.status='failed';process.exitCode=1}server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({status:report.status,error:report.error,out}));
 }

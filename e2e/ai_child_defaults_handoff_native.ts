@@ -1,10 +1,16 @@
 /** Isolated native child defaults and active-child model handoff. No business shell commands. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {createHash} from 'node:crypto';
 import {mkdir,mkdtemp,writeFile,readFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {settingsNav} from './settings_nav.ts';
+import {readRequestJson} from './provider_fixture.ts';
+const nav=settingsNav();
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-v04-task-build'),binary=join(prefix,'bin/zerowork');
 const out=resolve(process.argv[2]??'/tmp/zw-v04-child-handoff-native');await mkdir(out,{recursive:true});
 const iso=await realpath(await mkdtemp('/tmp/zw-task-gateway-')),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');
@@ -17,7 +23,7 @@ const tool=(res:any,id:string,name:string,args:any)=>res.end(frame({tool_calls:[
 const bodyOf=(result:any)=>{for(const block of result.content??[])try{return JSON.parse(block.text)}catch{}return result};
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST'){res.end('{"data":[{"id":"task-gateway"}]}');return}
- let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});res.flushHeaders();
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);res.writeHead(200,{'content-type':'text/event-stream'});res.flushHeaders();
  if(!body.tools?.length){finish(res,'交接测试');return}
  requests.push(body);
  if(JSON.stringify(body.messages).includes('CHILD_HELD')&&!JSON.stringify(body.messages).includes('ROOT_HANDOFF')){
@@ -46,20 +52,22 @@ const visible=(id:string)=>h.waitFor(async()=>{assert(alive());return(await h.qu
 const report:any={status:'running',isolation:iso,binary,binary_sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),checks:[],screenshots:[]};
 const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
 const capture=async(name:string)=>{await h.mouseMove(1,1);await h.sleep(200);assert((await h.screenshot(join(out,name+'.png'))).ok);report.screenshots.push(join(out,name+'.png'))};
-const journal=async()=>String(await readFile(join(data,'ai-sessions.jsonl'),'utf8')).trim().split('\n').map(row=>JSON.parse(row));
+const journal=async()=>String(await readFile(join(data,'ai-sessions.v4.jsonl'),'utf8')).trim().split('\n').map(row=>JSON.parse(row));
 const scrollTo=async(id:string)=>{for(let i=0;i<24;i++){const n=await visible(id),vp=(await visible('settings.viewport')).rect;if(n.rect.y>=vp.y&&n.rect.y+n.rect.h<=vp.y+vp.h)return;const delta=n.rect.y<vp.y?vp.y-n.rect.y+25:vp.y+vp.h-n.rect.y-n.rect.h-25;await h.scrollAt(vp.x+vp.w-4,vp.y+vp.h/2,0,Math.max(-500,Math.min(500,delta)));await h.sleep(70)}throw Error('Cannot reveal '+id)};
 const setting=async(id:string)=>{await scrollTo(id);await click(id)};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1280,900);await click('toolbar.settings');await click('settings.nav.ai');await click('settings.search');await h.type_('子 Agent');
+ // Two-level settings (settings_nav.ts): AI 辅助 › 行为与权限 holds the child-agent defaults.
+ await h.waitForServerReady(60000);await h.resizeWindow(1280,900);await nav.toField('child_context_mode');
  await setting('settings.field.child_context_mode');await click('settings.child_context.inherit');
  await setting('settings.field.child_reuse_policy');await click('settings.child_reuse.prefer_reuse');await capture('01-default-draft');await writeFile(join(out,'settings-geometry.json'),JSON.stringify(await h.query('settings.ai.children'),null,2));await click('settings.save');
  await h.waitFor(async()=>(await readFile(join(data,'config.toml'),'utf8')).includes('child_reuse_policy = "prefer_reuse"')||null,10000);
  const saved=await readFile(join(data,'config.toml'),'utf8');assert(saved.includes('child_context_mode = "inherit"'));
  await setting('settings.field.child_reuse_policy');await click('settings.child_reuse.model');await click('settings.revert');
  await h.resizeWindow(860,480);await scrollTo('settings.field.child_reuse_policy');await capture('02-compact-reverted');assert.equal(await readFile(join(data,'config.toml'),'utf8'),saved);
- await click('settings.close');await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ // 偏好设置窗口已无关闭按钮（settings.close 删除），按 Cmd+W 关闭（e2e/settings_nav.ts close()）。
+ await nav.close();await visible('toolbar.settings');await h.resizeWindow(1200,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await click('ai.prompt');await h.type_('ROOT_HANDOFF 委派子任务后创建组，保留原根任务');await click('ai.send');
- await h.waitFor(async()=>{if(fixtureError)throw Error(fixtureError);if(text(await h.query('ai.panel')).includes('HANDOFF_COMPLETE'))return true;for(const id of ['ai.interaction.approve','ai.host_approval.accept']){const q=await h.query(id);if(q.some(shown)){await h.clickTestId(id)}}return null},30000);
+ await h.waitFor(async()=>{if(fixtureError)throw Error(fixtureError);if(text(await h.query('ai.panel')).includes('HANDOFF_COMPLETE'))return true;for(const id of ['ai.interaction.approve']){const q=await h.query(id);if(q.some(shown)){await h.clickTestId(id)}}return null},30000);
  await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,15000);assert.equal(rootRound,5);
  const rows=await journal(),launch=rows.find(r=>r.event?.kind==='child_launch')?.event;assert(launch);assert.equal(launch.child_info.context_mode,'independent');assert.equal(launch.child_info.reusable,true);
  const handoff=rows.findIndex(r=>r.event?.kind==='handoff'&&r.event.conversation===launch.parent_binding.conversation),unbind=rows.findIndex(r=>r.event?.kind==='unbind'&&r.event.conversation===launch.conversation);assert(unbind>=0&&handoff>unbind,'child unbind precedes parent binding publication');

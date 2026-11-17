@@ -3,13 +3,53 @@
 const std = @import("std");
 const permission = @import("permission.zig");
 
+/// AI 对话的归属（PLUGIN_ARCH_PLAN 2.5.8 M10）：统一为所在的 tab（`identity.TabId` 的数值，与
+/// `workspace_model.Tab.id` 同一个标识）。单卡 tab 与分屏（会话组）tab 都绑定自己的 TabId，绑定、
+/// 交接、日志与界面都只认这一种。
+///
+/// `session` / `group` 是 M10 之前的两套归属，**只读**：只在回放 schema 1–3 的旧日志行时出现，
+/// 用于在会话列表里显示来源；`session_lifecycle.Store.attach` 拒绝用它们创建新绑定。
 pub const Owner = union(enum) {
+    tab: u64,
     session: u64,
     group: u64,
     pub fn eql(a: Owner, b: Owner) bool {
         return std.meta.activeTag(a) == std.meta.activeTag(b) and switch (a) {
+            .tab => |id| id == b.tab,
             .session => |id| id == b.session,
             .group => |id| id == b.group,
+        };
+    }
+    /// 旧日志里的只读归属（不能作为新绑定）。
+    pub fn legacy(self: Owner) bool {
+        return self != .tab;
+    }
+    pub fn raw(self: Owner) u64 {
+        return switch (self) {
+            inline else => |number| number,
+        };
+    }
+};
+/// 绑定 tab 里装的是什么：单卡 tab 的会话卡片，或分屏 tab 的会话组。它不是归属，而是每次捕获
+/// 作用域 / 宿主授权时从工作区派生的事实；会话组相关的宿主工具（`host.get_group` 等）与
+/// 模型可见的元数据（`binding`、`current_binding`）按它表达，因此与 M10 之前逐字相同。
+pub const Content = union(enum) {
+    session: u64,
+    group: u64,
+    pub fn eql(a: Content, b: Content) bool {
+        return std.meta.eql(a, b);
+    }
+    pub fn raw(self: Content) u64 {
+        return switch (self) {
+            inline else => |number| number,
+        };
+    }
+    /// 旧日志里的 `session` / `group` 归属本身就是内容。
+    pub fn ofLegacy(owner: Owner) ?Content {
+        return switch (owner) {
+            .tab => null,
+            .session => |value| .{ .session = value },
+            .group => |value| .{ .group = value },
         };
     }
 };
@@ -23,11 +63,19 @@ pub const Targets = struct {
 };
 pub const Scope = struct {
     owner: Owner,
+    /// 捕获时 tab 的内容（派生事实，见 `Content`）。绑定为 `.tab` 时必须给出；只读的旧归属
+    /// （测试夹具与旧日志）由归属本身派生。
+    content: ?Content = null,
     members: Targets,
     /// A frozen directory may contain more members than one tool call. Owners
     /// of a request must clone this slice; the legacy Targets stay call-sized.
     inventory: ?[]const u64 = null,
 
+    /// tab 的内容；旧归属由归属本身派生；`.tab` 归属而未捕获内容时是不含任何成员的空会话，
+    /// 所有成员与会话组判断都失败关闭。
+    pub fn contentOf(self: Scope) Content {
+        return self.content orelse Content.ofLegacy(self.owner) orelse .{ .session = 0 };
+    }
     pub fn memberIds(self: *const Scope) []const u64 {
         return self.inventory orelse self.members.slice();
     }
@@ -41,10 +89,11 @@ pub const Scope = struct {
         for (ids, 0..) |id, i| {
             if (id == 0 or std.mem.indexOfScalar(u64, self.memberIds(), id) == null) return error.TargetOutsideAssistant;
             if (std.mem.indexOfScalar(u64, ids[0..i], id) != null) return error.DuplicateTarget;
-            switch (self.owner) {
+            // 单卡 tab 只能指向它自己的会话。内容未捕获时（回放日志里的 tab 归属）只按成员目录校验。
+            if (self.content orelse Content.ofLegacy(self.owner)) |held| switch (held) {
                 .session => |session| if (id != session) return error.TargetOutsideAssistant,
                 .group => {},
-            }
+            };
         }
     }
     /// Validate again immediately before dispatch against the live roster.
@@ -62,7 +111,7 @@ pub const Scope = struct {
 test "frozen directory exceeds one call without granting extra call targets" {
     var ids: [300]u64 = undefined;
     for (&ids, 1..) |*id, index| id.* = index;
-    const original: Scope = .{ .owner = .{ .group = 1 }, .members = .{}, .inventory = &ids };
+    const original: Scope = .{ .owner = .{ .tab = 1 }, .content = .{ .group = 1 }, .members = .{}, .inventory = &ids };
     const frozen = try original.clone(std.testing.allocator);
     defer std.testing.allocator.free(frozen.inventory.?);
     ids[299] = 901;
@@ -125,7 +174,7 @@ pub const Dispatcher = struct {
         _ = try live.validate(call.targets.slice());
         if (call.max_bytes == 0 or call.max_bytes > 64 * 1024) return error.InvalidToolArguments;
         if (call.tool == .run_command) {
-            switch (permission.classify(policy, call.command, captured.owner == .group)) {
+            switch (permission.classify(policy, call.command, captured.contentOf() == .group)) {
                 .deny_exec_copy_only => return error.ToolExecutionDenied,
                 .need_confirm => if (!approved) return error.ToolApprovalRequired,
                 .allow_auto => {},
@@ -136,7 +185,7 @@ pub const Dispatcher = struct {
 };
 
 test "model selects a subset of group members and remote file targets" {
-    const scope: Scope = .{ .owner = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102, 103 } ++ @as([13]u64, @splat(0)), .len = 3 } };
+    const scope: Scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102, 103 } ++ @as([13]u64, @splat(0)), .len = 3 } };
     var parsed = try parse(std.testing.allocator, scope, "read_remote_file", "{\"session_ids\":[103,101],\"path\":\"/var/log/app.log\"}");
     defer parsed.deinit();
     try std.testing.expectEqualSlices(u64, &.{ 103, 101 }, parsed.call.targets.slice());
@@ -146,7 +195,7 @@ test "model selects a subset of group members and remote file targets" {
 }
 
 test "single assistant cannot cross sessions; unsupported subagents fail closed" {
-    const scope: Scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const scope: Scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     try std.testing.expectError(error.TargetOutsideAssistant, scope.validate(&.{102}));
     try std.testing.expectError(error.UnsupportedTool, parse(std.testing.allocator, scope, "spawn_agent", "{}"));
     try std.testing.expectError(error.InvalidToolArguments, parse(std.testing.allocator, scope, "read_remote_file", "{\"session_ids\":[101],\"path\":\"relative\"}"));
@@ -161,7 +210,7 @@ test "dispatch rejects stale membership before contacting any remote target" {
         }
     };
     var fake: Fake = .{};
-    const captured: Scope = .{ .owner = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
+    const captured: Scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
     var live = captured;
     live.members.len = 1;
     const call: Call = .{ .tool = .run_command, .command = "df -h", .targets = try captured.validate(&.{ 101, 102 }) };
@@ -181,7 +230,7 @@ test "approval never overrides blacklist including compounds and group writes re
         }
     };
     var fake: Fake = .{};
-    const scope: Scope = .{ .owner = .{ .group = 7 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const scope: Scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     const dispatcher: Dispatcher = .{ .ctx = &fake, .invoke = Fake.invoke };
     var call: Call = .{ .tool = .run_command, .command = "touch /tmp/file", .targets = try scope.validate(&.{101}) };
     try std.testing.expectError(error.ToolApprovalRequired, dispatcher.dispatch(scope, scope, call, .{}, false));

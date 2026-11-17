@@ -1,4 +1,5 @@
 /** Owned, background native sidebar identity/status acceptance. No clipboard. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -7,6 +8,8 @@ import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {waitForServerReady,waitFor,query,tree,clickTestId,clickAt,key,type_,resizeWindow,screenshot,sleep,mouseMove} from '../zig-out/share/zenit/harness/client.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
+import * as harness from '../zig-out/share/zenit/harness/client.ts';
+import {chooseTheme} from './theme_settings_entry.ts';
 const o:any={};for(let i=2;i<process.argv.length;i+=2)o[process.argv[i]]=process.argv[i+1];
 assert(o['--binary']&&o['--expected-sha']&&o['--out']&&o['--config']);
 const binary=resolve(o['--binary']),sha=createHash('sha256').update(await readFile(binary)).digest('hex');assert.equal(sha,o['--expected-sha']);
@@ -27,11 +30,11 @@ try{
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),child.pid);await resizeWindow(1440,900);
  await visible('sidebar.host');let q=await cap('01-expanded-offline');assert.equal(q['workspace.sidebar'].find(shown).rect.w,224);assert.equal(q['sidebar.host.icon'].filter(shown).length,2);for(const icon of q['sidebar.host.icon'].filter(shown)){assert.equal(icon.rect.w,14);assert.equal(icon.rect.h,14)}report.checks.push('Expanded sidebar width224, SSH and SFTP icons14x14');
  await click('sidebar.collapse');q=await cap('02-collapsed-offline');assert.equal(q['workspace.sidebar.collapsed'].find(shown).rect.w,48);for(const id of ['sidebar.rail.host.1','sidebar.rail.host.2']){assert.equal(q[id].find(shown).rect.w,32);assert.equal(q[id].find(shown).rect.h,32)}report.checks.push('Collapsed sidebar width48 and each host target32x32');
- await click('sidebar.rail.expand');const host=(await query('sidebar.host')).filter(shown)[0];assert((await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2,2)).ok);await visible('auth.challenge.trust_once');const whole=await tree();for(const cb of flat(whole).filter(n=>/checkbox/i.test(`${n.component??''} ${n.tag??''}`)))await clickAt(cb.rect.x+Math.min(12,cb.rect.w/2),cb.rect.y+cb.rect.h/2);await click('auth.challenge.trust_once');await click('auth.challenge.answer.0');await type_(credentials.password);await click('auth.challenge.submit');await waitFor(async()=>!(await query('connection.progress')).some(shown)&&(await query('status.connection.identity')).some(shown)||null,30000);
+ await click('sidebar.rail.expand');const host=(await query('sidebar.host')).filter(shown)[0];assert((await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2,2)).ok);await visible('auth.challenge.trust_once');const whole=await query('auth.challenge.form');for(const cb of whole.flatMap(flat).filter(n=>/checkbox/i.test(`${n.component??''} ${n.tag??''}`)))await clickAt(cb.rect.x+Math.min(12,cb.rect.w/2),cb.rect.y+cb.rect.h/2);await click('auth.challenge.trust_once');await click('auth.challenge.answer.0');await type_(credentials.password);await click('auth.challenge.submit');await waitFor(async()=>!(await query('connection.progress')).some(shown)&&(await query('status.connection.identity')).some(shown)||null,30000);
  q=await cap('03-expanded-connected');report.checks.push('Real SSH authenticated through production challenges; host expanded online');
  await click('sidebar.collapse');q=await cap('04-collapsed-connected');report.checks.push('Connected host retains same icon in collapsed rail');
  const connectedHost=q['sidebar.rail.host.1'].find(shown);await mouseMove(connectedHost.rect.x+16,connectedHost.rect.y+16);await cap('04b-collapsed-connected-hover');await mouseMove(700,400);
- for(const [index,next] of ['dark','light','sauber',theme].entries()) { await click('status.connection.theme');await click('status.theme.item.'+next);await key('escape');const hot=await cap(`07-hot-theme-${index}-${next}`);const host=hot['sidebar.rail.host.1'].find(shown);await mouseMove(host.rect.x+16,host.rect.y+16);await cap(`08-hot-hover-${index}-${next}`);await mouseMove(700,400); }
+ for(const [index,next] of ['dark','light','sauber',theme].entries()) { /* title-click: 设置 › 外观与主题 via 菜单栏“显示 › 外观…” */await chooseTheme(harness,next,join(data,'config.toml'));const hot=await cap(`07-hot-theme-${index}-${next}`);const host=hot['sidebar.rail.host.1'].find(shown);await mouseMove(host.rect.x+16,host.rect.y+16);await cap(`08-hot-hover-${index}-${next}`);await mouseMove(700,400); }
  report.checks.push('Same selected host survives actual global Dark/Light/Sauber runtime theme changes with current surface and online tint');
  await click('sidebar.rail.expand');await key('w',{cmd:true});await waitFor(async()=>!(await query('tabs.tab.1')).some(shown)||null,30000);await cap('05-expanded-disconnected');await click('sidebar.collapse');q=await cap('06-collapsed-disconnected');const closedHost=q['sidebar.rail.host.1'].find(shown);await mouseMove(closedHost.rect.x+16,closedHost.rect.y+16);await cap('06b-collapsed-disconnected-hover');await mouseMove(700,400);report.checks.push('Closing actual SSH tab returns expanded and collapsed host to offline status');
  report.pixels=JSON.parse(execFileSync('python3',[resolve('e2e/sidebar_final_pixels.py'),output,theme],{encoding:'utf8'}));report.checks.push('Native pixels verify state tints for all12 host snapshots and shared terminal glyph matches actual tab');report.status='passed';

@@ -47,7 +47,7 @@ pub const Row = struct {
     /// Ghostty render-row ids are never reused for a different row.
     id: RowId,
     /// UI composite document metadata; never sent to the VT parser.
-    presentation: @import("../ui/terminal_record_geometry.zig").Layout = .{},
+    presentation: @import("terminal_record_geometry.zig").Layout = .{},
     application_record_id: u64 = 0,
     application_kind: u8 = 0,
     application_state: u8 = 0,

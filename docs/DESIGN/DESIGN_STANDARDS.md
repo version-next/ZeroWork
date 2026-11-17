@@ -203,7 +203,7 @@ HTML基础token见三份HTML的`:root`块；R15新增动作语义token以本表�
 
 L0 是最底层画布与四大卡片。实际绘制在 L0 上的主机列表卡片、AI 助手、设置窗口均为 L1；在 L1 卡片上的结果卡片或菜单为 L2；其内部命令／输出卡片以及菜单触发的 Tooltip 为 L3。每个实际卡片或独立浮层边界增加一层，透明布局容器、标题、工具栏不增加层级。菜单和 Tooltip 沿触发控件的实际所属卡片回溯，不能只计算浮窗深度。
 
-浮层之间依靠背景实度、间距及必要的柔和投影区分，不追加整圈 border、outline 或描边式阴影。输入与键盘焦点同样遵循§3.2：使用底色、文字/图标与 caret/IME 表达状态，不以焦点 ring 补框。虚线空槽和组页签标记保留各自语义。
+（本段与下一段、层级表只适用于 ZeroWork 自己创建的表面；zenit 原生浮层保持 zenit 默认外观，见下方“材质归属”。）浮层之间依靠背景实度、间距及必要的柔和投影区分，不追加整圈 border、outline 或描边式阴影。输入与键盘焦点同样遵循§3.2：使用底色、文字/图标与 caret/IME 表达状态，不以焦点 ring 补框。虚线空槽和组页签标记保留各自语义。
 
 临时表面的透明度由其所在的视觉层级决定，不由 Tooltip、Popover、Modal、卡片等组件类型决定。`overlay` 只提供主题底色和首层的兼容参数；`well`、`surface-2` 等内部填充角色不能用于决定新浮层的透明度。实际卡片增加一层，输入内容及 hover 行反馈不单独增加卡片层级；纯布局节点的嵌套不计层。
 
@@ -216,13 +216,14 @@ L0 是最底层画布与四大卡片。实际绘制在 L0 上的主机列表卡�
 
 `T=clamp(background_transparency/100,0,1)`；最终透光率 `P(L)=T×Q(L)`，`Q(L)=(5−min(L,4))/5`，最终不透明度为 `1−P(L)`。在直接父表面上绘制时，实际填充 alpha 为 `1−Q(L)/Q(L−1)`（T=0 时用不透明填充），不能把最终不透明度再当作每层填充 alpha。L4+ 保留 20% 的设置透光率，不再强制全不透明。文字和图标保持独立。
 
-浮窗按实际覆盖区域补偿：若该区域下方实际最高表面为 K，则所需填充为 `max(0,1−Q(L)/Q(K))`。超出父卡片、圆角之外或完全落在画布上的部分分别计算；同层浮窗重叠不再次累加实度。已更实的下层保持其现有透光率，避免用新的浅层窗口继续加实。原生在背景专用绘制节点中按窗口坐标分区，不降低前景透明度，不复制背景图片。背景补偿不改变浮窗的布局、排序、输入或局部模糊设置。
+**材质归属（2026-11-15，zenit 用法整改批次 4）**
 
-父层按触发控件实际所在表面确定；原生 portal 浮层沿 OverlayStack 的存活 trigger 引用回溯父表面，手工定位的现有浮窗以其 overlay 材质边界识别。组件种类、节点嵌套深度、浮层 tier 和原始 z-index 均不直接选择透明度百分比；它们的排序、定位和交互职责保留。同层的独立浮窗共享 L1，不能按当前已打开窗口的数量升级透明度。
+- zenit 原生浮层（Popover、Menu、Select 面板、Modal、Tooltip、Notification / Toast、Glass 系列）的表面是 zenit 自己的：外观以 zenit 默认为准，任何透明度设置下都不透明，ZeroWork 不改写它们的底色、边框、阴影、圆角，也不给它们加背景模糊。上表的层级透明度只适用于 ZeroWork 自己创建的表面。
+- 每个 ZeroWork 表面在创建它的地方声明自己的材质：它画在什么上面由创建者说明（`surface_material.Ground`：`canvas` = 画布 / 岛，本身是 L1；`float` = ZeroWork 自己的 L1 浮动面板之上，本身是 L2；`card` = L2 卡片之上，本身是 L3；`solid` = 不透明表面之上，例如原生浮层内部，始终不透明填充）。填充 alpha 仍按上面的公式 `1−Q(L)/Q(L−1)`（T=0 时不透明）。
+- 没有“遍历窗口和浮层栈、推断归属和层级、再统一改写”的全局策略，也没有按覆盖区域分区的背景补偿：两个半透明表面重叠时就是普通的叠加。KVM 远程画面上方的弹层用固定深色色系的原生 Popover（`color_scheme`），画面上的状态、HUD、提示用原生 Tag / TooltipSurface / HintCapsule，可读性由这些显式声明保证，不靠识别“下面是视频”。
+- 主题、透明度、模糊变化经窗口的主题发布到达：具名样式函数由 zenit 重放；用普通 `BoxStyle` 创建的节点用 `surface_material.bindFill` 绑定自己的填充。
 
-模型示例：工作区 → AI 浮窗 L1 → 模型选择 L2 → 模型说明 L3。同一个 Tooltip 直接由工作区触发时是 L1，放在模型菜单里时是 L3。移动父表面、关闭重开、切换主题或全局材质参数后须重新解析；气泡伸出父浮窗边界也使用同一层级底色。L2/L3 与 L1 同步局部背景模糊 `max(12,B)`，不模糊自身文字。
-
-实现入口：`src/ui/app_theme.zig` 的 `layerAlpha/layerBackground` 和 `src/ui/layer_materials.zig`；原生主窗口与辅助窗口安装同一策略。
+实现入口：`src/shared/ui/theme/app_theme.zig` 的 `layerAlpha`（层级公式）和 `src/shared/ui/styles/surface_material.zig`（创建者使用的配方）。
 
 最终数值（全局滑块 T=0；alpha 表示不透明度，文字和图标不受影响）：
 
@@ -235,11 +236,11 @@ L0 是最底层画布与四大卡片。实际绘制在 L0 上的主机列表卡�
 | hover | 82.00000000% | 46/255 | 18.039216% |
 | tab-on | 68.00000000% | 82/255 | 32.156863% |
 
-唯一实现来源为 `src/ui/app_theme.zig` 的 `material_transparency_base`、`material_transparency_span` 与 `material_ratio`。`T=clamp(background_transparency/100,0,1)`，`P=min(M,P0+D×T)`，`alpha8=round(255×(1−P))`。`P0`为代码直接使用的最终基础透明度，`D`为当前滑块全程增量，达到角色上限`M`后保持不变；不存在历史调节倍率。此表达保持当前滑块响应与各角色上限。滑块 0 表示采用基础透明层级，**不再表示所有表面完全不透明**；滑块 100 也不能令浮窗完全透明。8 位 alpha 会产生不超过约 0.2 个百分点的舍入差异。
+唯一实现来源为 `src/shared/ui/theme/app_theme.zig` 的 `material_transparency_base`、`material_transparency_span` 与 `material_ratio`。`T=clamp(background_transparency/100,0,1)`，`P=min(M,P0+D×T)`，`alpha8=round(255×(1−P))`。`P0`为代码直接使用的最终基础透明度，`D`为当前滑块全程增量，达到角色上限`M`后保持不变；不存在历史调节倍率。此表达保持当前滑块响应与各角色上限。滑块 0 表示采用基础透明层级，**不再表示所有表面完全不透明**；滑块 100 也不能令浮窗完全透明。8 位 alpha 会产生不超过约 0.2 个百分点的舍入差异。
 
 图片沿用独立合成关系：图片 alpha 为 `T`（0% 隐藏图片，100% 完整显示图片），其开关只控制图片可见性，不关闭 UI 图层透明公式；不增加新配置字段。草稿预览与已保存值使用同一公式。根背景图使用 `B=clamp(blur_px,0,96)`；普通表面不额外模糊；临时浮层的局部背景模糊为 `max(12,B)` 逻辑 px，B=0 时也保留 12px，防止下层文字重影。采样应用窗口内已绘制的内容，不复制背景、不增加不透明地板，也不模糊浮层自身文字。
 
-可读性优先：主动作、状态色、媒体和显式 ANSI 色块保留语义颜色；不将其当作普通大面积容器底。修改参数时核对 T=0/中间值/100、角色上限和顺序，并检查有图/无图、普通/最小窗口的实际浮层。当前参数见 `src/ui/app_theme.zig`；通知历史浮窗现已在自身 panel 样式接入统一策略，并在 blur 单独变化时同步到保留节点。记录仍仅证明所列场景，不宣称全部主题和业务状态均已验收。
+可读性优先：主动作、状态色、媒体和显式 ANSI 色块保留语义颜色；不将其当作普通大面积容器底。修改参数时核对 T=0/中间值/100、角色上限和顺序，并检查有图/无图、普通/最小窗口的实际浮层。当前参数见 `src/shared/ui/theme/app_theme.zig`；通知历史浮窗现已在自身 panel 样式接入统一策略，并在 blur 单独变化时同步到保留节点。记录仍仅证明所列场景，不宣称全部主题和业务状态均已验收。
 
 - **原生能力以vendor 0.17源码为准**：`ui.Color`支持RGBA，`BoxStyle.background`可用alpha；通用`opacity`存在，但不能用它降低整份前景透明度来冒充背景材质。`glass.backdrop_blur`范围为0–96逻辑px，采样窗口自身`mainRT`中已经绘制的内容，可作用于下层app背景图片；公开`GlassParams`也有`backdrop_saturation/brightness`并已传至shader。这不是桌面采样，与CSS `blur(28px) saturate(1.5)`的最终视觉等价仍须同尺寸实机验收。旧文的`DrawCmd.blur(r, radius, saturate)`不是当前依赖的API，不得据此推导实现或性能保证。
 - **窗口边界**：根窗口surface为`fully_opaque`，`WindowConfig`没有透明窗口或`NSVisualEffect`接入；图像alpha与窗口桌面透出是不同能力。桌面透出需要独立原生窗口接入，原型不得承诺已具备。blur的应用绑定、采样顺序与性能仍需实机验证。
@@ -412,7 +413,7 @@ Figma节点`bounds`相对直接父级；画板在canvas上的x/y不进入应用�
 
 ## 6. 浮层、焦点与可访问性
 
-层级依次为常驻工作区、所属pane浮层、锚定菜单/tooltip、需明确决策的模态。OverlayRecord保存owner、trigger、anchor rect、focus return、dismiss policy；同一次动作绘制与命中使用同一几何来源。Modal及自定义模态遮罩统一使用`app_theme.modal_barrier`，保持全透明并保留原有交互拦截；弹窗面板材质独立维护。普通popover不加整窗scrim；局部删除确认、单字段编辑、列表选择及滑块使用锚定Popover，复杂表单、批量不可恢复操作、运行资源关闭与安全核对保留Modal。Esc先处理IME，再最上层可关闭浮层，不能穿透触发终端行为；焦点回到原触发项，触发项已不存在时回所属内容区。
+层级依次为常驻工作区、所属pane浮层、锚定菜单/tooltip、需明确决策的模态。OverlayRecord保存owner、trigger、anchor rect、focus return、dismiss policy；同一次动作绘制与命中使用同一几何来源。模态一律用原生`W.Modal`，不再手工拼“绝对定位铺满＋卡片”的遮罩层；遮罩用zenit默认（`overlay` token，主题不改写该token），保持半透明并保留原有交互拦截。Modal面板用zenit默认外观（`bg-primary`底、默认圆角／描边／阴影）：调用点不传`.background`/`overlay_color`，不对dialog／标题栏／正文节点覆盖背景、玻璃材质、描边、圆角或阴影，不对dialog叠加窗口材质（`isolate`/`bindMaterial`）；调用点只给尺寸与正文布局。普通popover不加整窗scrim；局部删除确认、单字段编辑、列表选择及滑块使用锚定Popover，复杂表单、批量不可恢复操作、运行资源关闭与安全核对保留Modal。Esc先处理IME，再最上层可关闭浮层，不能穿透触发终端行为；焦点回到原触发项，触发项已不存在时回所属内容区。
 
 表单、菜单、选择器、chip、图标和开关使用当前设计及对应原生组件参数；静态标识无点击/hover，动作有独立命中/名称/禁用原因。焦点、hover、selected、pressed不是互斥一枚enum；disabled与业务门控优先，focus独立，操作中的停止除外。主工作区的 Tab 关闭按钮常显；隐藏的行内按钮不命中不入Tab，显示不挤动文字。
 
@@ -480,7 +481,7 @@ Figma节点`bounds`相对直接父级；画板在canvas上的x/y不进入应用�
 | SFTP双pane、文件表、多选/排序/X-Y滚动 | Table有custom cell/sort/虚拟化但无完整selection/column resize；DataTable有Cmd/Shift和resize但字符串cell/分页、header排序未接；Grid有冻结行列及双轴虚拟化 | 产品FileTable用Grid+SelectionModel或VirtualList+同步header，按稳定file ID映射索引，各pane独立path/sort/selection/scroll；后端IO经插件服务 | `components/table/mod.zig:105`；`components/data_table/mod.zig:724`；`components/grid/state.zig:34`；`components/selection.zig:115` |
 | Toast、焦点与快捷键 | Notification有duration/sticky/hover pause/update；Focus/Actions有基础 | 全局普通4000ms、带操作8000ms、错误sticky；局部确认2000ms；统一feedback组件；按focus/IME/能力/owner路由，不全局截获普通shell输入 | `components/notification/mod.zig:78`；`ui/focus.zig:1`；`ui/actions.zig:51` |
 | AI浮条/浮窗/边角resize | portal/hit shape/drag.Binding公开；V0.1.7矩形事务、阅读恢复及八命中带未接 | 6px边/14px角、activation_distance=0、角优先、8px clamp、起始矩形+累计delta、Esc/blur rollback、desired/clamped/restore rect；不能覆盖编辑器raw handler | `ui/interaction/drag.zig:34,482,642`；`src/main.zig:3041` |
-| 新建会话、Local/SSH/SFTP插件入口 | manifest/caps模型为设计目标，当前src无统一registry；runtime/view硬编码SshWorker | 先实现V0.1.1静态注册与中性SessionCreateSpec，UI按插件terminal/files及可选服务挂载；Local PTY/exec在Local插件内部，复用同一VT/controller | `src/ui/session_runtime.zig:60`；`src/ui/terminal_view.zig:70`；`V0.1.1_FOUNDATION.md §3` |
+| 新建会话、Local/SSH/SFTP插件入口 | manifest/caps模型为设计目标，当前src无统一registry；runtime/view硬编码SshWorker | 先实现V0.1.1静态注册与中性SessionCreateSpec，UI按插件terminal/files及可选服务挂载；Local PTY/exec在Local插件内部，复用同一VT/controller | `src/features/workspace/host/session_runtime.zig:60`；`src/features/terminal/view/terminal_view.zig:70`；`V0.1.1_FOUNDATION.md §3` |
 
 表内`components/`路径均相对`vendor/zenit/src/ui/`；`core/`亦同。命名相同的widget不自动具有目标的完整组合行为。
 
@@ -497,7 +498,7 @@ Figma节点`bounds`相对直接父级；画板在canvas上的x/y不进入应用�
 
 ### 7.4 原生资源与性能设计基线（2026-11-03）
 
-性能属于组件设计和完成条件，覆盖原生 App 的主线程、后台任务、CPU、内存及 GPU。原生仍由 Zenit/Metal 实现。不得以减少功能、丢弃终端输出/录制、停止隐藏会话的真实工作、取消既定模糊或降低前景可读性来换取指标。材质层级与最终合成规则遵守§3.3，具体映射见 `src/ui/app_theme.zig`。
+性能属于组件设计和完成条件，覆盖原生 App 的主线程、后台任务、CPU、内存及 GPU。原生仍由 Zenit/Metal 实现。不得以减少功能、丢弃终端输出/录制、停止隐藏会话的真实工作、取消既定模糊或降低前景可读性来换取指标。材质层级与最终合成规则遵守§3.3，具体映射见 `src/shared/ui/theme/app_theme.zig`。
 
 - **更新必须幂等**：相同文本、颜色、图标、透明度、几何和设置值不得再次标脏或请求重绘。按实际变更选择绘制、合成、布局或尺寸失效；单个属性优先使用对应 setter，不以重复写整组样式更新颜色、位移或进度。当前帧已能绘制的更新，不额外形成下一帧的自激刷新循环。
 - **计算随事实变化，而非随帧变化**：状态投影、AI 历史估算、文本度量和列表派生结果按原始事实的 revision/generation、实际模型配置、主题及必要几何缓存。等长内容替换也须失效；不能只用条目数、字符串长度或悬空节点地址作版本。缓存更新保留原 owner、焦点、选择、滚动位置和业务状态。
@@ -533,6 +534,19 @@ UI/Cx/Node/Signal只在主线程访问，worker处理IO与计算，以不可变�
 凭据、OTP、私钥口令、API key不进入manifest、普通日志、tooltip、AI上下文或错误正文。V0.2持久秘密使用macOS Keychain单scope vault，TOML只保存不透明引用；0600是私有文件权限，不能代替凭据存储。旧明文迁移遵循[V0.2§4.2.1–4.2.2](V0.2_PLUGIN_HOST.md#421-macos-数据目录与兼容迁移2026-10-24-补充)的原子移动、失败保留和秘密事务，不额外生成明文备份。主机信任与替换落盘在V0.1.3，AI工具参数/范围/审批在V0.1.7；文件内容和工具输出都是不可信数据，不执行其中的宿主指令。
 
 每个字段同时区分raw输入域、typed持久化域与引擎可应用域；范围由对应版本唯一字段表规定。有限浮点拒NaN/Infinity；整数检查符号、尾随垃圾和乘法溢出；单位不混bit/byte、MB/MiB。输入错误保raw并定位字段，禁止静默clamp再保存。
+
+### 8.1 config.toml 前后版本兼容（2026-11-13）
+
+新版本写入的设置，旧版本读写一轮后不能丢；旧版本留下的键，新版本也不能丢。实现位于 `src/config/config_unknown.zig`（`config.zig` 解析／写出调用它），回归测试在 `src/config/tests/config_unknown_tests.zig`。
+
+- **只放宽“未知”，不放宽“非法”。** 不认识的键（已知段内、顶层、`[[ai.providers]]`／`[[ai.providers.models]]`／`[[plugin_preferences]]` 条目内、`[keys]` 中的未知动作）和不认识的段（`[name]`／`[[name]]`）跳过并记 `warning(config)`，日志只写键名或段名，不写值。已知键的非法值仍按原错误失败（`OutOfRange`、`InvalidValue`、`InvalidExecutionMode` 等）；语法错误仍失败：缺 `=` 的行、未闭合的段头、用已知表名重开表（如 `[[ui]]`、`[ai.providers]`）。旧的扁平 `provider_N_*` 键先确认字段已知，再分配槽位，所以未知后缀不会生成空的 provider。
+- **保留机制。** 未知内容按不透明文本保存，从不解释或执行：已知段里的未知键保存为 `key = value`（键名和值的原文），写出时追加在该段已知键之后；数组表条目里的未知键按 provider id、model name、`plugin_id`+`key` 挂回原条目（条目被删或改名后随之消失；没有 id 的条目无法匹配，不保留并告警）；未知段保存段头、段内赋值和整行注释，写回到原文件中它前面最近的那个已知段的输出之后，多个未知段保持原顺序。写出的结果再读一遍得到同样的文本。无未知内容时，写出的字节、段序、字段顺序与原来完全一致。
+- **注释。** 已知段原本就不保留注释，现在也不保留；未知段内的整行注释保留，行尾注释不保留。空行按统一格式重排。
+- **上限。** 最多 256 条（未知键、段头、段内行合计），单行最多 4096 字节，总计最多 64 KiB；配置文件本身仍受 `store.max_config_bytes`（256 KiB）限制。超出上限的条目跳过，不保留，并告警；不会因此让整份配置读不出来。
+- **转义校验。** 读入和写出时都检查：键名只能是裸键（`[A-Za-z0-9_-]`，可带点分段）；值必须是单行 UTF-8，不含控制字符，引号和反斜杠转义要闭合，`[]`/`{}` 要配平，引号外不能有 `#` 或 `;`。这样写回的一行只能被读成同一个赋值，不能开出新段，也不能多出一个键。`Config.validate()` 和 `Config.format()` 会再检查一遍保存的内容；手工构造的非法条目会导致保存失败（`InvalidValue`／`InvalidUnknownEntry`），不会写进磁盘。校验不过的读入内容只跳过，不保留。
+- **边界。** `Config.parse`（不传 allocator）只跳过未知内容，不保留；所有落盘路径（`store.load`、`RuntimeConfig`）都会传 allocator。不支持多行值（多行数组、`"""` 字符串），它们仍按语法错误处理。“恢复默认”会丢弃未知内容，新版本读到时使用自己的默认值。
+
+新增设置不需要再用“只在非默认值时写出”来避开旧版本解析失败，按常规写出即可。
 
 ## 9. 验证与完成定义
 
@@ -585,7 +599,7 @@ KVM 工具栏与视频布局见 [V4 KVM 工具栏](../UI_V4/README.md)和[主界
 - 所有浮层必须保存触发控件与所属窗口。打开二级菜单前先保存触发矩形，不能在原菜单隐藏或销毁后读取。顶部工具向下、底部状态栏与 AI 输入工具向上；空间不足时翻转并限制滚动，窗口边距以对应原生组件为准。不使用页面全局坐标直接冒充局部坐标。
 - 浮层打开、子菜单替换、滚动、窗口缩放、侧栏显隐、会话切换及 AI 拖动后都需检查。触发器消失时关闭，禁止回退到左上角或沿用旧会话坐标。菜单随几何变化关闭，详情浮层重新计算锚点。
 - 卡片不画整圈描边或描边式阴影，配合已有层级底色、留白和对齐表达边界；仅浮层保留必要的柔和投影。浅色设置导航继承设置根材质，选中行仅使用 10% 强调色。
-- 传输入口复用原生传输条目及直接操作、悬停详情，详见 §4.2.1 和 `src/ui/transfer_styles.zig`。暂停、继续/重试、查看、取消按真实状态及能力显示；完整路径可在提示/详情查看。
+- 传输入口复用原生传输条目及直接操作、悬停详情，详见 §4.2.1 和 `src/features/transfer/view/transfer_styles.zig`。暂停、继续/重试、查看、取消按真实状态及能力显示；完整路径可在提示/详情查看。
 - 按连接能力显示功能：本地 Shell 不展示 SSH 端口转发与跳板链路；SFTP 不展示终端广播；尚未就绪而可恢复的功能保留禁用态及原因，永久不适用能力直接移除。主机配置不等于会话。
 - 内置主题明确标注“不可删除”；自定义主题才提供删除。侧栏使用“显示/隐藏”，不再使用“折叠”。数据设置可展示配置路径，不提供“打开配置目录”。SSH 使用一个终端窗口图标，不附加 SSH 文字小标。
 

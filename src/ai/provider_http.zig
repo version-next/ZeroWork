@@ -1,4 +1,5 @@
 const std = @import("std");
+const error_text = @import("../shared/base/error_text.zig");
 const provider = @import("provider.zig");
 const provider_config = @import("provider_config.zig");
 const registry = @import("registry.zig");
@@ -38,20 +39,45 @@ pub const Diagnostic = struct {
         self.captureMessage(status, target, key);
     }
     pub fn format(self: *const Diagnostic, buffer: []u8, err: anyerror) []const u8 {
-        const summary: []const u8 = if (err == error.HtmlResponse) "该地址返回网页，请检查 HTTPS 和 API Base URL（如 /v1）" else if (err == error.InvalidModelResponse) "未收到完整有效的模型对话响应" else switch (self.status) {
-            300...399 => "接口发生重定向，请检查 HTTPS 和 API 路径",
-            400, 422 => "服务端拒绝请求参数",
-            401 => "鉴权失败，请检查 API Key",
-            403 => "当前凭据无访问权限",
-            404 => "接口或模型不存在",
-            408, 504 => "服务端请求超时",
-            429 => "请求被限流，请稍后重试",
-            500...503, 505...599 => "模型服务暂不可用",
-            else => "请求失败",
-        };
-        return if (self.status != 0) std.fmt.bufPrint(buffer, "HTTP {d} · {s}{s}{s}", .{ self.status, summary, if (self.len > 0) "\n" else "", self.message[0..self.len] }) catch @errorName(err) else if (err == error.Timeout) "请求超时 · 模型长时间未返回新内容" else if (err == error.HtmlResponse or err == error.InvalidModelResponse) summary else std.fmt.bufPrint(buffer, "请求失败 · {s}", .{@errorName(err)}) catch @errorName(err);
+        // HTTP 状态码文案取 shared/base/error_text.zig（唯一目录）；原始错误名不拼进用户文案。
+        const summary: []const u8 = if (err == error.HtmlResponse) "该地址返回网页，请检查 HTTPS 和 API Base URL（如 /v1）" else if (err == error.InvalidModelResponse) "未收到完整有效的模型对话响应" else error_text.httpStatus(self.status);
+        return if (self.status != 0) std.fmt.bufPrint(buffer, "HTTP {d} · {s}{s}{s}", .{ self.status, summary, if (self.len > 0) "\n" else "", self.message[0..self.len] }) catch summary else if (err == error.Timeout) "请求超时 · 模型长时间未返回新内容" else if (err == error.HtmlResponse or err == error.InvalidModelResponse) summary else if (connectFailure(err)) |text| text else std.fmt.bufPrint(buffer, "请求失败 · {s}", .{error_text.lineOr(err, "原因见应用日志")}) catch "请求失败";
     }
 };
+
+/// Connection failures with no HTTP status: dial failures before any exchange (net_connect maps
+/// sandbox / firewall EPERM to AccessDenied) and a connection the server dropped mid-request.
+pub fn connectFailure(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => "无法连接 · 系统或防火墙拒绝了网络访问，请检查网络权限、代理或防火墙设置",
+        error.ConnectionRefused => "无法连接 · 服务端拒绝连接，请检查 API 地址和端口",
+        error.NetworkUnreachable, error.HostUnreachable, error.NetworkDown => "无法连接 · 网络不可达，请检查网络连接或代理设置",
+        error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => "无法连接 · 无法解析服务地址，请检查 API 地址或 DNS",
+        error.ConnectionResetByPeer => "连接被重置 · 请稍后重试，或检查代理设置",
+        error.HttpConnectionClosing, error.EndOfStream, error.BrokenPipe => "连接中断 · 服务端提前关闭了连接，请稍后重试，或检查代理设置",
+        else => null,
+    };
+}
+
+test "provider diagnostic explains refused and denied connections instead of raw error names" {
+    var diagnostic: Diagnostic = .{};
+    var buffer: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.format(&buffer, error.AccessDenied), "防火墙") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.format(&buffer, error.ConnectionRefused), "拒绝连接") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.format(&buffer, error.NetworkUnreachable), "网络不可达") != null);
+    // 目录里没有的错误给通用说法，原始错误名不进用户文案（shared/base/error_text.zig）。
+    try std.testing.expectEqualStrings("请求失败 · 原因见应用日志", diagnostic.format(&buffer, error.FutureFailure));
+}
+
+test "provider diagnostic explains a connection the server closed mid-request instead of a raw error name" {
+    var diagnostic: Diagnostic = .{};
+    var buffer: [256]u8 = undefined;
+    for ([_]anyerror{ error.HttpConnectionClosing, error.EndOfStream, error.BrokenPipe }) |err| {
+        const text = diagnostic.format(&buffer, err);
+        try std.testing.expect(std.mem.indexOf(u8, text, "中断") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, @errorName(err)) == null);
+    }
+}
 
 pub const AuthStyle = enum { bearer, anthropic_key, none };
 pub const RequestPlan = struct {
@@ -209,10 +235,11 @@ pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_text_request_bytes: usize = max_request_bytes;
 pub const max_tool_request_bytes: usize = max_request_bytes;
 
+/// 共享解析（shared/base/retry.zig）；秒数超出 u32 视为无效，换算成毫秒时饱和。
 pub fn parseRetryAfter(value: []const u8) ?u32 {
-    const trimmed = std.mem.trim(u8, value, " \t");
-    const seconds = std.fmt.parseInt(u32, trimmed, 10) catch return null;
-    return std.math.mul(u32, seconds, 1000) catch std.math.maxInt(u32);
+    const seconds = @import("../shared/base/retry.zig").parseRetryAfterSeconds(value) orelse return null;
+    if (seconds > std.math.maxInt(u32)) return null;
+    return std.math.mul(u32, @intCast(seconds), 1000) catch std.math.maxInt(u32);
 }
 
 pub fn response(status: u16, retry_after_ms: ?u32) Response {
@@ -828,7 +855,7 @@ test "builtin tool declarations share one schema across compatibility dynamic an
         .{ .owner = .{ .session_id = @fromBackingInt(ids[0]), .generation = 1 }, .plugin_id = "fixture", .context = &context, .bindings = &bindings },
         .{ .owner = .{ .session_id = @fromBackingInt(ids[1]), .generation = 1 }, .plugin_id = "fixture", .context = &context, .bindings = &bindings },
     };
-    var table = try tools.RequestTable.init(a, .{ .owner = .{ .group = 7 }, .members = .{ .ids = ids ++ @as([14]u64, @splat(0)), .len = ids.len } }, &legacy.builtin_definitions, &members);
+    var table = try tools.RequestTable.init(a, .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = ids ++ @as([14]u64, @splat(0)), .len = ids.len } }, &legacy.builtin_definitions, &members);
     defer table.deinit();
     const dynamic = try tools.providerDefinitions(&table, table.arena.allocator());
     for ([_]registry.Kind{ .openai_compat, .anthropic, .ollama }) |kind| {

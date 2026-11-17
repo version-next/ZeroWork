@@ -79,7 +79,18 @@ test "fetch_url Zig streaming enforces 2MiB compressed and 4MiB decoded independ
     }
 }
 
+/// 真实联网验收：经本机配置的系统代理访问公网（默认 https://example.com/）。
+/// 常规 test / test-ui / test-* 一律跳过，不尝试联网；只在显式的 `zig build test-fetch-network`
+/// （它设置 ZEROWORK_FETCH_NETWORK_LIVE=1）里运行。ZEROWORK_FETCH_TEST_URL 可改目标地址。
+pub const network_opt_in_env = "ZEROWORK_FETCH_NETWORK_LIVE";
+
+pub fn networkOptIn() bool {
+    const value = std.c.getenv(network_opt_in_env) orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(value, 0), "1");
+}
+
 test "fetch_url std.http production route fetches through the configured system proxy" {
+    if (!networkOptIn()) return error.SkipZigTest;
     const Policy = struct {
         fn allow(_: *anyopaque, _: []const u8) net.Code {
             return .ok;

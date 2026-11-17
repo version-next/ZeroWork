@@ -31,6 +31,7 @@ const DrawContext = render_engine.DrawContext;
 const button_mod = @import("../button/mod.zig");
 const hooks = @import("../../hooks.zig");
 const input_mod = @import("../input/mod.zig");
+const scroll_area_mod = @import("../scroll_area/mod.zig");
 const TextInputState = @import("../input/state.zig").TextInputState;
 
 const model = @import("model.zig");
@@ -65,6 +66,27 @@ pub const Action = struct {
     shortcut: []const u8 = "",
 };
 
+/// Test ids for a notification's parts (empty = none). Strings are copied with the content and
+/// reapplied on every in-place transform.
+pub const TestIds = struct {
+    /// The card / capsule (its positioner).
+    root: []const u8 = "",
+    title: []const u8 = "",
+    body: []const u8 = "",
+    /// Detail text, its bounded scroll frame and the disclosure button (`detail`).
+    detail: []const u8 = "",
+    detail_frame: []const u8 = "",
+    detail_toggle: []const u8 = "",
+    /// The footer row holding the action buttons / reply box.
+    footer: []const u8 = "",
+    /// The life bar (remaining time; zero height on sticky cards and hints).
+    life_bar: []const u8 = "",
+    /// The close button (cards only).
+    close: []const u8 = "",
+    /// Every action button.
+    action: []const u8 = "",
+};
+
 pub const Progress = struct {
     /// 0..1
     value: f32 = 0,
@@ -88,6 +110,9 @@ pub const ContentSpec = struct {
     avatar: []const u8 = "",
     title: []const u8 = "",
     body: []const u8 = "",
+    /// Expandable details below the body (empty = none): a disclosure button reveals them in a
+    /// bounded scroll area (`Metrics.detail_max_height`).
+    detail: []const u8 = "",
     actions: []const Action = &.{},
     reply: bool = false,
     quote: ?[]const u8 = null,
@@ -97,6 +122,7 @@ pub const ContentSpec = struct {
     /// Caption hint (kind = .hint) line-start marker and keycap row.
     hint_mark: hint_mod.Mark = .none,
     keycap: ?hint_mod.Keycap = null,
+    test_ids: TestIds = .{},
 };
 
 pub const Strings = struct {
@@ -108,6 +134,9 @@ pub const Strings = struct {
     undo: []const u8 = "Undo",
     reply_placeholder: []const u8 = "Reply…",
     send: []const u8 = "Send",
+    /// Detail disclosure button (collapsed / expanded).
+    show_details: []const u8 = "Show details",
+    hide_details: []const u8 = "Hide details",
     close: []const u8 = "Dismiss notification",
     /// Collapsed-state badge: `{d}` = remaining count.
     more: []const u8 = "{d} more · hover to expand",
@@ -152,6 +181,10 @@ pub fn formatCount(buf: []u8, template: []const u8, n: u64) []const u8 {
 // Content layer
 
 /// Button click -> Notifier. Fixed context per button (card address + index).
+/// Card footer holds at most this many action buttons (one row, each fills its share); extra actions are
+/// dropped. A text hint holds one.
+pub const max_actions: usize = 3;
+
 pub const ButtonContext = struct {
     card: *Card,
     index: u8,
@@ -175,14 +208,22 @@ pub const Content = struct {
     /// Rotating indicator (custom draw, constant rotation needs per-frame redraw).
     spinner: ?*Node = null,
     body: ?*Node = null,
+    /// Detail disclosure (`ContentSpec.detail` non-empty): toggle button, bounded frame around the
+    /// scroll area, detail text, and the button label source.
+    detail_toggle: ?*Node = null,
+    detail_frame: ?*Node = null,
+    /// The ScrollArea inside `detail_frame`; carries the same max height as the frame.
+    detail_area: ?*Node = null,
+    detail_text: ?*Node = null,
+    detail_label: ?*core.Signal([]const u8) = null,
     quote: ?*Node = null,
     progress_block: ?*Node = null,
     progress_fill: ?*Node = null,
     ring_secs: ?*Node = null,
     footer: ?*Node = null,
     reply_row: ?*Node = null,
-    buttons: [2]?*Node = .{ null, null },
-    button_contexts: [2]ButtonContext = undefined,
+    buttons: [max_actions]?*Node = .{ null, null, null },
+    button_contexts: [max_actions]ButtonContext = undefined,
     send_button: ?*Node = null,
     send_context: ButtonContext = undefined,
     reply_input: ?*Node = null,
@@ -243,6 +284,11 @@ pub const Card = struct {
     fling_x: f32 = 0,
     /// Whether this card closed by user (x / drag), callback distinguishes auto expiry.
     closed_by_user: bool = false,
+    /// Details expanded (disclosure state survives an in-place morph that keeps details).
+    detail_open: bool = false,
+    /// The user opened the details (disclosure button): while any card's are, the stack's timers
+    /// hold. Details shown expanded from the start (`detail_expanded`) do not hold the timers.
+    detail_held: bool = false,
 
     // -- In-place morph --
     icon_pop_at_ms: ?f64 = null,
@@ -319,7 +365,7 @@ pub const Card = struct {
 pub const BuildParams = struct {
     cx: *Cx,
     scope: *Scope,
-    palette: *const styles.Palette,
+    palette: styles.Palette,
     strings: *const Strings,
     width: f32,
 };
@@ -421,7 +467,7 @@ pub fn buildShell(card: *Card, p: BuildParams) !void {
                 .align_items = .center,
                 .justify = .center,
                 .background = pal.close_light,
-                .border = .{ .width = 0.5, .color = pal.close_light_edge, .radius = M.close_size / 2 },
+                .border = .{ .overlay = true, .width = 0.5, .color = pal.close_light_edge, .radius = M.close_size / 2 },
                 .inset = .{ .left = .{ .px = M.close_inset }, .top = .{ .px = M.close_inset } },
                 .corner_radius = M.close_size / 2,
                 .z_index = 10,
@@ -516,6 +562,7 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
 
     var content = Content{ .scope = scope, .root = undefined, .title = undefined };
     var actions_row: ?*Node = null;
+    var detail_slot: ?*Node = null;
     const lead_px: f32 = if (spec.lead == .ring) M.ring_size else M.lead_size;
     const tone = pal.tone(spec.tone);
     const prog = spec.progress orelse Progress{};
@@ -531,20 +578,20 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
                 .justify = .center,
                 .flex_shrink = 0,
             } }, .{
-                // Semantic color block + white glyph / spinner
+                // Transparent lead box with semantic-color glyph / spinner
                 if (chip_like) view.capture(&content.lead, view.box(.{ .style = .{
                     .width = fixed(M.lead_size),
                     .height = fixed(M.lead_size),
                     .align_items = .center,
                     .justify = .center,
-                    .background = tone,
-                    .border = .{ .width = 0, .color = tone, .radius = M.chip_radius },
+                    .background = Color.TRANSPARENT,
+                    .border = .{ .overlay = true, .width = 0, .color = tone, .radius = M.chip_radius },
                     .corner_radius = M.chip_radius,
                 } }, view.branch(
                     spec.lead == .chip,
                     view.icon(.{
                         .style = .{ .width = fixed(M.glyph_size), .height = fixed(M.glyph_size) },
-                        .tint = pal.on_semantic,
+                        .tint = tone,
                     }, spec.glyph orelse defaultGlyph(spec.tone)),
                     view.capture(&content.spinner, view.setup(view.box(.{ .style = .{
                         .width = fixed(M.spinner_size),
@@ -576,25 +623,27 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
                     .align_items = .center,
                     .justify = .center,
                     .background = pal.avatar_bg,
-                    .border = .{ .width = 0, .color = pal.avatar_bg, .radius = M.lead_size / 2 },
+                    .border = .{ .overlay = true, .width = 0, .color = pal.avatar_bg, .radius = M.lead_size / 2 },
                     .corner_radius = M.lead_size / 2,
                 } }, plainText(spec.avatar, .{ .color = pal.avatar_fg, .font_size = M.avatar_initial_size, .font_weight = 600 }))) else null,
                 if (spec.lead == .dot) view.capture(&content.lead, view.box(.{ .style = .{
                     .width = fixed(M.quiet_dot),
                     .height = fixed(M.quiet_dot),
                     .background = tone,
-                    .border = .{ .width = 0, .color = tone, .radius = M.quiet_dot / 2 },
+                    .border = .{ .overlay = true, .width = 0, .color = tone, .radius = M.quiet_dot / 2 },
                     .corner_radius = M.quiet_dot / 2,
                 } }, {})) else null,
             })),
             // -- Text row --
-            view.col(.{ .style = .{ .width = fill, .gap = M.content_gap } }, .{
+            // min_width 0: a long unbroken token (path, hash) wraps instead of widening the column
+            // past the card (CSS min-width: auto).
+            view.col(.{ .style = .{ .width = fill, .min_width = 0, .gap = M.content_gap } }, .{
                 view.capture(&content.title_row, view.row(.{ .style = .{ .width = fill, .align_items = .center, .gap = M.title_gap } }, .{
                     view.capture(&content.title, plainText(spec.title, .{
                         .color = pal.ink,
                         .font_size = M.title_size,
                         .font_weight = M.title_weight,
-                        .wrap = .word,
+                        .wrap = .word_break,
                         .line_height = M.title_line_height,
                     })),
                     view.capture(&content.timestamp, styledText(p.strings.now, .{
@@ -608,17 +657,18 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
                     .color = pal.ink_2,
                     .font_size = M.body_size,
                     .line_height = M.body_line_height,
-                    .wrap = .word,
+                    .wrap = .word_break,
                     .max_lines = M.body_max_lines,
                 })) else null,
+                if (spec.detail.len > 0) view.capture(&detail_slot, view.col(.{ .style = .{ .width = fill, .min_width = 0, .height = fit, .gap = 2 } }, {})) else null,
                 if (spec.quote) |q| view.capture(&content.quote, view.row(.{ .style = .{
                     .width = fill,
                     .gap = 6,
                     .padding = .{ .top = 4, .right = 0, .bottom = 0, .left = 8 },
-                    .border = .{ .width = 0, .color = pal.separator, .radius = 0 },
+                    .border = .{ .overlay = true, .width = 0, .color = pal.separator, .radius = 0 },
                 } }, .{
                     view.box(.{ .style = .{ .width = fixed(2), .height = fill, .background = pal.track } }, {}),
-                    plainText(q, .{ .color = pal.ink_2, .font_size = M.body_size, .line_height = M.body_line_height, .wrap = .word, .max_lines = 2 }),
+                    plainText(q, .{ .color = pal.ink_2, .font_size = M.body_size, .line_height = M.body_line_height, .wrap = .word_break, .max_lines = 2 }),
                 })) else null,
                 if (spec.progress != null) view.capture(&content.progress_block, view.col(.{ .style = .{
                     .width = fill,
@@ -629,14 +679,14 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
                         .width = fill,
                         .height = fixed(M.progress_track),
                         .background = pal.track,
-                        .border = .{ .width = 0, .color = pal.track, .radius = M.progress_track / 2 },
+                        .border = .{ .overlay = true, .width = 0, .color = pal.track, .radius = M.progress_track / 2 },
                         .corner_radius = M.progress_track / 2,
                         .overflow_hidden = true,
                     } }, view.capture(&content.progress_fill, view.box(.{ .style = .{
                         .width = core.Sizing.pct(model.clamp01(prog.value) * 100),
                         .height = fill,
                         .background = pal.info,
-                        .border = .{ .width = 0, .color = pal.info, .radius = M.progress_track / 2 },
+                        .border = .{ .overlay = true, .width = 0, .color = pal.info, .radius = M.progress_track / 2 },
                         .corner_radius = M.progress_track / 2,
                     } }, {}))),
                     view.row(.{ .style = .{ .width = fill, .align_items = .center, .gap = 8 } }, .{
@@ -660,12 +710,14 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
                 .align_items = .center,
                 .gap = M.footer_gap,
                 .padding = M.footer_padding,
-            } }, if (!spec.reply) view.items(ActionCtx{ .content = &content, .pal = pal }, spec.actions[0..@min(spec.actions.len, 2)], actionElement) else null)),
+            } }, if (!spec.reply) view.items(ActionCtx{ .content = &content, .pal = pal }, spec.actions[0..@min(spec.actions.len, max_actions)], actionElement) else null)),
         })) else null,
     }));
     errdefer cx.freeNode(root);
     root.meta.ownership.meta.component_name = "Notification.content";
     content.root = root;
+
+    if (detail_slot) |slot| try buildDetail(card, p, scope, slot, &content);
 
     if (actions_row) |actions| {
         if (spec.reply) {
@@ -682,16 +734,17 @@ pub fn buildContent(card: *Card, p: BuildParams) !Content {
     return content;
 }
 
-const ActionCtx = struct { content: *Content, pal: *const styles.Palette };
+const ActionCtx = struct { content: *Content, pal: styles.Palette };
 const ActionButton = view.NodeCapture(*?*Node, view.Setup(button_mod.ButtonBuilder, NodeTweak, tweakNode));
 
-/// Action buttons (up to 2). Event context points to stable address in card.content: content
+/// Action buttons (up to `max_actions`, one row). Event context points to stable address in card.content: content
 /// returns by value,
 /// caller calls rebindButtons after content lands to write it.
 fn actionElement(c: ActionCtx, action: Action, i: usize) ActionButton {
     const pal = c.pal;
     const bg = if (action.primary) pal.button_primary else pal.button_secondary;
     const bg_hover = if (action.primary) pal.button_primary_hover else pal.button_secondary_hover;
+    const bg_pressed = if (action.primary) pal.button_primary_pressed else pal.button_secondary_pressed;
     return view.capture(&c.content.buttons[i], view.setup(button_mod.Button(.{
         .label = action.label,
         .variant = .secondary,
@@ -701,15 +754,18 @@ fn actionElement(c: ActionCtx, action: Action, i: usize) ActionButton {
         .event_context = null,
         .base_style = core.StyleOverride{
             .width = .fill(),
+            // Shrinks below its label: a long label truncates instead of pushing the row past the
+            // card.
+            .min_width = 0,
             .height = .fixed(M.button_height),
             .background = bg,
-            .border = .{ .width = 0, .color = bg, .radius = M.button_radius },
-            .text_color = if (action.primary) pal.ink else pal.ink_2,
+            .border = .{ .overlay = true, .width = if (action.primary) @as(f32, 0) else @as(f32, 1), .color = pal.separator, .radius = M.button_radius },
+            .text_color = if (action.primary) pal.on_semantic else pal.ink,
             .font_size = M.button_font,
             .font_weight = if (action.primary) 600 else 500,
         },
-        .hover_style = .{ .background = bg_hover, .border = .{ .width = 0, .color = bg_hover, .radius = M.button_radius } },
-        .pressed_style = .{ .background = bg_hover, .border = .{ .width = 0, .color = bg_hover, .radius = M.button_radius } },
+        .hover_style = .{ .background = bg_hover, .border = .{ .overlay = true, .width = if (action.primary) @as(f32, 0) else @as(f32, 1), .color = pal.separator, .radius = M.button_radius } },
+        .pressed_style = .{ .background = bg_pressed, .border = .{ .overlay = true, .width = if (action.primary) @as(f32, 0) else @as(f32, 1), .color = pal.separator, .radius = M.button_radius } },
     }), NodeTweak{ .name = "Notification.action" }, tweakNode));
 }
 
@@ -728,6 +784,79 @@ fn setLifebarHeight(card: *Card, bar_h: f32) void {
     }
 }
 
+/// Detail disclosure: a ghost button (label follows the open state) and a frame clipped to
+/// `Metrics.detail_max_height` holding a vertical ScrollArea with the detail text. The frame is
+/// hidden while collapsed; the card re-measures its height every frame, so the stack reflows.
+fn buildDetail(card: *Card, p: BuildParams, scope: *Scope, slot: *Node, content: *Content) !void {
+    const cx = p.cx;
+    const pal = p.palette;
+    const label = try scope.createSignal([]const u8, detailLabel(card));
+    content.detail_label = label;
+    var toggle: *Node = undefined;
+    var frame: *Node = undefined;
+    try view.mount(scope, cx, slot, .{
+        // In a row: the button keeps its own width (a column would stretch it).
+        view.row(.{ .style = .{ .width = fill, .height = fit } }, view.capture(&toggle, view.setup(button_mod.Button(.{
+            .label = label,
+            .variant = .ghost,
+            .size = .xs,
+            .on_event = detailEvent,
+            .event_context = @as(?*anyopaque, @ptrCast(card)),
+        }), NodeTweak{ .name = "Notification.detailToggle" }, tweakNode))),
+        view.capture(&frame, view.col(.{ .style = .{ .width = fill, .min_width = 0, .height = fit, .overflow_hidden = true } }, {})),
+    });
+    (try frame.style.ensureExtFallible(cx.allocator)).max_height = M.detail_max_height;
+    frame.meta.ownership.meta.component_name = "Notification.detail";
+    const area = try scroll_area_mod.ScrollArea(.{ .direction = .vertical }).mount(scope, cx);
+    area.container.style.width = fill;
+    area.container.style.height = fit;
+    area.container.style.flex_shrink = 1;
+    // The bound belongs on the scroll area as well: a fit-height frame does not shrink its child, so with
+    // the max height on the frame alone the area stays as tall as its text, the frame only clips it and
+    // nothing scrolls. `Notifier.fitDetails` keeps both in step.
+    (try area.container.style.ensureExtFallible(cx.allocator)).max_height = M.detail_max_height;
+    frame.appendChild(cx.allocator, area.container) catch |err| {
+        cx.freeNode(area.container);
+        return err;
+    };
+    var text: *Node = undefined;
+    try view.mount(scope, cx, area.content, view.capture(&text, styledText(card.spec.detail, .{
+        .color = pal.ink_2,
+        .font_size = M.body_size,
+        .line_height = M.body_line_height,
+        .wrap = .word_break,
+    }, .{ .width = fill })));
+    content.detail_toggle = toggle;
+    content.detail_frame = frame;
+    content.detail_area = area.container;
+    content.detail_text = text;
+    applyDetailState(card, content);
+}
+
+fn detailLabel(card: *const Card) []const u8 {
+    return if (card.detail_open) card.strings.hide_details else card.strings.show_details;
+}
+
+/// Writes the open state to the frame display and the button label (the label is also the
+/// button's accessible name, so it announces the state).
+pub fn applyDetailState(card: *Card, content: *Content) void {
+    const frame = content.detail_frame orelse return;
+    frame.setDisplay(if (card.detail_open) .flex else .none);
+    if (content.detail_label) |label| label.set(detailLabel(card));
+}
+
+fn detailEvent(event: core.Event, context: ?*anyopaque) core.EventResult {
+    if (event != .click) return .ignored;
+    const card: *Card = @ptrCast(@alignCast(context orelse return .ignored));
+    if (card.leaving or card.destroying) return .stop;
+    card.detail_open = !card.detail_open;
+    card.detail_held = card.detail_open;
+    applyDetailState(card, &card.content);
+    card.cx.requestRedraw();
+    if (card.positioner.parent) |container| container.markRenderDirty();
+    return .stop;
+}
+
 fn buildReply(card: *Card, p: BuildParams, scope: *Scope, row: *Node, content: *Content) !void {
     const cx = p.cx;
     const pal = p.palette;
@@ -739,7 +868,7 @@ fn buildReply(card: *Card, p: BuildParams, scope: *Scope, row: *Node, content: *
         .gap = 8,
         .padding = M.reply_padding,
         .background = pal.reply_field,
-        .border = .{ .width = 0.5, .color = pal.reply_border, .radius = M.button_radius },
+        .border = .{ .overlay = true, .width = 0.5, .color = pal.reply_border, .radius = M.button_radius },
         .corner_radius = M.button_radius,
     } }, {})));
 
@@ -751,18 +880,21 @@ fn buildReply(card: *Card, p: BuildParams, scope: *Scope, row: *Node, content: *
         .placeholder_color = pal.ink_3,
         .size = .sm,
         .embedded = true,
+        // field_style lands in the caller overlay layer, above inline and declarative layers,
+        // so it survives layer recomputes (unlike direct node.style writes).
+        .field_style = .{
+            .height = .{ .px = M.reply_height - 2 },
+            .border_width = 0,
+            .padding = Padding.ZERO,
+            .background = Color.TRANSPARENT,
+            .border_color = Color.TRANSPARENT,
+        },
     }).mountResult(scope, cx);
     field.appendChild(cx.allocator, result.node) catch |err| {
         result.abandon(cx);
         return err;
     };
-    result.node.style.width = .fill();
-    result.node.style.flex_shrink = 1;
-    result.input_container.setBackground(Color.TRANSPARENT);
-    result.input_container.setBorderColor(Color.TRANSPARENT);
-    result.input_container.style.border.width = 0;
-    result.input_container.style.padding = Padding.ZERO;
-    result.input_container.style.height = .fixed(M.reply_height - 2);
+    // width grow / flex_shrink declared by embedded Input's wrapper itself.
     // Horizontal padding handled by reply shell (left 11); Input internal layer (sm 8) zeros out,
     // cursor hit test reads same padding_h, appearance and hit align.
     result.state.padding_h = 0;
@@ -787,13 +919,13 @@ fn buildReply(card: *Card, p: BuildParams, scope: *Scope, row: *Node, content: *
                 .height = .fixed(M.send_height),
                 .padding = Padding.symmetric(0, 10),
                 .background = pal.button_primary,
-                .border = .{ .width = 0, .color = pal.button_primary, .radius = M.send_radius },
-                .text_color = pal.ink,
+                .border = .{ .overlay = true, .width = 0, .color = pal.button_primary, .radius = M.send_radius },
+                .text_color = pal.on_semantic,
                 .font_size = M.send_font,
                 .font_weight = 600,
             },
-            .hover_style = .{ .background = pal.button_primary_hover, .border = .{ .width = 0, .color = pal.button_primary_hover, .radius = M.send_radius } },
-            .pressed_style = .{ .background = pal.button_primary_hover, .border = .{ .width = 0, .color = pal.button_primary_hover, .radius = M.send_radius } },
+            .hover_style = .{ .background = pal.button_primary_hover, .border = .{ .overlay = true, .width = 0, .color = pal.button_primary_hover, .radius = M.send_radius } },
+            .pressed_style = .{ .background = pal.button_primary_hover, .border = .{ .overlay = true, .width = 0, .color = pal.button_primary_hover, .radius = M.send_radius } },
         }), NodeTweak{ .name = "Notification.send" }, tweakNode))),
     });
 }
@@ -806,6 +938,29 @@ fn replyKeyDown(key: core.KeyCode, _: core.Modifiers, context: ?*anyopaque) core
     if (state.imeIsComposing()) return .ignored;
     card.button_sink(card, send_index);
     return .stop;
+}
+
+fn setTestId(node: ?*Node, id: []const u8) void {
+    const n = node orelse return;
+    n.meta.ownership.meta.test_id = if (id.len == 0) null else id;
+}
+
+/// Writes `spec.test_ids` (arena strings) to the shell and the current content; called after the
+/// content lands (build and in-place transform).
+pub fn applyTestIds(card: *Card, previous: TestIds) void {
+    const ids = card.spec.test_ids;
+    // A retained shell may carry a caller's node id. Replace or clear it only if the
+    // notification spec owns the id, so in-place transforms also preserve caller tags.
+    if (ids.root.len != 0 or previous.root.len != 0) setTestId(card.positioner, ids.root);
+    if (ids.close.len != 0 or previous.close.len != 0) setTestId(card.close, ids.close);
+    setTestId(card.content.title, ids.title);
+    setTestId(card.content.body, ids.body);
+    setTestId(card.content.detail_text, ids.detail);
+    setTestId(card.content.detail_frame, ids.detail_frame);
+    setTestId(card.content.detail_toggle, ids.detail_toggle);
+    setTestId(card.content.footer, ids.footer);
+    setTestId(card.lifebar, ids.life_bar);
+    for (card.content.buttons) |b| setTestId(b, ids.action);
 }
 
 /// Button context points to array element in card.content; called after content lands.
@@ -850,6 +1005,10 @@ pub fn destroyContent(cx: *Cx, parent: *Node, content: *Content) void {
         }
     }
     if (content.send_button) |btn| {
+        btn.behavior.events.on_event = null;
+        btn.behavior.events.event_context = null;
+    }
+    if (content.detail_toggle) |btn| {
         btn.behavior.events.on_event = null;
         btn.behavior.events.event_context = null;
     }

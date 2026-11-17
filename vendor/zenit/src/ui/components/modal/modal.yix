@@ -2,34 +2,63 @@
 //! and focus trap in mod.zig, styles in styles.yss.
 const ui = @import("../../ui.zig");
 const S = @import("styles.yss");
+const B = @import("../button/mod.zig");
+const core = @import("../../core.zig");
+const icons = @import("zenit_icons");
+
+/// The close button's place: over the title bar's end (its padding top 16 / right 12), after the
+/// body in the tree so the focus order reaches the body first.
+fn closePlace() core.BoxStyle {
+    return .{ .position = .absolute, .inset = .{ .top = .{ .px = 16 }, .right = .{ .px = 12 } }, .width = .{ .px = 28 }, .height = .{ .px = 28 } };
+}
+
+/// The close button's glyph: the caller's icon, else the framework's x.
+fn closeIcon(asset: ?ui.SvgAsset) ?ui.SvgAsset {
+    return asset orelse icons.x;
+}
 
 /// Dialog panel. hasTitle determined at mount by mod.zig (when title statically empty, no title
 /// bar, thus no close button).
 /// title is mount-time snapshot: title changes after mount and dialog's a11y name written by
-/// mod.zig's bindTextLabel (name points to text node's own copy,
-/// pointing at source data directly would dangle after source update). Icon / 'X' glyph not
-/// readable name, close button's a11y name states Close.
+/// mod.zig's bindTextLabel (name points to text node's own copy, pointing at source data directly
+/// would dangle after source update).
+/// The close button is a native icon-only Button (focusable, keyboard-activated, focus ring), named
+/// for assistive tech by closeLabel (default "Close"; follows a source). It comes after the body
+/// in the tree, so the focus order (and a dialog's initial focus) reaches the body's controls
+/// first; it is laid out over the title bar's end, where the title bar keeps a slot for it.
+/// closable hides it (and its slot). titleRef / closeRef receive the title text and the button
+/// (ModalResult.title / close_button).
 pub fn ModalPanel(
     title: []const u8,
     hasTitle: bool,
     width: f32,
     maxHeight: f32,
+    height: ?f32 = null,
     background: ?ui.Color = null,
     closeIconAsset: ?ui.SvgAsset = null,
+    closeLabel: []const u8 = "Close",
+    closable: bool = true,
+    titleRef: *ui.view.Ref(*ui.Node),
+    closeRef: *ui.view.Ref(*ui.Node),
+    bodyPadding: ?ui.Padding = null,
+    bodyGap: ?f32 = null,
     onClose: Handler(void),
     children: View,
 ) View {
     return (
-        <box style={.{ S.dialog.of(.{ .width = width, .max_height = maxHeight, .background = background }) }} a11y={.{ .role = .dialog, .modal = true }}>
+        <box style={.{ S.dialog.of(.{ .width = width, .max_height = maxHeight, .height = height, .background = background }) }} a11y={.{ .role = .dialog, .modal = true }}>
             {if (hasTitle)
-                <box style={S.header}>
-                    <text style={S.title}>{title}</text>
-                    <box style={S.close_button} onClick={onClose} testId="modal.close" a11y={.{ .role = .button, .label = "Close" }}>
-                        {if (closeIconAsset) |asset| <icon style={S.close_icon} src={asset} /> else <text box={S.close_glyph_box} style={S.close_glyph}>✕</text>}
-                    </box>
+                <box style={.{ S.header, S.headerCorners }}>
+                    <text ref={titleRef} style={S.title}>{title}</text>
+                    <box style={S.close_slot} visible={closable} />
                 </box>
             }
-            <box style={S.body}>{children}</box>
+            <box style={S.body.of(.{ .padding = bodyPadding, .gap = bodyGap })}>{children}</box>
+            {if (hasTitle)
+                <box style={closePlace()} visible={closable}>
+                    <B.Button ref={closeRef} testId="modal.close" variant={.ghost} size={.sm} iconOnly={true} iconAsset={closeIcon(closeIconAsset)} iconSize={18} look={S.close_button} a11yLabel={closeLabel} onClick={onClose} />
+                </box>
+            }
         </box>
     );
 }

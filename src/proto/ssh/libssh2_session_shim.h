@@ -71,6 +71,10 @@ typedef struct {
 } ZW_SSH_HANDSHAKE_DIAGNOSTIC;
 int zw_libssh2_session_handshake_observed(LIBSSH2_SESSION *session,
     const ZW_SSH_DRIVE *drive, ZW_SSH_HANDSHAKE_DIAGNOSTIC *diagnostic);
+/* Copies the peer's public SSH identification string (RFC 4253 4.2, e.g.
+   "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13") after a completed handshake.
+   Returns its length, or -1 when none is available. Read-only: no packet. */
+int zw_libssh2_session_server_banner(LIBSSH2_SESSION *session, char *output, size_t output_len);
 /// Writes the negotiated host-key algorithm and SHA256 fingerprint. The
 /// fingerprint is returned as `SHA256:<base64>` (RFC 4716/OpenSSH form).
 /// Returns 0 on success and -1 when libssh2 has no host key/hash available or

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>zenit Storybook · Web</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #ffffff; }
+  #app { position: absolute; inset: 0; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+  import { startZenit } from '../runtime/zenit-dom.mjs';
+  const q = new URLSearchParams(location.search);
+  window.__zenit = await startZenit({
+    wasm: './storybook.wasm',
+    container: document.getElementById('app'),
+    renderer: q.get('renderer') || 'webgpu',
+  });
+  // P1: paint glass from native pass traces (docs/WEB_GLASS_DESIGN.md §8).
+  if (q.get('glass') === 'fixture') (await import('../runtime/zenit-glass-fixture.mjs')).installGlassFixtures(window.__zenit);
+</script>
+</body>
+</html>

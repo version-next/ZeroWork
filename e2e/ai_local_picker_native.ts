@@ -1,8 +1,10 @@
 /** Real system file chooser; run with a serialized foreground CUA lease. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,realpath,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 const prefix=process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-ai-v3-prefix',h=await import(join(prefix,'share/zenit/harness/client.ts'));
 const out=resolve(process.argv[2]??'/tmp/zw-ai-local-picker');await mkdir(out,{recursive:true});
 const iso=await realpath(await mkdtemp('/tmp/zw-ai-local-picker-')),data=join(iso,'data'),rpc=join(iso,'rpc');await mkdir(data);await mkdir(rpc);
@@ -20,7 +22,7 @@ const report:any={status:'running',pid:app.pid,rpc,fixture,fixtureKind,checks:[]
 const shown=(n:any)=>n&&!n.hidden&&n.visible!==false&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const click=async(id:string)=>{report.lastAction=id;await h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);assert((await h.clickTestId(id)).ok)};
 try{
- await h.waitForServerReady();await h.resizeWindow(1100,760);await click('workspace.empty.local');await click('ai.strip');
+ await h.waitForServerReady();await h.resizeWindow(1100,760);await click('workspace.empty.local');await click(await aiToggleId());
  await click('ai.composer.attachment');await click(process.env.ZW_LOCAL_ENTRY==='image'?'ai.attachment.image':'ai.attachment.local_text').catch(e=>{if(!String(e).includes('request timeout'))throw e});
  const id=referenceKind?'ai.attachment.local_reference':fixtureKind==='image'?'ai.image':'ai.attachment.local_text';
  await h.waitFor(async()=>(await h.query(id)).some(shown)||null,180000);

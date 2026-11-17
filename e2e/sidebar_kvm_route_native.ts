@@ -1,6 +1,7 @@
 /** Saved KVM routes in the production sidebar; isolated config, no connections.
  * node e2e/sidebar_kvm_route_native.ts BUILD_PREFIX [OUTPUT_DIRECTORY]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, realpath, rm, writeFile} from 'node:fs/promises';

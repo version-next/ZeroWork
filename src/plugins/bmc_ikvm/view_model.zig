@@ -1,6 +1,7 @@
 //! Renderer projection and persistent Boot draft. Pure protocol field checks
 //! share the executor's rules; no network or runtime access occurs here.
 const std = @import("std");
+const shared_format = @import("../../shared/base/format.zig");
 const services = @import("services.zig");
 const console = @import("console_service.zig");
 const boot_fields = @import("protocol/boot.zig");
@@ -391,7 +392,8 @@ pub fn failureReason(code: ?[]const u8, stage: ?console.progress.Stage) []const 
 }
 
 pub fn writeDuration(writer: *std.Io.Writer, ms: u64) !void {
-    try writer.print("{d}.{d} 秒", .{ ms / 1000, (ms % 1000) / 100 });
+    var buffer: shared_format.Buffer = undefined;
+    try writer.writeAll(shared_format.duration(&buffer, ms, .short));
 }
 
 /// Owned resource paths and registry IDs supplement static labels. Response
@@ -505,14 +507,15 @@ pub fn writeLogTimestamp(writer: *std.Io.Writer, event: console.progress.Event) 
 }
 pub fn writeLogDuration(writer: *std.Io.Writer, event: console.progress.Event) !void {
     const duration = event.duration_ms orelse (if (event.context) |context| context.duration_ms else null) orelse return writer.writeAll("—");
-    if (duration < 1000) try writer.print("{d} ms", .{duration}) else try writer.print("{d}.{d:0>3} s", .{ duration / 1000, duration % 1000 });
+    try writeDuration(writer, duration);
 }
 pub fn writeLogMessage(writer: *std.Io.Writer, event: console.progress.Event, target: ?[]const u8) !void {
     try writeProgressMessage(writer, event, target, false);
 }
 
 fn writeProgressEvent(writer: *std.Io.Writer, event: console.progress.Event, target: ?[]const u8) !void {
-    try writer.print("+{d}.{d}s  ", .{ event.at_ms / 1000, (event.at_ms % 1000) / 100 });
+    var at: shared_format.Buffer = undefined;
+    try writer.print("+{s}  ", .{shared_format.duration(&at, event.at_ms, .short)});
     try writeProgressMessage(writer, event, target, true);
 }
 fn writeProgressMessage(writer: *std.Io.Writer, event: console.progress.Event, target: ?[]const u8, include_duration: bool) !void {
@@ -532,8 +535,14 @@ fn writeProgressMessage(writer: *std.Io.Writer, event: console.progress.Event, t
         if (context.received_bytes) |bytes| try writer.print(" · 已收 {d} B", .{bytes});
         if (context.content_encoding) |encoding| try writer.print(" · 编码 {s}", .{@tagName(encoding)});
         if (context.content_length) |bytes| try writer.print(" · 正文长度 {d} B", .{bytes});
-        if (context.body_idle_ms) |ms| try writer.print(" · 正文无进展 {d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 });
-        if (include_duration) if (context.duration_ms) |ms| try writer.print(" · 请求 {d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 });
+        if (context.body_idle_ms) |ms| {
+            try writer.writeAll(" · 正文无进展 ");
+            try writeDuration(writer, ms);
+        }
+        if (include_duration) if (context.duration_ms) |ms| {
+            try writer.writeAll(" · 请求 ");
+            try writeDuration(writer, ms);
+        };
     }
     if (event.code != .none) try writer.print(" · {s}", .{console.progress.codeLabel(event.code)});
     if (event.resource != .none) try writer.print(" · {s}", .{console.progress.resourceLabel(event.resource)});

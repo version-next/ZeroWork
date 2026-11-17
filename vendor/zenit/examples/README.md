@@ -1,6 +1,6 @@
 # zenit examples
 
-Fourteen applications demonstrating different facets of the framework. **Every one uses the public `ui` and `zenit_app` APIs through `build.zig` (Yix examples also import their generated view module)** — they double as the build-time fence that enforces the [open-source boundary](../docs/UI_OSS_BOUNDARY.md).
+Thirteen applications demonstrating different facets of the framework. **Every one uses the public `ui` and `zenit_app` APIs through `build.zig` (Yix examples also import their generated view module)** — they double as the build-time fence that enforces the [open-source boundary](../docs/UI_OSS_BOUNDARY.md).
 
 Most examples write their UI in Yix: `view.yix` holds the components and `styles.yss` holds their styles, `main.zig` only starts the app (and runs smoke assertions for the probes). `main.zig` imports its generated twin, `@import("_view.yix.zig")` (checked in; `zig build gen-yix` regenerates it). Exceptions: `zig_native` deliberately uses no Yix / YSS (components, controlled values, slots and recipes written in plain Zig with `ui.view` — the path for people who prefer Zig only), `counter_reactive` stays hand-written as the pixel reference for `yix_counter`, `interop_probe` wires raw node events below the template layer; Storybook uses a mix of Zig and Yix views.
 
@@ -18,8 +18,7 @@ Most examples write their UI in Yix: `view.yix` holds the components and `styles
 | [`interop_probe/`](interop_probe/) | Rich clipboard / drag-out real-system interop verification target |
 | [`design_probe/`](design_probe/) | Pixel-accurate rebuild of a pencil design node, for numeric design-diff verification |
 | [`yix_counter/`](yix_counter/) | Yix version of the reactive counter (styles in `styles.yss`) |
-| [`window_chrome/`](window_chrome/) | Custom window Header per window backend (AppKit / Win32 / Wayland), native or application-drawn caption controls |
-| [`adaptive_window/`](adaptive_window/) | One Header adapted to every desktop: caption layouts per preset, native fallback, fullscreen Header and a real window per preset |
+| [`glass_reference_probe/`](glass_reference_probe/) | Internal native Glass comparison target (private repository only) |
 
 Requires [Zig **0.17.0**](https://ziglang.org/download/). Yix/Yss workflow: [developer guide](../docs/YIX_YSS_GUIDE.md).
 
@@ -30,8 +29,6 @@ The following commands run on macOS. For Windows x64/ARM64 executables, use [WIN
 ```bash
 zig build hello-button         # build .app bundle (ad-hoc signed)
 zig build run-hello-button     # run unbundled
-zig build window-chrome        # custom window Header example
-zig build adaptive-window      # platform-adaptive window example
 
 zig build yix-counter
 zig build run-yix-counter
@@ -60,6 +57,10 @@ zig build interop-probe
 zig build run-interop-probe
 zig build design-probe
 zig build run-design-probe
+
+# Internal research target; keep its sources and outputs private.
+zig build glass-reference-probe
+zig build run-glass-reference-probe
 ```
 
 After building, each example produces `zig-out/<Display Name>.app` you can double-click.

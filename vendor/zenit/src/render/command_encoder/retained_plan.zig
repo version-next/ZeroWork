@@ -39,9 +39,18 @@ pub const Plan = struct {
     damage_ranges: [64]DamageRange = @as([64]DamageRange, @splat(.{})),
     layers: [64]Layer = @as([64]Layer, @splat(.{})),
 
+    /// Treats image textures as immutable (the historical contract). Hosts
+    /// with in-place texture updates use `computeWithImages`.
     pub fn compute(self: *Plan, commands: anytype, scale: f32) void {
+        self.computeWithImages(commands, scale, ImmutableImages{});
+    }
+
+    /// `images.imageContentRevision(handle) ?u64`: the revision is hashed into
+    /// every enclosing layer and damage digest; null makes those layers
+    /// non-reusable.
+    pub fn computeWithImages(self: *Plan, commands: anytype, scale: f32, images: anytype) void {
         self.scale = scale;
-        scan(self, commands, NoImageRevisions{});
+        scan(self, commands, images);
         self.layers = @as([64]Layer, @splat(.{}));
         var stack: [64]usize = undefined;
         var depth: usize = 0;
@@ -73,9 +82,9 @@ pub const Plan = struct {
     }
 };
 
-const NoImageRevisions = struct {
-    fn imageContentRevision(_: NoImageRevisions, _: u64) ?u64 {
-        return null;
+const ImmutableImages = struct {
+    fn imageContentRevision(_: ImmutableImages, _: u64) ?u64 {
+        return 0;
     }
 };
 
@@ -119,7 +128,7 @@ pub fn scan(self: anytype, commands: anytype, images: anytype) void {
     var nest_rects: [6][4]f32 = undefined;
     var capture_depth: usize = 0; // Nested translation-only layers entered count.
 
-    for (commands) |it| {
+    for (commands) |*it| { // by pointer: a paint item is 512 B
         const is_image = it.kind == .image and it.icon_rep_ptr == null;
         const image_revision = if (is_image) images.imageContentRevision(it.resource_handle) else null;
         if (is_image and image_revision == null and depth != 0) {
@@ -201,10 +210,10 @@ pub fn scan(self: anytype, commands: anytype, images: anytype) void {
                                 // parent-raw draw origin, so nested-local q maps to parent-raw =
                                 // q + (draw_origin - geom.xy). Plain (no dt) draw==geom -> offset 0
                                 // (in-flow sublayer content coords already match the parent).
-                                const translate_only = it.use_draw_transform and it.rotate == 0 and
+                                const translate_only = it.use_draw_transform and it.rotate == 0 and !paint_fp.genieActive(it) and
                                     it.draw_transform[0] == 1 and it.draw_transform[1] == 0 and
                                     it.draw_transform[2] == 0 and it.draw_transform[3] == 1;
-                                const plain = !it.use_draw_transform and it.rotate == 0;
+                                const plain = !it.use_draw_transform and it.rotate == 0 and !paint_fp.genieActive(it);
                                 if ((plain or translate_only) and capture_depth < nest_offsets.len) {
                                     const pad: f32 = 4;
                                     var org_x: f32 = 0;
@@ -229,7 +238,7 @@ pub fn scan(self: anytype, commands: anytype, images: anytype) void {
                                 } else if (paint_fp.nestedCompositeBounds(it)) |b| {
                                     // Axis-aligned transform: whole subtree folds to single item.
                                     fold_hasher = std.hash.Wyhash.init(0);
-                                    paint_fp.hashPaintItemInto(&fold_hasher, it);
+                                    hashItem(&fold_hasher, it, image_revision);
                                     fold_bounds = .{ b[0] + off_x, b[1] + off_y, b[2], b[3] };
                                     fold_depth = 1;
                                     break :capture; // Fold item deferred to subtree end persist.

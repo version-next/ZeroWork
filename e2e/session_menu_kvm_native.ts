@@ -1,4 +1,5 @@
 /** New KVM uses the registered editor directly; never connects or saves data. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,writeFile,rm,realpath} from 'node:fs/promises';
@@ -32,8 +33,11 @@ try{
   await h.waitFor(async()=>!(await h.query('session.menu')).some(shown)||null);
   await h.screenshot(join(out,`kvm-${width}.png`));
   checks.push({width,height,activation:width===1440?'mouse':'keyboard',editor:'bmc_ikvm'});
-  assert((await h.clickTestId('wizard.close')).ok);
-  await h.waitFor(async()=>!(await h.query('wizard.dialog')).some(shown)||null);
+  // The connection editor is its own window (no title-bar close inside it). Its test_id query answers with the
+  // hidden SSH form's 取消 rather than the plugin editor's, so cancel with Escape (Wizard.windowKey → cancel).
+  assert((await h.key('escape')).ok);
+  await h.waitFor(async()=>{const q=await h.query('wizard.dialog');return !Array.isArray(q)||!q.some(shown)||null});
+  await visible('workspace.titlebar');  // automation is back on the main window
  }
  await writeFile(join(out,'report.json'),JSON.stringify({status:'passed',checks},null,2));
  console.log('passed: '+out);

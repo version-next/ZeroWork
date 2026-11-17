@@ -9,14 +9,26 @@ const files = @import("file_binding_host.zig");
 const routing = @import("file_route_factory.zig");
 const ssh = @import("../proto/ssh/session.zig");
 pub const auth = @import("../proto/ssh/auth_challenge.zig");
-pub const host_key = @import("../ui/host_key_confirmation.zig");
+pub const host_key = @import("host_key_confirmation.zig");
 pub const listener = @import("../proto/ssh/socks5_listener.zig");
 const progress = @import("../proto/ssh/connection_progress.zig");
 const hosts = @import("../config/hosts.zig");
-const Frozen = @import("../ui/session_lifecycle.zig").Snapshot;
+const Frozen = @import("session_lifecycle.zig").Snapshot;
 const Forward = @import("../proto/ssh/forward_service.zig");
 
 pub const Phase = enum(u8) { connecting, ready, paused, failed, closing, cleanup_unknown, closed };
+/// 转发状态的统一说法（shared/base/connection_presenter.zig）：chip、连接卡片与转发卡片同用。
+pub fn forwardPhase(phase: Phase, failed: bool) @import("../shared/base/connection_presenter.zig").ForwardPhase {
+    return switch (phase) {
+        .connecting => .starting,
+        .ready => .running,
+        .paused => .paused,
+        .failed => .failed,
+        .closing => .stopping,
+        .cleanup_unknown => .cleanup_unknown,
+        .closed => if (failed) .failed else .stopped,
+    };
+}
 pub const SharedProvider = struct {
     context: *anyopaque,
     get: *const fn (*anyopaque, sessions.ServiceHandle, ?usize) anyerror!*Forward.Service,

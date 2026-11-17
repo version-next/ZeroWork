@@ -25,12 +25,27 @@ The line is enforced at **build time**: `zig build hello-button` only allows the
 | `zenit_system_icons` | `src/ui/system_icons_*.zig` | Provider-neutral semantic icons used by framework components |
 | `zenit_reflection` | `src/reflection.zig` | Zig 0.17 compile-time field descriptors |
 | `zenit_time` | `src/time.zig` | Clock measurements using caller-supplied I/O |
-| `zenit_environment` | `src/environment.zig` | Native process diagnostic flags |
+| `zenit_environment` | `src/environment.zig`, `src/ui_environment.zig` | Native process diagnostic flags and build-selected development configuration |
 | `calendar_time` | `native/c_headers/calendar_time.h` | Native calendar-time declarations |
 
 Development tools such as YIX and the vendored ZLS live outside this GUI dependency
 boundary. They have explicit build/test targets; ordinary GUI applications do not
-compile or link the language servers. See `docs/ZIG_0_17_COMPAT.md` for the public profile.
+compile or link the language servers. See `vendor/zls/ZIG017.md` for the tooling profile.
+
+UI reads `dev_preview` through the existing `zenit_environment` injection point.
+The build supplies each UI graph's own options, including the separate LP2 graph;
+an application's optional `root.build_options` declaration cannot configure every
+test root or native/wasm oracle. The environment's `preview` namespace supplies
+the YSS style compiler and token adapters only to preview graphs. These are the
+existing styling development capability, not general language/editor services.
+Release graphs do not receive those dependencies, and the LP2 release-erasure
+gate checks the resulting executable.
+
+Repository YSS fixtures are a test-only adapter in
+`tools/style_reload_fixtures.zig`, injected through that same environment only
+when `lp2_gate` is enabled. `src/ui` may check its component styles using relative
+imports; it must not directly import application fixture modules or build-option
+modules. The static import allowlist is unchanged by this configuration route.
 
 ## What's OUT
 
@@ -147,3 +162,20 @@ If you find a genuine reason a piece of "OUT" functionality should move IN (or v
 - Whether the move is reversible
 
 Boundary changes should be rare.
+
+## Appendix: test status
+
+`zig build test-ui` passes cleanly on main (713 passed / 14 skipped /
+0 failed). The render tests, Textarea segfault, and the entire DatePicker /
+DateRangePicker / Calendar UAF cluster (a real bug in
+`freeDetachedNodeAfterScopeDispose`) have all been fixed.
+
+CI runs the full `test` step which includes `test-system-sdk`,
+`test-text-core`, `test-reactive`, **and `test-ui`**.
+
+**The 14 remaining skipped tests are quarantined failures**, not platform-
+gated skips. Most are first-open-render expectations that drifted as the
+popover prewarm pipeline evolved; the rest are SnapshotLayer/Grid render
+paths. See the [issue tracker](https://github.com/version-next/zenit/issues) for the full list and recommended fix
+order. A new contributor wanting to make a real difference should pick
+the first-open-render group from there; fixing one likely fixes ten.

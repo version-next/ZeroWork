@@ -1,4 +1,5 @@
 /** Native production statusbar, isolated loopback SSH, no user data. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,mkdir,writeFile,readFile,open,rm,realpath,copyFile} from 'node:fs/promises';
@@ -13,6 +14,7 @@ process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const peerCode=`import sys,time,stat
 sys.path.insert(0, 'e2e')
 import ssh_aux_download_loopback as peer
+const python=process.env.ZW_TEST_PYTHON;assert(python,'ZW_TEST_PYTHON (audited Python with paramiko, run with -I) is required');
 f=peer.file_fixture
 f.PAYLOAD=b'ZEROWORK_STATUSBAR_REAL_TICKER\\n'+bytes(range(256))*65536
 peer.PAYLOAD=f.PAYLOAD
@@ -39,12 +41,14 @@ def delayed_channel(self,kind,channel_id):
 peer.Server.check_channel_request=delayed_channel
 peer.main()
 `;
-const peerLog=await open(join(out,'peer.log'),'w');const peer=spawn('python3',['-c',peerCode,'--out',peerDir],{stdio:['ignore',peerLog.fd,peerLog.fd]});
+const peerLog=await open(join(out,'peer.log'),'w');const peer=spawn(python,['-I','-c',peerCode,'--out',peerDir],{stdio:['ignore',peerLog.fd,peerLog.fd]});
 const peerEnded=new Promise<void>(done=>peer.once('close',()=>done()));
 let app:any,appEnded:Promise<void>|undefined;const report:any={checks:[],theme,isolated,binary:resolve(process.argv[3]??'zig-out/bin/zerowork')};const shown=(n:any)=>n.hidden!==true&&n.visible!==false&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const visible=(id:string)=>waitFor(async()=>(await query(id)).find(shown)??null,15000);
 async function click(id:string){await visible(id);assert((await clickTestId(id)).ok,id);await sleep(150);}
-async function capture(name:string){await sleep(300);assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(['workspace.statusbar','status.transfer','status.connection','status.connection.footer','status.connection.viewport','connection.details','connection.details.footer','connection.details.body','connection.details.node-dialog','wizard.dialog','socks.info','status.theme','transfer.session','settings.footer.state','settings.appearance.font.header'].map(async id=>[id,id==='wizard.dialog'?await screenPos(id):await query(id)]))),null,2));}
+// title-click: the session card opens from the tab menu “会话连接” (right-click the tab's identity anchor); it never opens on hover and the anchor is not clickable.
+async function openIdentity(){const t=await visible('status.connection.identity');assert((await clickAt(t.rect.x+t.rect.w/2,t.rect.y+t.rect.h/2,1,'right')).ok);await click('context.menu.session_identity');}
+async function capture(name:string){await sleep(300);assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(['workspace.statusbar','status.transfer','status.connection','status.connection.footer','status.connection.viewport','connection.details','connection.details.footer','connection.details.body','connection.details.node-dialog','wizard.dialog','socks.info','settings.appearance.themes','transfer.session','settings.footer.state','settings.appearance.font.header'].map(async id=>[id,id==='wizard.dialog'?await screenPos(id):await query(id)]))),null,2));}
 const flatten=(n:any):any[]=>n?[n,...(n.children??[]).flatMap(flatten)]:[];
 const content=(n:any)=>flatten(n).map(n=>n.text??'').join(' ');
 const inside=(n:any,id:string)=>flatten(n).find(n=>n.test_id===id&&shown(n));
@@ -81,20 +85,20 @@ try{
  const latency=flatten(identity).find(n=>shown(n)&&n.text&&n.rect.x>=identity.rect.x+79);assert(latency);assert(latency.rect.x>=identity.rect.x&&latency.rect.x+latency.rect.w<=identity.rect.x+identity.rect.w);
  assert(!(await query('status.connection.rtt')).some(shown));assert(!(await query('status.connection.more')).some(shown));
  report.checks.push('Latency is inside the connection identity; redundant metric and More stay hidden.');await capture('01-statusbar');
- await click('status.connection.identity');let panel=await visible('status.connection');assert.equal(panel.rect.w,344);assert.equal(panel.rect.h,334);
+ await openIdentity();let panel=await visible('status.connection');assert.equal(panel.rect.w,344);assert.equal(panel.rect.h,334);
  const facts=content(panel);assert(facts.includes('SSH · 交互式 Shell'));assert(facts.includes('Statusbar Loopback'));assert(facts.includes('127.0.0.1'));assert(!content(await visible('status.connection.cipher')).includes('未知'));
  await capture('02-v3-connection');await click('status.connection.copy');await waitFor(async()=>content(await visible('status.connection')).includes('已复制信息')||null);
  const copy=await visible('status.connection.copy');assert.equal(copy.rect.w,90);await capture('03-copy-acknowledged');await key('escape');await waitFor(async()=>!(await query('status.connection')).some(shown)||null);
  report.checks.push('V3 labeled facts use the real negotiated cipher; Copy information acknowledges the production clipboard callback.');
- await click('status.connection.identity');await resizeWindow(860,480);await sleep(250);panel=await visible('status.connection');const minAnchor=await visible('status.connection.identity');
+ await openIdentity();await resizeWindow(860,480);await sleep(250);panel=await visible('status.connection');const minAnchor=await visible('status.connection.identity');
  assert(panel.rect.x>=8&&panel.rect.y>=8&&panel.rect.x+panel.rect.w<=852&&panel.rect.y+panel.rect.h<=minAnchor.rect.y);
  const footer=await visible('status.connection.footer');assert(footer.rect.y+footer.rect.h<=panel.rect.y+panel.rect.h);await capture('04-minimum-anchored');
  for(let step=0;step<2;step++){
   const toggle=(await query('sidebar.collapse')).some(shown)?'sidebar.collapse':'sidebar.rail.expand';await click(toggle);
-  await waitFor(async()=>!(await query('status.connection')).some(shown)||null);await click('status.connection.identity');panel=await visible('status.connection');
+  await waitFor(async()=>!(await query('status.connection')).some(shown)||null);await openIdentity();panel=await visible('status.connection');
   assert(panel.rect.x>=8&&panel.rect.y>=8&&panel.rect.x+panel.rect.w<=852&&panel.rect.y+panel.rect.h<=480);await capture(`05-sidebar-toggle-${step}`);
  }
- await click('status.connection.close');await waitFor(async()=>!(await query('status.connection')).some(shown)||null);await click('status.connection.identity');await clickAt(600,150);await waitFor(async()=>!(await query('status.connection')).some(shown)||null);
+ await click('status.connection.close');await waitFor(async()=>!(await query('status.connection')).some(shown)||null);await openIdentity();await clickAt(600,150);await waitFor(async()=>!(await query('status.connection')).some(shown)||null);
  report.checks.push('Actual 860x480 resize, sidebar fold/reopen, close, Escape and outside click keep the card inside the window.');
  await resizeWindow(1440,900);await click('status.connection.chain');let chain=await visible('connection.details');assert.equal(chain.rect.w,344);assert.equal(chain.rect.h,318);
  assert(content(chain).includes('↓ SSH 隧道'));assert((await query('connection.details.node.0')).some(shown));assert((await query('connection.details.node.1')).some(shown));await capture('06-v3-chain');
@@ -108,7 +112,7 @@ try{
  await click('connection.details.sample');await waitFor(async()=>content((await query('connection.details')).find(shown)).includes('采样中')||null,10000);await waitFor(async()=> (await protocolCalls()).filter(x=>x.operation==='CHANNEL').length>channelCount||null,15000);
  await waitFor(async()=>/\b\d+ms\b/.test(content((await query('connection.details')).find(shown)))||null,15000);await capture('09-real-chain-sample');
  const chainFooter=await visible('connection.details.footer');chain=await visible('connection.details');assert(chainFooter.rect.y+chainFooter.rect.h<=chain.rect.y+chain.rect.h);
- await click('connection.details.edit');await visible('wizard.name');assert(content(await visible('wizard.title')).includes('编辑连接'));const wizardBounds=await screenPos('wizard.dialog');assert(wizardBounds.w>0&&wizardBounds.h>0);assert(content(await visible('wizard.name')).includes('Statusbar Loopback'));assert(!(await query('connection.details')).some(shown));await capture('10-chain-edit-captured-host');
+ await click('connection.details.edit');await visible('wizard.name');assert(content(await visible('wizard.title')).includes('编辑主机'));const wizardBounds=await screenPos('wizard.dialog');assert(wizardBounds.w>0&&wizardBounds.h>0);assert(content(await visible('wizard.name')).includes('Statusbar Loopback'));assert(!(await query('connection.details')).some(shown));await capture('10-chain-edit-captured-host');
  await click('wizard.cancel');await waitFor(async()=>!(await query('wizard.name')).some(shown)||null);
  report.checks.push('Chain node list, captured fingerprint/cipher detail, minimum layout, real SSH CHANNEL sampling and editing original connection all passed.');
  report.status='passed';

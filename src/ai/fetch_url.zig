@@ -338,6 +338,11 @@ fn extract(allocator: std.mem.Allocator, body: []const u8, content_type: []const
     return .{ .text = owned_text, .title = try title.buffer.toOwnedSlice(allocator), .truncated = text.truncated };
 }
 
+test {
+    // 让 transport 的用例不依赖本文件其他用例的函数体：按名字过滤（如 test-fetch-network）时也能被收集到。
+    _ = transport;
+}
+
 test "fetch_url uses one fixed URL schema and actual-address public filter" {
     const a = std.testing.allocator;
     const schema = try std.json.parseFromSlice(std.json.Value, a, contribution.definition.schema, .{});
@@ -374,7 +379,7 @@ test "fetch_url extracts bounded readable HTML and never executes embedded instr
 test "fetch_url receipts preserve authority and cancellation without opening any session" {
     const a = std.testing.allocator;
     const identity = @import("../host/identity.zig");
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 2 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 2 };
     const Policy = struct {
         calls: usize = 0,
         fn denied(raw: *anyopaque, _: host.Context, _: u64, _: []const u8) Decision {
@@ -413,7 +418,7 @@ test "fetch_url receipts preserve authority and cancellation without opening any
 test "fetch_url missing HTTP runtime is a capability failure rather than permission rejection" {
     const a = std.testing.allocator;
     const identity = @import("../host/identity.zig");
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const Policy = struct {
         fn allow(_: *anyopaque, _: host.Context, _: u64, _: []const u8) Decision {
             return .allow;

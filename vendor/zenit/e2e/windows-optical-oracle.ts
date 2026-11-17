@@ -35,4 +35,3 @@ export function circleRay(x:number,y:number,s:number,warp=2,refraction=1){
   const luma=colors[0]*.2126+colors[1]*.7152+colors[2]*.0722,sat=1.01+(topEdge+bottomEdge*.45)*.06;
   return colors.map(c=>encode(clamp(mix(luma,c,sat))));
 }
-

@@ -1,5 +1,7 @@
 /** V0.1.8.1 comparable native-window workload. RPC observation includes automation
  * overhead and is NOT key-to-photon latency. Idle sampling makes no RPC calls. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 import {spawn, execFileSync} from 'node:child_process';
@@ -30,7 +32,7 @@ function discoverRows(node:any):string[]{return [...(node.test_id?.startsWith('t
 async function rows(_ids=rowIds){const result=await query('terminal.surface.viewport');assert(Array.isArray(result),JSON.stringify(result));return result.find(shown)?.children?.filter(shown)??[];}
 async function outputText(ids=rowIds){return (await rows(ids)).map(text).join('');}
 function sample(){
- const fields=execFileSync('/bin/ps',['-p',String(child.pid),'-o','time=,rss='],{encoding:'utf8'}).trim().split(/\s+/);
+ const fields=psCompat(['-p',String(child.pid),'-o','time=,rss=']).trim().split(/\s+/);
  const parts=fields[0].split(':').map(Number);let seconds=0;for(const part of parts) seconds=seconds*60+part;
  return {cpu_seconds:seconds,rss_kib:Number(fields[1]),at:performance.now()};
 }

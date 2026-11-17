@@ -77,6 +77,7 @@ pub const Service = struct {
         retire: *const fn (*anyopaque, identity.SessionHandle) anyerror!void,
         processSnapshot: *const fn (*anyopaque, identity.SessionHandle) anyerror!ProcessSnapshot,
         cwdSnapshot: *const fn (*anyopaque, identity.SessionHandle, std.mem.Allocator) anyerror!CwdSnapshot,
+        metadataRevision: *const fn (*anyopaque) u64,
         copyCwd: *const fn (*anyopaque, identity.SessionHandle, std.mem.Allocator) anyerror!?[]u8,
         closeRiskSnapshot: *const fn (*anyopaque, identity.SessionHandle, std.mem.Allocator) anyerror!CloseRiskSnapshot,
         terminalService: *const fn (*anyopaque, host.ServiceHandle) anyerror!terminal.Service,
@@ -110,6 +111,10 @@ pub const Service = struct {
     }
     pub fn cwdSnapshot(self: *Service, owner: identity.SessionHandle, allocator: std.mem.Allocator) anyerror!CwdSnapshot {
         return self.vtable.cwdSnapshot(self.context, owner, allocator);
+    }
+    /// Advances with published CWD or foreground process metadata.
+    pub fn metadataRevision(self: *Service) u64 {
+        return self.vtable.metadataRevision(self.context);
     }
     pub fn copyCwd(self: *Service, owner: identity.SessionHandle, allocator: std.mem.Allocator) anyerror!?[]u8 {
         return self.vtable.copyCwd(self.context, owner, allocator);
@@ -171,6 +176,9 @@ pub const Service = struct {
             fn cwdSnapshot(raw: *anyopaque, owner: identity.SessionHandle, allocator: std.mem.Allocator) anyerror!CwdSnapshot {
                 return get(raw).cwdSnapshot(owner, allocator);
             }
+            fn metadataRevision(raw: *anyopaque) u64 {
+                return get(raw).metadataRevision();
+            }
             fn copyCwd(raw: *anyopaque, owner: identity.SessionHandle, allocator: std.mem.Allocator) anyerror!?[]u8 {
                 return get(raw).copyCwd(owner, allocator);
             }
@@ -204,7 +212,7 @@ pub const Service = struct {
             fn execSnapshot(raw: *anyopaque, handle: ExecHandle, allocator: std.mem.Allocator) anyerror!ExecSnapshot {
                 return get(raw).execSnapshot(handle, allocator);
             }
-            const vtable: VTable = .{ .destroy = @This().destroy, .adapter = @This().adapter, .shutdownStep = @This().shutdownStep, .drain = @This().drain, .retire = @This().retire, .processSnapshot = @This().processSnapshot, .cwdSnapshot = @This().cwdSnapshot, .copyCwd = @This().copyCwd, .closeRiskSnapshot = @This().closeRiskSnapshot, .terminalService = @This().terminalService, .configureScrollback = @This().configureScrollback, .configureRecording = @This().configureRecording, .applyRecordingRetention = @This().applyRecordingRetention, .readOutput = @This().readOutput, .startExec = @This().startExec, .cancelExec = @This().cancelExec, .retireExec = @This().retireExec, .execSnapshot = @This().execSnapshot };
+            const vtable: VTable = .{ .destroy = @This().destroy, .adapter = @This().adapter, .shutdownStep = @This().shutdownStep, .drain = @This().drain, .retire = @This().retire, .processSnapshot = @This().processSnapshot, .cwdSnapshot = @This().cwdSnapshot, .metadataRevision = @This().metadataRevision, .copyCwd = @This().copyCwd, .closeRiskSnapshot = @This().closeRiskSnapshot, .terminalService = @This().terminalService, .configureScrollback = @This().configureScrollback, .configureRecording = @This().configureRecording, .applyRecordingRetention = @This().applyRecordingRetention, .readOutput = @This().readOutput, .startExec = @This().startExec, .cancelExec = @This().cancelExec, .retireExec = @This().retireExec, .execSnapshot = @This().execSnapshot };
         };
         const self = try service_allocator.create(Service);
         self.* = .{ .allocator = service_allocator, .context = implementation, .vtable = &Forward.vtable };

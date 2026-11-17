@@ -1,0 +1,19 @@
+//! 标题栏工具组的布局：只排位置、间距与收起时的叠放，不写按钮、分隔线、菜单、Tooltip 的外观（全部原生默认）。
+const ui = @import("ui");
+
+/// 一行：组内间距 2（行的 gap）；组间分隔线两侧各 6（gap 2 + margin 4）。收起的按钮绝对定位叠在行尾的“⋯”下。
+style tools { direction: row; align-items: center; height: 32; gap: 2; flex-shrink: 0; }
+/// 一个按钮的位置（32 × 32 是原生 md icon-only 的尺寸，这里只占位）。收起时叠到行尾“⋯”下方：透明、不参与命中，
+/// 留在树里以便弹层仍从这里（即“⋯”处）弹出。
+recipe Slot {
+  base { width: 32; height: 32; flex-shrink: 0; }
+  flag folded { position: absolute; inset: {ui.Inset{ .right = .{ .px = 0 }, .top = .{ .px = 0 } }}; opacity: 0; z-index: 0; hit-behavior: pass-through; }
+}
+/// 宿主挂进来的额外入口（后台 SOCKS 的远端入口）。
+style extra { direction: row; align-items: center; flex-shrink: 0; }
+/// 组间分隔线：1 × 16，两侧各 6。
+style divider { width: 1; height: 16; margin: 0 4; flex-shrink: 0; }
+/// “⋯”：与前一个按钮相距 6，叠在收起的按钮上面。
+style more { width: 32; height: 32; margin: 0 0 0 4; flex-shrink: 0; z-index: 1; }
+/// 未读通知圆点：贴在“⋯”右上角，不参与命中。
+style dot { position: absolute; inset: {ui.Inset{ .right = .{ .px = 4 }, .top = .{ .px = 4 } }}; width: 8; height: 8; hit-behavior: pass-through; }

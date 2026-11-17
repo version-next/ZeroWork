@@ -27,31 +27,13 @@ pub const ContentData = struct {
 pub const ContentTable = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(ContentData),
-    /// Replaced owned content/spans on text change: prior frame text blob and cached commands still
-    /// borrow them (blob content lifetime until next-frame blob reset); don't release immediately;
-    /// releaseRetired frees at next-frame blob reset. Node destroy doesn't go here (node already
-    /// invisible).
-    retired_content: std.ArrayListUnmanaged([]const u8) = .empty,
-    retired_spans: std.ArrayListUnmanaged([]const types.TextSpan) = .empty,
-
     pub fn init(allocator: std.mem.Allocator) ContentTable {
         return .{ .allocator = allocator, .items = .empty };
     }
 
     pub fn deinit(self: *ContentTable) void {
-        self.releaseRetired();
-        self.retired_content.deinit(self.allocator);
-        self.retired_spans.deinit(self.allocator);
         self.items.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    /// Release swapped-out old text (frame boundary call: prior frame's borrows now all invalid).
-    pub fn releaseRetired(self: *ContentTable) void {
-        for (self.retired_content.items) |c| self.allocator.free(c);
-        self.retired_content.clearRetainingCapacity();
-        for (self.retired_spans.items) |s| self.allocator.free(s);
-        self.retired_spans.clearRetainingCapacity();
     }
 
     /// Grow items and re-fixup all entry inline_buf self-refs.
@@ -93,7 +75,9 @@ pub const ContentTable = struct {
     /// Return TextProps value copy. After caller receives copy, content still points
     /// ContentTable internal inline_buf; intentional (caller usually reads immediately,
     /// doesn't copy struct). If caller `var t = getText().?; ... node.setText(t)`,
-    /// setText re-fixups stored entry's inline_buf for consistency.
+    /// setText re-fixups stored entry's inline_buf for consistency. Lifetime of the borrowed
+    /// slices: see `Node.getText` (a write to the entry, its clear, or table growth for inline
+    /// text ends it).
     pub fn getText(self: *const ContentTable, id: ElementId) ?TextProps {
         if (id.isNull() or id.index >= self.items.items.len) return null;
         return self.items.items[id.index].text;
@@ -105,20 +89,16 @@ pub const ContentTable = struct {
     pub fn setText(self: *ContentTable, id: ElementId, t: ?TextProps) void {
         if (id.isNull() or id.index >= self.items.items.len) return;
         var slot = &self.items.items[id.index];
-        // Release old owned content/spans on text change; else swapped dupe leaks permanently.
-        // Pointer guard: caller `getText -> modify field -> setText` writing back same memory can't
-        // free.
+        // Owned content / spans the node gives up are released here, like a destroyed node's:
+        // nothing the framework keeps borrows a node's text (the displayed frame's render data
+        // holds its own copy of every text it shows). A slice a caller read through `getText()`
+        // is valid until the node's text is written or the node is destroyed.
+        // Pointer guard: `getText -> modify field -> setText` writes the same memory back.
         if (slot.text) |old| {
             const new_content_ptr: ?[*]const u8 = if (t) |nt| nt.content.ptr else null;
             const new_spans_ptr: ?[*]const types.TextSpan = if (t) |nt| nt.spans.ptr else null;
-            // Retire instead of immediate release (see retired_content); fall back to immediate
-            // release if registration fails.
-            if (old.owned and old.content.len > 0 and old.content.ptr != new_content_ptr) {
-                self.retired_content.append(self.allocator, old.content) catch self.allocator.free(old.content);
-            }
-            if (old.spans_owned and old.spans.len > 0 and old.spans.ptr != new_spans_ptr) {
-                self.retired_spans.append(self.allocator, old.spans) catch self.allocator.free(old.spans);
-            }
+            if (old.owned and old.content.len > 0 and old.content.ptr != new_content_ptr) self.allocator.free(old.content);
+            if (old.spans_owned and old.spans.len > 0 and old.spans.ptr != new_spans_ptr) self.allocator.free(old.spans);
         }
         slot.text = t;
         if (slot.text) |*tt| {

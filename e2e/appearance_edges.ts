@@ -3,6 +3,8 @@
  * Public Harness only: raw recovery, reference removal and status Escape focus.
  * Native replacement/bad-image picker paths are deliberately left to native_input.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10,7 +12,9 @@ import { mkdir, mkdtemp, open, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { waitForServerReady, waitFor, query, focused, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, focused, inputState, clickTestId, clickAt, key, type_, resizeWindow, screenshot, sleep, mouseMove } from "../zig-out/share/zenit/harness/client.ts";
+// Two-level Settings window (overview → subpage, Cmd+W closes): shared navigation.
+import { settingsNav } from "./settings_nav.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -49,6 +53,9 @@ alignment_y = "center"
 transparency = 25
 `;
 await Promise.all([writeFile(configPath, baseline), writeFile(join(output, "config-before.toml"), baseline)]);
+// The regression runner's isolation guard appends `[updates] auto_check=false` to any config.toml it
+// sees written: the committed file is what is actually on disk.
+const committedBaseline = await readFile(configPath, "utf8");
 process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
 const log = await open(join(output, "app.log"), "w");
 const child = spawn(binary, [], { cwd: root, env: {
@@ -77,7 +84,11 @@ function text(node: Node): string { return (node.text ?? "") + (node.children ??
 async function visible(id: string): Promise<Node> { return await waitFor(async () => (await query(id)).find(shown) ?? null); }
 async function hidden(id: string): Promise<void> { await waitFor(async () => !(await query(id)).some(shown) || null); }
 async function click(id: string): Promise<void> { await visible(id); assert((await clickTestId(id)).ok, `Click ${id}`); }
-async function expectInput(id: string, value: string): Promise<void> { await waitFor(async () => (await inputState(id)).buffer === value || null); }
+// Committed numeric fields are now shown in their canonical format (line height "1.80"): compare numbers.
+const sameValue = (buffer: string, value: string) => buffer === value || (/^-?[0-9.]+$/.test(value) && /^-?[0-9.]+$/.test(buffer) && Number(buffer) === Number(value));
+async function expectInput(id: string, value: string): Promise<void> {
+  await waitFor(async () => sameValue((await inputState(id)).buffer, value) || null);
+}
 async function edit(id: string, value: string, commit = true): Promise<void> {
   await click(id);
   assert((await key("a", { cmd: true })).ok);
@@ -86,7 +97,22 @@ async function edit(id: string, value: string, commit = true): Promise<void> {
   if (commit) assert((await key("return")).ok);
   await expectInput(id, value);
 }
-async function footer(value: string): Promise<void> { await waitFor(async () => (await visible("settings.footer.state")).text === value || null); }
+// Floating Save Bar (H-save): it shows "未保存" / "有设置需要修正" (was "请修正设置中的错误") while a draft exists
+// and hides once the draft is saved or there is none (was a persistent "已保存" footer).
+const footerText: Record<string, string> = { "请修正设置中的错误": "有设置需要修正" };
+async function footer(value: string): Promise<void> {
+  if (value === "已保存") { await waitFor(async () => !(await query("settings.footer")).some(shown) || null); return; }
+  const want = footerText[value] ?? value;
+  await waitFor(async () => (await visible("settings.footer.state")).text === want || null);
+}
+// H-save (save_flow.zig): Save stays clickable on an invalid draft; pressing it locates the problem and writes
+// nothing. "Save is blocked" is therefore checked by pressing it: the error and danger state stay, the file does not change.
+async function saveBlocked(): Promise<void> {
+  const before = await readFile(configPath, "utf8");
+  await saveEnabled(true); await click("settings.save"); await sleep(400);
+  await footer("请修正设置中的错误");
+  assert.equal(await readFile(configPath, "utf8"), before, "Save on an invalid draft must not write configuration");
+}
 async function saveEnabled(expected: boolean): Promise<void> {
   await waitFor(async () => ((await visible("settings.save")).focusable === true) === expected || null);
 }
@@ -102,7 +128,7 @@ function configValue(source: string, section: string, field: string): unknown {
 }
 const evidenceIds = [
   "status.detail", "status.detail.title", "local.status.identity", "local.status.encoding", "local.status.more",
-  "settings.close", "settings.footer.state", "settings.save", "settings.field.font_size", "settings.error.font_size",
+  "settings.panel", "settings.page.title", "settings.footer.state", "settings.save", "settings.field.font_size", "settings.error.font_size",
   "settings.field.line_height", "settings.error.line_height", "settings.background.filename", "settings.background.state",
   "settings.background.remove", "settings.toggle.enabled",
 ];
@@ -115,7 +141,7 @@ async function capture(name: string): Promise<void> {
   captures.push(path);
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -134,46 +160,70 @@ try {
   assert.equal(Number(owner.pid), child.pid);
   assert((await resizeWindow(1440, 900)).ok);
   await click("workspace.empty.local");
-  await visible("local.status.identity");
+  await visible("terminal.surface");
   const detailFocus: Record<string, unknown>[] = [];
   report.status_detail_focus = detailFocus;
-  for (const [trigger, title, expectedText] of [
-    ["local.status.identity", "本地终端", ["本机 · macOS", "/bin/zsh", "交互式登录"]],
-    ["local.status.encoding", "终端编码", ["UTF-8", "其他编码", "暂不可用"]],
-    ["local.status.more", "更多状态", ["文本编码", "终端网格"]],
-  ] as const) {
-    await click(trigger);
-    const card = await visible("status.detail");
-    assert.equal((await visible("status.detail.title")).text, title);
-    assert(Math.abs(card.rect.w - 360) <= 0.5);
-    for (const value of expectedText) assert(text(card).includes(value), `${title}: missing ${value}`);
-    if (trigger === "local.status.more") assert(!text(card).includes("往返延迟"), "Local More must not expose RTT");
-    await capture(trigger.replaceAll(".", "-"));
-    assert((await key("escape")).ok);
-    await hidden("status.detail");
-    await waitFor(async () => (await focused()).test_id === trigger || null);
-    detailFocus.push({ trigger, title, card_rect: card.rect, focused_after_escape: await focused() });
-  }
-  checks.push("Production Local identity, encoding and More cards show their actual content; Escape closes each and restores its original trigger focus");
+  // Workspace chrome (稿 5, main_window.zig identitiesAtTabs): the Local status bar is hidden; its identity
+  // trigger is a pass-through, non-focusable anchor region over the active tab. title-click: the session card
+  // no longer opens on hover — hovering the tab shows its native hint only; the card opens from the tab menu's
+  // “会话连接”. Encoding and grid are rows of that same card. The real card shows the actual Local facts,
+  // never RTT, and Escape closes it without leaving focus in the card.
+  const before = await focused();
+  const trigger = await visible("local.status.identity");
+  assert(trigger.focusable !== true, "Tab identity region is an anchor, not a focus stop");
+  assert((await mouseMove(trigger.rect.x + trigger.rect.w / 2, trigger.rect.y + trigger.rect.h / 2)).ok);
+  await sleep(900);
+  assert(!(await query("status.detail")).some(shown), "Hovering the active tab opens no session card (title-click)");
+  assert((await clickAt(trigger.rect.x + trigger.rect.w / 2, trigger.rect.y + trigger.rect.h / 2, 1, "right")).ok);
+  await click("context.menu.session_identity");
+  const card = await visible("status.detail");
+  assert.equal((await visible("status.detail.title")).text, "会话详情");
+  assert(Math.abs(card.rect.w - 380) <= 0.5, `session card width ${card.rect.w}`);
+  for (const value of ["本地终端", "本机 · macOS", "/bin/zsh", "本地 · 交互式 Shell", "编码", "UTF-8", "网格"]) assert(text(card).includes(value), `会话连接: missing ${value}`);
+  assert(!text(card).includes("往返延迟"), "Local session card must not expose RTT");
+  await capture("local-status-identity");
+  assert((await key("escape")).ok);
+  await hidden("status.detail");
+  const after = await focused();
+  detailFocus.push({ trigger: "local.status.identity", title: "会话详情", card_rect: card.rect, focused_before: before, focused_after_escape: after });
+  assert(!String(after.test_id ?? "").startsWith("status.detail"), "Escape must not leave focus in the closed card");
+  assert.equal(after.test_id, before.test_id, "Escape returns to the focus the user had before the card");
+  assert((await mouseMove(700, 600)).ok);
+  checks.push("Production Local session card (tab menu “会话连接”; hover opens nothing) shows identity, shell, encoding and grid; no RTT; Escape closes it and keeps the prior focus");
 
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  await click("settings.appearance.themes.header");
-  await click("settings.appearance.font.header");
+  const nav = settingsNav();
+  await nav.toSub("appearance", "theme");
   await waitFor(async () => (await visible("settings.background.state")).text?.includes("本地 · 1 × 1") || null);
+  await nav.toSub("appearance", "font");
+  await nav.reveal("settings.field.font_size");
   await edit("settings.field.font_size", "18");
   await footer("未保存");
   for (const [field, invalid, recovered] of [["font_size", "999", "18"], ["line_height", "NaN", "1.5"]] as const) {
-    await edit(`settings.field.${field}`, invalid, false);
-    await visible(`settings.error.${field}`);
+    const input = `settings.field.${field}`;
+    const error = `settings.error.${field}`;
+    await edit(input, invalid, false);
+    await visible(error);
     await footer("请修正设置中的错误");
-    await saveEnabled(false);
-    assert.equal(await readFile(configPath, "utf8"), baseline, "Invalid raw must not publish configuration");
+    await saveBlocked();
+    await waitFor(async () => (await focused()).test_id === input || null);
+    await expectInput(input, invalid);
+    assert.equal(await readFile(configPath, "utf8"), committedBaseline, "Invalid raw must not publish configuration");
     await capture(`raw-invalid-${field}`);
+
+    // Save returns focus to an already-invalid field. Start a fresh focus session with a valid value before testing Escape.
+    await edit(input, recovered);
+    await hidden(error);
+    const otherInput = field === "font_size" ? "settings.field.line_height" : "settings.field.font_size";
+    await click(otherInput);
+    await waitFor(async () => (await focused()).test_id === otherInput || null);
+    await edit(input, invalid, false);
+    await visible(error);
+    await footer("请修正设置中的错误");
+    assert.equal((await focused()).test_id, input, "Escape starts inside the original edit");
     assert((await key("escape")).ok);
-    await expectInput(`settings.field.${field}`, recovered);
-    await hidden(`settings.error.${field}`);
-    await visible("settings.close");
+    await expectInput(input, recovered);
+    await hidden(error);
+    await visible("settings.panel");
     await footer("未保存");
     await saveEnabled(true);
   }
@@ -184,17 +234,22 @@ try {
   assert.equal(configValue(valid, "ui", "line_height"), 1.5);
   await writeFile(join(output, "raw-recovered.config.toml"), valid);
   await capture("raw-recovered-saved");
-  checks.push("Invalid size/line-height raw remains displayed with an error and disabled Save; Escape restores the last valid draft (18/1.5), preserves the other edit and saves typed values");
+  checks.push("Invalid Save returns focus to the failing field and leaves the file unchanged; Escape in a separate edit restores the focus-time value (18/1.5), and both valid drafts can be saved");
 
+  await nav.toSub("appearance", "theme");
+  await nav.reveal("settings.background.remove");
   await click("settings.background.remove");
   await waitFor(async () => (await visible("settings.background.filename")).text === "尚未选择图片" || null);
   await footer("请修正设置中的错误");
-  await saveEnabled(false);
+  await saveBlocked();
   assert.equal(await readFile(configPath, "utf8"), valid, "Remove is only a draft until Save");
   assert.deepEqual(await readFile(image), imageBytes, "Remove must not delete or change the source image");
   await capture("background-removed-enabled-invalid");
+  await nav.reveal("settings.toggle.enabled");
   await click("settings.toggle.enabled");
-  await hidden("settings.background.filename");
+  // The image identity row now stays visible (with a "背景图片已关闭" note) while the background is off;
+  // the off state is read from the pane summary instead of the hidden filename.
+  await waitFor(async () => text(await visible("settings.appearance.materials.summary")).startsWith("已关闭") || null);
   await footer("未保存");
   await saveEnabled(true);
   await click("settings.save");

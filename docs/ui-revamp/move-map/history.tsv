@@ -1,0 +1,27 @@
+old_path	new_path	layer	mixed	note
+src/record_cleanup_tests.zig	src/features/history/tests/record_cleanup_tests.zig	tests	no	仅 import host/record_cleanup、vt/session_archive（core）；被 record_cleanup_ui_tests 反向 import
+src/record_cleanup_ui_tests.zig	src/features/history/tests/record_cleanup_ui_tests.zig	tests	no	import ui/record_cleanup_view、app_theme、shell_styles、record_cleanup_tests
+src/ui/history_archive.zig	src/features/history/model/history_archive.zig	model	no	无 ui import；依赖 platform/presentation_wakeup、vt/session_archive；被 ssh_shell_execution_runner、terminal_execution_tests、workspace 引用（跨 feature）
+src/ui/history_cast.zig	src/vt/history_cast.zig	core	no	被 core import: src/local/recording.zig:1410、src/vt/ssh_worker.zig:2983；§5.2 下沉 vt/。风险：它 import history_replay、terminal_document、terminal_document_source（ui/ 下）与 host/terminal_service，下沉后 vt 会反向依赖这些文件，主 agent 需协调；src/root.zig、builtin_records_tests.zig 也引用
+src/ui/history_colors.zig	src/features/history/view/history_colors.zig	view	no	import ui（仅 test 块用 ui.Cx）、app_theme、terminal_view、builtin_records_styles；被 history_replay（model 层）与 terminal_view 引用，存在 model->view 与跨 feature 依赖
+src/ui/history_host.zig	src/features/history/host/history_host.zig	host	no	747 行；import ui、workspace、session_export*、floating_input；被 main.zig 引用
+src/ui/history_list.zig	src/features/history/model/history_list.zig	model	no	无 ui import；仅 vt/session_archive；被 root.zig、transfer_panel_tests 引用
+src/ui/history_reading.zig	src/features/history/model/history_reading.zig	model	no	无 ui import；被 history_archive、terminal_view、workspace、builtin_records_tests 引用
+src/ui/history_replay.zig	src/features/history/model/history_replay.zig	model	no	无 ui import；但 import history_colors（view 层）与 terminal_record_geometry（归 terminal/vt）；被 terminal_view、workspace、root.zig 等引用
+src/ui/history_row.zig	src/features/history/view/history_row.zig	view	no	import ui；含 1 个就地 test
+src/ui/history_styles.zig	src/features/history/view/history_styles.zig	view	no	import ui；跟随 history_row/history_host；自身 import ai_close_confirmation_styles、notification_styles（跨 feature）；被 terminal_view、command_history_view、ai_transcript_images、main.zig 引用
+src/ui/record_cleanup_styles.zig	src/features/history/view/record_cleanup_styles.zig	view	no	import ui；被 application_data_cleanup_styles、ui_constraint_tests 引用
+src/ui/record_cleanup_view.zig	src/features/history/view/record_cleanup_view.zig	view	no	import ui、host/record_cleanup；test_id 前缀为 settings.record_cleanup.*（见 TESTID）；被 main.zig 引用
+# CONTESTED src/ui/history_replay.zig terminal history_replay 被 terminal_view 与 workspace 大量引用，且依赖 terminal_record_geometry；暂认领 history/model，若主 agent 认为回放引擎属 terminal 可改判
+# CONTESTED src/ui/command_history_view.zig terminal 前缀 command_* 归 terminal，仅提示它依赖 history_styles（本包 view/）
+# CONTESTED src/ui/command_history_styles.zig terminal 前缀 command_* 归 terminal，仅提示
+# CONTESTED src/ui/ai_history_view.zig ai 前缀 ai_* 归 ai，仅提示
+# CONTESTED src/ui/builtin_records_styles.zig terminal 前缀 builtin_* 归 terminal；history_colors 依赖它
+# CONTESTED src/ui/terminal_record_geometry.zig terminal 前缀 terminal_* 归 terminal（§5.2 下沉 vt/）；history_replay 依赖它
+# CONTESTED src/builtin_records_tests.zig terminal import history_cast/history_reading 但主体测 builtin records，归 terminal
+# CONTESTED src/transfer_panel_tests.zig transfer import history_list/history_replay/history_row，是 transfer 聚合根，不归 history
+# E2E build.zig 引用 src/ 下 history/record_cleanup 旧路径：无（仅 src/root.zig:151,326,328 引用 ui/history_cast.zig 及 history_list/history_replay，src/main.zig 引用 history_host/history_styles/record_cleanup_view；这些是源码 import 需 P1 改写）
+# E2E docs/DESIGN/V0.1.5_TERMINAL_HISTORY.md 引用了 src/ui/history_replay.zig src/ui/history_cast.zig src/ui/history_list.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/ui/history_list.zig src/ui/history_cast.zig src/ui/history_replay.zig
+# TESTID history
+# TESTID settings.record_cleanup（record_cleanup_view 使用 settings.* 前缀，需裁决是否归 history）

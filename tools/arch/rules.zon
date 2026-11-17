@@ -1,0 +1,307 @@
+// check-arch 规则：路径 → 层、具名模块 → 层、import 矩阵、标识符禁用序列、
+// test_id 提取上下文。依据 docs/ui-revamp/ARCHITECTURE_PLAN.md §4.1–4.3、§5.1–5.2。
+//
+// 格式说明见 tools/arch/README.md。要点：
+// - `layers` 有序，第一个匹配的条目生效；具体的放前面。
+// - glob 按段匹配：`*` 段内通配，`**` 零个或多个整段，`{feature}` 一个整段并作为 feature 键。
+// - `.transitional = true` 的条目只服务于“尚未分层”的布局：P1 搬迁后只剩 plugins 的条目，
+//   等 P5 把插件按 model/view/host 分层后删除，届时 legacy_plugin、plugin_registry 也从 `allow` 中移除。
+.{
+    .roots = .{"src"},
+    .extensions = .{ ".zig", ".yix" },
+    .skip = .{ "**/_*.yix.zig", "**/_*.yss.zig" },
+    .test_files = .{ "**/*_tests.zig", "src/**/tests/**" },
+
+    .modules = .{
+        .{ .name = "std", .layer = "std" },
+        .{ .name = "builtin", .layer = "std" },
+        .{ .name = "root", .layer = "std" },
+        .{ .name = "ui", .layer = "zenit_ui" },
+        .{ .name = "icon_ir", .layer = "zenit_ui" },
+        .{ .name = "zenit_app", .layer = "zenit_app" },
+        // translate-c 生成的 C ABI 绑定
+        .{ .name = "generated_ghostty_vt", .layer = "native_gen" },
+        .{ .name = "generated_ssh_session", .layer = "native_gen" },
+        .{ .name = "generated_ssh_channel", .layer = "native_gen" },
+        // build.zig 注入的选项与资源模块
+        .{ .name = "application_options", .layer = "build_options" },
+        .{ .name = "preview_options", .layer = "build_options" },
+        .{ .name = "build_options", .layer = "build_options" },
+        .{ .name = "app_icon_assets", .layer = "build_options" },
+        .{ .name = "ui_font_assets", .layer = "build_options" },
+        .{ .name = "formal_environment", .layer = "build_options" },
+        // src/preview.zig、src/acceptance.zig、src/tests_local.zig 的多路复用选择项
+        .{ .name = "root_select", .layer = "build_options" },
+        // build.zig 给更新器 helper / fixture 注入的 platform/user_dirs_native.zig（模块根在 src/update 之外）
+        .{ .name = "user_dirs_native", .layer = "platform" },
+        .{ .name = "zerowork", .layer = "entry" },
+    },
+
+    .layers = .{
+        // ── 目标布局（§5.1）────────────────────────────────────────
+        // 入口与聚合根：src/ 根目录的 main.zig、root.zig、tests_*.zig、preview.zig、acceptance.zig
+        .{ .pattern = "src/main.zig", .layer = "entry" },
+        .{ .pattern = "src/root.zig", .layer = "entry" },
+        .{ .pattern = "src/tests_*.zig", .layer = "entry" },
+        .{ .pattern = "src/preview.zig", .layer = "entry" },
+        .{ .pattern = "src/acceptance.zig", .layer = "entry" },
+        .{ .pattern = "src/app/**", .layer = "app" },
+        .{ .pattern = "src/features/{feature}/mod.zig", .layer = "facade" },
+        .{ .pattern = "src/features/{feature}/preview.zig", .layer = "host" },
+        // 预览与验收 runner：由 src/preview.zig / src/acceptance.zig 选中的程序入口（§5.4）
+        .{ .pattern = "src/features/{feature}/**/preview/**", .layer = "runner" },
+        .{ .pattern = "src/features/{feature}/**/tests/acceptance/**", .layer = "runner" },
+        .{ .pattern = "src/features/{feature}/**/tests/**", .layer = "tests" },
+        .{ .pattern = "src/features/{feature}/**/model/view_model.zig", .layer = "view_model" },
+        .{ .pattern = "src/features/{feature}/**/model/**", .layer = "model" },
+        .{ .pattern = "src/features/{feature}/**/view/**", .layer = "view" },
+        .{ .pattern = "src/features/{feature}/**/host/**", .layer = "host" },
+        // 子域的门面：features/<f>/<sub>/mod.zig 也按门面对待（对外仍以 feature 为边界）
+        .{ .pattern = "src/features/{feature}/*/mod.zig", .layer = "facade" },
+        .{ .pattern = "src/shared/base/**", .layer = "shared_base" },
+        // 跨 feature 的主题/材质/按钮测试与预览（move-map 裁决原则 3）：允许 import 各 feature 内部，不受跨 feature 限制
+        .{ .pattern = "src/shared/ui/tests/**", .layer = "shared_ui_tests" },
+        .{ .pattern = "src/shared/ui/preview/**", .layer = "shared_ui_tests" },
+        .{ .pattern = "src/shared/ui/**", .layer = "shared_ui" },
+        .{ .pattern = "src/shared/testing/**", .layer = "shared_testing" },
+        // 插件、core 目录与 platform 下的预览/验收 runner（位置随所属目录，层按程序入口算）
+        .{ .pattern = "src/plugins/{feature}/**/preview/**", .layer = "runner" },
+        .{ .pattern = "src/plugins/{feature}/**/acceptance/**", .layer = "runner" },
+        .{ .pattern = "src/*/**/acceptance/**", .layer = "runner" },
+        .{ .pattern = "src/platform/**", .layer = "platform" },
+        // plugins/* 按 feature 对待（§4.2）
+        .{ .pattern = "src/plugins/{feature}/mod.zig", .layer = "facade" },
+        .{ .pattern = "src/plugins/{feature}/**/tests/**", .layer = "tests" },
+        .{ .pattern = "src/plugins/{feature}/**/model/view_model.zig", .layer = "view_model" },
+        .{ .pattern = "src/plugins/{feature}/**/model/**", .layer = "model" },
+        .{ .pattern = "src/plugins/{feature}/**/view/**", .layer = "view" },
+        .{ .pattern = "src/plugins/{feature}/**/host/**", .layer = "host" },
+
+        // ── 过渡布局：plugins 尚未分层（P5 删除）──────────────────────
+        .{ .pattern = "src/plugins/*.zig", .layer = "plugin_registry", .transitional = true },
+        .{ .pattern = "src/plugins/{feature}/non_ui.zig", .layer = "facade", .transitional = true },
+        .{ .pattern = "src/plugins/{feature}/plugin.zig", .layer = "facade", .transitional = true },
+        .{ .pattern = "src/plugins/{feature}/**", .layer = "legacy_plugin", .transitional = true },
+
+        // ── core（§4.1；D1 = A，位置不变）───────────────────────────
+        .{ .pattern = "src/proto/**", .layer = "core" },
+        .{ .pattern = "src/vt/**", .layer = "core" },
+        .{ .pattern = "src/transfer/**", .layer = "core" },
+        .{ .pattern = "src/local/**", .layer = "core" },
+        .{ .pattern = "src/host/**", .layer = "core" },
+        .{ .pattern = "src/ai/**", .layer = "core" },
+        .{ .pattern = "src/config/**", .layer = "core" },
+        .{ .pattern = "src/update/**", .layer = "core" },
+    },
+
+    // 来源层 → 允许的目标层（§4.2 矩阵）。不在列表里的一律违规，规则名 `layer:<来源层>-><目标层>`。
+    .allow = .{
+        .{ .from = "std", .to = .{"std"} },
+        .{ .from = "zenit_ui", .to = .{} },
+        .{ .from = "zenit_app", .to = .{} },
+        .{ .from = "native_gen", .to = .{} },
+        .{ .from = "build_options", .to = .{} },
+        .{ .from = "entry", .to = .{
+            "std",       "zenit_ui",    "zenit_app",       "native_gen",    "build_options", "platform",       "core",
+            "shared_base", "shared_ui", "shared_testing", "app",           "facade",        "model",          "view_model",
+            "view",      "host",        "tests",           "runner",        "shared_ui_tests", "entry",
+            "legacy_plugin", "plugin_registry",
+        } },
+        .{ .from = "app", .to = .{
+            "std",         "zenit_ui",  "zenit_app",      "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "app",            "facade",     "model",         "view_model",    "view",
+            "host",
+            "legacy_plugin", "plugin_registry",
+        } },
+        .{ .from = "platform", .to = .{ "std", "native_gen", "build_options", "platform", "shared_base" } },
+        .{ .from = "core", .to = .{ "std", "zenit_app", "native_gen", "platform", "core", "shared_base" } },
+        .{ .from = "model", .to = .{ "std", "core", "shared_base", "model", "view_model", "facade" } },
+        .{ .from = "view_model", .to = .{ "std", "zenit_ui", "core", "shared_base", "model", "view_model", "facade" } },
+        .{ .from = "view", .to = .{
+            "std",   "zenit_ui",   "shared_base", "shared_ui", "model", "view_model", "view", "facade",
+        } },
+        .{ .from = "host", .to = .{
+            "std",         "zenit_ui",  "zenit_app", "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "model",     "view_model", "view",          "host",     "facade",
+        } },
+        .{ .from = "facade", .to = .{
+            "std",         "zenit_ui",  "zenit_app", "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "model",     "view_model", "view",          "host",     "facade",
+            "legacy_plugin",
+        } },
+        .{ .from = "tests", .to = .{
+            "std",         "zenit_ui",  "zenit_app",      "native_gen", "core",  "shared_base", "shared_ui",
+            "shared_testing", "model",  "view_model",     "view",       "host",  "facade",      "tests",
+            // 过渡（P5 删除）：插件尚未分层，插件自己的 tests/ 与 runner 引用本插件内部文件；跨插件/跨 feature 仍报 cross-feature
+            "legacy_plugin",
+        } },
+        .{ .from = "shared_base", .to = .{ "std", "shared_base" } },
+        .{ .from = "shared_ui", .to = .{ "std", "zenit_ui", "shared_base", "shared_ui" } },
+        .{ .from = "shared_testing", .to = .{
+            "std", "zenit_ui", "zenit_app", "core", "shared_base", "shared_ui", "shared_testing",
+        } },
+        // 预览/验收 runner：程序入口性质，可用 build 注入模块与 platform；仍受跨 feature 限制。
+        .{ .from = "runner", .to = .{
+            "std",         "zenit_ui",  "zenit_app", "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "shared_testing", "facade", "model", "view_model", "view",
+            "host",        "tests",     "runner",
+            "legacy_plugin", // 过渡（P5 删除），同上
+        } },
+        // src/shared/ui/{tests,preview}：跨 feature 的主题/材质/按钮测试（cross_feature_exempt）。
+        .{ .from = "shared_ui_tests", .to = .{
+            "std",         "zenit_ui",  "zenit_app", "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "shared_testing", "facade", "model", "view_model", "view",
+            "host",        "tests",     "shared_ui_tests",
+        } },
+        // ── 过渡层（plugins 尚未分层，P5 删除）──
+        // 未分层的插件：等同 host 的权限（插件自己的 view/model/host 混在一起），
+        // 但不得依赖 features 的内部文件（只能经门面）。
+        .{ .from = "legacy_plugin", .to = .{
+            "std",         "zenit_ui",  "zenit_app", "native_gen", "build_options", "platform", "core",
+            "shared_base", "shared_ui", "facade",    "legacy_plugin",
+        } },
+        // src/plugins/*.zig（插件注册表）：组合根性质。
+        .{ .from = "plugin_registry", .to = .{
+            "std", "zenit_ui", "zenit_app", "native_gen", "build_options", "platform", "core", "shared_base", "facade",
+            "legacy_plugin", "plugin_registry",
+        } },
+    },
+
+    // 测试代码（测试文件与 `test` 块）额外允许：本 feature 任意层、shared/testing、core、platform（§4.2 对测试放宽）。
+    .test_allow = .{ "core", "shared_testing", "model", "view_model", "view", "host", "facade", "tests", "zenit_app", "native_gen", "platform" },
+    .cross_feature_allowed = .{"facade"},
+    .cross_feature_exempt = .{ "entry", "shared_ui_tests" },
+
+    // 标识符级规则（§4.2 补充规则）。test 块内不检查。
+    .idents = .{
+        .{
+            .name = "view_model-reactive-subset",
+            .files = .{
+                "src/features/*/**/model/view_model.zig",
+                "src/plugins/*/**/model/view_model.zig",
+                // 过渡：bmc_ikvm 已有平铺的 view_model.zig
+                "src/plugins/*/view_model.zig",
+            },
+            .forbid = .{ "ui.Node", "ui.Cx", "ui.box", "ui.widgets", "ui.view", "appendChild", "setStyleInline" },
+        },
+        .{
+            .name = "view-no-io",
+            .files = .{ "src/features/*/**/view/**", "src/plugins/*/**/view/**" },
+            .forbid = .{ "std.Thread", "std.Io.Dir", "std.posix" },
+        },
+        // 硬性规则（2026-11-12，用户）：基础组件只用 zenit 原生的，不许用 inline 样式覆盖其外观，
+        // 也不许伸手改它们的内部节点（track / thumb 等）。视图与宿主代码里的 setStyleInline 一律算违规；
+        // 现存调用进基线，只能缩短（见 docs/ui-revamp/NATIVE_AUDIT.md）。测试文件与 test 块不检查。
+        .{
+            .name = "no-inline-style",
+            .files = .{ "src/features/**", "src/plugins/**", "src/shared/ui/**", "src/app/**" },
+            .forbid = .{"setStyleInline"},
+        },
+        // 按下标取子节点基本都是在伸手改某个组件的内部结构（node.children.items[0] 即 track / thumb / label）。
+        .{
+            .name = "no-widget-internals",
+            .files = .{ "src/features/**", "src/plugins/**", "src/shared/ui/**", "src/app/**" },
+            .forbid = .{"children.items"},
+        },
+        // test_id 只给测试用（usage-b5f-ai-testid，审计第 3 条“用 test_id 充当生产组件接口”）：生产代码不读节点的
+        // test_id，不按它找节点、不按它决定样式或行为。给节点命名（`… .meta.test_id = …` 赋值）不算；挂载后再改名
+        // （`test_id_owned` 是“id 是改名时分配的”标记）单列一条。测试文件、test 块、预览 / 验收程序、测试支撑与 test-mode
+        // 路由不检查。目标带函数名（`meta.test_id @ findTagged`），基线按函数记，同一文件里新写的查找也会被拦下。
+        .{
+            .name = "no-test-id-read",
+            .files = .{"src/**"},
+            .skip = .{
+                "src/**/preview/**",          "src/preview.zig",             "src/**/acceptance/**", "src/acceptance.zig",
+                "src/shared/testing/**",       "src/**/*_test_routes.zig",    "src/**/test_fixtures/**", "src/tests_*.zig",
+            },
+            .forbid = .{"meta.test_id"},
+            .reads_only = true,
+            .per_function = true,
+        },
+        .{
+            .name = "no-test-id-rewrite",
+            .files = .{"src/**"},
+            .skip = .{
+                "src/**/preview/**",          "src/preview.zig",             "src/**/acceptance/**", "src/acceptance.zig",
+                "src/shared/testing/**",       "src/**/*_test_routes.zig",    "src/**/test_fixtures/**", "src/tests_*.zig",
+            },
+            .forbid = .{"flags.test_id_owned"},
+            .per_function = true,
+        },
+    },
+
+    // 术语表护栏（docs/ui-revamp/GLOSSARY.md，用户拍板 2026-11-14）：用户可见字符串里禁止出现的说法。
+    // `.zig` 只看非测试代码的字符串字面量；`.yix` 按行扫描（跳过 `//` 注释行）。违规进同一份 baseline.txt，
+    // 只能缩短：设置窗口的旧文案（settings-3f 合入后另行处理）在基线里，修掉后 `imports --prune`。
+    // 确属合理的例外写进 `allow`，必须写明理由。
+    .terms = .{
+        .files = .{ "src/**" },
+        .skip = .{
+            "src/**/preview/**", "src/**/acceptance/**", "src/**/tests/**", "src/preview.zig", "src/acceptance.zig",
+        },
+        .forbid = .{
+            .{ .term = "鉴权", .use = "认证" },
+            .{ .term = "身份验证", .use = "认证" },
+            .{ .term = "在线", .use = "已连接" },
+            .{ .term = "离线", .use = "已断开 / 已结束" },
+            .{ .term = "断开并关闭", .use = "关闭页签" },
+            .{ .term = "关闭本地会话", .use = "关闭页签" },
+            .{ .term = "会话连接", .use = "会话 / 会话详情" },
+            .{ .term = "新建连接", .use = "新建主机" },
+            .{ .term = "编辑连接", .use = "编辑主机" },
+            .{ .term = "连接配置", .use = "主机配置" },
+            .{ .term = "连接列表", .use = "主机列表" },
+            .{ .term = "连接名称", .use = "主机名称" },
+            .{ .term = "保存的连接", .use = "已保存的主机" },
+            .{ .term = "删除跳板", .use = "移除跳板" },
+            .{ .term = "移除此主题", .use = "删除此主题（导入主题是永久删除）" },
+            // 字节单位（用户拍板 2026-11-14 units-iec）：1024 进制、IEC 写法，一律走 shared/base/format。
+            // 子串匹配：“KiB”“MiB/s” 不含 “KB”“MB/s”，不会误伤；裸单位字面量（如后缀 "MB"）按带引号的整串匹配。
+            .{ .term = " KB", .use = "KiB（shared/base/format）" },
+            .{ .term = " MB", .use = "MiB（shared/base/format）" },
+            .{ .term = " GB", .use = "GiB（shared/base/format）" },
+            .{ .term = " TB", .use = "TiB（shared/base/format）" },
+            .{ .term = "KB/s", .use = "KiB/s（shared/base/format）" },
+            .{ .term = "MB/s", .use = "MiB/s（shared/base/format）" },
+            .{ .term = "GB/s", .use = "GiB/s（shared/base/format）" },
+            .{ .term = "kB/s", .use = "KiB/s（shared/base/format）" },
+            .{ .term = "\"KB\"", .use = "\"KiB\"（shared/base/format）" },
+            .{ .term = "\"MB\"", .use = "\"MiB\"（shared/base/format）" },
+        },
+        .allow = .{
+            .{ .file = "src/features/connections/progress/view/connection_details_view.zig", .term = "编辑连接", .reason = "“编辑连接路径”指跳板路由，不是保存的主机" },
+            .{ .file = "src/shared/base/connection_presenter.zig", .term = "在线", .reason = "presenter 自检：断言文案里没有“在线”" },
+            .{ .file = "src/features/settings/**/ai_*.zig", .term = "连接配置", .reason = "AI 服务提供方的连接参数（地址、API Key），不是保存的 SSH 主机" },
+            .{ .file = "src/ai/fetch_url.zig", .term = "连接配置", .reason = "“无法连接配置的代理”：动词“连接”+“配置的代理”，不是术语" },
+            .{ .file = "src/ai/lifecycle_runtime.zig", .term = "新建连接", .reason = "AI 工作终端的网络连接复用策略（“不新建连接”），不是新建主机" },
+        },
+    },
+
+    // 快捷键文字护栏（一致性审查 #9，用户拍板 2026-11-14 第 4 条：shortcut_router 是唯一入口）：视图、宿主与插件的
+    // 用户可见字符串里不许手写修饰键符号；Tooltip、菜单项、设置页的快捷键文字一律从 shortcut_router 取（随 [keys]
+    // 变化），插件这类不能依赖应用 feature 的代码用 shared/base/shortcut_glyphs.zig 的同一格式化。扫描方式同 terms。
+    .shortcut_text = .{
+        .files = .{ "src/features/**", "src/plugins/**", "src/shared/ui/**", "src/app/**" },
+        .skip = .{
+            "src/**/preview/**", "src/**/acceptance/**", "src/**/tests/**",
+            "src/features/shell/model/shortcut_router.zig",
+        },
+        .forbid = .{
+            .{ .term = "⌘", .use = "shortcut_router.hint / shortcut_glyphs" },
+            .{ .term = "⌃", .use = "shortcut_router.hint / shortcut_glyphs" },
+            .{ .term = "⌥", .use = "shortcut_router.hint / shortcut_glyphs" },
+            .{ .term = "⇧", .use = "shortcut_router.hint / shortcut_glyphs" },
+        },
+    },
+
+    .test_ids = .{
+        // 这些标识符之后同一表达式内的字符串字面量是“确定的 test_id 定义点”。
+        .contexts = .{ "test_id", "testId", "stableId", "headerTestId", "subtitleTestId", "closeTestId", "buttonTestId", "titleTestId", "descriptionTestId", "actionTestId", "header_test_id", "title_test_id", "subtitle_test_id", "close_test_id", "tooltipTestId", "closeTooltipTestId", "close_tooltip_test_id", "test_ids" },
+        .exclude_suffixes = .{
+            ".zig", ".zon", ".json", ".yix", ".yss", ".txt", ".md", ".png", ".svg", ".jpg", ".ts", ".py",
+            ".sh", ".log", ".toml", ".plist", ".app", ".dmg", ".zip", ".tar", ".gz", ".sock", ".so", ".dylib",
+        },
+        .e2e_dirs = .{"e2e"},
+        .e2e_extensions = .{ ".ts", ".mts" },
+    },
+}

@@ -375,7 +375,7 @@ test "image offload does not treat text overflow as successful image recovery" {
 test "image offload loop persists omission across failed answer retry and new turns" {
     const a = std.testing.allocator;
     const loop_mod = @import("tool_loop.zig");
-    const scope: @import("tool_scope.zig").Scope = .{ .owner = .{ .session = 171 }, .members = .{ .ids = .{171} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const scope: @import("tool_scope.zig").Scope = .{ .owner = .{ .tab = 171 }, .content = .{ .session = 171 }, .members = .{ .ids = .{171} ++ @as([15]u64, @splat(0)), .len = 1 } };
     var image = try images.ContentRef.create(a, "fixture", test_png, 1, .{});
     defer image.release();
     const messages = [_]p.Message{

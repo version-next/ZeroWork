@@ -8,13 +8,14 @@
 /// - click/hover/manual trigger modes
 /// - OverlayStack manages z-index, Escape, outside-click
 /// - Anchor auto-positions + flip + cross-axis shift
-/// - Default scale_fade enter/exit animations (overridable)
+/// - Anchored fade enter/exit animations (overridable)
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
 const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
+const ViewThemeReplay = @import("../../core/node.zig").ViewThemeReplay;
 const box = core.box;
 const BoxStyle = core.BoxStyle;
 const Color = core.Color;
@@ -27,12 +28,14 @@ const Model = reactive.Model;
 const Handler = core.Handler;
 const animation = @import("../../animation/mod.zig");
 const overlay_stack_mod = @import("../../overlay_stack.zig");
+const overlay_layer_refs = @import("../../overlay_layer_refs.zig");
 const render_engine = @import("../../core/render_engine/mod.zig");
 const floating = @import("../../compute_position.zig");
 const scroll_area_mod = @import("../scroll_area/mod.zig");
 
 // Styling layer in styles.zig
 const styles = @import("styles.zig");
+pub const pointer_grace = @import("pointer_grace.zig");
 const HIDDEN_OPACITY: f32 = 0.001;
 
 /// Popover position
@@ -67,26 +70,20 @@ pub const PopoverPosition = floating.Placement;
 //
 // The popover before-render hook re-reads the anchor every frame, so it follows a moving anchor.
 
-/// Anchor rect, absolute (viewport) coordinates
-pub const AnchorRect = struct {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-};
+/// Anchor rect in window (portal) coordinates (shared with Modal `within`: overlay_stack).
+pub const AnchorRect = overlay_stack_mod.AnchorRect;
 
-/// Virtual anchor: caller provides ctx + callback to fetch rect.
-pub const VirtualAnchor = struct {
-    ctx: *anyopaque,
-    /// Return rect in absolute viewport coordinate system.
-    getRect: *const fn (ctx: *anyopaque) AnchorRect,
-};
+/// Virtual anchor: caller provides ctx + callback to fetch rect (a pure read, see
+/// overlay_stack.VirtualAnchor).
+pub const VirtualAnchor = overlay_stack_mod.VirtualAnchor;
 
-/// Popover anchor: either real Node (using its globalRect()) or VirtualAnchor.
-pub const Anchor = union(enum) {
-    node: *Node,
-    virtual: VirtualAnchor,
-};
+/// Popover anchor: either real Node (its laid-out rect; tracked by identity, a freed node counts
+/// as an invalid anchor) or VirtualAnchor.
+pub const Anchor = overlay_stack_mod.Anchor;
+
+/// An anchor rect below this on either axis means "no valid anchor" (callers return it from a
+/// virtual anchor; a freed node anchor reports it): the panel stays where it was.
+const anchor_offscreen: f32 = -1.0e6;
 
 /// Popover trigger mode
 pub const PopoverTrigger = enum {
@@ -113,6 +110,7 @@ pub const SizePolicy = enum {
 /// Equivalent to floating-ui OffsetOptions; exposed to caller as .{ .static = N }
 /// or .{ .derive = .{ .ctx = ..., .compute = fn } }.
 pub const PopoverOffset = floating.OffsetValue;
+
 pub const OffsetDeriveState = floating.OffsetDeriveState;
 
 /// Popover properties
@@ -121,6 +119,9 @@ pub const PopoverProps = struct {
     position: PopoverPosition = .bottom_start,
     /// Trigger mode
     trigger: PopoverTrigger = .click,
+    /// For hover triggers, preserve the panel while the pointer crosses the
+    /// gap towards it. Noninteractive hover hints can opt out.
+    safe_triangle: bool = true,
     /// Main-axis distance from trigger element; supports static/derivable (computed
     /// dynamically per placement). Default static 4px. Caller writes:
     ///   .offset = .{ .static = 8 }  or
@@ -132,14 +133,44 @@ pub const PopoverProps = struct {
     /// Esc just propose; parent can reject, keeping state unchanged).
     open: Model(bool) = .{ .local = false },
     /// Callback after user-initiated open/close lands.
+    /// A close the positioning hook proposes (hover pointer left the grace corridor, anchor
+    /// scrolled or left the viewport) runs it synchronously inside Popover's `.dirty_marking`
+    /// hook, which nothing verifies at run time: it must not write nodes raw; a write goes
+    /// through a dirty-marking API (setters, or the matching mark after a raw write; see
+    /// Node.BeforeRenderScope).
     on_open_change: ?Handler(bool) = null,
     /// Close on outside click
     close_on_outside_click: bool = true,
     /// Consume outside-click to prevent triggering the clicked element. Requires
     /// close_on_outside_click.
-    consume_outside_click: bool = false,
+    consume_outside_click: bool = true,
     /// Escape closes
     close_on_escape: bool = true,
+    /// Click popovers dismiss when a scroll ancestor moves or the anchor is
+    /// no longer visible. Manual consumers can opt in without changing their trigger.
+    close_on_anchor_scroll: ?bool = null,
+    /// Move focus into a click popover, confine Tab, and restore the trigger on close.
+    /// Composite controls such as Menu can supply their own focus policy.
+    /// Focus is restored only while it is still inside the panel (or nowhere): a close caused by
+    /// clicking another control keeps the focus that control took. A trigger with nothing
+    /// focusable in it (a `.manual` popover anchored elsewhere) restores the node that had focus
+    /// when the panel opened, unless `return_focus` names another target.
+    trap_focus: ?bool = null,
+    /// focusId of the control a focus-trapping popover focuses when it takes focus (each open,
+    /// once the panel is positioned): the current value is read then and looked up inside the
+    /// panel (`FocusManager.pushScopeWith`, `ScopeEntry.initial_focus`); a change while the panel
+    /// still waits is followed. A target mounted but not shown or enabled yet is waited for with
+    /// focus on the panel itself; one not mounted yet (rows filled after the open, or a stale
+    /// name) leaves the first control focused meanwhile. Either way it takes focus in the frame it
+    /// becomes ready, unless the user acted or focus moved first. null = a declared `autoFocus`
+    /// inside, else the first focusable control. An opener that already put focus in the panel, or a `focusRequest`
+    /// aimed into it, wins (see `trap_focus`). While the panel itself holds focus, assistive
+    /// technology reads the panel: give it a role / label through `parts.chrome` when it has one.
+    initial_focus: Source(?[]const u8) = .{ .value = null },
+    /// focusId of the control focus returns to when a focus-trapping popover closes with focus
+    /// still inside it (or nowhere). Read at close and looked up in the whole window once the
+    /// panel's trap is gone; null or not ready = the default target (see `trap_focus`).
+    return_focus: Source(?[]const u8) = .{ .value = null },
     /// Content width
     width: ?f32 = null,
     /// Content max width (common for auto-fit; overflow handled by interior content
@@ -147,6 +178,14 @@ pub const PopoverProps = struct {
     max_width: ?f32 = null,
     /// When open, float width tracks trigger width.
     match_trigger_width: bool = false,
+    /// The trigger takes the width it is given instead of its content's (wrapper and trigger
+    /// `fill`, min width 0, children stretched across): a truncating label inside a hover trigger
+    /// (Tooltip over an ellipsized title) stays within its row. Off keeps the content-sized trigger.
+    fill_trigger: bool = false,
+    /// The trigger keeps its content's width but may shrink below it (min width 0) when its row
+    /// runs out of space: a truncating label in a status bar item stays within the bar. Ignored
+    /// when `fill_trigger` is set.
+    shrink_trigger: bool = false,
     /// Allow fixed/matched width to shrink within viewport.
     constrain_width_to_viewport: bool = false,
     /// Content max height
@@ -176,11 +215,34 @@ pub const PopoverProps = struct {
     /// display delay.
     open_delay_ms: f32 = 0,
     /// Enter animation
-    enter_transition: overlay_stack_mod.Transition = .scale_fade,
+    enter_transition: overlay_stack_mod.Transition = .anchored_fade,
+    /// Play `enter_transition` when `open` is already true as the popover mounts. Default false:
+    /// a popover mounted open (a page shown with its picker open) is the open result, not an
+    /// opening, so it appears at once. Set true when the caller mounts it in response to the
+    /// opening itself.
+    animate_initial_open: bool = false,
     /// Semantic z-index tier; null = overlay (Tooltip passes .tooltip). See StackTier.
     tier: ?overlay_stack_mod.StackTier = null,
+    /// false: the content is display-only (a tooltip bubble). The whole content subtree is
+    /// excluded from hit testing on every showing, so pointer and wheel reach what lies below
+    /// and controls inside the panel cannot be clicked. Consequences of that choice:
+    /// - a click on the panel counts as a click outside it (`close_on_outside_click` closes it;
+    ///   `consume_outside_click` swallows that press);
+    /// - `trigger = .hover`: the panel never receives hover, so use `safe_triangle = false`
+    ///   (Tooltip does) unless the geometric hover retention is wanted;
+    /// - keyboard focus can still be moved in (`trap_focus`, `initial_focus`); do not combine.
+    /// Opening such a panel never interrupts a running scroll gesture.
+    content_hit_test_visible: bool = true,
+    /// Fixed colour scheme of the floating panel (Yix `colorScheme`): the chrome and everything
+    /// in it resolve against `cx.schemeTokens(scheme)` instead of the app theme (a panel over
+    /// remote video that keeps the dark scheme in a light app). The default chrome paints the
+    /// scheme's popover surface; content the caller appends after mount is replayed with the
+    /// scheme's tokens each time the popover opens (see `Cx.setColorScheme` for the limits).
+    /// null = follow the app theme, or the scheme of the subtree the popover is opened from (a
+    /// Select / Menu inside a fixed panel keeps the panel's scheme).
+    color_scheme: ?core.theme.ColorScheme = null,
     /// Exit animation
-    exit_transition: overlay_stack_mod.Transition = .scale_fade,
+    exit_transition: overlay_stack_mod.Transition = .anchored_fade,
     /// Keep hidden measurable layout after close, for first-frame warmup.
     prewarm_hidden_layout: bool = false,
     /// After close and exit animation completes, detach content from wrapper subtree.
@@ -211,6 +273,9 @@ pub const PopoverProps = struct {
     /// placement avoids them (treated as 'walls'). Typical: signature popup avoids the current
     /// completion and docs chrome. null = no avoidance. Caller provides buf (stack array fine);
     /// provider writes into it and returns the slice.
+    /// Runs inside Popover's `.dirty_marking` positioning hook, which nothing verifies at run time:
+    /// it must not write nodes raw; a write to the overlay's subtree goes through a dirty-marking
+    /// API (setters, or the matching mark after a raw write; see Node.BeforeRenderScope).
     avoid_rects_provider: ?*const fn (cx: *Cx, buf: []floating.Rect) []const floating.Rect = null,
 };
 
@@ -292,8 +357,11 @@ pub const PopoverBuilder = struct {
         errdefer if (!scope_bound) my_scope.dispose();
         const allocator = cx.allocator;
         const resource_allocator = my_scope.allocator;
-        const t = cx.tokens;
         const p = self.props;
+        const t = if (p.color_scheme) |scheme| cx.schemeTokens(scheme) else cx.tokens;
+        const trap_focus = p.trap_focus orelse (p.trigger == .click);
+        reactive.checkBorrow(my_scope, p.initial_focus);
+        reactive.checkBorrow(my_scope, p.return_focus);
 
         const open_bound = try reactive.resolveModel(bool, my_scope, p.open);
         const open_ctl = try my_scope.allocator.create(PopoverOpen);
@@ -310,9 +378,24 @@ pub const PopoverBuilder = struct {
         // goes portal, see below).
         var trigger_node: *Node = undefined;
         const wrapper = try view.render(my_scope, cx, view.col(.{
-            .style = BoxStyle{
+            .style = if (p.fill_trigger) BoxStyle{
+                // Filled trigger: the wrapper takes the caller's width and the trigger spans it,
+                // so the trigger rect still starts at the wrapper origin (popover positions by it).
+                .width = .fill(),
+                .min_width = 0,
+                .height = .{ .fit = .{} },
+                .align_items = .stretch,
+            } else if (p.shrink_trigger) BoxStyle{
+                // Shrinking trigger: content width, but the wrapper and trigger give way (min 0)
+                // when the caller's row is too narrow.
+                .width = .{ .fit = .{} },
+                .min_width = 0,
+                .height = .{ .fit = .{} },
+                .align_items = .stretch,
+            } else BoxStyle{
                 .width = .{ .fit = .{} },
                 .height = .{ .fit = .{} },
+                .no_cross_stretch = true,
                 // `.start` required: column's default cross-axis stretch/center pushes trigger to
                 // container center, misaligning trigger visual position with its box rect origin
                 // (popover positions by this).
@@ -324,7 +407,19 @@ pub const PopoverBuilder = struct {
             .on_hover = if (p.trigger == .hover) core.Cx.simpleHandler(PopoverOpen.show, open_ctl) else null,
             .on_leave = if (p.trigger == .hover) core.Cx.simpleHandler(PopoverOpen.hide, open_ctl) else null,
         }, view.capture(&trigger_node, view.box(.{
-            .style = BoxStyle{
+            .style = if (p.fill_trigger) BoxStyle{
+                .width = .fill(),
+                .min_width = 0,
+                .height = .{ .fit = .{} },
+                .direction = .column,
+                .align_items = .stretch,
+            } else if (p.shrink_trigger) BoxStyle{
+                .width = .{ .fit = .{} },
+                .min_width = 0,
+                .height = .{ .fit = .{} },
+                .direction = .column,
+                .align_items = .stretch,
+            } else BoxStyle{
                 .width = .{ .fit = .{} },
                 .height = .{ .fit = .{} },
             },
@@ -350,12 +445,13 @@ pub const PopoverBuilder = struct {
                 .padding = Padding.all(0),
                 .border = styles.popoverContentBorder(t),
                 .transform_origin = transformOriginForPlacement(p.position),
-                .shadows = core.ShadowList.of(&.{ styles.popoverKeyShadow(t), styles.popover_ambient_shadow }),
+                .shadows = core.ShadowList.of(&.{styles.popoverKeyShadow(t)}),
                 .keep_rendering_when_transparent = true,
                 .max_width = p.max_width,
                 .hit_shape = .{ .rounded_rect = styles.popoverRadius(t) },
                 .clip_shape = .{ .rounded_rect = styles.popoverRadius(t) },
-                // Intercept pointer events on blank area, prevent pass-through to below.
+                // Intercept pointer events on blank area, prevent pass-through to below. (A wheel
+                // over the blank area is contained by the layer: cx_input.dispatchScroll.)
                 .hit_roles = .{ .pointer = true, .scroll = false, .inspect = true },
             },
         }, {}));
@@ -365,8 +461,18 @@ pub const PopoverBuilder = struct {
             cx.freeNode(popover_content);
         };
         popover_content.meta.ownership.meta.component_name = "PopoverContent";
-        // Closed popovers retain their content/Scope, but reserve no overlay slot.
-        // Registration happens on open and lasts through the complete exit animation.
+        // The chrome was built with the scheme's tokens above; later replays keep them.
+        popover_content.meta.ownership.color_scheme = p.color_scheme;
+        if (trap_focus) {
+            popover_content.setFocusable(true);
+            popover_content.setTabIndex(-1);
+            popover_content.setFocusScope(.{ .trap = true, .auto_focus = true });
+        }
+        // A closed popover whose content is detached (detach_hidden_content, the default) holds
+        // no overlay layer: the layer is registered on open and released once its exit has
+        // committed, so mounted-but-closed popovers and tooltips do not consume the stack's
+        // capacity. Content kept attached while hidden keeps its (suspended) layer, which gates
+        // its hit testing and semantic actions.
         const layer_config: overlay_stack_mod.LayerConfig = .{
             .kind = .non_modal,
             .dismiss = .{
@@ -382,11 +488,14 @@ pub const PopoverBuilder = struct {
             .on_dismiss_request = core.Cx.simpleHandler(PopoverOpen.hide, open_ctl),
             .trigger_node = trigger_node,
             .tier = p.tier,
+            .content_hit_test_visible = p.content_hit_test_visible,
         };
+        _ = try popover_content.style.ensureExtFallible(allocator);
         popover_content.style.width = .{ .px = 0 };
         popover_content.style.height = .{ .px = 0 };
         popover_content.style.overflow_hidden = true;
         popover_content.setOpacityRaw(0);
+        // Hidden until a layer reactivates it (the layer owns hit visibility from then on).
         popover_content.setHitTestVisible(false);
 
         // Portalization: floating content, regardless of trigger mode, always mounts directly to
@@ -409,13 +518,30 @@ pub const PopoverBuilder = struct {
             .content = popover_content,
             .cx = cx,
             .layer_config = layer_config,
+            .trigger_ref = overlay_layer_refs.trackNode(cx.overlay_stack.node_registry, trigger_node),
+            .wrapper = wrapper,
+            .wrapper_binding = wrapper.meta.ownership.scope.node_slot.?,
             .detach_hidden_content = p.detach_hidden_content,
             .portaled = true,
+            .animate_initial_open = p.animate_initial_open,
+            .trap_focus = trap_focus,
+            .initial_focus = p.initial_focus,
+            .return_focus = p.return_focus,
+            .chrome_theme = t,
+            .color_scheme = p.color_scheme,
         };
-        my_scope.registerResource(@ptrCast(mount_ctx), struct {
+        my_scope.adoptResource(@ptrCast(mount_ctx), struct {
             fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
                 const ctx: *DetachedContentCtx = @ptrCast(@alignCast(ptr));
+                ctx.unlinkSchemeReplay();
+                if (ctx.focus_pushed) {
+                    if (ctx.cx.focus_manager.getFocused()) |focused| {
+                        if (focused.isDescendantOf(ctx.content)) ctx.cx.focus_manager.abandonFocus(focused);
+                    }
+                    ctx.releaseFocus(false);
+                }
                 if (ctx.layer_handle) |handle| ctx.cx.overlay_stack.removePermanently(handle);
+                ctx.layer_handle = null;
                 // Under portal, content on portal root (outside caller subtree), scope dispose
                 // doesn't
                 // free via caller tree, must detach first then release detached; otherwise portal
@@ -434,9 +560,34 @@ pub const PopoverBuilder = struct {
             return err;
         };
         content_registered = true;
-        // Preserve mount's error channel for initially open components. Later
-        // user-triggered opens cannot throw through the reactive effect.
-        if (is_open.peek()) _ = try ensurePopoverLayer(mount_ctx);
+        // A name computed from data that arrives after the open: the pending entry follows it.
+        if (trap_focus and !p.initial_focus.isStatic()) try my_scope.createEffect(.{ .mount = mount_ctx, .initial = p.initial_focus }, struct {
+            fn follow(c: anytype) void {
+                const name = c.initial.get();
+                if (c.mount.focus_pushed) c.mount.cx.focus_manager.updateScopeEntry(c.mount.content, name);
+            }
+        }.follow);
+        // Attached-while-hidden content keeps a suspended layer from mount; an initially open
+        // popover registers here so a failure reaches mount's error channel.
+        if (!p.detach_hidden_content or is_open.peek()) _ = try ensurePopoverLayer(mount_ctx);
+        // The chrome recolours whenever its subtree replays with other tokens: a fixed scheme's
+        // new tokens (setSchemeTokens), the scheme it inherits from its trigger when it opens.
+        mount_ctx.scheme_replay.next = popover_content.meta.per_frame.hooks.view_theme;
+        popover_content.meta.per_frame.hooks.view_theme = &mount_ctx.scheme_replay;
+        mount_ctx.scheme_replay_linked = true;
+        if (cx.themeSignal()) |theme_signal| {
+            try my_scope.createEffect(.{ .mount = mount_ctx, .theme = theme_signal }, struct {
+                fn update(c: anytype) void {
+                    _ = c.theme.get();
+                    const theme = c.mount.cx.tokensFor(c.mount.content);
+                    const previous = c.mount.chrome_theme;
+                    c.mount.chrome_theme = theme;
+                    if (previous != theme) styles.updateChromeTheme(c.mount.content, previous, theme);
+                }
+            }.update);
+        } else |err| {
+            if (err != error.TemplateCandidateSideEffects) return err;
+        }
 
         // Determine the caller's content mount point by size_policy. .fit_or_scroll: nest a
         // ScrollArea
@@ -452,10 +603,10 @@ pub const PopoverBuilder = struct {
             // no reason library code kills host for caller skipping a field. (Framework's
             // @panic("OOM:") strategy only for 'half-updated irrecoverable' index/reactive paths,
             // not here.)
-            const max_w: f32 = p.max_width orelse return error.FitOrScrollRequiresMaxWidth;
+            const max_w = p.max_width;
             const max_h: f32 = p.max_height orelse return error.FitOrScrollRequiresMaxHeight;
             if (p.prewarm_hidden_layout) {
-                popover_content.style.width = .{ .fit = .{ .max = max_w } };
+                popover_content.style.width = .{ .fit = .{ .max = max_w orelse std.math.inf(f32) } };
                 popover_content.style.height = .{ .fit = .{ .max = max_h } };
             }
             var scroll_result: scroll_area_mod.ScrollAreaResult = undefined;
@@ -468,6 +619,10 @@ pub const PopoverBuilder = struct {
                 .width = max_w,
                 .height = max_h,
             })));
+            if (max_w == null) {
+                scroll_result.container.style.width = .{ .fit = .{} };
+                scroll_result.content.style.width = .{ .fit = .{} };
+            }
             scroll_container_node = scroll_result.container;
             break :blk scroll_result.content;
         } else popover_content;
@@ -495,20 +650,34 @@ pub const PopoverBuilder = struct {
             .clip_subtree = p.clip_subtree_to_chrome,
         }, struct {
             fn update(c: anytype) void {
+                const initial = !c.mount_ctx.presence_settled;
+                c.mount_ctx.presence_settled = true;
                 if (c.is_open.get()) {
-                    const handle = ensurePopoverLayer(c.mount_ctx) catch |err| {
-                        std.log.warn("popover open: {s}", .{@errorName(err)});
+                    // A later open cannot throw through the effect: stay closed on failure.
+                    const layer_handle = ensurePopoverLayer(c.mount_ctx) catch |err| {
+                        std.log.warn("[popover] open failed: {s}", .{@errorName(err)});
                         return;
                     };
                     ensurePopoverContentAttached(c.mount_ctx);
-                    c.cx.overlay_stack.reactivate(handle);
+                    c.mount_ctx.noteOpenedFrom();
+                    // A popover opened from inside a subtree with a fixed colour scheme (a Select
+                    // or Menu in a dark panel) inherits that scheme: its content is portaled, so
+                    // it is not under the fixed node. Content appended after mount was built with
+                    // the app tokens: resolve the whole panel against the scheme before it shows.
+                    const scheme = c.mount_ctx.color_scheme orelse c.cx.colorSchemeOf(c.mount_ctx.wrapper);
+                    const had = c.popover.meta.ownership.color_scheme;
+                    c.popover.meta.ownership.color_scheme = scheme;
+                    if (scheme != null or had != null) c.cx.replaySubtreeTheme(c.popover);
+                    const animate = !initial or c.mount_ctx.animate_initial_open;
+                    c.mount_ctx.instant_enter = !animate;
+                    c.cx.overlay_stack.reactivateWith(layer_handle, .{ .animate = animate });
                     // Re-open mid-exit animation: reactivate only handles suspended layers; exiting
                     // layers
                     // must pull back to entering, else animation finishes commitExit writes
                     // just-set true
                     // visible back to false (same Modal/Sheet handling).
-                    if (c.cx.overlay_stack.findLayer(handle)) |layer| {
-                        if (layer.state == .exiting) c.cx.overlay_stack.cancelExit(handle, .entering);
+                    if (c.cx.overlay_stack.findLayer(layer_handle)) |layer| {
+                        if (layer.state == .exiting) c.cx.overlay_stack.cancelExit(layer_handle, .entering);
                     }
                     var sizing_changed = false;
                     // size_policy=.fit_or_scroll: popover_content fixed px (max_width/max_height),
@@ -516,15 +685,9 @@ pub const PopoverBuilder = struct {
                     // (set 0 on hide).
                     if (c.fit_or_scroll) {
                         // Hide state px=0; on open reset to fit{max=N}.
-                        if (c.target_width) |w| {
-                            const need_reset = switch (c.popover.style.width) {
-                                .px => |v| v <= 1,
-                                else => false,
-                            };
-                            if (need_reset) {
-                                c.popover.style.width = .{ .fit = .{ .max = w } };
-                                sizing_changed = true;
-                            }
+                        if (isZeroPx(c.popover.style.width)) {
+                            c.popover.style.width = .{ .fit = .{ .max = c.target_width orelse std.math.inf(f32) } };
+                            sizing_changed = true;
                         }
                         if (c.fit_h) |h| {
                             const need_reset = switch (c.popover.style.height) {
@@ -583,7 +746,8 @@ pub const PopoverBuilder = struct {
                     c.popover.markRenderDirty();
                     c.popover.markCompositeDirty();
                 } else {
-                    if (c.mount_ctx.layer_handle) |handle| c.cx.overlay_stack.beginExit(handle);
+                    if (c.mount_ctx.layer_handle) |layer_handle| c.cx.overlay_stack.beginExit(layer_handle);
+                    c.mount_ctx.releaseFocus(true);
                 }
                 c.cx.needs_redraw = true;
             }
@@ -592,7 +756,7 @@ pub const PopoverBuilder = struct {
         // on_before_render: position after layout (rect computed correctly by then).
         const position_ctx = try resource_allocator.create(PopoverPositionCtx);
         const effective_anchor: EffectiveAnchor = if (p.anchor) |a| switch (a) {
-            .node => |n| .{ .external_node = n },
+            .node => |n| .{ .external_node = overlay_stack_mod.TrackedNode.track(cx, n) },
             .virtual => |v| .{ .virtual = v },
         } else .self_trigger;
 
@@ -602,7 +766,8 @@ pub const PopoverBuilder = struct {
             .trigger_node = trigger_node,
             .effective_anchor = effective_anchor,
             .is_open = is_open,
-            .layer_handle = .{ .id = 0, .z_index = 0 },
+            .open_ctl = open_ctl,
+            .close_on_anchor_scroll = p.close_on_anchor_scroll orelse (p.trigger == .click),
             .pos = p.position,
             .offset = p.offset,
             .cx = cx,
@@ -632,14 +797,36 @@ pub const PopoverBuilder = struct {
         my_scope.registerResource(@ptrCast(position_ctx), struct {
             fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
                 const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(ptr));
+                clearHoverTimer(ctx);
                 alloc.destroy(ctx);
             }
         }.cleanup) catch |err| {
             resource_allocator.destroy(position_ctx);
             return err;
         };
-        popover_content.meta.per_frame.hooks.before_render.main = popoverBeforeRender;
+        // Every write popoverBeforeRender makes (this node, its fit_or_scroll container, the
+        // content it detaches, the overlay stack's enter controller) goes through a
+        // dirty-marking entry: raw style / opacity / translate writes are followed by
+        // markSizingDirty / markRenderDirty / markComposite*Dirty, structure changes use
+        // appendChild / detachChildRetained. The hover / anchor-scroll checks write only
+        // PopoverPositionCtx state and propose a close (the open effect's beginExit /
+        // commitExit mark what they change); trap_focus moves focus through FocusManager.setFocus,
+        // which marks both nodes (the restored trigger lies outside this subtree, a marked write
+        // all the same). Declared `.dirty_marking`, the overlay root stays
+        // cache-trusted without the per-frame raw-state verification, so its promoted surface is
+        // reused with verification on or off (ZENIT_DISABLE_HOOK_VERIFY).
+        popover_content.addBeforeRenderScoped(popoverBeforeRender, .dirty_marking);
+        // Hook ring full (8 hooks on this node): keep positioning as an undeclared main hook.
+        if (!popover_content.hasScopedBeforeRender(popoverBeforeRender))
+            popover_content.meta.per_frame.hooks.before_render.main = popoverBeforeRender;
         popover_content.meta.per_frame.hooks.slots.anim_state = @ptrCast(position_ctx);
+        if (p.trigger == .hover and p.safe_triangle) {
+            position_ctx.hover = .{};
+            wrapper.behavior.events.on_hover = core.Cx.simpleHandler(hoverEnter, position_ctx);
+            wrapper.behavior.events.on_leave = core.Cx.simpleHandler(hoverLeave, position_ctx);
+            popover_content.behavior.events.on_hover = core.Cx.simpleHandler(hoverPanelEnter, position_ctx);
+            popover_content.behavior.events.on_leave = core.Cx.simpleHandler(hoverPanelLeave, position_ctx);
+        }
 
         if (!is_open.peek()) {
             detachPopoverContentIfSuspended(mount_ctx);
@@ -668,11 +855,123 @@ const DetachedContentCtx = struct {
     parent: *Node,
     content: *Node,
     cx: *Cx,
+    /// The registered overlay layer (null while closed and detached, see ensurePopoverLayer).
     layer_handle: ?overlay_stack_mod.LayerHandle = null,
     layer_config: overlay_stack_mod.LayerConfig,
+    /// Generation-checked trigger identity: a layer is never pushed for a freed trigger.
+    trigger_ref: ?core.NodeHandle,
+    /// The wrapper holding the trigger and its slot in this scope's binding: freeing the
+    /// wrapper (directly or through an ancestor) clears the slot first, so a slot still naming
+    /// the wrapper proves the trigger alive even when a retained detach retired its registry
+    /// identity. The binding is a resource of the same scope and outlives this context.
+    wrapper: *Node,
+    wrapper_binding: *const ?*Node,
     detach_hidden_content: bool,
     /// Content on popover_portal_root (not caller subtree), on dispose must manually detach.
     portaled: bool = false,
+    /// The open effect has run once (mount); later opens are openings.
+    presence_settled: bool = false,
+    /// The current open shows at once (no enter transition), see `animate_initial_open`.
+    instant_enter: bool = false,
+    animate_initial_open: bool = false,
+    trap_focus: bool = false,
+    focus_pushed: bool = false,
+    initial_focus: Source(?[]const u8) = .{ .value = null },
+    return_focus: Source(?[]const u8) = .{ .value = null },
+    /// Focus when this open began (before the opener may have moved it into the panel):
+    /// generation-tracked handle plus the cached node (`overlay_layer_refs`).
+    opened_from: ?core.NodeHandle = null,
+    opened_from_node: ?*Node = null,
+    chrome_theme: *const core.ThemeTokens,
+    /// Fixed colour scheme (`PopoverProps.color_scheme`) and the chrome's replay hook for it.
+    color_scheme: ?core.theme.ColorScheme = null,
+    scheme_replay: ViewThemeReplay = .{ .run = schemeReplay },
+    scheme_replay_linked: bool = false,
+
+    fn schemeReplay(replay: *ViewThemeReplay, tokens: *const core.ThemeTokens) void {
+        const ctx: *DetachedContentCtx = @fieldParentPtr("scheme_replay", replay);
+        const previous = ctx.chrome_theme;
+        ctx.chrome_theme = tokens;
+        if (previous != tokens) styles.updateChromeTheme(ctx.content, previous, tokens);
+    }
+
+    fn unlinkSchemeReplay(ctx: *DetachedContentCtx) void {
+        if (!ctx.scheme_replay_linked) return;
+        ctx.scheme_replay_linked = false;
+        var link = &ctx.content.meta.per_frame.hooks.view_theme;
+        while (link.*) |r| : (link = &r.next) {
+            if (r == &ctx.scheme_replay) {
+                link.* = r.next;
+                return;
+            }
+        }
+    }
+
+    fn noteOpenedFrom(ctx: *DetachedContentCtx) void {
+        if (!ctx.trap_focus or ctx.focus_pushed) return;
+        const focused = ctx.cx.focus_manager.getFocused() orelse {
+            ctx.opened_from = null;
+            ctx.opened_from_node = null;
+            return;
+        };
+        if (focused == ctx.content or focused.isDescendantOf(ctx.content)) return;
+        ctx.opened_from = overlay_layer_refs.trackNode(&ctx.cx.node_registry, focused);
+        ctx.opened_from_node = if (ctx.opened_from != null) focused else null;
+    }
+
+    /// The panel is positioned (`popoverBeforeRender`, once registered): push its trap scope.
+    /// Moving focus in is the scope entry's (`FocusManager.pushScopeWith`): focus an opener
+    /// already put in the panel stays; else a request aimed in, `initial_focus`, a declared
+    /// `autoFocus`, the first focusable control; waiting for one of them, the panel itself.
+    fn takeFocus(ctx: *DetachedContentCtx, trigger: *Node) void {
+        if (!ctx.trap_focus or ctx.focus_pushed) return;
+        const registry = &ctx.cx.node_registry;
+        if (registry.resolve(registry.handleFor(ctx.content), null) == null) {
+            // The first positioning pass may precede registration of the
+            // portaled subtree. Wait so its focus order is ready.
+            ctx.cx.needs_redraw = true;
+            return;
+        }
+        const fm = &ctx.cx.focus_manager;
+        const focused_now = fm.getFocused();
+        const already_inside = if (focused_now) |node| node == ctx.content or node.isDescendantOf(ctx.content) else false;
+        const recorded = overlay_layer_refs.resolveTrackedNode(&ctx.cx.node_registry, ctx.opened_from, ctx.opened_from_node);
+        ctx.opened_from = null;
+        ctx.opened_from_node = null;
+        // Where focus returns on close: a focusable control of the trigger, else (a trigger with
+        // nothing focusable in it: a manual popover anchored elsewhere, opened by a button or a
+        // shortcut) the node that had focus when the open began.
+        const opened_from = if (already_inside) recorded else focused_now orelse recorded;
+        var restore = opened_from;
+        if (restore == null or !restore.?.isDescendantOf(trigger)) {
+            restore = null;
+            for (fm.focus_order.items) |candidate| {
+                if (candidate.isDescendantOf(trigger) and candidate.isDisplayedInTree()) {
+                    restore = candidate;
+                    break;
+                }
+            }
+        }
+        if (restore == null) if (opened_from) |node| {
+            if (!node.isDescendantOf(ctx.content)) restore = node;
+        };
+        const before = fm.scope_count;
+        fm.pushScopeWith(ctx.content, .{ .initial_focus = ctx.initial_focus.peek(), .default_return = restore orelse trigger });
+        if (before == fm.scope_count) return;
+        ctx.focus_pushed = true;
+    }
+
+    fn releaseFocus(ctx: *DetachedContentCtx, restore: bool) void {
+        if (!ctx.focus_pushed) return;
+        ctx.focus_pushed = false;
+        const fm = &ctx.cx.focus_manager;
+        // Restore only while focus is still in the panel (or nowhere): an outside click that
+        // focused another control closes the panel and keeps that focus.
+        const focused = fm.getFocused();
+        const inside = if (focused) |node| node == ctx.content or node.isDescendantOf(ctx.content) else true;
+        const give_back = restore and inside;
+        fm.removeScopeWith(ctx.content.id, .{ .restore = give_back, .return_focus = if (give_back) ctx.return_focus.peek() else null });
+    }
 };
 
 fn ensurePopoverContentAttached(ctx: *DetachedContentCtx) void {
@@ -685,18 +984,55 @@ fn ensurePopoverContentAttached(ctx: *DetachedContentCtx) void {
     ctx.cx.needs_redraw = true;
 }
 
+/// Register the popover's layer if it has none: pushed, bound to the content and suspended at
+/// once (the closed state every open reactivates from, as a mount-time layer was).
 fn ensurePopoverLayer(ctx: *DetachedContentCtx) !overlay_stack_mod.LayerHandle {
     if (ctx.layer_handle) |handle| return handle;
-    const handle = try ctx.cx.overlay_stack.push(ctx.layer_config);
+    const stack = &ctx.cx.overlay_stack;
+    if (ctx.layer_config.trigger_node != null) {
+        if (liveTrigger(ctx) == null) return error.PopoverTriggerFreed;
+    }
+    const ext = try ctx.content.style.ensureExtFallible(ctx.cx.allocator);
+    const handle = try stack.push(ctx.layer_config);
     ctx.layer_handle = handle;
-    ctx.cx.overlay_stack.bindFloatingContent(ctx.cx.allocator, handle, ctx.content);
-    // Opening from a trigger must not be dismissed by that same event.
-    if (ctx.cx.overlay_stack.findLayer(handle)) |layer| layer.skip_outside_click_frame = true;
-    ctx.content.markRuntimeIndexFullRebuild();
+    ext.z_index = handle.z_index;
+    stack.bindFloatingContent(ctx.cx.allocator, handle, ctx.content);
+    stack.commitExit(handle);
     return handle;
 }
 
+/// The popover's trigger while its wrapper is alive, else null (never dereferences a freed
+/// trigger). A retained detach of an ancestor (a menu closing with this popover's trigger in
+/// its content) unregisters the subtree and retires the trigger's registry identity although the
+/// node survives; re-track it here, for the next push and for a layer still registered, or the
+/// stack's freed-trigger guard would close the layer for good and block every later open.
+fn liveTrigger(ctx: *DetachedContentCtx) ?*Node {
+    const trigger = ctx.layer_config.trigger_node orelse return null;
+    const stack = &ctx.cx.overlay_stack;
+    const layer = if (ctx.layer_handle) |handle| stack.findLayer(handle) else null;
+    const tracked = overlay_layer_refs.resolveTrackedNode(stack.node_registry, ctx.trigger_ref, trigger) != null;
+    const layer_tracked = if (layer) |l| stack.resolveTrigger(l) != null else true;
+    if (tracked and layer_tracked) return trigger;
+    // Identity retired: alive only while the wrapper is still bound (a free clears the slot).
+    if (ctx.wrapper_binding.* != ctx.wrapper) return null;
+    if (!tracked) ctx.trigger_ref = overlay_layer_refs.trackNode(stack.node_registry, trigger);
+    if (!layer_tracked) stack.retrackTrigger(layer.?.handle, trigger);
+    return trigger;
+}
+
+/// Whether `node` hangs under the window root (the portal lives under it too).
+fn attachedToWindow(cx: *const Cx, node: *Node) bool {
+    const root = cx.root orelse return false;
+    var top = node;
+    while (top.parent) |parent| top = parent;
+    return top == root;
+}
+
+/// Closed with its exit committed: release the layer and, for detach_hidden_content, take the
+/// content out of the tree (both come back on the next open). Content kept attached keeps its
+/// suspended layer.
 fn detachPopoverContentIfSuspended(ctx: *DetachedContentCtx) void {
+    if (!ctx.detach_hidden_content) return;
     if (ctx.layer_handle) |handle| {
         if (ctx.cx.overlay_stack.findLayer(handle)) |layer| {
             if (!layer.suspended) return;
@@ -704,7 +1040,7 @@ fn detachPopoverContentIfSuspended(ctx: *DetachedContentCtx) void {
         ctx.cx.overlay_stack.removePermanently(handle);
         ctx.layer_handle = null;
     }
-    if (!ctx.detach_hidden_content or ctx.content.parent == null) return;
+    if (ctx.content.parent == null) return;
     ctx.cx.detachChildRetained(ctx.parent, ctx.content);
     ctx.cx.needs_redraw = true;
 }
@@ -713,8 +1049,8 @@ fn detachPopoverContentIfSuspended(ctx: *DetachedContentCtx) void {
 const EffectiveAnchor = union(enum) {
     /// Default: use trigger_node (Popover's own mount).
     self_trigger,
-    /// Caller-provided real Node.
-    external_node: *Node,
+    /// Caller-provided real Node, tracked by identity (the caller may free it while open).
+    external_node: overlay_stack_mod.TrackedNode,
     /// Virtual anchor.
     virtual: VirtualAnchor,
 };
@@ -727,7 +1063,13 @@ pub const PopoverPositionCtx = struct {
     /// Actual anchor for positioning.
     effective_anchor: EffectiveAnchor,
     is_open: Source(bool),
-    layer_handle: overlay_stack_mod.LayerHandle,
+    open_ctl: ?*PopoverOpen = null,
+    close_on_anchor_scroll: bool = false,
+    anchor_scroll_stamp: ?u64 = null,
+    anchor_was_outside: bool = false,
+    /// Current overlay layer (mirrors `mount_ctx.layer_handle`; an unregistered id while closed
+    /// and detached, which no stack lookup matches).
+    layer_handle: overlay_stack_mod.LayerHandle = no_layer,
     pos: PopoverPosition,
     offset: PopoverOffset,
     cx: *Cx,
@@ -747,6 +1089,10 @@ pub const PopoverPositionCtx = struct {
     is_visible: bool,
     prewarm_hidden_layout: bool,
     mount_ctx: ?*DetachedContentCtx = null,
+    /// The trigger was found freed (traced once under the popover debug switch).
+    orphan_reported: bool = false,
+    /// The self trigger was seen in the window during the current open (see closeOnAnchorDetach).
+    anchor_attached: bool = false,
     enter_transition: overlay_stack_mod.Transition,
     exit_transition: overlay_stack_mod.Transition,
     /// Each frame fetch 'must-avoid rect list' via it (see PopoverProps.avoid_rects_provider
@@ -764,6 +1110,7 @@ pub const PopoverPositionCtx = struct {
     /// rewrite translate.
     rest_translate_x: f32 = 0,
     rest_translate_y: f32 = 0,
+    hover: ?HoverState = null,
 
     /// Current active anchor rect (absolute viewport coordinate).
     pub fn anchorRect(self: *const PopoverPositionCtx) AnchorRect {
@@ -775,7 +1122,9 @@ pub const PopoverPositionCtx = struct {
                 const offset = if (self.cx.windowHeaderOwns(self.trigger_node)) self.cx.window_header_offset else [2]f32{ 0, 0 };
                 break :blk .{ .x = g.x + offset[0], .y = g.y + offset[1], .w = r.w, .h = r.h };
             },
-            .external_node => |n| blk: {
+            .external_node => |tracked| blk: {
+                // A freed anchor is an invalid anchor (the sentinel freezes the panel where it was).
+                const n = tracked.get(self.cx) orelse break :blk .{ .x = anchor_offscreen, .y = anchor_offscreen, .w = 0, .h = 0 };
                 const g = n.globalRect();
                 const r = n.rectFromWorldOrFallback();
                 const offset = if (self.cx.windowHeaderOwns(n)) self.cx.window_header_offset else [2]f32{ 0, 0 };
@@ -785,6 +1134,168 @@ pub const PopoverPositionCtx = struct {
         };
     }
 };
+
+const HoverState = struct {
+    origin: ?core.Point = null,
+    timer: ?u64 = null,
+    over_panel: bool = false,
+};
+
+/// An open popover anchored to its own trigger closes when that trigger, seen in the window
+/// during this open, leaves it alive (the menu holding it closed and detached its content): the
+/// anchor no longer exists on screen, so the panel goes at once rather than fading at the stale
+/// rect, and the close goes through the open state so the next open (a hover, a click) shows
+/// it again. A trigger never mounted in the window (a virtually anchored menu) is not affected.
+fn closeOnAnchorDetach(ctx: *PopoverPositionCtx, mount_ctx: *DetachedContentCtx) bool {
+    if (!ctx.is_open.peek()) {
+        ctx.anchor_attached = false;
+        return false;
+    }
+    if (ctx.effective_anchor != .self_trigger) return false;
+    const trigger = liveTrigger(mount_ctx) orelse return false;
+    if (attachedToWindow(ctx.cx, trigger)) {
+        ctx.anchor_attached = true;
+        return false;
+    }
+    if (!ctx.anchor_attached) return false;
+    ctx.anchor_attached = false;
+    const ctl = ctx.open_ctl orelse return false;
+    PopoverOpen.hide(ctl);
+    // A parent that rejects the proposal keeps the panel open where it was.
+    if (ctx.is_open.peek()) return false;
+    if (mount_ctx.layer_handle) |handle| ctx.cx.overlay_stack.commitExit(handle);
+    ctx.cx.needs_redraw = true;
+    return true;
+}
+
+fn clearHoverTimer(ctx: *PopoverPositionCtx) void {
+    const hover = if (ctx.hover) |*h| h else return;
+    if (hover.timer) |timer| ctx.cx.clearTimer(timer);
+    hover.timer = null;
+}
+
+fn hoverEnter(raw: *anyopaque) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(raw));
+    clearHoverTimer(ctx);
+    const hover = &ctx.hover.?;
+    hover.origin = if (ctx.cx.pointerLive()) .{ .x = ctx.cx.mouse_x, .y = ctx.cx.mouse_y } else null;
+    hover.over_panel = false;
+    PopoverOpen.show(ctx.open_ctl.?);
+}
+
+fn hoverLeave(raw: *anyopaque) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(raw));
+    if (!ctx.is_open.peek()) return;
+    clearHoverTimer(ctx);
+    const hover = &ctx.hover.?;
+    if (ctx.cx.pointerLive() and ctx.entry_ready and hover.origin != null) {
+        hover.timer = ctx.cx.setTimer(pointer_grace.duration_ms * std.time.ns_per_ms, hoverExpired, ctx) catch null;
+        if (hover.timer != null) return;
+    }
+    PopoverOpen.hide(ctx.open_ctl.?);
+}
+
+fn hoverPanelEnter(raw: *anyopaque) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(raw));
+    clearHoverTimer(ctx);
+    ctx.hover.?.over_panel = true;
+}
+
+fn hoverPanelLeave(raw: *anyopaque) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(raw));
+    ctx.hover.?.over_panel = false;
+    if (!ctx.is_open.peek()) return;
+    const cx = ctx.cx;
+    if (cx.pointerLive()) {
+        if (liveHoverTrigger(ctx)) |trigger| {
+            if (trigger.globalRect().contains(cx.mouse_x, cx.mouse_y)) return;
+        }
+    }
+    PopoverOpen.hide(ctx.open_ctl.?);
+}
+
+fn liveHoverTrigger(ctx: *PopoverPositionCtx) ?*Node {
+    const stack = &ctx.cx.overlay_stack;
+    // Hover callbacks run outside popoverBeforeRender, which refreshes the
+    // mirrored handle: read the layer the content currently holds.
+    const handle = if (ctx.mount_ctx) |mount_ctx| mount_ctx.layer_handle orelse return null else ctx.layer_handle;
+    const layer = stack.findLayer(handle) orelse return null;
+    return stack.resolveTrigger(layer);
+}
+
+fn hoverExpired(raw: ?*anyopaque) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(raw orelse return));
+    ctx.hover.?.timer = null;
+    if (ctx.is_open.peek()) _ = updateHover(ctx, true);
+}
+
+/// A dismissal can unmount the trigger. Stop using the positioning state on
+/// this frame after proposing a close.
+fn updateHover(ctx: *PopoverPositionCtx, expired: bool) bool {
+    const hover = if (ctx.hover) |*h| h else return false;
+    const cx = ctx.cx;
+    const pointer: core.Point = .{ .x = cx.mouse_x, .y = cx.mouse_y };
+    if (cx.pointerLive()) {
+        if (liveHoverTrigger(ctx)) |trigger| {
+            if (trigger.globalRect().contains(pointer.x, pointer.y)) {
+                clearHoverTimer(ctx);
+                hover.origin = pointer;
+                hover.over_panel = false;
+                return false;
+            }
+        }
+        const panel = ctx.popover.globalRect();
+        if (ctx.entry_ready and panel.contains(pointer.x, pointer.y)) {
+            clearHoverTimer(ctx);
+            hover.over_panel = true;
+            return false;
+        }
+        if (hover.timer != null and pointer_grace.contains(hover.origin.?, pointer, panel, floating.getSide(ctx.active_position))) return false;
+    }
+    if (!expired and hover.timer == null and !hover.over_panel) return false;
+    clearHoverTimer(ctx);
+    hover.over_panel = false;
+    PopoverOpen.hide(ctx.open_ctl.?);
+    return true;
+}
+
+fn anchorScrolled(ctx: *PopoverPositionCtx) bool {
+    var hash = std.hash.Wyhash.init(0);
+    var parent: ?*Node = switch (ctx.effective_anchor) {
+        .self_trigger => ctx.trigger_node.parent,
+        .external_node => |tracked| if (tracked.get(ctx.cx)) |anchor| anchor.parent else null,
+        .virtual => null,
+    };
+    while (parent) |node| : (parent = node.parent) {
+        if (node.tag != .scroll) continue;
+        const scroll = scroll_area_mod.persistView(node) orelse continue;
+        hash.update(std.mem.asBytes(&node.id));
+        hash.update(std.mem.asBytes(&scroll.x));
+        hash.update(std.mem.asBytes(&scroll.y));
+    }
+    const stamp = hash.final();
+    const previous = ctx.anchor_scroll_stamp;
+    ctx.anchor_scroll_stamp = stamp;
+    return if (previous) |old| old != stamp else false;
+}
+
+fn anchorOutsideViewport(ctx: *const PopoverPositionCtx, rect: AnchorRect) bool {
+    const cx = ctx.cx;
+    if (cx.viewport.width <= 0 or cx.viewport.height <= 0) return false;
+    return rect.x + rect.w < cx.safe_area_left or
+        rect.y + rect.h < cx.safe_area_top or
+        rect.x >= cx.viewport.width - cx.safe_area_right or
+        rect.y >= cx.viewport.height - cx.safe_area_bottom;
+}
+
+/// Raw opacity write of the hidden / paused states, marked the way the overlay stack's
+/// transition controller marks the same property (composite only: the promoted surface and the
+/// prewarmed descendant caches stay valid).
+fn setPopoverOpacityMarked(node: *Node, value: f32) void {
+    const changed = node.getOpacity() != value;
+    node.setOpacityRaw(value);
+    if (changed) node.markCompositeAnimFrameDirty();
+}
 
 fn isZeroPx(sizing: core.Sizing) bool {
     return switch (sizing) {
@@ -811,7 +1322,11 @@ fn sizingPxValue(sizing: core.Sizing) ?f32 {
 pub const DROPDOWN_SLIDE_PX: f32 = 6;
 
 pub fn dropdownSlideOffset(side: floating.Side, opacity: f32) [2]f32 {
-    const d = (1 - std.math.clamp(opacity, 0, 1)) * DROPDOWN_SLIDE_PX;
+    return anchorSlideOffset(side, opacity, DROPDOWN_SLIDE_PX);
+}
+
+fn anchorSlideOffset(side: floating.Side, opacity: f32, distance: f32) [2]f32 {
+    const d = (1 - std.math.clamp(opacity, 0, 1)) * distance;
     return switch (side) {
         .bottom => .{ 0, -d },
         .top => .{ 0, d },
@@ -826,24 +1341,41 @@ pub fn dropdownSlideOffset(side: floating.Side, opacity: f32) [2]f32 {
 fn setPopoverRestTranslate(ctx: *PopoverPositionCtx, x: f32, y: f32) bool {
     ctx.rest_translate_x = x;
     ctx.rest_translate_y = y;
-    return applyDropdownSlide(ctx);
+    return applyAnchorSlide(ctx);
 }
 
-fn applyDropdownSlide(ctx: *PopoverPositionCtx) bool {
+fn applyAnchorSlide(ctx: *PopoverPositionCtx) bool {
     var x = ctx.rest_translate_x;
     var y = ctx.rest_translate_y;
-    const uses_dropdown = ctx.enter_transition == .dropdown or ctx.exit_transition == .dropdown;
-    if (uses_dropdown) {
-        const unit = dropdownSlideOffset(floating.getSide(ctx.active_position), 0);
+    const side = floating.getSide(ctx.active_position);
+    const enter_distance = ctx.enter_transition.anchorSlidePx();
+    const exit_distance = ctx.exit_transition.anchorSlidePx();
+    var motion_changed = false;
+    if (enter_distance != 0 or exit_distance != 0) {
+        var distance = enter_distance;
         if (ctx.cx.overlay_stack.findLayer(ctx.layer_handle)) |layer| {
-            layer.enter_ctrl.slide = unit;
-            layer.exit_ctrl.slide = unit;
+            layer.enter_ctrl.slide = anchorSlideOffset(side, 0, enter_distance);
+            layer.exit_ctrl.slide = anchorSlideOffset(side, 0, exit_distance);
+            if (layer.state == .exiting) distance = exit_distance;
         }
-        const off = dropdownSlideOffset(floating.getSide(ctx.active_position), ctx.popover.getOpacity());
+        if (@import("../../a11y/preferences.zig").reduceMotion()) distance = 0;
+        const off = anchorSlideOffset(side, ctx.popover.getOpacity(), distance);
         x += off[0];
         y += off[1];
+        // The slide is transient: a composited panel anchors its pixel grid to the rest position.
+        if (ctx.popover.style.ext) |ext| {
+            motion_changed = !std.meta.eql(ext.motion_offset, off);
+            ext.motion_offset = off;
+        } else if (off[0] != 0 or off[1] != 0) {
+            ctx.popover.style.ensureExtPanic(ctx.cx.allocator).motion_offset = off;
+            motion_changed = true;
+        }
     }
-    return setPopoverTranslate(ctx.popover, x, y);
+    const moved = setPopoverTranslate(ctx.popover, x, y);
+    // The offset normally changes with the translate it is part of (marked there); a rest move
+    // that cancels it exactly still needs the composite mark.
+    if (motion_changed and !moved) ctx.popover.markCompositePropDirty();
+    return moved;
 }
 
 fn setPopoverTranslate(node: *Node, x: f32, y: f32) bool {
@@ -889,7 +1421,7 @@ fn syncTransformOriginForPlacement(node: *Node, pos: PopoverPosition, allocator:
 }
 
 fn popoverDebugEnabled() bool {
-    return @import("zenit_environment").has("ZENIT_POPOVER_DEBUG");
+    return @import("zenit_environment").flag("ZENIT_POPOVER_DEBUG");
 }
 
 fn popoverContentReady(node: *Node) bool {
@@ -970,32 +1502,69 @@ fn applyAutosizeMaxHeight(ctx: *PopoverPositionCtx, auto_opt: ?floating.Autosize
     }
 }
 
+/// Layer ids start at 1: id 0 is never registered.
+const no_layer: overlay_stack_mod.LayerHandle = .{ .id = 0, .z_index = 0 };
+
+/// Enter delay for a popover's current and future opens. A closed popover with detached content
+/// holds no layer, so the delay is also kept in the configuration its next open registers. A
+/// zero delay also skips what remains of a running one (e.g. keyboard focus after hover).
+pub fn setEnterDelay(content: *Node, cx: *Cx, delay_ms: f32) void {
+    const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(content.meta.per_frame.hooks.slots.anim_state orelse return));
+    const mount_ctx = ctx.mount_ctx orelse return;
+    mount_ctx.layer_config.enter_delay_ms = delay_ms;
+    const layer = cx.overlay_stack.findLayer(mount_ctx.layer_handle orelse return) orelse return;
+    layer.config.enter_delay_ms = delay_ms;
+    if (delay_ms == 0) layer.enter_ctrl.delay_remaining_ms = 0;
+}
+
 pub fn popoverBeforeRender(node: *Node) void {
     const ctx: *PopoverPositionCtx = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.anim_state orelse return));
     if (ctx.mount_ctx) |mount_ctx| {
-        ctx.layer_handle = mount_ctx.layer_handle orelse .{ .id = 0, .z_index = 0 };
+        ctx.layer_handle = mount_ctx.layer_handle orelse no_layer;
+        // Revalidate the trigger identity a retained detach may have retired (see liveTrigger)
+        // before the freed-trigger guard below reads it.
+        if (mount_ctx.layer_handle != null) _ = liveTrigger(mount_ctx);
+        if (closeOnAnchorDetach(ctx, mount_ctx)) return;
     }
+    // The trigger lives in the caller's subtree and can be freed before the Popover's scope is
+    // disposed: a scope disposal requested inside a reactive callback is deferred, while the
+    // subtree's nodes may already be gone, and a frame can run in between (zeditor rebuilding a
+    // blockquote citation row under its tooltips). Never dereference the freed trigger (the
+    // stack's generation-checked handle tells): close the layer until the scope disposal lands.
+    if (ctx.cx.overlay_stack.findLayer(ctx.layer_handle)) |layer| {
+        // A layer pushed without a trigger has nothing to lose.
+        if (layer.trigger_node != null and ctx.cx.overlay_stack.resolveTrigger(layer) == null) {
+            if (popoverDebugEnabled() and !ctx.orphan_reported) {
+                ctx.orphan_reported = true;
+                std.debug.print("[popover] trigger freed before the scope disposal (content test_id={s})\n", .{ctx.popover.meta.ownership.meta.test_id orelse "(nil)"});
+            }
+            if (!layer.suspended and layer.state != .exiting) ctx.cx.overlay_stack.beginExit(ctx.layer_handle);
+            if (ctx.mount_ctx) |mount_ctx| mount_ctx.releaseFocus(true);
+            return;
+        }
+    }
+    if (ctx.is_open.peek() and updateHover(ctx, false)) return;
     const overlay_visual_in_progress = ctx.popover.frame_state.state_bits.flags.manual_opacity_animation_active or
         ctx.popover.frame_state.state_bits.flags.manual_transform_animation_active or
         ((ctx.popover.getOpacity() > (HIDDEN_OPACITY + 0.0001) and ctx.popover.getOpacity() < 0.999) or
             @abs(ctx.popover.style.scale_x() - 1.0) > 0.0001 or
             @abs(ctx.popover.style.scale_y() - 1.0) > 0.0001);
-    const should_stabilize_text = (ctx.enter_transition == .scale_fade or ctx.enter_transition == .dropdown or ctx.enter_transition == .glass_popover) and overlay_visual_in_progress;
-    if (ctx.popover.frame_state.state_bits.flags.text_stabilize_subtree != should_stabilize_text) {
-        ctx.popover.frame_state.state_bits.flags.text_stabilize_subtree = should_stabilize_text;
-        ctx.popover.markRenderDirty();
-        ctx.popover.markCompositeDirty();
-    }
-
     if (!ctx.is_open.peek()) {
+        ctx.anchor_scroll_stamp = null;
+        ctx.anchor_was_outside = false;
+        if (ctx.hover) |*hover| {
+            hover.origin = null;
+            clearHoverTimer(ctx);
+            hover.over_panel = false;
+        }
         if (ctx.mount_ctx) |mount_ctx| {
-            const suspended = if (mount_ctx.layer_handle) |handle| blk: {
-                const layer = ctx.cx.overlay_stack.findLayer(handle) orelse break :blk true;
-                break :blk layer.suspended;
-            } else true;
+            const suspended = if (ctx.cx.overlay_stack.findLayer(ctx.layer_handle)) |layer| layer.suspended else mount_ctx.layer_handle == null;
             if (suspended) {
-                // Keep geometry/caches for reopening, but release the registration
-                // only after the exit controller has hidden and restored focus.
+                // An exit with `.none` commits synchronously, so this can
+                // be the first closed-frame callback. Reset placement
+                // readiness before detaching; otherwise reopen skips the
+                // entry-ready branch and retains commitExit's opacity=0.
+                // Detaching also releases the layer registration.
                 ctx.active_position = ctx.pos;
                 ctx.entry_ready = false;
                 ctx.is_visible = false;
@@ -1023,8 +1592,6 @@ pub fn popoverBeforeRender(node: *Node) void {
             });
         }
         ctx.cx.overlay_stack.setEnterPaused(ctx.layer_handle, false, ctx.cx.allocator);
-        ctx.active_position = ctx.pos;
-        syncTransformOriginForPlacement(ctx.popover, ctx.active_position, ctx.cx.allocator);
         ctx.entry_ready = false;
         ctx.is_visible = false;
         // During an exit transition OR while a visible remnant remains, don't reset
@@ -1037,10 +1604,17 @@ pub fn popoverBeforeRender(node: *Node) void {
         const popup_still_visible = ctx.popover.getOpacity() > (HIDDEN_OPACITY + 0.0001) or
             @abs(ctx.popover.style.scale_x() - exit_hidden_scale) > 0.001 or
             @abs(ctx.popover.style.scale_y() - exit_hidden_scale) > 0.001;
+        // The exit leaves from where the popover is placed: a flipped (top) popover keeps its side,
+        // so the dropdown slide and the scale origin point at its anchor. Placement resets once
+        // the exit has finished.
+        if (!(overlay_visual_in_progress or popup_still_visible)) {
+            ctx.active_position = ctx.pos;
+            syncTransformOriginForPlacement(ctx.popover, ctx.active_position, ctx.cx.allocator);
+        }
         if (overlay_visual_in_progress or popup_still_visible) {
             // During exit, positioner doesn't run: pass landing direction to exit controller, it
             // same-frame push slide-out.
-            if (ctx.exit_transition == .dropdown) _ = applyDropdownSlide(ctx);
+            if (ctx.exit_transition.anchorSlidePx() != 0) _ = applyAnchorSlide(ctx);
             if (popoverDebugEnabled()) {
                 std.debug.print("[popover-exit] tid={s} stage=transition_freeze visual_in_prog={} still_visible={} op={d:.3}\n", .{
                     ctx.popover.meta.ownership.meta.test_id orelse "(nil)",
@@ -1137,6 +1711,18 @@ pub fn popoverBeforeRender(node: *Node) void {
     }
 
     const anchor_rect = ctx.anchorRect();
+    if (ctx.close_on_anchor_scroll) {
+        const scrolled = anchorScrolled(ctx);
+        const outside = anchorOutsideViewport(ctx, anchor_rect);
+        const left_viewport = outside and !ctx.anchor_was_outside;
+        ctx.anchor_was_outside = outside;
+        if (scrolled or left_viewport) {
+            if (ctx.open_ctl) |ctl| {
+                PopoverOpen.hide(ctl);
+                return;
+            }
+        }
+    }
     // Anchor invalidation signal: caller explicitly marks 'invalid' with
     // ANCHOR_OFFSCREEN_SENTINEL (convention x/y < -1e5). Note: cursor-like anchor legally
     // returns w=0 h=0 (virtual zero-width point), can't deem w/h=0 as invalid.
@@ -1228,7 +1814,7 @@ pub fn popoverBeforeRender(node: *Node) void {
             });
         }
         ctx.cx.overlay_stack.setEnterPaused(ctx.layer_handle, true, ctx.cx.allocator);
-        ctx.popover.setOpacityRaw(HIDDEN_OPACITY);
+        setPopoverOpacityMarked(ctx.popover, HIDDEN_OPACITY);
         ctx.cx.needs_redraw = true;
         return;
     }
@@ -1246,7 +1832,7 @@ pub fn popoverBeforeRender(node: *Node) void {
             });
         }
         ctx.cx.overlay_stack.setEnterPaused(ctx.layer_handle, true, ctx.cx.allocator);
-        ctx.popover.setOpacityRaw(HIDDEN_OPACITY);
+        setPopoverOpacityMarked(ctx.popover, HIDDEN_OPACITY);
         ctx.cx.needs_redraw = true;
         return;
     }
@@ -1366,9 +1952,23 @@ pub fn popoverBeforeRender(node: *Node) void {
             const popover_w = ctx.popover.rectFromWorldOrFallback().w;
             const current_within_new_cap = popover_w > 0 and popover_w <= target_max_width + 0.5;
             ext.max_width = target_max_width;
-            needs_remeasure = !current_within_new_cap;
+            // Never clear a remeasure the target width above asked for. A cap the current width
+            // fits does not pause, but it is a layout input all the same (a panel the old cap
+            // held widens).
+            if (!current_within_new_cap) needs_remeasure = true else ctx.popover.markSizingDirty();
         }
 
+        if (needs_remeasure and ctx.entry_ready) {
+            // Already positioned (entered, or its enter transition running): remeasure in place.
+            // Pausing the enter and hiding would never be undone, as the reveal below runs only
+            // before the first placement and the enter controller has finished (or would sit at
+            // progress 0). Keep the panel and its current translate; the next frame places the
+            // remeasured size.
+            ctx.popover.markSizingDirty();
+            ctx.popover.markSubtreeDirty();
+            ctx.cx.needs_redraw = true;
+            return;
+        }
         if (needs_remeasure) {
             if (popoverDebugEnabled()) {
                 std.debug.print("[popover] pause remeasure match_trigger_width={} preferred_width={any} target_width={any} max_width={d:.1}\n", .{
@@ -1480,13 +2080,24 @@ pub fn popoverBeforeRender(node: *Node) void {
             });
         }
         ctx.cx.overlay_stack.setEnterPaused(ctx.layer_handle, false, ctx.cx.allocator);
-        // `.none` layers enter the overlay stack directly in `.visible`, so
-        // there is no TransitionController tick to restore the opacity that
+        // `.none` layers (and an instant initial open) enter the overlay stack
+        // directly in `.visible`, so there is no TransitionController tick to
+        // restore the opacity (and hidden prewarm scale) that
         // commitExit set to zero. Once geometry is ready, make the content
         // atomically visible here. Animated transitions keep ownership of
         // opacity in the overlay controller.
-        if (ctx.enter_transition == .none and ctx.popover.getOpacity() != 1) {
+        if ((ctx.enter_transition == .none or (if (ctx.mount_ctx) |m| m.instant_enter else false)) and
+            (ctx.popover.getOpacity() != 1 or ctx.popover.style.scale_x() != 1 or ctx.popover.style.scale_y() != 1))
+        {
             ctx.popover.setOpacityRaw(1);
+            if (ctx.popover.style.scale_x() != 1 or ctx.popover.style.scale_y() != 1) {
+                const ext = ctx.popover.style.ensureExtPanic(ctx.cx.allocator);
+                ext.scale_x = 1;
+                ext.scale_y = 1;
+            }
+            // Positioning added the hidden dropdown offset (it tracks opacity): land at rest now,
+            // or the first opaque frame sits 6 px off and jumps on the next.
+            _ = applyAnchorSlide(ctx);
             ctx.popover.markCompositeAnimFrameDirty();
             ctx.popover.markRenderDirty();
             ctx.cx.needs_redraw = true;
@@ -1495,6 +2106,7 @@ pub fn popoverBeforeRender(node: *Node) void {
         ctx.prewarmed_ready = false;
         ctx.is_visible = true;
     }
+    if (ctx.mount_ctx) |mount_ctx| mount_ctx.takeFocus(ctx.trigger_node);
 }
 
 // ========== Flip positioning algorithm (see floating-ui/flip) ==========

@@ -140,9 +140,14 @@ pub const Inbox = struct {
         return .start;
     }
     pub fn setWorkPhase(self: *Inbox, turn: u64, phase: WorkPhase) void {
-        self.lock();
-        defer self.unlock();
-        if (self.active_turn == turn and !self.closing) self.work_phase = phase;
+        {
+            self.lock();
+            defer self.unlock();
+            if (self.active_turn != turn or self.closing or self.work_phase == phase) return;
+            self.work_phase = phase;
+        }
+        // The queue and its send hint show the phase (LIFECYCLE.md §5.3).
+        @import("publication.zig").publishAll();
     }
     pub fn reissue(self: *Inbox, fence: Fence, original: identity.SubmissionId, revision: u64, id: identity.SubmissionId, message: provider.Message, mode: Mode) !Receipt {
         self.lock();

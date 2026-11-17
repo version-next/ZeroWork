@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Real local PTY default-foreground selection, without modifying ANSI content.
  * node e2e/theme_terminal_selection_native.ts BINARY OUT [theme,theme] [transparency=0] [prompt]

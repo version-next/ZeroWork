@@ -6,7 +6,7 @@ const source_codec = @import("connection_source.zig");
 const SourceSnapshot = source_codec.SourceSnapshot;
 const freezeSource = source_codec.freezeSource;
 const sourceSpec = source_codec.sourceSpec;
-const workspace_mod = @import("../../ui/workspace.zig");
+const workspace_mod = @import("../../features/workspace/view/workspace.zig");
 pub fn Binding(comptime Host: type) type {
     return struct {
         pub fn createRemoteEnvelope(self: *Host, request: session.CreateRequest, create_engine: *const fn (*anyopaque, session.CreateRequest) anyerror!void) !void {

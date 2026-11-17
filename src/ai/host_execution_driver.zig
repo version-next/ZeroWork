@@ -104,6 +104,9 @@ pub const Driver = struct {
     queued: usize = 0,
     waiting: [capacity]?*Request = @splat(null),
     wake: Wakeup,
+    /// The UI that reads this driver's evidence and work (its owner binds it): evidence changes,
+    /// work starting / finishing and the driver finishing publish to it (LIFECYCLE.md §5.3).
+    ui_wake: ?*const @import("publication.zig").Wake = null,
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
@@ -117,11 +120,18 @@ pub const Driver = struct {
     execution_input_evidence: []?ExecutionInputRecord = &.{},
     closing_targets: std.ArrayList(identity.SessionHandle) = .empty,
     command_records: []?CommandRecord = &.{},
+    /// Settled executions copied out by the owner thread just before its controller is released.
+    retained: []execution.Retained = &.{},
 
     /// Configuration/acquisition itself performs no journal IO. The caller's
     /// allocator must support calls from the owner and UI scheduler threads;
     /// page_allocator is suitable. Returned Results use this same allocator.
     pub fn start(allocator: std.mem.Allocator, journal_owner: *lifecycle.ProcessJournal, scheduler: lifecycle.Scheduler, backend: execution.Backend) !*Driver {
+        return startAdopting(allocator, journal_owner, scheduler, backend, &.{});
+    }
+    /// `start`, first adopting settled executions an earlier driver of the same conversation
+    /// retained (copied; read-only receipts, see `execution.Retained`).
+    pub fn startAdopting(allocator: std.mem.Allocator, journal_owner: *lifecycle.ProcessJournal, scheduler: lifecycle.Scheduler, backend: execution.Backend, settled: []const execution.Retained) !*Driver {
         const retained = try lifecycle.ProcessJournal.acquire(.{ .data_root = journal_owner.data_root, .path = journal_owner.path });
         errdefer retained.release();
         const self = try allocator.create(Driver);
@@ -129,6 +139,8 @@ pub const Driver = struct {
         self.* = .{ .allocator = allocator, .journal_owner = retained, .scheduler = scheduler, .backend = backend, .controller = undefined, .wake = try Wakeup.init() };
         errdefer self.wake.deinit();
         self.controller = execution.Controller.initWithJournal(allocator, execution.JournalAccess.from(lifecycle.ProcessJournal, retained), .{ .retained_shell_snapshots = backend.retained_shell_snapshots, .context = self, .authorize = authorize, .resolve = resolve, .handed_to_user = handedToUser, .terminal_call = terminalCall, .should_cancel = shouldCancel, .authorize_input = authorizeInput, .request_secret = requestSecret, .authorize_read = authorizeRead });
+        errdefer self.controller.deinit();
+        try self.controller.adoptSettled(settled);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
@@ -298,6 +310,13 @@ pub const Driver = struct {
     /// Never joins a running owner. Call after requestShutdown while continuing
     /// the normal UI pump, or poll until it succeeds. No self-join path exists.
     pub fn finish(self: *Driver) !void {
+        const allocator = self.allocator;
+        const retained = try self.finishRetaining();
+        for (retained) |*item| item.deinit(allocator);
+        allocator.free(retained);
+    }
+    /// `finish`, handing the settled executions to the caller (owned by this driver's allocator).
+    pub fn finishRetaining(self: *Driver) ![]execution.Retained {
         if (!self.shutdownReady()) return error.WorkerRunning;
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -307,7 +326,9 @@ pub const Driver = struct {
         self.allocator.free(self.execution_input_evidence);
         self.allocator.free(self.command_records);
         self.closing_targets.deinit(self.allocator);
+        const retained = self.retained;
         self.allocator.destroy(self);
+        return retained;
     }
     fn lock(self: *Driver) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -489,8 +510,9 @@ pub const Driver = struct {
             };
             self.lock();
             count += self.queued;
-            self.work.store(count, .release);
+            const previous = self.work.swap(count, .acq_rel);
             self.mutex.unlock();
+            if ((previous == 0) != (count == 0)) @import("publication.zig").publish(self.ui_wake);
             self.wake.wait(-1, false, 100);
         }
         while (self.take()) |request| self.complete(request, error.ExecutionDriverStopped);
@@ -501,10 +523,12 @@ pub const Driver = struct {
         while (!self.evidence_mutex.tryLock()) std.atomic.spinLoopHint();
         @memset(self.command_records, null);
         self.evidence_mutex.unlock();
+        self.retained = self.controller.retainSettled(self.allocator) catch &.{};
         self.controller.deinit();
         self.journal_owner.release();
         self.work.store(0, .release);
         self.finished.store(true, .release);
+        @import("publication.zig").publish(self.ui_wake);
     }
     fn publishEvidence(self: *Driver) void {
         const next = self.allocator.alloc(?TaskEvidence, self.controller.finished_tasks.items.len + self.controller.entries.items.len) catch return;
@@ -624,7 +648,7 @@ pub const Driver = struct {
         self.command_records = commands;
         transferred = true;
         self.evidence_mutex.unlock();
-        if (changed) @import("../platform/presentation_wakeup.zig").notify();
+        if (changed) @import("publication.zig").publish(self.ui_wake);
     }
     fn scheduled(self: *Driver, raw: *anyopaque, function: *const fn (*anyopaque) anyerror!void, admission: bool) !void {
         const Scope = struct {
@@ -833,7 +857,7 @@ test "efficiency interrupted run wait preserves dispatched execution instead of 
         }
     };
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 1 };
     const id = identity.ExecutionId.generate();
     var marker: u8 = 0;
@@ -910,7 +934,7 @@ const AdmissionTest = struct {
         return .{ .allocator = std.testing.allocator, .journal_owner = undefined, .scheduler = .{ .context = self, .call = schedule }, .backend = backend, .controller = .{ .allocator = std.testing.allocator, .journal = undefined, .backend = undefined }, .wake = undefined, .active_request = self.request };
     }
     fn invocation() host.Invocation {
-        return .{ .context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .authority = .execution_control, .operation_id = 9, .turn_id = 1, .call_id = "fixture", .tool_id = "host.run_in_terminal", .arguments = .null, .arguments_json = "", .arguments_hash = @splat(0), .canonical_arguments_hash = @splat(0) };
+        return .{ .context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .authority = .execution_control, .operation_id = 9, .turn_id = 1, .call_id = "fixture", .tool_id = "host.run_in_terminal", .arguments = .null, .arguments_json = "", .arguments_hash = @splat(0), .canonical_arguments_hash = @splat(0) };
     }
 };
 test "execution deadline admission scheduler observes Stop and elapsed budget before effects" {

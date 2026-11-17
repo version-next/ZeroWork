@@ -1,0 +1,41 @@
+//! 协议插件（F-set-plugins，人工验收反馈第 10 条）的样式：列表页（`T5k96`）与详情页（`KUKQ5`）的面板列、详情页头部卡片。
+//! 列表行是 `components/rows.yix` 的 `DrillRow`（样式在 `../styles.yss`）；来源标签是原生 `W.Tag`、偏好控件是原生
+//! `W.Switch` / `W.Input` / `W.Select`、“?”是原生 `W.Tooltip` + ghost 图标按钮（默认外观，不覆盖）。颜色全部是 token。
+const ui = @import("ui");
+
+/// 面板列（`upC2F` / `l3IbX`）：面板之间 18（内边距由内容页的 `PageBody` 给）。
+style panes { width: fill; height: fit; direction: column; gap: 18; flex-shrink: 0; min-width: 0; }
+/// 详情页的概要面板（`B57vb`）：卡片 + 下方说明，gap 6。
+style summary_pane { width: fill; direction: column; gap: space150; flex-shrink: 0; min-width: 0; }
+/// 头部卡片（`Y01lz` › `E3vPk2`）：padding [12, 14]、圆角 12，窗面静止底色（同其它面板的正文卡片）；图标底 + 名称 / 说明 + 来源标签，gap 12。
+style head_card { width: fill; direction: row; align-items: center; gap: space300; padding: 12 14; corner-radius: 12; background: zw-window-rest; flex-shrink: 0; min-width: 0; }
+/// 图标底（`vWhvc`）：40、圆角 10、发丝描边，窗面底色；图标 20 次要墨色。
+style head_tile { width: 40; height: 40; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 10; background: zw-window-surface; border-overlay: true; border: 1 border; }
+style head_icon { width: 20; height: 20; icon-color: fg-secondary; }
+style head_copy { width: fill; flex: 1; min-width: 0; direction: column; align-items: start; gap: 2; }
+/// 名称（`oydWb`）15 / 600；说明（`s4bhsc`）11.5 次要墨色。
+style head_name { font-size: 15; font-weight: 600; line-height: {20.0 / 15.0}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+style head_summary { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: word; }
+style head_text_box { width: fill; min-width: 0; }
+/// 卡片下的说明（`cP48r` / `Xz83P`）：padding [0, 10]，11、行高 1.4，次要墨色。
+style note_wrap { width: fill; direction: row; padding: 0 10; flex-shrink: 0; }
+style note { font-size: 11; font-weight: 400; line-height: 1.4; color: zw-fg-supporting; wrap: word; }
+style note_box { width: fill; min-width: 0; }
+/// 只读值（版本、权限）右侧一组：值 + “?”，gap 4。
+style value_group { flex-shrink: 0; direction: row; align-items: center; gap: 4; }
+
+// ── 计划中（路线条目，`T5k96` › `g3bxO3`） ──
+
+/// 计划行（`Wlmxe`）：结构同 `DrillRow`（图标底 + 行内 gap 12），但不可点击：没有悬停 / 按下态、尾注与箭头。
+style planned_row { width: fill; height: fit; flex-shrink: 0; direction: row; align-items: center; gap: space300; padding: 0; background: transparent; }
+/// 图标（`l04y41`）16，三级墨色。
+style planned_icon { width: 16; height: 16; icon-color: zw-fg-supporting; }
+/// 名称（`Nz8ue`）13 / 400，次要墨色（未实现的条目比已注册插件弱一级）。
+style planned_title { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; color: fg-secondary; wrap: none; text-overflow: ellipsis; }
+
+// ── 状态（Q5，Pencil XqqLV 稿 2） ──
+
+/// 待重启 / 已禁用提示（原生 `W.Alert`）的外框：撑满面板宽度，只负责布局，不改 Alert 外观。
+style notice { width: fill; direction: column; flex-shrink: 0; min-width: 0; }
+/// 开关下方的说明（Jm2fZ）：随行宽展开（设计稿里是一行），窄窗口时折行。
+style toggle_hint_box { width: fill; min-width: 0; }

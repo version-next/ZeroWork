@@ -115,11 +115,11 @@ test "API2 LIVE gateway verifies unpredictable text tool result through producti
     var random: [16]u8 = undefined;
     try std.testing.io.randomSecure(&random);
     var host: TokenHost = .{ .nonce = std.fmt.bytesToHex(random, .lower) };
-    const captured: scope.Scope = if (host_authority) .{ .owner = .{ .group = 7 }, .members = .{} } else .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const captured: scope.Scope = if (host_authority) .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{} } else .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     const definition: tools.ToolDefinition = .{ .id = "synthetic.measure", .schema = schema, .description = "Read the current synthetic measurement and its unpredictable verification nonce." };
     const member: tools.Member = .{ .owner = .{ .session_id = @fromBackingInt(101) }, .plugin_id = "synthetic", .context = &host, .bindings = &.{.{ .plugin_id = "synthetic", .definition_id = definition.id, .handler = Host.binding }} };
     const host_definition: tools.ToolDefinition = .{ .id = "host.measure", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}", .description = definition.description };
-    var table = if (host_authority) try tools.RequestTable.initWithHost(a, captured, &.{}, &.{}, .{ .conversation_id = @import("../host/identity.zig").ConversationId.generate(), .task_id = @import("../host/identity.zig").TaskId.generate(), .binding = captured.owner, .binding_revision = 1, .grant_revision = 1 }, &.{.{ .definition = host_definition, .authority = .conversation_context }}) else try tools.RequestTable.init(a, captured, &.{definition}, &.{member});
+    var table = if (host_authority) try tools.RequestTable.initWithHost(a, captured, &.{}, &.{}, .{ .conversation_id = @import("../host/identity.zig").ConversationId.generate(), .task_id = @import("../host/identity.zig").TaskId.generate(), .binding = captured.owner, .content = captured.content, .binding_revision = 1, .grant_revision = 1 }, &.{.{ .definition = host_definition, .authority = .conversation_context }}) else try tools.RequestTable.init(a, captured, &.{definition}, &.{member});
     defer table.deinit();
     const wire = try tools.providerDefinitions(&table, table.arena.allocator());
     var native_context: transport.NativeContext = .{ .io = std.testing.io };
@@ -195,7 +195,7 @@ test "API2 LIVE gateway model discovery tool image roundtrip through production 
             }
         } else continue;
         var host: Host = .{ .image_bytes = image_bytes };
-        const captured: scope.Scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+        const captured: scope.Scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
         const definition: tools.ToolDefinition = .{ .id = "synthetic.observe", .schema = schema, .description = "Return the actual synthetic test image. Call once, then inspect its pixels.", .effect = .observe_image };
         const member: tools.Member = .{ .owner = .{ .session_id = @fromBackingInt(101) }, .plugin_id = "synthetic", .context = &host, .bindings = &.{.{ .plugin_id = "synthetic", .definition_id = definition.id, .handler = Host.binding }} };
         var table = try tools.RequestTable.init(a, captured, &.{definition}, &.{member});

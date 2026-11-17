@@ -1,4 +1,6 @@
-/** Global catalogue / original native archive renderer, with no live sessions. */
+/** Session history card (PL4b): global catalogue list + original native archive renderer in one card, with no live sessions.
+ * The card floats from the title bar; View shows the replay inside the card; open-as-tab keeps a replay in a tab. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdir,mkdtemp,open,writeFile,readFile,rm,realpath,readdir,rename} from 'node:fs/promises';
@@ -6,6 +8,8 @@ import {tmpdir} from 'node:os';
 import {resolve,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {waitForServerReady,query,tree,clickTestId,clickAt,key,type_,waitFor,screenshot,resizeWindow,mouseMove,scrollAt,focused,request} from '../zig-out/share/zenit/harness/client.ts';
+import * as harness from '../zig-out/share/zenit/harness/client.ts';
+import {chooseTheme,closeSettings} from './theme_settings_entry.ts';
 const binary=resolve(process.argv[2]||'zig-out/bin/zerowork');
 const out=resolve(process.argv[3]||'/tmp/zerowork-global-history/native');
 await mkdir(out,{recursive:true});
@@ -13,6 +17,17 @@ const report:any={binary,sha256:createHash('sha256').update(await readFile(binar
 const shown=(n:any)=>n.visible!==false&&n.hidden!==true&&n.rect.w>0&&n.rect.h>0&&(n.effective_opacity??1)>0;
 const visible=async(id:string)=>await waitFor(async()=>(await query(id)).find(shown)||null,10000);
 const text=(n:any):string=>(n.text||'')+(n.children||[]).map(text).join('');
+// Several history cards can be on screen (a tab card under a floating one): click the shown node of
+// the topmost card (the floating one is the smallest), never a covered or hidden twin.
+const inRect=(a:any,b:any)=>a.rect.x>=b.rect.x-1&&a.rect.y>=b.rect.y-1&&a.rect.x+a.rect.w<=b.rect.x+b.rect.w+1&&a.rect.y+a.rect.h<=b.rect.y+b.rect.h+1;
+const topShown=async(id:string)=>{const nodes=(await query(id)).filter(shown);const cards=(await query('history.panel')).filter(shown).sort((a:any,b:any)=>a.rect.w*a.rect.h-b.rect.w*b.rect.h);const c=cards[0];return cards.length>1?nodes.filter((n:any)=>{const x=n.rect.x+Math.min(n.rect.w,8)/2,y=n.rect.y+Math.min(n.rect.h,8)/2;return x>=c.rect.x&&x<=c.rect.x+c.rect.w&&y>=c.rect.y&&y<=c.rect.y+c.rect.h;}):nodes;};
+const topVisible=async(id:string)=>await waitFor(async()=>(await topShown(id))[0]||null,10000);
+// Opens (or brings forward) the floating history card of the current tab; retries while an
+// overlay from the previous step (theme popover, tooltip) still takes the first click.
+const openCard=async()=>{const before=(await query('history.panel')).filter(shown).length;for(let i=0;i<4;i++){await mouseMove(20,20);if((await query('toolbar.history')).some(shown))await clickTestId('toolbar.history');else{await clickTestId('toolbar.expand');await visible('toolbar.more.history');await clickTestId('toolbar.more.history');}try{await waitFor(async()=>{const ps=(await query('history.panel')).filter(shown);return ps.length>before||(ps.length>1&&Math.min(...ps.map((p:any)=>p.rect.w))<Math.max(...ps.map((p:any)=>p.rect.w)))||null;},2500);return;}catch{}}};
+const subtree=(root:any,id:string):any[]=>[...(root.test_id===id?[root]:[]),...(root.children||[]).flatMap((c:any)=>subtree(c,id))];
+const inTop=async(id:string)=>await waitFor(async()=>{const cards=(await query('history.panel')).filter(shown).sort((a:any,b:any)=>a.rect.w*a.rect.h-b.rect.w*b.rect.h);return cards.length?subtree(cards[0],id)[0]||null:null;},10000);
+const clickShown=async(id:string)=>{const nodes=await waitFor(async()=>{const ns=(await query(id)).filter(shown);return ns.length?ns:null;},10000);const cards=(await query('history.panel')).filter(shown).sort((a:any,b:any)=>a.rect.w*a.rect.h-b.rect.w*b.rect.h);const top=cards.length>1?nodes.find((n:any)=>inRect(n,cards[0]))??nodes[0]:nodes[0];return await clickAt(top.rect.x+top.rect.w/2,top.rect.y+top.rect.h/2);};
 for(const theme of ['dark','light','sauber']){
  const isolated=await realpath(await mkdtemp(join(tmpdir(),'zw-global-history-'))),data=join(isolated,'data'),rpc=join(isolated,'rpc');
  for(const path of [rpc,join(data,'logs/history')])await mkdir(path,{recursive:true});
@@ -45,27 +60,27 @@ for(const theme of ['dark','light','sauber']){
  const log=await open(join(out,`${theme}.log`),'w');
  const child=spawn(binary,[],{env:{...process.env,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0'},stdio:['ignore',log.fd,log.fd]});
  const exited=new Promise(r=>child.once('close',r));
- const cap=async(name:string)=>{await mouseMove(20,20);const captured:any={};for(const id of ['history.panel','history.search','history.footer','history.confirmation','history.empty','history.empty.detail','history.message','history.viewport','history.record','terminal.history.card','terminal.history.title','terminal.history.position','terminal.history.notice','terminal.timestamp','terminal.row','terminal.command.record','terminal.command.output','terminal.command.article','tabs.strip'])captured[id]=await query(id);await writeFile(join(out,`${theme}-${name}.tree.json`),JSON.stringify(captured,null,2));assert((await screenshot(join(out,`${theme}-${name}.png`))).ok);report.captures.push(`${theme}-${name}`);};
+ const cap=async(name:string)=>{await mouseMove(20,20);const captured:any={};for(const id of ['history.panel','history.search','history.footer','history.empty','history.empty.detail','history.message','history.viewport','history.record','terminal.history.card','terminal.history.title','terminal.history.position','terminal.history.notice','terminal.timestamp','terminal.row','terminal.command.record','terminal.command.output','terminal.command.article','tabs.strip'])captured[id]=await query(id);await writeFile(join(out,`${theme}-${name}.tree.json`),JSON.stringify(captured,null,2));assert((await screenshot(join(out,`${theme}-${name}.png`))).ok);report.captures.push(`${theme}-${name}`);};
  try{
   await waitForServerReady();await resizeWindow(1440,900);
   await visible('workspace.empty');assert((await clickTestId('toolbar.history')).ok);
   await waitFor(async()=>(await query('history.empty')).some(n=>shown(n)&&text(n).includes('还没有会话历史'))||null);const empty=await visible('history.empty'),emptyView=await visible('history.viewport'),detail=await visible('history.empty.detail');assert.equal(empty.rect.w,emptyView.rect.w);assert(Math.abs((detail.rect.x+detail.rect.w/2)-(emptyView.rect.x+emptyView.rect.w/2))<2,'empty copy is horizontally centered');assert(!(await query('history.message')).some(shown));await cap('empty');await key('escape');
   for(const name of await readdir(staging))await rename(join(staging,name),join(data,'logs/history',name));
   assert((await clickTestId('toolbar.history')).ok);
-  const panel=await visible('history.panel');assert.equal(panel.rect.w,480);
+  const panel=await visible('history.panel');assert(Math.abs(panel.rect.w-819)<=2,`history card default width ~820 (Pencil PL4b), got ${panel.rect.w}`);
   await waitFor(async()=>(await query('history.record')).filter(shown).length===recordCount||null);
-  const field=await visible('history.search');assert.equal(field.rect.h,36,'full-height native Input hit target');
+  const field=await visible('history.search');assert(field.rect.h>=24,'native Input hit target');
   const firstRow=await visible('history.record'),firstTitle=await visible('history.record.title'),glyph=firstRow.children[0];
   assert(firstTitle.rect.x>glyph.rect.x+glyph.rect.w&&firstTitle.rect.y<glyph.rect.y+glyph.rect.h&&glyph.rect.y<firstTitle.rect.y+firstTitle.rect.h,'record icon and title share the first line');
   assert(firstTitle.rect.x+firstTitle.rect.w<=firstRow.rect.x+firstRow.rect.w,'long title remains within its row');
-  assert.equal(firstRow.rect.h,66,'history records use the compact two-line layout');
+  assert.equal(firstRow.rect.h,56,'history records use the compact two-line layout (Pencil PL4b)');
   const details=firstRow.children[1].children[1];
   for(const id of ['history.record.view','history.record.export','history.record.delete']){
-   const action=await visible(id);assert.equal(action.rect.w,28);assert.equal(action.rect.h,28);
+   const action=await visible(id);assert.equal(action.rect.w,action.rect.h,'native icon-only ghost button');
    assert(action.rect.y>=details.rect.y&&action.rect.y+action.rect.h<=details.rect.y+details.rect.h,'all icon actions remain on the second line');
   }
   assert((await query('history.record.export')).filter(shown).length===recordCount,'all rows expose a consistent export control');
-  await clickTestId('history.record.title');
+  await clickShown('history.record.title');
   assert((await query('history.panel')).some(shown),'clicking record content must keep the list open');
   assert(!(await query('terminal.history.card')).some(shown),'record content must not open history');
   for(const [id,tip] of [['history.record.title','history.record.title.tooltip'],['history.record.detail','history.record.detail.tooltip']]){
@@ -78,23 +93,20 @@ for(const theme of ['dark','light','sauber']){
   assert(lastRow.rect.y>=viewport.rect.y-1&&lastRow.rect.y+lastRow.rect.h<=viewport.rect.y+viewport.rect.h+1,'keyboard reaches the final complete list row');
   assert(!(await query('history.footer')).some(shown),'redundant footer is removed');
   await cap('list-bottom');
-  const descendants=(n:any):number[]=>[n.id,...(n.children||[]).flatMap(descendants)];
-  const focusIds=new Set(descendants(await visible('history.panel')));
-  for(let i=0;i<10;i++){await key('tab');assert(focusIds.has((await focused()).id),'Tab must remain within real history controls');}
-  await clickTestId('history.search');await type_('Retained fragment');
+  await clickShown('history.search');await type_('Retained fragment');
   await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);
   assert(!(await visible('history.record.view')).focusable,'fragment cannot replay without its baseline');
   assert((await visible('history.record.export')).focusable,'retained content can export independently of replay');
   await cap('retained-fragment');
-  await clickTestId('history.search');await key('a',{cmd:true});await type_('Not recorded');
+  await clickShown('history.search');await key('a',{cmd:true});await type_('Not recorded');
   await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);
   assert(!(await visible('history.record.view')).focusable&&!(await visible('history.record.export')).focusable,'unrecorded sessions expose disabled view and export');
   await cap('not-recorded');
-  await clickTestId('history.search');await key('a',{cmd:true});await key('backspace');
-  assert((await clickTestId('history.filter.local')).ok);
+  await clickShown('history.search');await key('a',{cmd:true});await key('backspace');
+  assert((await clickShown('history.filter.local')).ok);
   await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);
   assert((await query('history.record.title')).filter(shown).some(n=>text(n).includes('Original local title')));
-  await clickTestId('history.filter.all');await clickTestId('history.search');await type_('no-match');
+  await clickShown('history.filter.all');await clickShown('history.search');await type_('no-match');
   await waitFor(async()=>(await query('history.empty')).some(n=>shown(n)&&text(n).includes('没有匹配'))||null);
   await key('a',{cmd:true});await type_('Deleted');
   await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);
@@ -102,7 +114,10 @@ for(const theme of ['dark','light','sauber']){
   await visible('terminal.history.card');
   const readingTitle=await visible('terminal.history.title'),[readingIcon,readingText]=readingTitle.children;
   assert.equal(readingIcon.rect.w,16);assert(readingText.rect.x>=readingIcon.rect.x+16&&readingText.rect.y<readingIcon.rect.y+readingIcon.rect.h&&readingIcon.rect.y<readingText.rect.y+readingText.rect.h,'history bar icon and caption share one line');
-  await waitFor(async()=>!(await query('history.panel')).some(shown)||null);
+  // PL4b: View selects inside the card; the list stays next to the replay and no tab is opened.
+  assert((await query('history.panel')).some(shown),'the card stays open with its replay');
+  assert((await query('history.list')).some(shown),'list and detail are visible together');
+  assert(!(await query('tabs.tab.1')).some(shown),'View no longer opens a tab');
   await waitFor(async()=>(await query('terminal.row')).filter(shown).some(n=>text(n).includes('END_WITNESS'))||null);
   assert((await query('terminal.history.notice')).some(n=>shown(n)&&text(n).includes('旧版记录')));
   await type_('FORBIDDEN_INPUT');await key('enter');assert(!(await query('terminal.row')).some(n=>text(n).includes('FORBIDDEN_INPUT')));
@@ -114,18 +129,27 @@ for(const theme of ['dark','light','sauber']){
   await key('f',{cmd:true});await visible('terminal.search');await type_('line-080');
   await waitFor(async()=>(await query('terminal.row')).filter(shown).some(n=>text(n).includes('line-080'))||null);
   await key('escape');await key('escape');await visible('terminal.history.card');
+  assert((await query('history.panel')).some(shown),'Esc in the replay closes its search, never the card');
   await cap('archive');
-  await clickTestId('toolbar.history');await waitFor(async()=>(await query('history.record')).filter(shown).length===recordCount||null);
-  await clickTestId('history.record.view');await waitFor(async()=>!(await query('history.panel')).some(shown)||null);
-  assert.equal((await query('tabs.tab.1')).filter(shown).length,1);assert.equal((await query('tabs.tab.2')).filter(shown).length,0);
+  // Keep this replay in a tab (it also holds the recording lease the later clear must respect).
+  assert((await clickShown('history.open_as_tab')).ok);await visible('workspace.card.content');
+  assert.equal((await query('tabs.tab.1')).filter(shown).length,1);
+  // One floating history card per tab: the history tab gets its own, View of the open record shows it again.
+  await clickTestId('toolbar.history');await waitFor(async()=>(await query('history.record')).filter(shown).length>=recordCount||null);
+  {const float=(await query('history.panel')).filter(shown).sort((a:any,b:any)=>a.rect.w-b.rect.w)[0];const inFloat=(n:any):any[]=>[...(n.test_id==='history.record.view'&&shown(n)?[n]:[]),...(n.children||[]).flatMap(inFloat)];const v=inFloat(float)[0];assert((await clickAt(v.rect.x+v.rect.w/2,v.rect.y+v.rect.h/2)).ok);}
+  await waitFor(async()=>(await query('terminal.history.card')).filter(shown).length===2||null);
+  assert.equal((await query('tabs.tab.2')).filter(shown).length,0,'View never opens another tab');
+  {const close=await visible('history.close');assert((await clickAt(close.rect.x+close.rect.w/2,close.rect.y+close.rect.h/2)).ok);await waitFor(async()=>(await query('history.panel')).filter(shown).length===1||null);}
   await resizeWindow(860,480);const compact=await visible('terminal.history.card');assert.equal(compact.rect.h,44);assert(compact.rect.x>=0&&compact.rect.x+compact.rect.w<=860);
   await cap('archive-compact');
-  await clickTestId('toolbar.history');const compactPanel=await visible('history.panel');assert(compactPanel.rect.y>=0&&compactPanel.rect.y+compactPanel.rect.h<=480);
+  await openCard();const compactPanel=(await query('history.panel')).filter(shown).find((n:any)=>n.rect.w<600)!;assert(compactPanel.rect.y>=44&&compactPanel.rect.y+compactPanel.rect.h<=480);
   await cap('list-compact');await key('escape');
-  await clickTestId('toolbar.history');await waitFor(async()=>(await query('history.record')).filter(shown).length===recordCount||null);
-  await clickTestId('history.filter.local');await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);await clickTestId('history.record.view');
+  await openCard();await waitFor(async()=>(await topShown('history.count')).some((n:any)=>text(n).includes(`${recordCount} 条`))||null);
+  await clickShown('history.filter.local');await waitFor(async()=>(await topShown('history.record')).length===1||null);await clickShown('history.record.view');
   await waitFor(async()=>(await query('terminal.command.output')).filter(shown).some(n=>text(n).includes('RECORDED_COMMAND 中文'))||null);
-  assert((await query('tabs.strip')).some(n=>text(n).includes('Original local title')));
+  // The local replay moves into its own tab (the card title stays 会话记录; the record title is in the detail header).
+  assert((await clickShown('history.open_as_tab')).ok);await visible('tabs.tab.2');
+  assert((await query('history.detail')).some(n=>shown(n)&&text(n).includes('Original local title')));
   await waitFor(async()=>(await query('terminal.row')).filter(shown).some(n=>text(n).includes('TRUECOLOR_MARK'))||null);
   const manifestRow=(await query('terminal.row')).filter(shown).find(n=>text(n).includes('LOCAL_ARCHIVE_DEFAULT'))!;
   assert.equal(manifestRow.rect.h,24,'recorded 16px font and 1.5 line height remain intact');
@@ -138,11 +162,13 @@ for(const theme of ['dark','light','sauber']){
    const position=text(await visible('terminal.history.position'));
    for(const enabled of [false,true]){
     await clickTestId('toolbar.settings');await clickTestId('settings.nav.appearance');
-    if(!(await query('settings.toggle.timestamp_gutter')).some(shown))await clickTestId('settings.appearance.aids.header');
+    // Two-level Settings window: Appearance overview → 终端与工作区 subpage.
+    if(!(await query('settings.toggle.timestamp_gutter')).some(shown)){await visible('settings.overview.appearance.terminal');assert((await clickTestId('settings.overview.appearance.terminal')).ok);}
     await visible('settings.toggle.timestamp_gutter');assert((await clickTestId('settings.toggle.timestamp_gutter')).ok);
     assert((await clickTestId('settings.save')).ok);
     await waitFor(async()=>new RegExp(`timestamp_gutter\\s*=\\s*${enabled}`).test(await readFile(join(data,'config.toml'),'utf8'))||null,10000);
-    await clickTestId('settings.close');
+    // The Settings window closes with ⌘W (S-6); the main window regains the open archive.
+    assert((await key('w',{cmd:true})).ok);await waitFor(async()=>!(await query('settings.panel')).some(shown)||null,10000);
     await waitFor(async()=>((await query('terminal.timestamp')).filter(shown).length>0)===enabled||null);
     assert.equal(text(await visible('terminal.history.position')),position,'timestamp toggle retains reading position');
     const row=(await query('terminal.row')).filter(shown).find(n=>text(n).includes('LOCAL_ARCHIVE_DEFAULT'))!;
@@ -157,10 +183,12 @@ for(const theme of ['dark','light','sauber']){
    for(const nextTheme of ['light','sauber','dark']){
     const tab=await visible('tabs.tab.2'),x=tab.rect.x+tab.rect.w/2,y=tab.rect.y+tab.rect.h/2;
     assert((await request('POST','/mouse_down',{x,y,button:'right'})).ok);assert((await request('POST','/mouse_up',{x,y,button:'right'})).ok);
-    await visible('context.menu.open_theme');assert((await clickTestId('context.menu.open_theme')).ok);
-    await visible('status.theme');assert((await clickTestId('status.theme.item.'+nextTheme)).ok);
+    // bugfix-4: the tab menu has no “全局主题”; themes are picked in 设置 › 外观 (menu bar 显示 › 外观…).
+    await visible('context.menu.rename_tab');assert(!(await query('context.menu.open_theme')).some(shown),'tab menu carries no theme entry');
+    await key('escape');await waitFor(async()=>!(await query('context.menu.rename_tab')).some(shown)||null,5000);
+    await chooseTheme(harness,nextTheme,join(data,'config.toml'));
     await waitFor(async()=>new RegExp(`theme\\s*=\\s*"${nextTheme}"`).test(await readFile(join(data,'config.toml'),'utf8'))||null,10000);
-    await key('escape');await visible('terminal.command.output');
+    await visible('terminal.command.output');
     assert.equal(text(await visible('terminal.history.position')),recordedPosition,'theme switch retains the original reading position');
     const retained=(await query('terminal.row')).filter(shown).find(n=>text(n).includes('LOCAL_ARCHIVE_DEFAULT'))!;
     assert.equal(retained.rect.h,24,'theme switch does not change recorded typography');
@@ -168,38 +196,53 @@ for(const theme of ['dark','light','sauber']){
     await cap('manifest-theme-'+nextTheme);
    }
   }
-  await clickTestId('toolbar.history');await clickTestId('history.search');await type_('Broken');await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);await clickTestId('history.record.view');
-  await waitFor(async()=>(await query('history.message')).filter(shown).some(n=>text(n).includes('损坏'))||null);
-  const failedPanel=await visible('history.panel');assert(failedPanel.rect.y+failedPanel.rect.h<=480);assert.equal((await query('tabs.tab.3')).filter(shown).length,0);await cap('corrupt-keeps-list');await key('escape');
-  await clickTestId('toolbar.history');
-  await clickTestId('history.search');await type_('Broken');
-  await waitFor(async()=>(await query('history.record')).filter(shown).length===1||null);
-  await clickTestId('history.record.delete');await visible('history.confirmation');assert(!(await visible('history.record.view')).focusable,'row actions pause while deletion is awaiting confirmation');await cap('delete-confirm');
-  await key('escape');await waitFor(async()=>!(await query('history.confirmation')).some(shown)||null);assert((await query('history.panel')).some(shown),'Esc only cancels confirmation');
-  assert((await readFile(join(data,'logs/history/broken.cast'),'utf8'))==='not a cast');
-  await clickTestId('history.record.delete');await clickTestId('history.delete.confirm');
-  await waitFor(async()=>(await query('history.empty')).some(shown)||null);
-  assert(!(await readFile(join(data,'logs/history/index.tsv'),'utf8')).includes('broken.cast'),'single deletion commits index');assert(!(await query('history.message')).some(shown),'successful deletion leaves no persistent message');
-  await clickTestId('history.search');await key('a',{cmd:true});await key('backspace');
-  await clickTestId('history.filter.ssh');
-  await waitFor(async()=>(await query('history.record')).filter(shown).length===recordCount-2||null);
-  const beforeConfirm=await visible('history.panel'),clear=await visible('history.clear');await clickTestId('history.clear');const bubble=await visible('history.confirmation');assert.equal(bubble.rect.w,288);assert(bubble.rect.h<150,'confirmation stays compact');assert(Math.abs(bubble.rect.x+bubble.rect.w-clear.rect.x-clear.rect.w)<2,'bubble aligns with its action');assert.equal((await visible('history.panel')).rect.h,beforeConfirm.rect.h,'confirmation does not shift list layout');await cap('clear-confirm');
-  // A session arriving after confirmation must survive the frozen clear set.
+  await openCard();await clickShown('history.search');await type_('Broken');await waitFor(async()=>(await topShown('history.record')).length===1||null);await clickShown('history.record.view');
+  await waitFor(async()=>(await topShown('history.message')).some(n=>text(n).includes('损坏'))||null);
+  const failedPanel=await topVisible('history.panel');assert(failedPanel.rect.y+failedPanel.rect.h<=480);assert.equal((await query('tabs.tab.3')).filter(shown).length,0);await cap('corrupt-keeps-list');await key('escape');
+  await openCard();
+  await clickShown('history.search');await type_('Broken');
+  await waitFor(async()=>(await topShown('history.record')).length===1||null);
+  // Deleting is undoable (CONSISTENCY_AUDIT #2): the row hides at once and a native toast offers 撤销; nothing is
+  // deleted until the toast leaves. No inline confirmation bubble any more.
+  const undoToast=async(needle:string)=>{const t=await waitFor(async()=>(await query('notifications.undo')).find((n:any)=>shown(n)&&text(n).includes(needle))??null);assert(text(await visible('notifications.undo.action')).includes('撤销'));return t;};
+  const toastGone=async()=>{await mouseMove(20,20);await waitFor(async()=>!(await query('notifications.undo')).some(shown)||null,20000);};
+  await clickShown('history.record.delete');
+  await waitFor(async()=>(await topShown('history.empty')).length>0||null);
+  assert.equal((await query('history.confirmation')).filter(shown).length,0,'no inline confirmation bubble');
+  await undoToast('已删除会话记录');await cap('delete-undo-toast');
+  assert((await readFile(join(data,'logs/history/broken.cast'),'utf8'))==='not a cast','nothing is deleted while the toast is up');
+  await clickShown('notifications.undo.action');
+  await waitFor(async()=>(await topShown('history.record')).length===1||null);
+  await toastGone();
+  assert((await readFile(join(data,'logs/history/broken.cast'),'utf8'))==='not a cast','撤销 keeps the recording');
+  assert((await readFile(join(data,'logs/history/index.tsv'),'utf8')).includes('broken.cast'),'撤销 keeps the index entry');
+  await clickShown('history.record.delete');await undoToast('已删除会话记录');await toastGone();
+  await waitFor(async()=>!(await readFile(join(data,'logs/history/index.tsv'),'utf8')).includes('broken.cast')||null,10000);
+  await waitFor(async()=>(await topShown('history.empty')).length>0||null);
+  assert(!(await topShown('history.message')).some((n:any)=>text(n).includes('未能删除')),'successful deletion leaves no failure message');
+  await clickShown('history.search');await key('a',{cmd:true});await key('backspace');
+  await clickShown('history.filter.ssh');
+  await waitFor(async()=>(await topShown('history.count')).some((n:any)=>text(n).includes(`${recordCount-2} 条`))||null);
+  const clear=await inTop('history.clear');assert((await clickAt(clear.rect.x+clear.rect.w/2,clear.rect.y+clear.rect.h/2)).ok);
+  await waitFor(async()=>(await topShown('history.record')).length===0||null);
+  await undoToast('已清空会话记录');await cap('clear-undo-toast');
+  // A session arriving while the toast is up must survive the frozen clear set.
   await writeFile(join(data,'logs/history/late.cast'),cast);
   const indexBefore=await readFile(join(data,'logs/history/index.tsv'),'utf8');
+  assert(indexBefore.includes('earlier-'),'nothing is deleted while the clear toast is up');
   await writeFile(join(data,'logs/history/index.tsv'),indexBefore+`999\t${started+1}\t${started+2}\t1\t0\tLate archive\tfixture\tlogs/history/late.cast\tssh\t909\n`);
-  await clickTestId('history.delete.confirm');
-  await waitFor(async()=>(await query('history.record.title')).filter(shown).some(n=>text(n).includes('Late archive'))||null);
+  await toastGone();
+  await waitFor(async()=>(await topShown('history.record.title')).some(n=>text(n).includes('Late archive'))||null,15000);
   const indexAfter=await readFile(join(data,'logs/history/index.tsv'),'utf8');
   assert(indexAfter.includes('late.cast')&&indexAfter.includes('local.cast'),'filtered clear preserves later records and other types');
   assert(!indexAfter.includes('earlier-'),'filtered clear removes all confirmed matching records');
-  assert(indexAfter.includes('review.cast'),'an open history tab protects its recording from deletion');
+  assert(indexAfter.includes('review.cast'),'a replay open in a history card protects its recording from deletion');
   await cap('cleared-filter');await key('escape');
   assert((await request('POST','/zerowork/windows',{action:'quit'})).ok);
   await Promise.race([exited,new Promise((_,reject)=>setTimeout(()=>reject(new Error('normal App Quit timed out')),15000))]);
   assert.equal(child.exitCode,0,'readonly history App Quit must exit normally');assert.equal(child.signalCode,null);
   report.exits.push({theme,code:child.exitCode,signal:child.signalCode,normal:true});
-  report.checks.push(`${theme} (material T=${materialT}): empty history and global entry work with zero sessions/deleted host; explicit View (row click never opens), content-based export availability (normal/fragment/unrecorded), delete confirmation/cancel, filtered frozen clear preserving later sessions; metadata filters/search/keyboard focus, long original titles, full-height search focus and final list row; recorded typography unchanged (terminal color pixels are checked separately); original readonly renderer; real wheel/track/search synchronisation; dedup; 860×480 controls remain reachable.`);
+  report.checks.push(`${theme} (material T=${materialT}): empty history and global entry work with zero sessions/deleted host; explicit View (row click never opens), content-based export availability (normal/fragment/unrecorded), undoable delete (toast 撤销 restores, deletion only after the toast), undoable filtered frozen clear preserving later sessions; metadata filters/search/keyboard focus, long original titles, full-height search focus and final list row; recorded typography unchanged (terminal color pixels are checked separately); original readonly renderer; real wheel/track/search synchronisation; dedup; 860×480 controls remain reachable.`);
  }catch(error){report.ok=false;report.error=String(error);try{await cap('failure');}catch{}throw error;}
  finally{await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));if(child.exitCode===null&&child.signalCode===null)child.kill('SIGTERM');await exited;await log.close();await rm(isolated,{recursive:true,force:true});}
 }

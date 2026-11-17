@@ -82,6 +82,7 @@ public static class ZenitUiaQuery {
         if(root==null || root.Current.ProcessId!=pid) throw new InvalidOperationException("UIA root owner mismatch");
         var matches=root.FindAll(TreeScope.Descendants,new AndCondition(
           new PropertyCondition(AutomationElement.NameProperty,name),
+          new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Edit),
           new PropertyCondition(AutomationElement.FrameworkIdProperty,"Zenit")));
         if(matches.Count!=1) throw new InvalidOperationException("Text action needs exactly one owned control");
         var element=matches[0];
@@ -143,6 +144,7 @@ public static class ZenitUiaQuery {
         if(root==null || root.Current.ProcessId!=pid) throw new InvalidOperationException("UIA root owner mismatch");
         var matches=root.FindAll(TreeScope.Descendants,new AndCondition(
           new PropertyCondition(AutomationElement.NameProperty,name),
+          new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Edit),
           new PropertyCondition(AutomationElement.FrameworkIdProperty,"Zenit")));
         if(matches.Count!=1) throw new InvalidOperationException("UIA action needs exactly one owned named control: "+matches.Count);
         object pattern;

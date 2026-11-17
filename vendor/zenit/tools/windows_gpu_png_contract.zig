@@ -4,7 +4,7 @@ extern fn zenit_d12_test_decode_png([*:0]const u8, [*]u8) c_int;
 pub fn run(io: std.Io) !void {
     if (gpu.backend_kind != .d3d12) return error.WrongSelectedBackend;
     const a = std.heap.page_allocator;
-    const temp = try @import("zenit_environment").getOwned(a, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(a, "TEMP");
     defer a.free(temp);
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);

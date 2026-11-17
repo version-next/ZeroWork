@@ -1,0 +1,37 @@
+//! 快捷键面板（P3 3e 第二批，人工验收反馈第 7 条）的样式：键帽区与行下的说明。
+//! 键帽本身是原生 `W.Kbd`（sm，色调随录制状态），按钮是原生 `W.Button`，这里只给 `W.Pressable` 根（它没有自己的外观）
+//! 与布局盒子定外观；颜色全部是 token。
+const ui = @import("ui");
+
+/// 键帽区（`W.Pressable` 根）：键帽 + 录制提示 + 铅笔，gap 4，圆角 6。静止透明（只有一圈透明描边占位，状态切换不跳），
+/// 悬停 / 按下 bg-hover / bg-active；录制中 accent 描边、无效 danger 描边、冲突 warning 描边；固定动作没有悬停反馈。
+recipe KeyArea {
+  base {
+    min-height: 28; flex-shrink: 0; direction: row; align-items: center; gap: 4; padding: 2 6; corner-radius: 6;
+    background: transparent; border: 1 transparent; transition: background 150ms ease-out;
+    :hover { background: bg-hover; }
+    :active { background: bg-active; }
+  }
+  variant tone = rest {
+    rest { }
+    recording { border: 1 accent; background: bg-primary; :hover { background: bg-primary; } }
+    invalid { border: 1 danger; background: bg-primary; :hover { background: bg-primary; } }
+    conflict { border: 1 warning; background: bg-primary; :hover { background: bg-primary; } }
+  }
+  flag fixed { :hover { background: transparent; } :active { background: transparent; } }
+}
+/// 键帽区右侧的铅笔：淡墨，提示“可以改”；录制中 / 固定动作不显示。
+style key_pencil { width: 12; height: 12; flex-shrink: 0; icon-color: zw-fg-supporting; }
+/// 录制中的提示：“按下新快捷键…”（12，accent 墨）与“Esc 取消”（11，淡墨）。
+style key_prompt { font-size: 12; font-weight: 500; line-height: {16.0 / 12.0}; color: accent; wrap: none; }
+style key_escape { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; wrap: none; }
+/// 行尾“恢复默认”的位置：固定 24 宽，按钮出现 / 消失时键帽区不左右跳。
+style key_reset_slot { width: 24; height: 24; flex-shrink: 0; direction: row; align-items: center; justify: center; }
+/// 行下的说明行（无效原因 / 冲突 + 交换 / 取消），与标签左对齐。
+style key_problem { width: fill; min-width: 0; direction: row; align-items: center; gap: 8; padding: 0 0 10 0; }
+style key_problem_text { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: danger; wrap: word; }
+style key_problem_text_box { width: fill; flex: 1; min-width: 0; }
+/// 冲突说明用 warning 墨（不是错误：给出了一步解决）。
+style key_conflict_text { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: warning; wrap: word; }
+/// 键帽区的外层（Tooltip 的触发点）；不占额外空间。
+style key_slot { flex-shrink: 0; direction: row; align-items: center; }

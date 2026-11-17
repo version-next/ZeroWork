@@ -30,6 +30,7 @@
 /// ```
 const std = @import("std");
 const builtin = @import("builtin");
+const dev_preview = @import("zenit_environment").dev_preview;
 const Allocator = std.mem.Allocator;
 const system_sdk_mod = @import("system_sdk");
 const svg_assets_mod = @import("svg_assets.zig");
@@ -73,8 +74,12 @@ pub const Modifiers = events_mod.Modifiers;
 pub const MouseButton = events_mod.MouseButton;
 
 const event_dispatcher_mod = @import("event_dispatcher.zig");
+/// Per-scroll-event handler effect accounting (event_dispatcher.scroll_effect).
+pub const scroll_effect = event_dispatcher_mod.scroll_effect;
 const interaction_drag = @import("interaction/drag.zig");
 const focus_mod = @import("focus.zig");
+const focus_targets_mod = @import("focus_targets.zig");
+const anchor_transition_mod = @import("anchor_transition.zig");
 const widget_state_mod = @import("widget_state.zig");
 const actions_mod = @import("actions.zig");
 const console_mod = @import("console.zig");
@@ -179,6 +184,7 @@ pub const interaction_semantics = @import("core/interaction_semantics.zig");
 // redraw.zig global only set by node.markRenderDirty, Cx.render no longer depends on it
 // (HMR across dylib: Plugin/Host each have own global, unreliable)
 pub const layout_engine = @import("core/layout_engine.zig");
+pub const TextTruncation = layout_engine.TextTruncation;
 
 pub const render_engine = @import("core/render_engine/mod.zig");
 const inspector_mod = @import("core/inspector.zig");
@@ -212,9 +218,11 @@ pub const Margin = core_types.Margin;
 
 // ========== Sizing model (learned from Gooey) ==========
 pub const Sizing = core_types.Sizing;
+pub const FlexBasis = core_types.FlexBasis;
 pub const Direction = core_types.Direction;
 pub const JustifyContent = core_types.JustifyContent;
 pub const AlignItems = core_types.AlignItems;
+pub const AlignContent = core_types.AlignContent;
 pub const FlexWrap = core_types.FlexWrap;
 pub const ScrollDirectionHint = core_types.ScrollDirectionHint;
 
@@ -292,6 +300,8 @@ pub const TextInputSelection = core_types.TextInputSelection;
 pub const ElementTag = core_types.ElementTag;
 pub const TextProps = core_types.TextProps;
 pub const TextWrap = core_types.TextWrap;
+pub const OverflowWrap = core_types.OverflowWrap;
+pub const WordBreak = core_types.WordBreak;
 pub const TextAlign = core_types.TextAlign;
 pub const TextSpan = core_types.TextSpan;
 pub const UnderlineStyle = core_types.UnderlineStyle;
@@ -380,8 +390,12 @@ const resolveInspectTarget = cx_hit_target.resolveInspectTarget;
 //   cx_bulk_quads     bulk quad layer
 const cx_input = @import("core/cx_input.zig");
 const cx_cursor = @import("core/cx_cursor.zig");
+const cx_hover = @import("core/cx_hover.zig");
 const cx_render = @import("core/cx_render.zig");
 const cx_frame = @import("core/cx_frame.zig");
+const cx_inbox = @import("core/cx_inbox.zig");
+/// Frame-first delivery handle (`Cx.createInbox`, docs/design/append-inbox.md).
+pub const Inbox = cx_inbox.Inbox;
 const cx_runtime_index = @import("core/cx_runtime_index.zig");
 const cx_world_sync = @import("core/cx_world_sync.zig");
 const cx_world_hooks = @import("core/cx_world_hooks.zig");
@@ -409,10 +423,16 @@ pub const platform_services = @import("core/platform_services.zig");
 pub const LoweringBuffers = struct {
     _dead_main: std.ArrayList(display_list_mod.DisplayItem) = .empty,
     main_paint: std.ArrayList(paint_table.DisplayItem) = .empty,
+    /// Web DOM host only: owner Node.id per main_paint item (see RenderContext.lowered_nodes).
+    main_paint_nodes: std.ArrayListUnmanaged(u32) = .empty,
+    /// Web DOM host only: the lowered (window-space) union items, 1:1 with main_paint_nodes.
+    web_lowered: std.ArrayList(display_list_mod.DisplayItem) = .empty,
 
     pub fn deinit(self: *LoweringBuffers, allocator: Allocator) void {
         self._dead_main.deinit(allocator);
         self.main_paint.deinit(allocator);
+        self.main_paint_nodes.deinit(allocator);
+        self.web_lowered.deinit(allocator);
     }
 };
 
@@ -433,6 +453,19 @@ pub var a11y_context_register_failures: u64 = 0;
 /// independent of components). scroll is ancestor container with tag=.scroll; returns whether
 /// scroll position actually adjusted.
 pub var a11y_scroll_into_view_hook: ?*const fn (scroll: *Node, target: *Node) bool = null;
+
+/// A scroll container that a DOM host may let the browser scroll natively (Web DOM host:
+/// overflow:auto, scrollTop <-> ScrollState). `x`/`y` are the content's visual offset
+/// (= -content translate), i.e. what scrollLeft/scrollTop must be.
+pub const HostScroll = struct { content: *Node, x: f32, y: f32, axis_x: bool, axis_y: bool };
+/// Registered by ScrollArea: query a container / apply a browser-driven offset.
+pub var host_scroll_query_hook: ?*const fn (container: *const Node) ?HostScroll = null;
+pub var host_scroll_set_hook: ?*const fn (container: *Node, x: f32, y: f32) bool = null;
+/// Set by a host whose editable text is a native control (Web DOM host: <input>/<textarea>).
+/// The platform then scrolls the text: a single-line Input stops following its own caret and
+/// takes the native control's offset through EditableText.set_scroll, so its layout (text
+/// padding, overflow fade) mirrors what the platform shows.
+pub var host_native_text_fields: bool = false;
 
 /// Per-glass luminance sample (renderer projects from luminance slot each frame; key = glass owner
 /// node id).
@@ -458,6 +491,9 @@ pub const WINDOW_PORTAL_Z_INDEX: i16 = 31_000;
 pub const OwnedCell = struct {
     ptr: *anyopaque,
     destroyFn: *const fn (*anyopaque, Allocator) void,
+    /// Reclaim before a later registration only after both owner and every
+    /// escaped node callback have released the cell. Null retains until exit.
+    can_destroy: ?*const fn (*anyopaque) bool = null,
 };
 
 /// Callback result after layout, before generating paint commands.
@@ -470,12 +506,22 @@ const AfterLayoutHook = struct { ctx: *anyopaque, run: AfterLayoutFn };
 
 pub const CountingAllocator = @import("core/counting_allocator.zig").CountingAllocator;
 
+/// A left release that may dismiss overlays its press began outside of (`Cx.press_releases`).
+pub const PressRelease = struct {
+    press_handle: ?NodeHandle,
+    press_owner: ?overlay_stack_mod.LayerHandle,
+    press_mark: u64,
+};
+
 pub const Cx = struct {
     pub const AllocationOwner = enum { text, world, display_list, property_tree, frame_arena, interaction, node_cache, text_blob, scene_runtime };
     pub const PresentationSample = @import("core/presentation_clock.zig").Sample;
     /// Retained as public alias (implementation: core/frame_perf.zig).
     pub const frame_perf_history_size: usize = frame_perf_mod.history_size;
     pub const window_portal_z_index: i16 = WINDOW_PORTAL_Z_INDEX;
+
+    /// Escape policy for text fields (`Cx.input_escape`).
+    pub const InputEscape = enum { keep, revert_to_focus_value };
 
     /// Ref-counted liveness marker for cross-window observers such as DevTools.
     /// The marker outlives `Cx` when another window still holds a reference, so
@@ -484,7 +530,8 @@ pub const Cx = struct {
         allocator: Allocator,
         ref_count: usize = 1,
         alive: bool = true,
-        /// Owned scopes detach their hooks after external observer access closes.
+        /// Cleared just before FocusManager teardown: scope-owned focus hooks
+        /// that outlive the Cx detach without touching the freed manager.
         focus_manager_alive: bool = true,
 
         pub fn retain(self: *LifetimeToken) *LifetimeToken {
@@ -539,6 +586,11 @@ pub const Cx = struct {
     /// magnify gesture dispatch target locked during gesture (hit on began, cleared on
     /// ended/cancelled)
     magnify_target_handle: ?NodeHandle = null,
+    /// `overlay_stack.activationMark()` when the current trackpad gesture latched its owner: a
+    /// layer shown after that which blocks the owner ends the gesture (`cx_input.dispatchScroll`).
+    scroll_latch_mark: u64 = 0,
+    /// The same mark for the current mouse-wheel transaction (taken when a notch starts one).
+    wheel_latch_mark: u64 = 0,
     /// Current drop target in drag session. Store handle not raw pointer: resolve brings existence
     /// check, avoids use-after-free if node freed during drag (see invalidateReferencesTo comment
     /// on hovered_node).
@@ -560,11 +612,25 @@ pub const Cx = struct {
     last_mouse_down_handle: ?NodeHandle = null,
     /// Mark whether this frame has new mouseDown event (cleared each frame)
     has_new_mouse_down: bool = false,
+    /// A left press is down whose release may dismiss overlays it began outside of.
+    outside_press_armed: bool = false,
+    /// OverlayStack.activationMark() when that press began: layers it opened stay open.
+    outside_press_mark: u64 = 0,
+    /// This frame released such a press (cleared each frame): outside-click dismissal.
+    has_new_press_release: bool = false,
+    /// Those releases, each with the press it ends (one event batch can hold a release and a
+    /// later press, which overwrites the press fields above). Render dismisses in order.
+    press_releases: [4]PressRelease = undefined,
+    press_release_count: u8 = 0,
 
     // (Deleted: hovered_node_id/pressed_node_id/focused_node_id, retain mode: nodes don't rebuild,
     // use ?*Node directly)
 
     mouse_x: f32 = 0,
+    tooltip_state: struct {
+        dismiss: ?Handler(void) = null,
+        last_close: ?struct { trigger_id: u32, time_ns: i128 } = null,
+    } = .{},
     mouse_y: f32 = 0,
     viewport: Size = Size.ZERO,
     /// App-defined 'safe area' insets, space occupied by title bar / tab bar / status bar. floating
@@ -580,6 +646,9 @@ pub const Cx = struct {
     current_cursor: CursorShape = .default,
     cursor_override: ?CursorShape = null,
     cursor_state: cursor.State = .{},
+    /// Stationary-pointer hover: pointer liveness and the hit-scene epoch the current hover was
+    /// resolved against (core/cx_hover.zig).
+    hover_sync: cx_hover.HoverSync = .{},
     /// Custom bitmap cursor (content of CursorShape.custom), key -> rasterized bitmap. Only one
     /// active bitmap at any moment (active_custom_cursor). Store responsible for 'desc -> rasterize
     /// -> content-addressed cache', handoff to system stays in updateCursorShape (where system_sdk
@@ -651,6 +720,10 @@ pub const Cx = struct {
     /// times. Self-contained, no Cx state touched, moved to independent value type; Cx methods now
     /// thin forwards, call sites unchanged.
     frame_perf: frame_perf_mod.FramePerf = .{},
+    /// Per-frame view of the process work counters (`ui.devtools.work_counters`). The host
+    /// commits it once per presented frame, next to its frame timing history (zenit_app does);
+    /// read by the harness `/stats` `work` object, cleared by `/stats/reset`.
+    work_counters: @import("trace").work_counters.Sampler = .{},
     /// Frame-level redraw flag (R4a: idle zero cost). Set on input, active animation, window
     /// resize. App checks during frame loop, skips buildUI/layout/render/GPU submit when idle.
     needs_redraw: bool = true,
@@ -667,6 +740,8 @@ pub const Cx = struct {
     // inspector overlay + internal diagnostics. Direct lowering.* reads = internal; external
     // callers use cx.lowerForEncoderPaintTable().
     lowering: LoweringBuffers = .{},
+    /// Periodic custom draws handed to the system compositor (see compositor_sprite).
+    sprites: @import("core/compositor_sprite.zig").Registry = .{},
 
     /// Stage B R3d: clean fast path returns display_list slice directly (display_list stable
     /// cross-frame, no snapshot). Flag set false on first frame / resize / force redraw to walk
@@ -680,6 +755,11 @@ pub const Cx = struct {
     paint_duplicate_fills: u64 = 0,
     /// Most recent duplicate node id (diagnostics; 0 = never occurred)
     paint_duplicate_node: u32 = 0,
+    /// ZENIT_VERIFY_INCREMENTAL: cumulative lowered items that differed between the cached path
+    /// and the reference full path (only increases, 0 = incremental == full on every frame).
+    incremental_verify_mismatch_total: u64 = 0,
+    /// render_engine/raw_shadow.zig per-Cx state (verification pass counter / generation).
+    hook_verify: @import("core/render_engine/raw_shadow.zig").CxState = .{},
     /// frame_time_ms from last render(). frame_time_ms advance means possible animation running,
     /// can't skip even if dirty clean (animation hook no chance to advance).
     last_render_frame_time_ms: f64 = 0,
@@ -688,6 +768,7 @@ pub const Cx = struct {
     /// tiers correct). Frame-level arena allocator, reset each frame, for temporary computation
     /// (avoid heap fragmentation).
     frame_arena: std.heap.ArenaAllocator,
+    /// Set by trimIdleRenderCapacity: capacity the next frame-boundary reset keeps.
     idle_scratch_limit: ?usize = null,
     deferred_epoch: @import("zenit_time").Instant,
     deferred_scheduler: DeferredScheduler,
@@ -706,6 +787,11 @@ pub const Cx = struct {
     console_store: console_mod.Console,
 
     node_registry: NodeRegistry,
+    /// See setHostHitTarget (Web DOM host).
+    host_hit_enabled: bool = false,
+    host_hit_fallback: bool = false,
+    host_hit_stack: [32]NodeHandle = undefined,
+    host_hit_len: u8 = 0,
     interaction_index: InteractionIndex,
     /// Window-local observation cache; global dirty generation invalidates it.
     loose_interaction_memo: struct {
@@ -772,15 +858,19 @@ pub const Cx = struct {
     accessibility_tree: a11y_tree_mod.AccessibilityTree,
     /// A11yNode stores u64 hash of label/description/value only; this table holds hash -> string
     /// reverse map, lets platform bridge (NSAccessibility / IAccessible) look up real UTF-8 string
-    /// for AT tools. Rebuilt each frame tail in syncA11yTreeFromInteractions.
+    /// for AT tools. Rebuilt by each syncA11yTreeFromInteractions.
     a11y_label_buf: @import("core/a11y_projection.zig").LabelStore = .{},
-    /// macOS: skip the per-frame a11y projection until an assistive client
-    /// queries this process (see `a11y.macos_bridge.ProjectionDemand`). App
-    /// runtimes enable it; a bare Cx (tests, tools) keeps eager projection.
-    /// Other platforms always project: their bridges read the tree directly.
+    /// Skip the frame-end a11y projection while no assistive client can read
+    /// the tree (see `cx_a11y.projectionPolicy`). macOS: until the first
+    /// NSAccessibility query (`a11y.macos_bridge.ProjectionDemand`). Windows:
+    /// the UIA publisher projects (`projectA11yIfStale`) only when it publishes
+    /// or acts. App runtimes enable it; a bare Cx (tests, tools) keeps eager
+    /// projection. Other platforms always project.
     a11y_on_demand: bool = false,
     /// A frame skipped projection, so the a11y tree lags the node tree.
     a11y_projection_stale: bool = false,
+    /// Completed projections (diagnostics and tests).
+    a11y_projection_count: u64 = 0,
     /// A render happened since World.paint / World.interaction last mirrored the
     /// node tree. Those tables have no reader in the render, hit-test or event
     /// path (only `layerizeFrame`, the layout integrity audit and tests), so the
@@ -796,6 +886,12 @@ pub const Cx = struct {
         .label_resolver = undefined,
     },
     perf: PerfCounters = .{},
+    /// Input-side work since the last traced frame (ZENIT_PERF_TRACE); reset by the host.
+    input_perf: hit_runtime_mod.InputPerfCounters = .{},
+    /// node_tree.g_scene_mutation_gen / frame_time_ms at the end of the last before-render tick
+    /// (frame or event-time hit refresh); see cx_render.ensureHitTestSceneFresh.
+    hit_scene_tick_gen: u64 = 0,
+    hit_scene_tick_time_ms: f64 = std.math.nan(f64),
     before_render_frame: ?u64 = null,
     before_render_time_ms: f64 = std.math.nan(f64),
     next_redraw_scheduled_at: ?@import("zenit_time").Instant = null,
@@ -807,6 +903,9 @@ pub const Cx = struct {
     caret_flip_host: bool = false,
     caret_phase_valid: bool = false,
     caret_visible: bool = true,
+    /// Whether the focused field painted its blinking caret this frame (null:
+    /// none, or the compositor blinks it). Pacing traces time the flips.
+    caret_shown: ?bool = null,
     caret_next_ns: i128 = 0,
     caret_half_ns: u64 = 500 * std.time.ns_per_ms,
     caret_paint_override: ?bool = null,
@@ -816,6 +915,9 @@ pub const Cx = struct {
 
     // Theme tokens (runtime switchable)
     tokens: *const theme.ThemeTokens = &theme.dark,
+    /// App-registered tokens per colour scheme (`setSchemeTokens`), used by subtrees whose colour
+    /// scheme is fixed (`setColorScheme`). null = zenit's generated `theme.light` / `theme.dark`.
+    scheme_tokens: [2]?*const theme.ThemeTokens = .{ null, null },
     /// setTheme increments on each swap; before_render hook can compare to decide whether to
     /// re-read tokens (avoid syncing derived style every frame).
     theme_version: u32 = 0,
@@ -827,9 +929,13 @@ pub const Cx = struct {
     window_header_node: ?*Node = null,
     window_header_offset: [2]f32 = .{ 0, 0 },
     window_header_reveal_leases: u32 = 0,
+    /// Owner of the Cx-wide reactive services below (see `serviceScope`).
+    service_scope: ?*Scope = null,
     theme_signal: ?*Signal(*const theme.ThemeTokens) = null,
+    style_generation: if (dev_preview) u64 else void = if (dev_preview) 0 else {},
+    style_signal: if (dev_preview) ?*Signal(u64) else void = if (dev_preview) null else {},
     /// System a11y display preferences (a11y/preferences.zig): this Cx's synced process-level
-    /// version, and lazy-created Signal (a11yPreferencesSignal, lifetime = theme_signal).
+    /// version, and lazy-created Signal (a11yPreferencesSignal, a Cx service like theme_signal).
     a11y_prefs_version: u32 = 0,
     a11y_prefs_signal: ?*Signal(a11y_preferences.Preferences) = null,
     // System communications SDK (optional)
@@ -894,6 +1000,8 @@ pub const Cx = struct {
     /// Next index in runAfterLayoutHooks traversal; removeAfterLayoutHook before this index syncs
     /// back during traversal, avoids skipping successors. null = not traversing.
     after_layout_cursor: ?usize = null,
+    /// Frame-first delivery (`createInbox`): this window's slot, inboxes and delivery state.
+    inbox_hub: cx_inbox.Hub = .{},
     /// Node queued for free during tick, batched at traversal end. Path: before_render hook /
     /// animation done callback disposes component scope, scope cleanup runs detachChild + freeNode
     /// (snapshot_layer animateOpacity(done) typical), while tickBeforeRender recursion stack holds
@@ -918,6 +1026,16 @@ pub const Cx = struct {
     /// session, no business payload.
     drag_manager: interaction_drag.Manager = .{},
     focus_manager: focus_mod.FocusManager,
+    /// What Escape does in a text field (`Input`) whose text changed since it gained focus.
+    /// `.keep` (default): nothing (Escape only clears the selection and reaches the overlay stack
+    /// and the app as before). `.revert_to_focus_value`: Escape puts back the text the field had
+    /// when it gained focus (one undoable edit, `on_change` fires) and is consumed; a field with
+    /// unchanged text leaves Escape alone. An app sets it once for all its fields.
+    input_escape: InputEscape = .keep,
+    /// Declarative focus (focusId / autoFocus / focusRequest / focusRestore) for this window.
+    focus_targets: focus_targets_mod.FocusTargets,
+    /// Named anchors for anchor transitions (Yix `motionAnchor`, ui.fx.anchor_transition).
+    motion_anchors: anchor_transition_mod.AnchorRegistry,
     state_store: widget_state_mod.StateStore,
     action_dispatcher: actions_mod.ActionDispatcher = .{},
     overlay_stack: OverlayStack = .{},
@@ -1006,7 +1124,7 @@ pub const Cx = struct {
             .owner = owner,
             .lifetime_token = lifetime_token,
             .lowering = .{},
-            .frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .frame_arena = std.heap.ArenaAllocator.init(allocator),
             .deferred_epoch = try @import("zenit_time").Instant.now(io),
             .deferred_scheduler = DeferredScheduler.init(allocator, io),
             .node_registry = NodeRegistry.init(allocator),
@@ -1014,7 +1132,7 @@ pub const Cx = struct {
             .svg_textures = svg_texture_store.SvgTextureStore.init(allocator),
             .scene_runtime = scene_runtime_mod.SceneRuntime.init(allocator),
             .property_tree = property_tree_mod.PropertyTree.init(allocator),
-            .display_list = display_list_mod.DisplayList.init(std.heap.page_allocator),
+            .display_list = display_list_mod.DisplayList.init(allocator),
             .text_blob_store = text_blob_mod.BlobStore.init(allocator),
             .world = world.World.init(allocator),
             .layer_tree = layer_tree.LayerTree.init(allocator, .{}),
@@ -1022,15 +1140,19 @@ pub const Cx = struct {
             .accessibility_tree = a11y_tree_mod.AccessibilityTree.init(allocator),
             .dispatcher = event_dispatcher_mod.EventDispatcher.init(allocator, io),
             .focus_manager = focus_mod.FocusManager.init(allocator),
+            .focus_targets = focus_targets_mod.FocusTargets.init(allocator),
+            .motion_anchors = anchor_transition_mod.AnchorRegistry.init(allocator),
             .state_store = widget_state_mod.StateStore.init(allocator),
             .console_store = console_mod.Console.init(allocator, io, .{}),
             // GlyphRun pipeline cache, capacity 1024 = ShapingCache default watermark (tuning later
             // on perf data).
             .text = text_context.TextContext.init(allocator, 1024),
+            // Work before this window existed belongs to none of its frames.
+            .work_counters = @import("trace").work_counters.Sampler.init(),
         };
         // These constructors allocate lazily. Rebind before their first use;
         // Cx is heap-owned, so the ledger addresses survive all table growth.
-        if (@import("zenit_environment").has("ZENIT_CPU_ALLOC_PROBE")) {
+        if (@import("zenit_environment").flag("ZENIT_CPU_ALLOC_PROBE")) {
             cx.allocation_probe_enabled = true;
             for (&cx.allocation_counters) |*counter| counter.* = .{ .parent = allocator };
             cx.text = text_context.TextContext.init(cx.allocation_counters[0].allocator(), 1024);
@@ -1050,10 +1172,12 @@ pub const Cx = struct {
         cx.focus_manager.setRegistry(&cx.node_registry);
         cx.focus_manager.settled_context = cx;
         cx.focus_manager.on_focus_settled = &cx_platform.focusSettled;
+        cx.focus_manager.observer = focus_targets_mod.FocusTargets.observer(cx);
         cx.dispatcher.setRegistry(&cx.node_registry);
         cx.action_dispatcher.setRegistry(&cx.node_registry);
         cx.action_dispatcher.active_use_depth = &cx.active_use_depth;
         cx.overlay_stack.setRegistry(&cx.node_registry);
+        cx.overlay_stack.allocator = allocator;
 
         // Enable layout intrinsic cache (currently global static; v0.2-P3 dismantles Node, migrates
         // to LayoutTable per-node field). allocator = Cx.allocator, persists cross-frame.
@@ -1148,6 +1272,12 @@ pub const Cx = struct {
         // down. They can now stop without ever touching this soon-to-be-freed Cx.
         const lifetime_token = self.lifetime_token;
         lifetime_token.alive = false;
+        // Producers on other threads may keep notifying: close this window's inboxes now.
+        cx_inbox.deinit(self);
+        // Stop pending callbacks now, but keep timer storage valid until scope
+        // cleanup has cancelled its own timers. Deinit-before-scope made the
+        // ordinary onCleanup(clearTimer) path read freed ArrayList storage.
+        self.timers.clearRetainingCapacity();
 
         // Active drag cancel first: callback ctx may be held by scope about to destroy, reversed
         // order = UAF (docs/DRAG_INTERACTION_DESIGN.md sect 11.2).
@@ -1204,10 +1334,13 @@ pub const Cx = struct {
         }
         self.scroll_ctx_cells.deinit(self.allocator);
 
-        self.overlay_stack.clear();
+        self.overlay_stack.deinit();
         self.console_store.deinit();
         self.text.deinit();
         self.state_store.deinit();
+        self.focus_manager.observer = null;
+        self.focus_targets.deinit();
+        self.motion_anchors.deinit();
         lifetime_token.focus_manager_alive = false;
         self.focus_manager.deinit();
         self.dispatcher.deinit();
@@ -1239,13 +1372,21 @@ pub const Cx = struct {
         self.inspector.deinitTraceStore(self.allocator);
         self.frame_arena.deinit();
         self.lowering.deinit(self.allocator);
+        self.sprites.deinit(self.allocator);
 
         // intrinsic cache free
         layout_engine.disableIntrinsicCache();
 
+        // Cx services outlive every app scope and node (all gone above) and go before their owner.
+        if (self.service_scope) |scope| {
+            self.theme_signal = null;
+            self.a11y_prefs_signal = null;
+            if (dev_preview) self.style_signal = null;
+            self.service_scope = null;
+            scope.dispose();
+        }
         self.owner.deinit();
-        // Scope/node/state cleanup may cancel component timers. Keep their
-        // storage alive until every owner has released its callbacks.
+        // Owner teardown may still run scope cleanups that cancel timers.
         self.timers.deinit(self.allocator);
         // Last: root scope / node tree destroy calls component deinit (e.g. editor), unregister
         // callbacks.
@@ -1295,17 +1436,16 @@ pub const Cx = struct {
         self.state_store = widget_state_mod.StateStore.init(self.allocator);
         // Reset OverlayStack
         self.overlay_stack.clear();
+        // Activation marks compare against the stack's orders, which restart.
+        self.scroll_latch_mark = 0;
+        self.wheel_latch_mark = 0;
         // Reset EventDispatcher, clear dangling pointers to destroyed nodes
         self.dispatcher.clearPersistentState();
         // Reset FocusManager, clear dangling pointers to destroyed nodes
         self.focus_manager.current_focus = null;
         self.focus_manager.current_focus_handle = null;
         self.focus_manager.focus_order.clearRetainingCapacity();
-        self.focus_manager.scope_count = 0;
-        self.focus_manager.scope_stack = @as([64]?*Node, @splat(null));
-        self.focus_manager.scope_stack_handles = @as([64]?NodeHandle, @splat(null));
-        self.focus_manager.scope_memory = @as([64]?u32, @splat(null));
-        self.focus_manager.scope_memory_handles = @as([64]?NodeHandle, @splat(null));
+        self.focus_manager.resetScopes();
         // Reset Cx's own node state fields
         self.pressed_node = null;
         self.pressed_handle = null;
@@ -1344,7 +1484,12 @@ pub const Cx = struct {
         // already-!*Node function = turns one propagable alloc failure into process abort. Consumer
         // downstream editor tried OOM injection on MdEditor.mount per-allocation: signal 6, stack
         // top = this line. Switch to fallible version, propagate.
-        (try portal.style.ensureExtFallible(self.allocator)).z_index = WINDOW_PORTAL_Z_INDEX;
+        const portal_ext = try portal.style.ensureExtFallible(self.allocator);
+        portal_ext.z_index = WINDOW_PORTAL_Z_INDEX;
+        // Same as the runtime's portal (zenit_app/runtime.zig): the full-window layer itself takes
+        // no hits — only the floating content in it does. Otherwise it is the topmost
+        // window-chrome hit everywhere and hides every windowRegion under it.
+        portal_ext.hit_behavior = .children_only;
         try root_node.appendChild(self.allocator, portal);
         self.popover_portal_root = portal;
         self.checkPopoverPortalAncestry(portal);
@@ -1521,6 +1666,21 @@ pub const Cx = struct {
         return cx_platform.notifyAccessibilityPropertyChange(self, node);
     }
 
+    /// Reserve key chords for this window (docs/RESERVED_KEY_CHORDS.md): a
+    /// reserved key-down still arrives as a key event, but the platform input
+    /// method never interprets it, so it produces no text (macOS: ⌥] would
+    /// otherwise type ‘ in the same keystroke). Replaces the previous set;
+    /// empty clears; at most 32 (more are ignored). Matching is exact on key
+    /// and Shift/Control/Option/Command. An active IME composition still
+    /// receives every key. Reserve only while the chord means a command (e.g.
+    /// while an inline suggestion is visible), so layouts that type brackets
+    /// with Option keep working otherwise. Returns false when the platform
+    /// has no such hook (Windows/Linux: Alt chords make no IME text) or no
+    /// system SDK is attached (tests). UI thread.
+    pub fn setReservedKeyChords(self: *Cx, chords: []const events_mod.KeyChord) bool {
+        return cx_platform.setReservedKeyChords(self, chords);
+    }
+
     /// Update IME candidate anchor (window logical pixels, top-left origin)
     pub fn setImeCursorRect(self: *Cx, x: f32, y: f32, width: f32, height: f32) bool {
         return cx_platform.setImeCursorRect(self, x, y, width, height);
@@ -1533,6 +1693,9 @@ pub const Cx = struct {
     /// Callback adapter for text_core.WrapMap APIs taking erased context pointer.
     ///
     /// Warning: context must be *Cx (not *TextContext), all call sites pass cx.
+    pub fn measureMonoTextWidthCallback(context: *anyopaque, text_ptr: [*]const u8, text_len: usize, font_size: f32, font_weight: u16, italic: bool) f32 {
+        return cx_platform.measureMonoTextWidthCallback(context, text_ptr, text_len, font_size, font_weight, italic);
+    }
     pub fn measureTextWidthCallback(
         context: *anyopaque,
         text_ptr: [*]const u8,
@@ -1588,6 +1751,22 @@ pub const Cx = struct {
         return cx_node_lifetime.detachChildRetained(self, parent, child);
     }
 
+    /// Ask the open popovers / menus / hints that hang off `subtree` (trigger or anchor inside
+    /// it, and their own children) to close; `OverlayStack.dismissLayersFrom`. For an owner about
+    /// to hide or move the subtree.
+    pub fn dismissOverlaysFrom(self: *Cx, subtree: *Node) usize {
+        const count = self.overlay_stack.dismissLayersFrom(subtree);
+        if (count != 0) self.requestRedraw();
+        return count;
+    }
+
+    /// Move a live subtree to another place in the tree as one operation: keyboard focus, the
+    /// native text-input session and node identities are kept, pointer-bound input state ends.
+    /// Full contract: `cx_node_lifetime.moveChildRetained`.
+    pub fn moveChildRetained(self: *Cx, child: *Node, new_parent: *Node, before: ?*Node) cx_node_lifetime.MoveError!void {
+        return cx_node_lifetime.moveChildRetained(self, child, new_parent, before);
+    }
+
     pub fn freeNode(self: *Cx, node: *Node) void {
         self.beginActiveUse();
         defer self.endActiveUse();
@@ -1622,7 +1801,7 @@ pub const Cx = struct {
     /// recursion.
     ///
     /// Key order: **invalidateSubtreeHookState before clearNodeScopes**. Invalidate breaks both
-    /// directions (clears node.hooks.slots.animated_bg_state and sets anim_state.node=null).
+    /// directions (clears the node's hook slots and the hook state's node back-pointer).
     /// clearNodeScopes = unidirectional node->ptr only, reverse: invalidate sees
     /// node.hooks.slots==null skips, anim_state still holds dangling node*, later hook scope
     /// dispose calls destroyFn -> deref freed node -> SEGV.
@@ -1804,6 +1983,11 @@ pub const Cx = struct {
     /// yet) defer until the first assistive query.
     pub fn syncOrDeferA11yProjection(self: *Cx, root: *Node) void {
         return cx_a11y.syncOrDeferA11yProjection(self, root);
+    }
+
+    /// Project now if the last frame deferred projection (on-demand mode).
+    pub fn projectA11yIfStale(self: *Cx) void {
+        return cx_a11y.projectA11yIfStale(self);
     }
 
     // Whole-tree health check: LayoutTable and Node.rect strictly consistent.
@@ -2065,7 +2249,9 @@ pub const Cx = struct {
 
     pub fn setWindowMetrics(self: *Cx, width: f32, height: f32, scale: f32) void {
         self.viewport = Size.init(width, height);
-        self.window_scale = if (scale > 0) scale else 1.0;
+        const next_scale = if (scale > 0) scale else 1.0;
+        if (self.window_scale != next_scale) text_layout.invalidateMeasureCache();
+        self.window_scale = next_scale;
         self.needs_redraw = true;
         if (self.root) |r| {
             r.markLayoutDirty();
@@ -2105,41 +2291,86 @@ pub const Cx = struct {
         for (n.children.items) |c| invalidateForA11yPreferences(c);
     }
 
-    /// Accessibility preference Signal (lazy-created, lifetime rules match themeSignal). Components
-    /// use to switch high-contrast tokens, non-color graphic markers, etc.
-    pub fn a11yPreferencesSignal(self: *Cx, scope: *Scope) !*Signal(a11y_preferences.Preferences) {
+    /// Accessibility preference Signal (created on first use; a Cx service like `themeSignal`).
+    /// Components use it to switch high-contrast tokens, non-color graphic markers, etc.
+    pub fn a11yPreferencesSignal(self: *Cx) !*Signal(a11y_preferences.Preferences) {
         if (self.a11y_prefs_signal) |sig| return sig;
-        const sig = try scope.createSignal(a11y_preferences.Preferences, a11y_preferences.current());
-        try scope.onCleanup(Cx, self, struct {
-            fn unbind(cx: *Cx) void {
-                cx.a11y_prefs_signal = null;
-            }
-        }.unbind);
+        if (comptime dev_preview) if (@import("preview_mount.zig").current != null) return error.TemplateCandidateSideEffects;
+        const sig = try (try self.serviceScope()).createSignal(a11y_preferences.Preferences, a11y_preferences.current());
         self.a11y_prefs_signal = sig;
         return sig;
     }
 
+    /// Preview invalidation is independent of theme identity. A Cx service like `themeSignal`.
+    pub fn prepareStyleGeneration(self: *Cx) !void {
+        if (!dev_preview) return;
+        _ = try self.styleGenerationSignal();
+    }
+
+    pub fn styleGenerationSignal(self: *Cx) !*Signal(u64) {
+        if (!dev_preview) unreachable;
+        if (self.style_signal) |sig| return sig;
+        if (comptime dev_preview) if (@import("preview_mount.zig").current != null) return error.TemplateCandidateSideEffects;
+        const sig = try (try self.serviceScope()).createSignal(u64, self.style_generation);
+        self.style_signal = sig;
+        return sig;
+    }
+
+    /// Reserve propagation work before publishing a preview transaction. Existing
+    /// dependencies keep their capacity, and shape validation forbids new ones.
+    pub fn reserveStyleNotification(self: *Cx) !void {
+        if (!dev_preview) return;
+        const g = &self.owner.graph;
+        const n = g.nodes.items.len;
+        try g.propagation_stack.ensureTotalCapacity(g.allocator, n);
+        try g.pending_effects.ensureTotalCapacity(g.allocator, n);
+        try g.drain_buffer.ensureTotalCapacity(g.allocator, n);
+        try g.tracking_stack.ensureTotalCapacity(g.allocator, n + g.tracking_stack.items.len + 1);
+    }
+
+    /// Called once per window at the same UI safe point, before any frame renders.
+    pub fn publishStyleGeneration(self: *Cx, generation: u64) void {
+        if (!dev_preview) return;
+        self.style_generation = generation;
+        self.needs_redraw = true;
+        if (self.style_signal) |sig| sig.set(generation);
+    }
+
     pub fn setTheme(self: *Cx, t: *const theme.ThemeTokens) void {
         if (self.tokens == t) return;
+        if (dev_preview) self.owner.beginReactiveCallback();
+        defer if (dev_preview) self.owner.endReactiveCallback();
+        // Signal subscribers and the replay restyle retained nodes, starting their transitions:
+        // run them on this window's clock, not whichever window rendered last.
+        const outer_clock = self.bindThemeClock();
+        defer if (outer_clock) |outer| render_engine.restoreFrameClock(outer);
         self.tokens = t;
         self.theme_version +%= 1;
+        const replay_version = self.theme_version;
         if (self.theme_signal) |sig| sig.set(t);
+        // A signal subscriber may synchronously choose another theme. Its complete
+        // replay wins; never start an older replay after returning from it.
+        if (dev_preview and self.theme_version != replay_version) return;
         self.replayThemeRoots(t);
         self.needs_redraw = true;
     }
 
-    /// Replay the current theme on a live retained branch that missed setTheme
-    /// while detached. Does not republish theme signals or rebuild its state.
-    pub fn replaySubtreeTheme(self: *Cx, root: *Node) void {
-        invokeThemeHookRecursive(root, self.tokens, self.allocator);
-        self.requestRedraw();
+    /// Theme publication outside this Cx's frame (a host or app call, possibly while another
+    /// window's clock is bound) binds this window's event clock like a host entry; returns the
+    /// clock to restore. Inside this Cx's own render tick the frame clock is already bound.
+    fn bindThemeClock(self: *const Cx) ?render_engine.SavedFrameClock {
+        if (self.tick_depth > 0) return null;
+        const outer = render_engine.saveFrameClock();
+        self.bindEventClock();
+        return outer;
     }
 
     fn replayThemeRoots(self: *Cx, t: *const theme.Values) void {
+        const replay_version = self.theme_version;
         const refs = @import("overlay_layer_refs.zig");
         // A layer may share the app tree or another layer's ancestor. Replay
         // each tree once, including retained/suspended and rootless portals.
-        const capacity = 2 + 2 * @typeInfo(@TypeOf(self.overlay_stack.layers)).array.len;
+        const capacity = 2 + 2 * OverlayStack.MAX_LAYERS;
         var roots: [capacity]*Node = undefined;
         var handles: [capacity]?NodeHandle = undefined;
         var count: usize = 0;
@@ -2147,7 +2378,7 @@ pub const Cx = struct {
         candidates[0] = self.root;
         candidates[1] = self.popover_portal_root;
         var n: usize = 2;
-        for (self.overlay_stack.layers) |maybe| if (maybe) |layer| {
+        for (self.overlay_stack.layers.items) |maybe| if (maybe) |layer| {
             candidates[n] = layer.content_node;
             candidates[n + 1] = layer.barrier_node;
             n += 2;
@@ -2168,48 +2399,72 @@ pub const Cx = struct {
         // Hooks in an earlier tree can close a later overlay. Validate its
         // generation before dereferencing the captured pointer.
         for (roots[0..count], handles[0..count]) |root, handle| {
+            if (dev_preview and self.theme_version != replay_version) return;
             if (refs.resolveTrackedNode(&self.node_registry, handle, root)) |live|
-                invokeThemeHookRecursive(live, t, self.allocator);
+                if (dev_preview) self.invokePreviewThemeHooks(live, t, replay_version) else self.invokeThemeHookRecursive(live, t, self.allocator);
         }
     }
 
-    /// Get (lazy-create) theme Signal. Lifetime tied to the passed scope (typically app root);
-    /// invalid
-    /// after scope.dispose(). The cache must invalidate with **the Scope that created it**:
-    /// `createSignal`
-    /// builds the Signal on the passed scope (`createInScope`), but `theme_signal` is a **global**
-    /// Cx cache
-    /// and the first subscriber is often a component/panel scope; once it closes the cache dangles
-    /// and
-    /// both `get()` and `setTheme()` are UAF. Registers a resource on the same scope whose dispose
-    /// clears
-    /// the cache. Registration comes after the last fallible op; if it fails, don't cache (rebuild
-    /// next
-    /// time; see [[register-must-follow-last-fallible-step]]).
-    pub fn themeSignal(self: *Cx, scope: *Scope) !*Signal(*const theme.ThemeTokens) {
+    /// The theme Signal (created on first use): every Effect / Memo that reads it re-runs on
+    /// `setTheme`. It is a Cx service: owned by the Cx (`serviceScope`), so it lives exactly as
+    /// long as the Cx, no matter which window, panel or component asked for it first. A window
+    /// that replaces another on the same Cx keeps reading the same live Signal.
+    pub fn themeSignal(self: *Cx) !*Signal(*const theme.ThemeTokens) {
         if (self.theme_signal) |sig| return sig;
-        const sig = try scope.createSignal(*const theme.ThemeTokens, self.tokens);
-
-        // Use **onCleanup (disposeNow step 2) not registerResource (step 5)**. disposeNow order:
-        //   1 child scopes -> 2 cleanups -> 3 effects -> 4 **destroy signals** -> 5 resources
-        // Resource cleanup happens after Signal destruction. Steps 3-4 run user callbacks (effect
-        // destroy, etc.); any re-calls themeSignal hit unflushed cache -> dangling pointer.
-        // Cross-review (glm-5.3) identified this transient window; order confirmed on measured
-        // disposeNow sequence.
-        try scope.onCleanup(Cx, self, struct {
-            fn unbind(cx: *Cx) void {
-                // Identity check: clear cache only if still pointing to ours. Current mechanism:
-                // cache non-null -> early return, never overwritten; this branch unreachable. Kept
-                // as future safeguard if explicit rebuild allowed.
-                cx.theme_signal = null;
-            }
-        }.unbind);
-
+        if (comptime dev_preview) if (@import("preview_mount.zig").current != null) return error.TemplateCandidateSideEffects;
+        const sig = try (try self.serviceScope()).createSignal(*const theme.ThemeTokens, self.tokens);
         self.theme_signal = sig;
         return sig;
     }
 
-    fn invokeThemeHookRecursive(n: *Node, t: *const theme.ThemeTokens, allocator: std.mem.Allocator) void {
+    /// Scope owning the Cx-wide reactive services (theme, accessibility preferences, preview
+    /// style generation). Created on first use, disposed by `deinit` after every app scope and
+    /// node is gone and before the signal owner. App scopes never own these signals: a holder
+    /// in one scope must not lose them when an unrelated scope (the first caller's window or
+    /// panel) is disposed.
+    fn serviceScope(self: *Cx) !*Scope {
+        if (self.service_scope) |scope| return scope;
+        const scope = try Scope.init(self.allocator, null, self.owner);
+        self.service_scope = scope;
+        return scope;
+    }
+
+    /// Callbacks can unmount their tree. Deferred disposal keeps memory alive;
+    /// pending destruction stops further callbacks, and child lists are reread.
+    fn invokePreviewThemeHooks(self: *Cx, n: *Node, inherited: *const theme.ThemeTokens, replay_version: u64) void {
+        if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+        const t = if (n.meta.ownership.color_scheme) |scheme| self.schemeTokens(scheme) else inherited;
+        if (n.meta.per_frame.hooks.before_render.main) |hook| hook(n);
+        if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+        var h: usize = 0;
+        while (h < n.meta.per_frame.hooks.before_render.count) : (h += 1) {
+            if (n.meta.per_frame.hooks.before_render.hooks[h]) |hook| hook(n);
+            if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+        }
+        n.replayThemeDeclaration(t, self.allocator);
+        if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+        var replay = n.meta.per_frame.hooks.view_theme;
+        while (replay) |r| {
+            const next = r.next;
+            r.run(r, t);
+            if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+            replay = next;
+        }
+        n.markRenderDirty();
+        n.markCompositeDirty();
+        var i: usize = 0;
+        while (i < n.children.items.len) {
+            const child = n.children.items[i];
+            self.invokePreviewThemeHooks(child, t, replay_version);
+            if (self.theme_version != replay_version or n.freeing or n.pending_free_cx != null) return;
+            if (i < n.children.items.len and n.children.items[i] == child) i += 1;
+        }
+    }
+
+    fn invokeThemeHookRecursive(self: *const Cx, n: *Node, inherited: *const theme.ThemeTokens, allocator: std.mem.Allocator) void {
+        // A subtree with a fixed colour scheme replays with that scheme's tokens (all its hooks,
+        // named style functions and view-layer styles), whatever the inherited tokens are.
+        const t = if (n.meta.ownership.color_scheme) |scheme| self.schemeTokens(scheme) else inherited;
         if (n.meta.per_frame.hooks.before_render.main) |hook| {
             hook(n);
         }
@@ -2217,9 +2472,8 @@ pub const Cx = struct {
             if (maybe) |hook| hook(n);
         }
         // setTheme-only theme replay (boxStyled/textStyled named style functions).
-        if (n.meta.per_frame.hooks.on_theme) |hook| {
-            hook(n, t, allocator);
-        }
+        // Inline writes stay above the declaration (setTheme-only replay of named style fns).
+        n.replayThemeDeclaration(t, allocator);
         var replay = n.meta.per_frame.hooks.view_theme;
         while (replay) |r| {
             replay = r.next;
@@ -2227,9 +2481,24 @@ pub const Cx = struct {
         }
         n.markRenderDirty();
         n.markCompositeDirty();
-        for (n.children.items) |c| {
-            invokeThemeHookRecursive(c, t, allocator);
+        // A hook can attach, detach or reparent nodes (an open Popover / Tooltip moving its
+        // floating content during the replay), shrinking or reallocating this list: reread it
+        // every step, never a captured slice (same rule as invokePreviewThemeHooks).
+        var i: usize = 0;
+        while (i < n.children.items.len) {
+            const child = n.children.items[i];
+            self.invokeThemeHookRecursive(child, t, allocator);
+            if (n.freeing or n.pending_free_cx != null) return;
+            if (i < n.children.items.len and n.children.items[i] == child) i += 1;
         }
+    }
+
+    /// Whether what the user is interacting with (focus, a press, pointer capture, a drag, a
+    /// scroll / magnify gesture, an open layer opened from it) lies in `node`'s subtree. Ask before
+    /// hiding a subtree outside the viewport or recycling it. Pure. See
+    /// core/cx_node_lifetime.zig `isUserRelevant`.
+    pub fn isUserRelevant(self: *Cx, node: *const Node) bool {
+        return cx_node_lifetime.isUserRelevant(self, node);
     }
 
     // ---- Pointer Capture ----
@@ -2250,6 +2519,14 @@ pub const Cx = struct {
         self.beginActiveUse();
         defer self.endActiveUse();
         self.focus_manager.setFocus(node);
+    }
+
+    /// Run pending declarative focus work (autoFocus, focusRequest, focusRestore) whose target
+    /// is now ready. Cx.render calls this at frame start; hosts and tests may call it directly.
+    pub fn settlePendingFocus(self: *Cx) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
+        self.focus_targets.settle(self);
     }
 
     pub fn clearFocus(self: *Cx) void {
@@ -2321,10 +2598,53 @@ pub const Cx = struct {
     }
 
     pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
+        self.handlePointerMove(x, y, modifiers, false);
+    }
+
+    /// Compatibility mouse motion from a touch contact still drives drags,
+    /// while hover requires a hover-capable device.
+    pub fn handlePointerMove(self: *Cx, x: f32, y: f32, modifiers: Modifiers, from_touch: bool) void {
         self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
-        return cx_input.handleMouseMoveEx(self, x, y, modifiers);
+        return cx_input.handlePointerMove(self, x, y, modifiers, from_touch);
+    }
+
+    /// The platform reports the pointer is no longer over this window's visible content (macOS
+    /// content tracking-area exit, including another window covering it; Windows WM_MOUSELEAVE;
+    /// Wayland wl_pointer.leave). Clears hover and stops stationary re-resolution until the next
+    /// pointer event; the last position no longer describes the pointer.
+    pub fn handlePointerLeave(self: *Cx) void {
+        self.input_epoch +%= 1;
+        const host = self.enterHost();
+        defer self.exitHost(host);
+        return cx_hover.handlePointerLeave(self);
+    }
+
+    /// The last pointer position describes where the pointer is now: reported by the platform, no
+    /// leave since, no OS drag session, inside the content. Components that hit-test
+    /// `mouse_x`/`mouse_y` themselves (outside the hover dispatch) must gate on this, or they keep
+    /// acting on a pointer that left the window or is under another window.
+    pub fn pointerLive(self: *const Cx) bool {
+        return cx_hover.pointerLive(self);
+    }
+
+    /// Re-resolve hover under a stationary pointer when the committed hit scene changed since
+    /// hover was last resolved (scroll, layout, mount/unmount). Called by render at the start of
+    /// each frame; no hit test when nothing changed. See core/cx_hover.zig.
+    pub fn reconcileStationaryHover(self: *Cx) void {
+        if (!cx_hover.pending(self)) return;
+        const host = self.enterHost();
+        defer self.exitHost(host);
+        return cx_hover.reconcile(self);
+    }
+
+    /// `node` was just brought to rest under the pointer by a transition (AnchorTransition
+    /// expand landing). If the pointer is live and does not move, hover stays outside `node`'s
+    /// subtree; the first pointer event at another position resolves hover normally again.
+    /// Other scene changes under a stationary pointer are unaffected. See core/cx_hover.zig.
+    pub fn holdHoverOutsideLanded(self: *Cx, node: *Node) void {
+        cx_hover.holdLanded(self, node);
     }
 
     /// Unified cancel of in-progress pointer interactions (drag session + gesture recognizers).
@@ -2404,6 +2724,11 @@ pub const Cx = struct {
     }
 
     pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
+        _ = self.handleKeyDownConsumed(key, modifiers);
+    }
+
+    /// handleKeyDown that reports whether anything consumed the key.
+    pub fn handleKeyDownConsumed(self: *Cx, key: KeyCode, modifiers: Modifiers) bool {
         self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
@@ -2479,6 +2804,13 @@ pub const Cx = struct {
     }
 
     pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
+        _ = self.handleScrollConsumed(scroll);
+    }
+
+    /// handleScroll that reports whether the scroll was used: it moved something, or it was aimed at
+    /// an overlay layer (contained) or was the dropped rest of a gesture. A web host lets the browser
+    /// handle a scroll that was not used.
+    pub fn handleScrollConsumed(self: *Cx, scroll: events_mod.ScrollEvent) bool {
         self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
@@ -2490,7 +2822,7 @@ pub const Cx = struct {
         self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
-        return cx_input.handleScroll(self, cx_input.scrollEventFromSdk(wheel));
+        _ = cx_input.handleScroll(self, cx_input.scrollEventFromSdk(wheel));
     }
 
     /// Pinch gesture: dispatch by pointer hit to target node (bubbles). Target locked at began,
@@ -2537,12 +2869,32 @@ pub const Cx = struct {
 
     // ---- Hit testing ----
 
+    /// Web DOM host with browser layout: the browser hit-tests (CSS boxes, clip,
+    /// stacking, pointer-events) and passes the stack of mirrored elements under the
+    /// point, topmost first; a pointer/scroll query resolves to the first whose proxy
+    /// answers that query kind. `geometric_fallback` (a canvas island is in the
+    /// stack): when no DOM node answers, zenit hit-tests the coordinates.
+    pub fn setHostHitStack(self: *Cx, enabled: bool, stack: []const *Node, geometric_fallback: bool) void {
+        self.host_hit_enabled = enabled;
+        self.host_hit_fallback = geometric_fallback;
+        const n = @min(stack.len, self.host_hit_stack.len);
+        for (stack[0..n], 0..) |node, i| self.host_hit_stack[i] = self.node_registry.handleFor(node);
+        self.host_hit_len = @intCast(n);
+    }
+
     pub fn hitTestQuery(self: *Cx, query: HitQuery) ?HitResult {
         // The scene is being mutated. Reentering hooks can recurse forever,
         // and the previous index may still contain retiring nodes. The outer
         // refresh publishes the next usable scene when it finishes.
         if (self.tick_depth > 0 or self.draining_deferred_frees) return null;
         cx_render.ensureHitTestSceneFresh(self);
+        self.input_perf.in_hit_queries += 1;
+        if (self.host_hit_enabled and query.capture_override == null and (query.kind == .pointer or query.kind == .scroll)) {
+            for (self.host_hit_stack[0..self.host_hit_len]) |h| {
+                if (self.interaction_index.hostTargetHit(h, query, &self.node_registry)) |hit| return hit;
+            }
+            if (!self.host_hit_fallback) return null;
+        }
         return self.interaction_index.hitTestQuery(query, &self.node_registry, &self.perf);
     }
 
@@ -2561,6 +2913,11 @@ pub const Cx = struct {
             if (signal.peek().effective_mode != .native) cx_render.ensureHitTestSceneFresh(self);
         }
     }
+    /// Legacy `.custom_inset` title bar: is (x, y) on a control (dispatch the click) rather than
+    /// empty space (drag the window)? Any pointer or scroll target counts as a control. This path
+    /// does not read `window_region`: regions (Yix `windowRegion`) belong to the window chrome
+    /// API (`WindowConfig.chrome`, `windowRegionAt`), which is what an application declaring drag
+    /// regions should use.
     pub fn legacyWindowControlAt(self: *Cx, x: f32, y: f32) bool {
         if (self.tick_depth > 0 or self.draining_deferred_frees) return true;
         inline for (.{ HitQueryKind.pointer, HitQueryKind.scroll }) |kind| {
@@ -2620,9 +2977,16 @@ pub const Cx = struct {
     pub fn advanceFrameClock(self: *Cx) void {
         return cx_frame.advanceFrameClock(self);
     }
+    /// Fixed-step/manual animation time is the sole clock while a harness
+    /// controls it. A screenshot's real display tick must not advance poses.
+    pub fn setFramePresentationSample(self: *Cx, sample: ?PresentationSample) void {
+        self.frame_presentation_sample = if (self.test_frame_step_ms != null) null else sample;
+    }
+
     pub fn setTestFrameStep(self: *Cx, step: ?f32) !void {
         if (step) |ms| if (!std.math.isFinite(ms) or ms < 1 or ms > 100) return error.InvalidFrameStep;
         self.test_frame_step_ms = step;
+        self.frame_presentation_sample = null;
         if (step == null) self.test_clock_budget_ms = null;
         self.clock_time_offset_ms = self.frame_time_ms;
         self.clock_epoch = null;
@@ -2742,6 +3106,11 @@ pub const Cx = struct {
         return cx_frame.hasPendingWork(self);
     }
 
+    /// Time until the earliest `setTimer` callback is due (0 = overdue); null with none pending.
+    pub fn nextTimerDelayNs(self: *const Cx) ?u64 {
+        return cx_frame.nextTimerDelayNs(self);
+    }
+
     /// Idle frame-gate unified criterion: does this wake need to render one frame.
     /// First consumes expired scheduleRedrawAfterNs deadline (sets needs_redraw).
     /// needs_redraw edge consumption at advanceFrameClock (after clock read); caller **must not**
@@ -2814,14 +3183,98 @@ pub const Cx = struct {
         return cx_render.render(self);
     }
 
-    /// Call after a large view retires and the window has become idle. Keep
-    /// live commands, fonts and node caches; reset scratch at its normal frame
-    /// boundary so no encoder/paint payload can outlive its storage.
+    /// Call after a large view retires and the window has become idle.
+    /// Releases spare display-item capacity now and shrinks the frame arena
+    /// and display payload arena to `retain_bytes` at their next normal frame
+    /// boundary (so no encoder/paint payload can outlive its storage). Live
+    /// commands, fonts and node caches are kept. Returns the bytes released now.
     pub fn trimIdleRenderCapacity(self: *Cx, retain_bytes: usize) usize {
-        const released = self.display_list.trimIdleCapacity(retain_bytes);
+        var released = self.display_list.trimIdleCapacity(retain_bytes);
+        // The long-text line scratch keeps the longest layout's capacity between frames.
+        released += self.world.layout_output.trimLineScratch(retain_bytes);
         self.idle_scratch_limit = retain_bytes;
         self.scheduleRedrawAfterNs(1);
         return released;
+    }
+
+    /// Replay the current theme on a live retained branch that missed setTheme
+    /// while detached. Does not republish theme signals or rebuild its state.
+    /// The branch replays with `tokensFor(root)`: a branch inside (or rooted at) a subtree with a
+    /// fixed colour scheme gets that scheme's tokens.
+    pub fn replaySubtreeTheme(self: *Cx, root: *Node) void {
+        const outer_clock = self.bindThemeClock();
+        defer if (outer_clock) |outer| render_engine.restoreFrameClock(outer);
+        const t = self.tokensFor(root);
+        if (dev_preview) self.invokePreviewThemeHooks(root, t, self.theme_version) else self.invokeThemeHookRecursive(root, t, self.allocator);
+        self.requestRedraw();
+    }
+
+    // ---- Fixed colour scheme for a subtree ----
+    //
+    // `setColorScheme(node, .dark)` makes a subtree resolve against the dark scheme's tokens
+    // regardless of the app theme (a panel floating over remote video, a preview of the other
+    // scheme). Theme replay (setTheme, setSchemeTokens, replaySubtreeTheme) hands the subtree the
+    // scheme's tokens: on_theme hooks, named style functions (boxStyled / textStyled) and
+    // view-layer styles all resolve against them. Known limits: nodes built while detached resolve
+    // against `cx.tokens` until the next replay of their branch (call `replaySubtreeTheme` after
+    // appending; Popover does it when it opens). View-layer styles (`ui.view` / Yix style, text style,
+    // tint) and Select resolve with `tokensFor` both in their effects and in replays, so native
+    // controls follow the scheme, hover included. Effects that read `themeSignal()` directly and
+    // paint from it still see the app theme (Tooltip / TooltipSurface / ComboBox / InlineHint
+    // internals, app Effects): read `tokensFor(node)` there. A Popover opened from inside a fixed
+    // subtree inherits its scheme (its content is portaled, not under the fixed node).
+
+    /// Register the app's tokens for `scheme` (null restores zenit's generated scheme tokens), then
+    /// replay every tree so subtrees fixed to that scheme pick them up. Like `setTheme`, a change
+    /// is detected by address: publish changed tokens at a new address (double buffer), not by
+    /// rewriting the registered ones in place. Order against `setTheme` does not matter: effects
+    /// and replays resolve each node with `tokensFor`, whichever call comes last repaints.
+    pub fn setSchemeTokens(self: *Cx, scheme: theme.ColorScheme, tokens: ?*const theme.ThemeTokens) void {
+        const slot = &self.scheme_tokens[@intFromEnum(scheme)];
+        if (slot.* == tokens) return;
+        slot.* = tokens;
+        if (dev_preview) self.owner.beginReactiveCallback();
+        defer if (dev_preview) self.owner.endReactiveCallback();
+        const outer_clock = self.bindThemeClock();
+        defer if (outer_clock) |outer| render_engine.restoreFrameClock(outer);
+        self.replayThemeRoots(self.tokens);
+        self.needs_redraw = true;
+    }
+
+    /// The tokens a subtree fixed to `scheme` resolves against.
+    pub fn schemeTokens(self: *const Cx, scheme: theme.ColorScheme) *const theme.ThemeTokens {
+        return self.scheme_tokens[@intFromEnum(scheme)] orelse switch (scheme) {
+            .light => &theme.light,
+            .dark => &theme.dark,
+        };
+    }
+
+    /// The tokens `node` resolves against: the nearest fixed ancestor's (or its own) scheme
+    /// tokens, else the app theme.
+    pub fn tokensFor(self: *const Cx, node: *const Node) *const theme.ThemeTokens {
+        var current: ?*const Node = node;
+        while (current) |n| : (current = n.parent) {
+            if (n.meta.ownership.color_scheme) |scheme| return self.schemeTokens(scheme);
+        }
+        return self.tokens;
+    }
+
+    /// The colour scheme `node` resolves against: its own or its nearest fixed ancestor's, null
+    /// when it follows the app theme.
+    pub fn colorSchemeOf(self: *const Cx, node: *const Node) ?theme.ColorScheme {
+        _ = self;
+        var current: ?*const Node = node;
+        while (current) |n| : (current = n.parent) {
+            if (n.meta.ownership.color_scheme) |scheme| return scheme;
+        }
+        return null;
+    }
+
+    /// Fix (or with null, release) the colour scheme of `node`'s subtree and replay it at once.
+    pub fn setColorScheme(self: *Cx, node: *Node, scheme: ?theme.ColorScheme) void {
+        if (node.meta.ownership.color_scheme == scheme) return;
+        node.meta.ownership.color_scheme = scheme;
+        self.replaySubtreeTheme(node);
     }
 
     /// Encoder consumes paint_table.DisplayItem. Lowering phase already double-writes to
@@ -2834,12 +3287,23 @@ pub const Cx = struct {
         return cx_render.lowerForEncoderPaintTable(self);
     }
 
+    /// Advances whenever a hit layer moves (a scroll offset change); see
+    /// node_dirty.g_hit_layer_motion_gen.
+    pub fn layerMotionGen(self: *const Cx) u64 {
+        _ = self;
+        return @import("core/node_dirty.zig").g_hit_layer_motion_gen;
+    }
+
     pub fn scheduleRedrawAfterNs(self: *Cx, delay_ns: u64) void {
         return cx_render.scheduleRedrawAfterNs(self, delay_ns);
     }
 
     /// Declare during before-render. Does not request an ordinary scene redraw.
     pub fn setBlinkCaretPhase(self: *Cx, visible: bool, remaining_ns: u64, half_ns: u64) void {
+        if (!self.window_active) {
+            self.caret_phase_valid = false;
+            return;
+        }
         if (half_ns == 0) return;
         self.caret_phase_valid = true;
         self.caret_visible = visible;
@@ -2848,11 +3312,13 @@ pub const Cx = struct {
     }
 
     pub fn blinkCaretVisible(self: *const Cx, normal: bool) bool {
+        if (!self.window_active) return false;
         return self.caret_paint_override orelse normal;
     }
 
     /// Scene-space visible portion, declared even when paint is hidden.
     pub fn addBlinkCaretRect(self: *Cx, rect: [4]f32) void {
+        if (!self.window_active) return;
         for (rect) |v| if (!std.math.isFinite(v)) return;
         if (rect[2] <= 0 or rect[3] <= 0) return;
         if (self.caret_rect_count == self.caret_rects.len) {
@@ -2867,6 +3333,53 @@ pub const Cx = struct {
         return cx_render.processScheduledRedraw(self);
     }
 
+    /// How a laid-out text node falls short of showing all of its content (ellipsized / clipped
+    /// single line, `max_lines` clamp, overflowing wrapped line); null when it cannot be told yet.
+    /// See `layout_engine.textTruncation`.
+    pub fn textTruncation(self: *Cx, node: *const Node) ?layout_engine.TextTruncation {
+        return layout_engine.textTruncation(&self.text, node);
+    }
+
+    /// Frame-first delivery (docs/design/append-inbox.md). Main thread. While `scope` lives,
+    /// `on_notify` runs on the main thread after `Inbox.notify()` (from any thread): in this
+    /// window's next frame **before its first layout** (`deliverInboxes`), as a host entry inside
+    /// one owner batch, so it may write signals (`set` / `append`) and change the tree and that
+    /// frame lays it out. Notifications before the call coalesce; a notify during the call is
+    /// delivered next time. Only this window is asked to render. Disposing `scope` (or destroying
+    /// the window) closes the inbox: later notifies do nothing. A window that renders no frames
+    /// (occluded, minimized) still delivers, at most once per display period.
+    pub fn createInbox(self: *Cx, scope: *Scope, on_notify: HandlerRef) !Inbox {
+        return cx_inbox.createInbox(self, scope, on_notify);
+    }
+
+    /// Host frame phase: run the notified inboxes' callbacks. A host calls it in its ordinary
+    /// frame path before `advanceFrameClock` / `layout` (where it also drains deferred work),
+    /// never from a native paint callback that must not run application work. Returns the
+    /// callbacks run.
+    pub fn deliverInboxes(self: *Cx) usize {
+        return cx_inbox.deliver(self);
+    }
+
+    /// Host integration: the function `Inbox.notify` calls to wake this window's event loop.
+    /// Must be callable from any thread for the life of the process (a global function such as
+    /// `platform.Window.postEmptyEvent`). null: notifications only show up when the host next
+    /// asks `wantsFrame`.
+    pub fn setWakeHandler(self: *Cx, wake: ?*const fn () void) void {
+        cx_inbox.setWakeHandler(self, wake);
+    }
+
+    /// Some inbox of this window was notified and not yet delivered (part of `wantsFrame`).
+    pub fn inboxPending(self: *const Cx) bool {
+        return cx_inbox.pending(self);
+    }
+
+    /// For a host whose window renders no frames (occluded): null = no inbox pending, 0 = call
+    /// `deliverInboxes` now, else wake after this many ns (deliveries are paced at the display
+    /// period, as frames would be).
+    pub fn inboxDelayWhileUnrenderedNs(self: *const Cx) ?u64 {
+        return cx_inbox.delayWhileUnrenderedNs(self);
+    }
+
     /// Register post-layout callback (same ctx, single entry only).
     pub fn addAfterLayoutHook(self: *Cx, ctx: *anyopaque, run: AfterLayoutFn) !void {
         return cx_render.addAfterLayoutHook(self, ctx, run);
@@ -2878,6 +3391,12 @@ pub const Cx = struct {
 
     /// Test-only: expose rebuildRuntimeIndexes fallibility to lock 'OOM returns error (so caller
     /// @panic is not dead code)' premise. Not public API.
+    /// Bench / test switch for the translate-only hit-index path (node_dirty.markTranslationDirty).
+    /// false: translate writes mark interaction dirty and rebuild, as before that path existed.
+    pub fn setHitTranslationPathForTest(enabled: bool) void {
+        @import("core/node_dirty.zig").translation_hit_path_enabled = enabled;
+    }
+
     pub fn rebuildRuntimeIndexesForTest(self: *Cx) !void {
         return cx_runtime_index.rebuildRuntimeIndexesForTest(self);
     }
@@ -3049,6 +3568,10 @@ pub const DisplayItem = display_list_mod.DisplayItem;
 
 test {
     _ = @import("core/cx_tests.zig");
+    _ = @import("core/ime_key_routing_tests.zig");
+    _ = @import("core/cx_node_lifetime.zig");
+    _ = @import("core/inbox.zig");
+    _ = @import("core/cx_inbox_tests.zig");
     _ = @import("core/window_chrome_tests.zig");
     _ = @import("core/presentation_clock.zig");
 }

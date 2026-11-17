@@ -12,6 +12,8 @@ const Queue = @import("queue.zig").Queue;
 /// CommandEncoder - command encoder.
 ///
 /// Records GPU commands, can create RenderPass and ComputePass.
+const glass_trace = @import("glass_trace.zig");
+
 pub const CommandEncoder = struct {
     raw: *mtl.MTLCommandBuffer,
     state: State = .initial,
@@ -193,7 +195,21 @@ pub const CommandEncoder = struct {
             .encoder = encoder,
             .command_encoder = self,
             .generation = generation,
+            .trace_id = glass_trace.onBeginPass(self.raw, desc),
         };
+    }
+
+    /// A render pass with no attachments over a width x height raster
+    /// (Metal): draws write textures from their fragment functions, so one
+    /// encoder can carry independent passes into different targets.
+    pub fn beginAttachmentlessRenderPass(self: *CommandEncoder, width: u32, height: u32) !RenderPass {
+        if (self.state != .initial) return error.InvalidEncoderState;
+        if (width == 0 or height == 0) return error.InvalidTextureRegion;
+        const encoder = mtl.metal_command_buffer_create_attachmentless_render_encoder(self.raw, width, height) orelse
+            return error.RenderEncoderCreationFailed;
+        const generation = self.activatePass(.render_pass);
+        self.active_pass_raw = @ptrCast(encoder);
+        return .{ .encoder = encoder, .command_encoder = self, .generation = generation };
     }
 
     pub fn beginBlitPass(self: *CommandEncoder) !BlitPass {
@@ -214,6 +230,7 @@ pub const CommandEncoder = struct {
             dx > destination.width or width > destination.width - dx or dy > destination.height or height > destination.height - dy)
             return error.InvalidTextureRegion;
         if (mtl.metal_command_buffer_copy_texture_region_render(self.raw, source.raw, sx, sy, width, height, destination.raw, dx, dy, @intFromBool(clear)) == 0) return error.RenderCopyFailed;
+        glass_trace.onCopy(self.raw, source, sx, sy, width, height, destination, dx, dy, clear, true);
     }
 
     /// Finish encoding, return CommandBuffer.
@@ -253,6 +270,10 @@ pub const BlitPass = struct {
     encoder: *mtl.MTLBlitCommandEncoder,
     command_encoder: *CommandEncoder,
     generation: u64,
+    /// Copies recorded by the glass trace once the blit encoder has ended.
+    trace_copies: [4]?TraceCopy = @splat(null),
+
+    const TraceCopy = struct { src: resources.TextureBinding, sx: u32, sy: u32, w: u32, h: u32, dst: resources.TextureBinding, dx: u32, dy: u32 };
 
     fn assertActive(self: *const BlitPass) void {
         self.command_encoder.assertActivePass(.blit, self.generation);
@@ -282,6 +303,10 @@ pub const BlitPass = struct {
         {
             return error.InvalidTextureRegion;
         }
+        for (&self.trace_copies) |*slot| if (slot.* == null) {
+            slot.* = .{ .src = source, .sx = source_x, .sy = source_y, .w = width, .h = height, .dst = destination, .dx = destination_x, .dy = destination_y };
+            break;
+        };
         mtl.metal_blit_encoder_copy_texture_region(
             self.encoder,
             source.raw,
@@ -300,6 +325,8 @@ pub const BlitPass = struct {
         mtl.metal_blit_encoder_end_encoding(self.encoder);
         mtl.release(self.encoder);
         self.command_encoder.closePass(.blit, self.generation);
+        for (self.trace_copies) |c| if (c) |t|
+            glass_trace.onCopy(self.command_encoder.raw, t.src, t.sx, t.sy, t.w, t.h, t.dst, t.dx, t.dy, false, false);
     }
 };
 
@@ -313,6 +340,11 @@ pub const RenderPass = struct {
     /// Root target is a cropped piece of the full scene. Preserve the scene's
     /// shader coordinates/NDC arithmetic and translate only rasterization.
     root_crop: ?[4]u32 = null,
+    /// Where the crop lands in the attachment (atlas cells); zero for a
+    /// target that is exactly the crop.
+    root_offset: [2]u32 = .{ 0, 0 },
+    /// Glass pass trace id (glass_trace.zig); 0 = not traced.
+    trace_id: u32 = 0,
 
     fn assertActive(self: *const RenderPass) void {
         self.command_encoder.assertActivePass(.render_pass, self.generation);
@@ -325,6 +357,7 @@ pub const RenderPass = struct {
     /// Set render pipeline.
     pub fn setPipeline(self: *RenderPass, pipeline: *const RenderPipeline) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onPipeline(pipeline);
         mtl.metal_render_encoder_set_render_pipeline_state(self.encoder, pipeline.raw);
     }
 
@@ -339,10 +372,11 @@ pub const RenderPass = struct {
         max_depth: f32,
     ) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onViewport(x, y, width, height);
         mtl.metal_render_encoder_set_viewport(
             self.encoder,
-            x - if (self.root_crop) |r| @as(f32, @floatFromInt(r[0])) else @as(f32, 0),
-            y - if (self.root_crop) |r| @as(f32, @floatFromInt(r[1])) else @as(f32, 0),
+            x - if (self.root_crop) |r| @as(f32, @floatFromInt(r[0])) - @as(f32, @floatFromInt(self.root_offset[0])) else @as(f32, 0),
+            y - if (self.root_crop) |r| @as(f32, @floatFromInt(r[1])) - @as(f32, @floatFromInt(self.root_offset[1])) else @as(f32, 0),
             width,
             height,
             min_depth,
@@ -353,12 +387,13 @@ pub const RenderPass = struct {
     /// Set scissor rectangle.
     pub fn setScissorRect(self: *RenderPass, x: u32, y: u32, width: u32, height: u32) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onScissor(x, y, width, height);
         if (self.root_crop) |r| {
             const left = @min(@max(x, r[0]), r[0] + r[2]);
             const top = @min(@max(y, r[1]), r[1] + r[3]);
             const right = @max(left, @min(x +| width, r[0] + r[2]));
             const bottom = @max(top, @min(y +| height, r[1] + r[3]));
-            mtl.metal_render_encoder_set_scissor_rect(self.encoder, left - r[0], top - r[1], right - left, bottom - top);
+            mtl.metal_render_encoder_set_scissor_rect(self.encoder, left - r[0] + self.root_offset[0], top - r[1] + self.root_offset[1], right - left, bottom - top);
             return;
         }
         mtl.metal_render_encoder_set_scissor_rect(self.encoder, x, y, width, height);
@@ -367,41 +402,48 @@ pub const RenderPass = struct {
     /// Set vertex buffer.
     pub fn setVertexBuffer(self: *RenderPass, slot: u32, buffer: *const resources.Buffer, offset: u64) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onUnsupported("setVertexBuffer");
         mtl.metal_render_encoder_set_vertex_buffer(self.encoder, buffer.raw, offset, slot);
     }
 
     /// Set fragment buffer.
     pub fn setFragmentBuffer(self: *RenderPass, slot: u32, buffer: *const resources.Buffer, offset: u64) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onBuffer(slot, buffer, offset);
         mtl.metal_render_encoder_set_fragment_buffer(self.encoder, buffer.raw, offset, slot);
     }
 
     /// Set fragment texture.
     pub fn setFragmentTexture(self: *RenderPass, slot: u32, texture: *const resources.Texture) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onTexture(slot, texture.raw);
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture.raw, slot);
     }
 
     pub fn setFragmentTextureBinding(self: *RenderPass, slot: u32, texture: resources.TextureBinding) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onTexture(slot, texture.raw);
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture.raw, slot);
     }
 
     /// Set fragment texture (raw MTLTexture pointer).
     pub fn setFragmentTextureRaw(self: *RenderPass, slot: u32, texture: ?*mtl.MTLTexture) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onTexture(slot, texture);
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture, slot);
     }
 
     /// Set fragment sampler (raw MTLSamplerState pointer).
     pub fn setFragmentSamplerRaw(self: *RenderPass, slot: u32, sampler: ?*mtl.MTLSamplerState) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onRawSampler(slot);
         mtl.metal_render_encoder_set_fragment_sampler(self.encoder, sampler, slot);
     }
 
     /// Set a sampler through the backend-neutral resource wrapper.
     pub fn setFragmentSampler(self: *RenderPass, slot: u32, sampler: ?*const resources.Sampler) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onSampler(slot, sampler);
         mtl.metal_render_encoder_set_fragment_sampler(
             self.encoder,
             if (sampler) |value| value.raw else null,
@@ -412,12 +454,14 @@ pub const RenderPass = struct {
     /// Set vertex bytes (push constants).
     pub fn setVertexBytes(self: *RenderPass, slot: u32, data: []const u8) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onUnsupported("setVertexBytes");
         mtl.metal_render_encoder_set_vertex_bytes(self.encoder, data.ptr, data.len, slot);
     }
 
     /// Set fragment bytes (push constants).
     pub fn setFragmentBytes(self: *RenderPass, slot: u32, data: []const u8) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onBytes(slot, data);
         mtl.metal_render_encoder_set_fragment_bytes(self.encoder, data.ptr, data.len, slot);
     }
 
@@ -431,6 +475,7 @@ pub const RenderPass = struct {
         first_instance: u32,
     ) void {
         self.assertActive();
+        if (glass_trace.live(self.trace_id)) glass_trace.onDraw(vertex_count, instance_count, first_vertex, first_instance, primitive == .TriangleStrip);
         // Count must cover **both** draw paths. Previously only drawIndexed counted, but UI main
         // path (SDF/text/image/icon instancing) uses non-indexed draw here, so draw call stats
         // long under-estimated (review report §4).
@@ -563,6 +608,7 @@ pub const RenderPass = struct {
         mtl.metal_render_encoder_end_encoding(self.encoder);
         mtl.release(self.encoder);
         self.command_encoder.closePass(.render_pass, self.generation);
+        if (glass_trace.live(self.trace_id)) glass_trace.onEnd(self.command_encoder.raw);
     }
 };
 
@@ -632,6 +678,7 @@ pub const CommandBuffer = struct {
     pub fn submit(self: *CommandBuffer) void {
         mtl.metal_command_buffer_notify_error(self.raw, null, &onCommandBufferError);
         mtl.metal_command_buffer_commit(self.raw);
+        glass_trace.onSubmit(self.raw);
     }
 
     /// Retained copy for cross-frame completion/timestamp observation.
@@ -647,6 +694,10 @@ pub const CommandBuffer = struct {
     /// reads of 'data only readable after completion', no main thread block.
     pub fn isCompleted(self: *const CommandBuffer) bool {
         return mtl.metal_command_buffer_is_completed(self.raw);
+    }
+
+    pub fn completedSuccessfully(self: *const CommandBuffer) bool {
+        return mtl.metal_command_buffer_completed_successfully(self.raw);
     }
 
     /// Available after completion. Null means the backend did not publish a

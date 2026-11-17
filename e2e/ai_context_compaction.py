@@ -45,7 +45,7 @@ class Model(http.server.BaseHTTPRequestHandler):
 server = http.server.ThreadingHTTPServer(('127.0.0.1',18987), Model)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
-    result = subprocess.run(['zig','test','src/compaction_e2e_tests.zig','-lc','-framework','CoreFoundation','-framework','CoreGraphics','-framework','ImageIO','--test-filter','compaction real'], cwd=ROOT)
+    result = subprocess.run(['zig','build','test-compaction-e2e'], cwd=ROOT)
     assert result.returncode == 0
     assert sum(x['path'] == '/worker-failure' for x in requests) == 1, 'failed worker compaction must not retry unchanged input'
     assert sum(x['path'] == '/limit' for x in requests) == 4

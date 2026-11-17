@@ -2,12 +2,16 @@
  * ZW_AI_TEST_PREFIX=$PWD/zig-out node e2e/ai_live_permission_native.ts /tmp/zw-live-permission-evidence
  * Provider replies are deterministic; commands, approvals and recordings use the real App.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,open,realpath,rm,readdir} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleBody,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText,pollWithin} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'zig-out');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
 const h=await import(join(prefix,'share/zenit/harness/client.ts'));
@@ -31,13 +35,15 @@ const bodyOf=(result:any)=>{
  for(const block of result.content??[])try{return JSON.parse(block.text)}catch{}
  return result;
 };
+// 早于本 Task 的历史消息带「[历史环境，仅作记录]\n」前缀（src/ai/session_runtime.zig 历史投影）。
+const historyPrefix='[历史环境，仅作记录]\n',historical=(content:string)=>content.startsWith(historyPrefix)?content.slice(historyPrefix.length):content;
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'live-permission-fixture'}]}));return}
-  let raw='';for await(const chunk of req)raw+=chunk;
+  const raw=await readRequestText(req);if(isTitleBody(raw))return skipTitle(res);
   const request=JSON.parse(raw),results=new Map<string,any>();
   for(const message of request.messages??[])if(message.role==='tool'){
-   const envelope=JSON.parse(message.content),body=bodyOf(envelope);
+   const envelope=JSON.parse(historical(message.content)),body=bodyOf(envelope);
    observations.set(message.tool_call_id,{envelope,body});results.set(message.tool_call_id,body);
   }
   res.writeHead(200,{'content-type':'text/event-stream'});res.flushHeaders();
@@ -50,9 +56,9 @@ const server=createServer(async(req,res)=>{
   const completed=(id:string)=>{
    const runResult=results.get(id);if(!runResult)return false;
    assert(runResult.execution_ref,JSON.stringify(runResult));
-   for(let i=0;i<12;i++){
+   for(let i=0;;i++){
     const waitId=id+'-wait-'+i,value=results.get(waitId);
-    if(!value){const previous=i===0?runResult:results.get(id+'-wait-'+(i-1));emit(waitId,'host.wait_execution',{execution_ref:runResult.execution_ref,after_revision:previous.source_revision,wait_ms:1000,max_bytes:8192});return false}
+    if(!value){if(!pollWithin(id+'-wait',30000))break;const previous=i===0?runResult:results.get(id+'-wait-'+(i-1));emit(waitId,'host.wait_execution',{execution_ref:runResult.execution_ref,after_revision:previous.source_revision,wait_ms:1000,max_bytes:8192});return false}
     assert(!['cancelled_unsent','outcome_unknown','handed_off','recording_degraded'].includes(value.state),JSON.stringify(value));
     if(value.state==='interval_recorded'){
      assert.equal(value.snapshot.process.exit_code,0);assert.equal(value.snapshot.interval_saved,true);return true;
@@ -98,7 +104,7 @@ const visible=(id:string)=>h.waitFor(async()=>{assert.equal(fixtureFailure,null)
 const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
 const capture=async(name:string)=>{
  assert((await h.screenshot(join(out,name+'.png'))).ok);
- await writeFile(join(out,name+'.json'),JSON.stringify({permission:await h.query('ai.composer.permission'),approval:await h.query('ai.host_approval'),status:await h.query('ai.turn.status')},null,2));
+ await writeFile(join(out,name+'.json'),JSON.stringify({permission:await h.query('ai.composer.permission'),approval:await h.query('ai.interaction.panel'),pending:await h.query('ai.interaction.pending'),turn:await h.query('ai.turn.label')},null,2));
 };
 const mode=async(value:'auto'|'confirm')=>{
  await click('ai.composer.permission');await click('ai.permission.'+value);
@@ -107,25 +113,27 @@ const mode=async(value:'auto'|'confirm')=>{
 try{
  await h.waitForServerReady(60000);
  assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  await click('ai.prompt');await h.type_('验证回合中权限立即生效，仅执行测试工具调用。');await click('ai.send');
- await visible('ai.host_approval');await capture('01-confirm-pending');
- assert.equal(text(await visible('ai.host_approval.summary')),command);
+ await visible('ai.interaction.panel');await capture('01-confirm-pending');
+ assert.equal(text(await visible('ai.interaction.command')),command);
+ // 交互卡展开时输入区控件（含权限按钮）隐藏（ai_composer_controls_view.zig setInteraction）；先「稍后处理」收成待办胶囊，请求仍挂起，再切权限。
+ await click('ai.interaction.postpone');await visible('ai.interaction.pending');
  await mode('auto');report.checks.push('confirm -> auto resumes the original waiting PTY call without clicking approve');
  await h.waitFor(async()=>{assert.equal(fixtureFailure,null);return readyToDowngrade||null},60000);
- assert(!(await h.query('ai.host_approval')).some(shown));await capture('02-auto-continued');
+ assert(!(await h.query('ai.interaction.panel')).some(shown)&&!(await h.query('ai.interaction.pending')).some(shown));await capture('02-auto-continued');
  assert.equal(await readFile(output,'utf8'),'COMPOUND_OK\n');
  report.checks.push('compound PTY commands with a conditional, semicolons, a pipeline and redirection run automatically and produce the expected file');
  await mode('confirm');continueAfterDowngrade();
- await visible('ai.host_approval');assert.equal(text(await visible('ai.host_approval.summary')),command);await capture('03-confirm-restored');
+ await visible('ai.interaction.panel');assert.equal(text(await visible('ai.interaction.command')),command);await capture('03-confirm-restored');
  report.checks.push('auto -> confirm during provider streaming makes the next PTY call wait');
- await click('ai.host_approval.reject');report.decisions.push({call:'confirm-run',approved:false});
+ await click('ai.interaction.reject');report.decisions.push({call:'confirm-run',approved:false});
  await h.waitFor(async()=>{assert.equal(fixtureFailure,null);return readyForBlocked||null},20000);
  await mode('auto');continueBlocked();
  await h.waitFor(async()=>{assert.equal(fixtureFailure,null);return finished||null},30000);
  await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,20000);
  assert.equal((await readdir(empty)).length,0);report.checks.push('dangerous rm inside a compound command is blocked in auto mode before dispatch and preserves the owned empty target');
- const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));
+ const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));
  const runs=journal.records.filter((record:any)=>record.tool_id==='host.run_in_terminal'&&record.execution);
  assert.deepEqual(runs.map((record:any)=>record.original_call).sort(),['automatic-run','pending-run']);
  for(const record of runs){assert.equal(record.stage,'succeeded');assert.equal(record.execution_receipt.interval_saved,true)}

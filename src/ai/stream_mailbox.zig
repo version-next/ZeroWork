@@ -1,5 +1,6 @@
 //! Worker-to-UI owned text batches. Neither thread borrows the other's bytes.
 const std = @import("std");
+const publication = @import("publication.zig");
 pub const Batch = struct { reset: bool, bytes: []u8, thinking: []u8 };
 pub const Mailbox = struct {
     allocator: std.mem.Allocator,
@@ -8,6 +9,8 @@ pub const Mailbox = struct {
     reset_pending: bool = false,
     thinking: std.ArrayList(u8) = .empty,
     total_bytes: usize = 0,
+    /// The UI that drains this box (its owner binds it); every write publishes to it.
+    wake: ?*const publication.Wake = null,
     pub const limit = 8 * 1024 * 1024;
     pub fn init(allocator: std.mem.Allocator) Mailbox {
         return .{ .allocator = allocator };
@@ -16,26 +19,35 @@ pub const Mailbox = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn reset(self: *Mailbox) void {
-        self.lock();
-        defer self.mutex.unlock();
-        self.pending.clearRetainingCapacity();
-        self.thinking.clearRetainingCapacity();
-        self.total_bytes = 0;
-        self.reset_pending = true;
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            self.pending.clearRetainingCapacity();
+            self.thinking.clearRetainingCapacity();
+            self.total_bytes = 0;
+            self.reset_pending = true;
+        }
+        publication.publish(self.wake);
     }
     pub fn append(self: *Mailbox, bytes: []const u8) !void {
-        self.lock();
-        defer self.mutex.unlock();
-        if (bytes.len > limit -| self.total_bytes) return error.StreamTooLarge;
-        try self.pending.appendSlice(self.allocator, bytes);
-        self.total_bytes += bytes.len;
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            if (bytes.len > limit -| self.total_bytes) return error.StreamTooLarge;
+            try self.pending.appendSlice(self.allocator, bytes);
+            self.total_bytes += bytes.len;
+        }
+        publication.publish(self.wake);
     }
     pub fn appendThinking(self: *Mailbox, bytes: []const u8) !void {
-        self.lock();
-        defer self.mutex.unlock();
-        if (bytes.len > limit -| self.total_bytes) return error.StreamTooLarge;
-        try self.thinking.appendSlice(self.allocator, bytes);
-        self.total_bytes += bytes.len;
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            if (bytes.len > limit -| self.total_bytes) return error.StreamTooLarge;
+            try self.thinking.appendSlice(self.allocator, bytes);
+            self.total_bytes += bytes.len;
+        }
+        publication.publish(self.wake);
     }
     pub fn drain(self: *Mailbox) !?Batch {
         self.lock();

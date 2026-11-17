@@ -1,0 +1,32 @@
+//! AI 面板的本地反馈条（回退成功 / 阻塞原因）：原生 `W.Alert` 默认外观（NATIVE_AUDIT 清单 4 · Notification / Toast）。
+//!
+//! - 位置不变：在会话滚动区里、紧跟对话之后，不是助手消息，也不进模型历史。
+//! - 回退（`rollback`）：`info` 色调，可关闭——原生 `W.Alert` 的关闭钮没有 test_id 写法（组件不暴露 `parts`），
+//!   所以关闭用全应用统一的 `PanelClose`（`ai.feedback.dismiss`；提示“关闭”——反馈条不归 Esc 管）放在提示右侧，
+//!   Alert 自己不带关闭钮。
+//! - 阻塞原因（`warning`）：`warning` 色调，不可关闭，原因解除时由宿主清空。
+//! - 状态（文字、类别、显隐）是宿主经 `ai_feedback_view.zig` 写的信号；同值重复写不触发任何更新。
+const ui = @import("ui");
+const W = ui.widgets;
+const IdSpace = @import("../../shared/view/ai_id_space.zig").IdSpace;
+const S = @import("ai_feedback.yss");
+const P = @import("../../../../shared/ui/components/panel_header/panel_header.yix");
+const PH = @import("../../../../shared/ui/components/panel_header/panel_header.zig");
+
+pub const Kind = enum { rollback, warning };
+
+pub fn Feedback(space: IdSpace, text: []const u8, kind: Kind, shown: bool, onDismiss: ?Handler(void) = null) View {
+    return (
+        <box testId={space.id("ai.feedback")} style={S.holder} visible={shown}>
+            {switch (kind) {
+                .rollback => <row testId={space.id("ai.feedback.rollback")} style={S.line}>
+                    <W.Alert testId={space.id("ai.feedback.text")} style={S.alert} variant={.info} message={text} />
+                    <P.PanelClose label="关闭提示" tooltip={PH.close_tooltip_plain} buttonTestId={space.id("ai.feedback.dismiss")} onClose={onDismiss} />
+                </row>,
+                .warning => <row testId={space.id("ai.feedback.warning")} style={S.line}>
+                    <W.Alert testId={space.id("ai.feedback.text")} style={S.alert} variant={.warning} message={text} />
+                </row>,
+            }}
+        </box>
+    );
+}

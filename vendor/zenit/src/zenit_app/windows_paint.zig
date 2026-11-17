@@ -4,6 +4,7 @@
 const std = @import("std");
 const ui = @import("ui");
 const platform = @import("platform");
+const render = @import("render");
 
 extern fn zenit_d3d11_probe_clear_text(probe: *anyopaque) c_int;
 extern fn zenit_d3d11_probe_create(hwnd: *anyopaque) ?*anyopaque;
@@ -239,6 +240,8 @@ pub const Painter = struct {
     }
 
     pub fn update(self: *Painter, cx: *ui.Cx, window: *platform.Window) !void {
+        const frame_scope = @import("windows_accessibility.zig").enterFrame();
+        defer frame_scope.leave();
         const started = try @import("zenit_time").Instant.now(self.io);
         _ = self.refreshLuminance(cx);
         // Match the shared AppRenderer frame contract. layout advances the
@@ -254,6 +257,9 @@ pub const Painter = struct {
         };
         const paint = cx.lowerForEncoderPaintTable();
         var retained_plan: @import("render").RetainedPlan = .{};
+        // Windows textures are immutable: zenit_d3d11_texture_load hands out
+        // monotonically increasing ids and has no in-place update, so a
+        // handle never changes content and needs no content revision.
         retained_plan.compute(paint, window.getScaleFactor());
         // Film grain changes on every rendered frame. Do not reuse any
         // enclosing retained surface, including ancestors of nested layers.
@@ -539,8 +545,12 @@ pub const Painter = struct {
                             }
                         }
                         if (!item.use_draw_transform and item.rotate != 0) unsupported += 1;
-                        var blur = clipItem(21, item.geom, item.radii.tl);
-                        blur.shadow_radii = radiiArray(item.radii);
+                        // The glass shape fits its corners to the glass rect like the shared
+                        // encoder (render backdrop_blur.shapeRadii): oversized, +inf, negative and
+                        // NaN radii resolve the same way, single-radius shapes take one corner.
+                        const glass_radii = render.backdrop_blur.shapeRadii(.{ .corner_radii = radiiArray(item.radii), .arrow = glass.arrow, .tab_lens = glass.tab_lens }, 1, item.geom.w, item.geom.h);
+                        var blur = clipItem(21, item.geom, glass_radii[0]);
+                        blur.shadow_radii = glass_radii;
                         const sx = if (!std.math.isNan(item.draw_w) and item.geom.w > 0) item.draw_w / item.geom.w else 1;
                         const sy = if (!std.math.isNan(item.draw_h) and item.geom.h > 0) item.draw_h / item.geom.h else 1;
                         var matrix: [6]f32 = if (item.use_draw_transform) item.draw_transform else .{
@@ -558,7 +568,7 @@ pub const Painter = struct {
                             .surface = .{ @floatFromInt(@backingInt(glass.surface)), glass.bezel_width, glass.specular_angle, glass.magnification },
                             .bottom = .{ @floatFromInt(@backingInt(glass.bottom_surface)), glass.bottom_bezel_width, 0, 0 },
                             .lens = .{ glass.center_zoom_radius, glass.center_zoom_falloff, glass.edge_field_strength, glass.scale_ratio },
-                            .radii = radiiArray(item.radii),
+                            .radii = glass_radii,
                             .radius = glass.backdrop_blur,
                             .level = glass.blur_level,
                             .saturation = glass.backdrop_saturation,
@@ -750,6 +760,8 @@ pub const Painter = struct {
         // to WM_PAINT presented the previous commands while handling input and
         // added a message-pump wait on top of the swap chain's vsync wait.
         if (zenit_d3d11_probe_render(self.native) == 0) return error.PaintPresentFailed;
+        // One presented frame of the work counters (docs/design/streaming-content.md §5.8).
+        cx.work_counters.commit();
         @import("test_harness").observeSubmittedFrame(cx);
         self.path_draw_calls = 0;
         for (items.items) |item| if (item.kind == 19 or item.kind == 20) {

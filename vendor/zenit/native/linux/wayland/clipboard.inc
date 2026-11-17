@@ -1,7 +1,7 @@
 /* Wayland data-device clipboard. Pipe I/O progresses alongside display I/O;
  * callbacks never block on another client's reader. The existing synchronous
  * SDK is a bounded veneer over this transfer state, not a blocking pipe read. */
-#define CLIPBOARD_TRACE(...) do { if (getenv("ZENIT_WAYLAND_CLIPBOARD_TRACE")) fprintf(stderr, __VA_ARGS__); } while (0)
+#define CLIPBOARD_TRACE(...) do { if (zenitAutomationEnvironment("ZENIT_WAYLAND_CLIPBOARD_TRACE")) fprintf(stderr, __VA_ARGS__); } while (0)
 #define CLIPBOARD_LIMIT (16u * 1024u * 1024u)
 struct ClipboardOffer {
     ZenitWaylandWindow *window;

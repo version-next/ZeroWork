@@ -1,0 +1,93 @@
+//! AI 辅助（第 4 类）面板正文（F-set-ai，人工验收反馈第 10 条后半）：
+//! - 服务提供方（`GV8pb`）：列表页 → 提供方详情页两级（`ai_providers.yix`）；
+//! - 行为与权限（`e2ys05`）：权限、运行方式、对话、子 Agent、上下文、附件、其他行为——普通设置行（`components/rows.yix`），
+//!   文案 / id / 搜索词在 `model/pane_fields.zig` 的 `ai`；
+//! - 技能与 MCP（`ai_extensions.yix`）；
+//! - 模型编辑器与删除确认（`ai_dialogs.yix`，原生 `W.Modal`）。
+//! 子页面 / 搜索的显示规则同其它分类（`vm.paneShown` / `vm.rowShown`）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const Providers = @import("ai_providers.yix");
+const Extensions = @import("ai_extensions.yix");
+const Dialogs = @import("ai_dialogs.yix");
+const A = m.ai;
+const F = m.fields.ai;
+
+const permissions = &F.permissions;
+const execution = &F.execution;
+const conversation = &F.conversation;
+const children = &F.children;
+const context = &F.context;
+const attachments = &F.attachments;
+const behavior = &F.behavior;
+
+const permission_options = [_]W.SelectOption{ .{ .value = "confirm", .label = "确认后执行" }, .{ .value = "auto", .label = "自动执行" } };
+const execution_options = [_]W.SelectOption{
+    .{ .value = "auto", .label = "自行判断" },
+    .{ .value = "ask", .label = "每次询问" },
+    .{ .value = "isolated_exec", .label = "批处理" },
+    .{ .value = "attached_pty", .label = "附加现有 PTY" },
+    .{ .value = "new_pty", .label = "新建 PTY" },
+};
+const retention_options = [_]W.SelectOption{ .{ .value = "auto_idle", .label = "空闲后关闭" }, .{ .value = "ask", .label = "每次询问" }, .{ .value = "keep", .label = "保留任务会话" } };
+const follow_up_options = [_]W.SelectOption{ .{ .value = "steer", .label = "引导", .test_id = "settings.follow_up_mode.steer" }, .{ .value = "queue", .label = "排队", .test_id = "settings.follow_up_mode.queue" } };
+const child_context_options = [_]W.SelectOption{ .{ .value = "independent", .label = "独立上下文", .test_id = "settings.child_context.independent" }, .{ .value = "inherit", .label = "继承当前上下文", .test_id = "settings.child_context.inherit" } };
+const child_reuse_options = [_]W.SelectOption{ .{ .value = "new", .label = "每次新建", .test_id = "settings.child_reuse.new" }, .{ .value = "prefer_reuse", .label = "优先复用", .test_id = "settings.child_reuse.prefer_reuse" }, .{ .value = "model", .label = "模型决定", .test_id = "settings.child_reuse.model" } };
+const step_options = [_]W.SelectOption{ .{ .value = "collapsed", .label = "折叠", .test_id = "settings.step_display.collapsed" }, .{ .value = "expanded", .label = "展开", .test_id = "settings.step_display.expanded" } };
+
+// “默认服务提供方”的选项：view-model 给出数据（`A.providerChoices`，未就绪的提供方不可选），这里换成原生 `W.SelectOption`。
+// 选项在内容页挂载时取一次（行组件的 `options` 是普通参数）；提供方在别的子页面里改，回到本页时整页重挂。
+var provider_options: [2][64]W.SelectOption = undefined;
+var provider_flip: u1 = 0;
+fn providerOptions(vm: *m.ViewModel) []const W.SelectOption {
+    const choices = A.providerChoices(vm);
+    provider_flip +%= 1;
+    const list = &provider_options[provider_flip];
+    const count = @min(choices.len, list.len);
+    for (choices[0..count], 0..) |choice, i| list[i] = .{ .value = choice.value, .label = choice.label, .disabled = choice.disabled };
+    return list[0..count];
+}
+/// 旧实现在没有任何提供方时不建“默认服务提供方”这一行。
+fn hasProviders(vm: *m.ViewModel) bool {
+    return A.hasProviders(vm);
+}
+
+pub fn AiPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.ai" style={S.category_panes}>
+            {if (A.listShown(vm)) <Providers.ProviderList vm={vm} /> else <Providers.ProviderDetail vm={vm} index={A.detailIndex(vm)} />}
+            <R.Pane vm={vm} pane={permissions}>
+                <R.SelectRow vm={vm} pane={permissions} row={F.permission_mode} options={&permission_options} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={execution}>
+                <R.SelectRow vm={vm} pane={execution} row={F.execution_mode} options={&execution_options} />
+                <R.SelectRow vm={vm} pane={execution} row={F.session_retention} options={&retention_options} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={conversation}>
+                <R.SelectRow vm={vm} pane={conversation} row={F.follow_up_mode} options={&follow_up_options} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={children}>
+                <R.SelectRow vm={vm} pane={children} row={F.child_context_mode} options={&child_context_options} />
+                <R.SelectRow vm={vm} pane={children} row={F.child_reuse_policy} options={&child_reuse_options} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={context}>
+                <R.ToggleRow vm={vm} pane={context} row={F.redact_ip} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={attachments}>
+                <R.InfoRow vm={vm} pane={attachments} row={F.image_limit} />
+                <R.InfoRow vm={vm} pane={attachments} row={F.text_limit} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={behavior}>
+                {if (hasProviders(vm)) <R.SelectRow vm={vm} pane={behavior} row={F.default_provider} options={providerOptions(vm)} />}
+                <R.SelectRow vm={vm} pane={behavior} row={F.step_display} options={&step_options} />
+                <R.ToggleRow vm={vm} pane={behavior} row={F.error_hint} />
+            </R.Pane>
+            <Extensions.Extensions vm={vm} />
+            <Dialogs.ModelEditor vm={vm} />
+            <Dialogs.DeleteConfirm vm={vm} />
+        </box>
+    );
+}

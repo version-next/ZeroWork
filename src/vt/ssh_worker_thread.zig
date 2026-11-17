@@ -300,3 +300,42 @@ test "worker thread notifies transport loss without any terminal text" {
     thread.publishRelease(false, .released, error.ConnectionClosed);
     try std.testing.expect(!wake.take());
 }
+
+test "worker thread reconnect snapshot publishes the environment from both threads only on change" {
+    const environment = @import("../host/environment.zig");
+    const key: OperationKey = .{ .owner = .{ .session = .{ .session_id = @fromBackingInt(7) } }, .operation_id = 1, .attempt_id = 1 };
+    var next = key;
+    next.owner.session.generation += 1;
+    next.operation_id += 1;
+    next.attempt_id = 2;
+    var worker: SshWorker = undefined;
+    worker.execution = null;
+    worker.execution_mutex = .unlocked;
+    worker.execution_recording = null;
+    worker.execution_control = null;
+    worker.execution_deployment = null;
+    worker.options = .{ .host = "fixture", .user = "fixture", .auth = .agent, .operation_key = key };
+    var thread: Thread = undefined;
+    thread.worker = &worker;
+    thread.stop_requested = .init(false);
+    thread.explicit_disconnect_active = .init(false);
+    thread.reconnect_control = reconnect.Control.init(key);
+    // IO owner: a transport loss and its release receipt.
+    var before = environment.revision();
+    thread.publishRelease(false, .awaiting, error.ConnectionClosed);
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    thread.publishRelease(false, .awaiting, error.ConnectionClosed);
+    try std.testing.expectEqual(before, environment.revision());
+    thread.publishRelease(false, .released, error.ConnectionClosed);
+    try std.testing.expect(environment.revision() > before);
+    // UI controller: the reconnect request, then the stop.
+    before = environment.revision();
+    try thread.requestReconnect(key, next);
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    try std.testing.expectError(error.ReconnectAlreadyRequested, thread.requestReconnect(key, next));
+    try std.testing.expectEqual(before, environment.revision());
+    thread.requestStop();
+    try std.testing.expect(environment.revision() > before);
+}

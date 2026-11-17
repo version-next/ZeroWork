@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {openSidebarHostMenu} from './sidebar_host_menu.ts';
 /** Own immutable loopback peer + own isolated native app. Requires root's
  * frozen test binary. Writes only the fresh local test target and fixtures. */

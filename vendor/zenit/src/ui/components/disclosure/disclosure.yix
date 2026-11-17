@@ -1,0 +1,65 @@
+//! Disclosure view. Styles in styles.yss, types and tests in mod.zig.
+const ui = @import("../../ui.zig");
+const S = @import("styles.yss");
+const mod = @import("mod.zig");
+const DisclosureTone = mod.DisclosureTone;
+const icons = @import("zenit_icons");
+
+fn chevronOf(open: bool) ui.SvgAsset {
+    return if (open) icons.chevron_down else icons.chevron_right;
+}
+
+/// Disclosure: one-line trigger (chevron, status icon or `status` slot, title, detail such as a
+/// count or a status, and a trailing text such as a duration at the right) that shows and hides
+/// its children. The content hangs on a 1px rail at the left instead of sitting in a card.
+/// `open` is a Model: bool = the component holds it, a signal = two-way, ui.split = the parent
+/// decides; `onOpenChange` reports the settled value. The trigger is a button for assistive tech
+/// (Tab stop, Enter / Space toggle, `expanded` state); `disabled` suppresses toggling.
+/// `<W.Disclosure title="读取 PDU 日志" iconAsset={icons.circle_x} iconTone={.danger} detail="· 5 个步骤 · 1 个失败" detailTone={.danger} trailing="9.4s">…steps…</W.Disclosure>`
+/// `triggerTestId` names the trigger row and `contentTestId` the rail (a `testId` on the element
+/// names only the root); `chevronTestId` / `titleTestId` / `detailTestId` / `trailingTestId` name
+/// those parts (a detail or trailing text that appears later carries its id); read at mount.
+pub fn Disclosure(
+    open: Model(bool) = false,
+    title: Text = "",
+    iconAsset: ?ui.SvgAsset = null,
+    iconTone: DisclosureTone = .neutral,
+    detail: []const u8 = "",
+    detailTone: DisclosureTone = .neutral,
+    trailing: []const u8 = "",
+    disabled: bool = false,
+    onOpenChange: ?Handler(bool) = null,
+    triggerTestId: ?[]const u8 = null,
+    contentTestId: ?[]const u8 = null,
+    chevronTestId: ?[]const u8 = null,
+    titleTestId: ?[]const u8 = null,
+    detailTestId: ?[]const u8 = null,
+    trailingTestId: ?[]const u8 = null,
+    status: ?View,
+    children: View,
+) View {
+    const chevron = computed(chevronOf(open));
+    const enabled = computed(!disabled);
+    return (
+        <col style={S.root}>
+            <row
+                testId={triggerTestId}
+                style={S.Trigger.of(.{ .open = open, .disabled = disabled })}
+                tag={.button}
+                focusable={enabled}
+                focusRing={.{}}
+                a11y={.{ .role = .button, .expanded = open, .disabled = disabled, .label = title }}
+                onClick={if (!disabled) open = !open}
+            >
+                <icon testId={chevronTestId} style={S.chevron} src={chevron} />
+                {if (status) <box style={S.status_slot}>{status}</box>}
+                {if (iconAsset) |asset| <icon style={S.Status.of(.{ .tone = iconTone })} src={asset} />}
+                <text testId={titleTestId} style={S.title} box={S.fixed_box}>{title}</text>
+                {if (detail.len != 0) <text testId={detailTestId} style={S.Detail.of(.{ .tone = detailTone })} box={S.detail_box}>{detail}</text>}
+                <box style={S.spacer} />
+                {if (trailing.len != 0) <text testId={trailingTestId} style={S.trailing} box={S.fixed_box}>{trailing}</text>}
+            </row>
+            <col testId={contentTestId} style={S.rail} visible={open} a11y={.{ .role = .group, .label = title }}>{children}</col>
+        </col>
+    );
+}

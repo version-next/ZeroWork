@@ -126,6 +126,7 @@ pub fn appendNodeShadowAndBackgroundBorrowed(
     _ = radii;
     const draw_opacity = if (exec_state.use_opacity_layer) 1.0 else exec_state.node_opacity;
     const effective_bg = computeEffectiveBackdropFill(node, draw_opacity);
+    if (node.layoutOutputPtr()) |lo| if (lo.vector.shape) |shape| return appendShapePathBackground(cx, node, lo, shape, header, draw_opacity);
 
     // outer shadow: 1 layer uses shadow, 2 layers uses shadow_dual
     const shadow_slice = node.style.shadowSlice();
@@ -181,7 +182,7 @@ pub fn appendNodeShadowAndBackgroundBorrowed(
         });
     } else if (shadow_slice.len == 1) {
         const s1 = shadow_slice[0];
-        if (@import("zenit_environment").has("ZENIT_DEBUG_SHADOW")) {
+        if (@import("zenit_environment").flag("ZENIT_DEBUG_SHADOW")) {
             std.debug.print("[shadow] node={d} comp={s} rect=({d:.0},{d:.0},{d:.0},{d:.0}) r={d:.0} blur={d:.0} a={d}\n", .{
                 node.id, node.meta.ownership.meta.component_name orelse "?", local_rect.x, local_rect.y, local_rect.w, local_rect.h, local_radii[0], s1.blur, s1.color.a,
             });
@@ -328,76 +329,78 @@ pub fn appendNodeShadowAndBackgroundBorrowed(
     // layoutOutputPtr gives World slot stable address; display_list stores geometry pointer, must
     // remain valid before frame consumption (slot dense by element_id, stable in-frame).
     if (node.layoutOutputPtr()) |lo| {
-        // vector path fill
-        if (lo.vector.fill.path) |*geom| {
-            // gradient priority over solid background: vector-fill gradient per-vertex shaded by
-            // path_renderer. note criterion is 'gradient valid or background opaque', nodes with
-            // gradient set often have transparent background (container shouldn't pad color),
-            // checking only background.a skips gradient entirely.
-            const mg = node.style.multi_gradient();
-            const has_grad = mg != null and mg.?.stop_count >= 2;
-            if (has_grad or node.getBackground().a > 0) {
-                const fill_color = geometry.modulateColorOpacity(node.getBackground(), draw_opacity);
-                var g_colors: [16]types.Color = @as([16]types.Color, @splat(types.Color.rgba(0, 0, 0, 0)));
-                var g_positions: [16]f32 = @as([16]f32, @splat(0));
-                var g_dir: u8 = 0;
-                var g_cnt: u8 = 0;
-                var g_cx: f32 = 0.5;
-                var g_cy: f32 = 0.5;
-                var g_ang: f32 = 0;
-                if (has_grad) {
-                    const g = mg.?;
-                    g_cnt = g.stop_count;
-                    for (0..g_cnt) |i| {
-                        g_colors[i] = geometry.modulateColorOpacity(g.stops[i].color, draw_opacity);
-                        g_positions[i] = g.stops[i].position;
-                    }
-                    g_dir = @backingInt(g.direction);
-                    // MultiGradient carries only stops + direction; radial/conic center and start
-                    // angle not in struct, use geometry center defaults.
-                    g_cx = 0.5;
-                    g_cy = 0.5;
-                    g_ang = 0;
-                }
-                try cx.display_list.append(.{
-                    .fill_path = .{
-                        .header = header,
-                        .geometry = geom,
-                        .color = fill_color,
-                        .offset_x = 0,
-                        .offset_y = 0,
-                        .opacity = 1.0,
-                        .gradient_direction = g_dir,
-                        .gradient_stop_colors = g_colors,
-                        .gradient_stop_positions = g_positions,
-                        .gradient_stop_count = g_cnt,
-                        .gradient_center_x = g_cx,
-                        .gradient_center_y = g_cy,
-                        .gradient_start_angle = g_ang,
-                    },
-                });
-            }
-        }
-
-        // vector path stroke
-        if (lo.vector.stroke.geometry) |*geom| {
-            if (lo.vector.stroke.color.a > 0 and lo.vector.stroke.width > 0) {
-                const stroke_color = geometry.modulateColorOpacity(lo.vector.stroke.color, draw_opacity);
-                try cx.display_list.append(.{
-                    .stroke_path = .{
-                        .header = header,
-                        .geometry = geom,
-                        .color = stroke_color,
-                        .width = lo.vector.stroke.width,
-                        .line_join = lo.vector.stroke.line_join,
-                        .offset_x = 0,
-                        .offset_y = 0,
-                        .opacity = 1.0,
-                    },
-                });
-            }
-        }
+        if (lo.vector.fill.path) |*geom| try appendVectorFill(cx, node, header, geom, draw_opacity);
+        try appendVectorStroke(cx, lo, header, draw_opacity);
     }
+}
+
+/// Background (solid or multi-stop gradient) filling `geom`: per-vertex shaded by path_renderer.
+fn appendVectorFill(cx: *render_context_mod.RenderContext, node: *Node, header: display_list_mod.ItemHeader, geom: *const types.PathGeometry, draw_opacity: f32) !void {
+    // gradient priority over solid background: vector-fill gradient per-vertex shaded by
+    // path_renderer. note criterion is 'gradient valid or background opaque', nodes with
+    // gradient set often have transparent background (container shouldn't pad color),
+    // checking only background.a skips gradient entirely.
+    const mg = node.style.multi_gradient();
+    const has_grad = mg != null and mg.?.stop_count >= 2;
+    if (!has_grad and node.getBackground().a == 0) return;
+    const fill_color = geometry.modulateColorOpacity(node.getBackground(), draw_opacity);
+    var g_colors: [16]types.Color = @as([16]types.Color, @splat(types.Color.rgba(0, 0, 0, 0)));
+    var g_positions: [16]f32 = @as([16]f32, @splat(0));
+    var g_dir: u8 = 0;
+    var g_cnt: u8 = 0;
+    if (has_grad) {
+        const g = mg.?;
+        g_cnt = g.stop_count;
+        for (0..g_cnt) |i| {
+            g_colors[i] = geometry.modulateColorOpacity(g.stops[i].color, draw_opacity);
+            g_positions[i] = g.stops[i].position;
+        }
+        g_dir = @backingInt(g.direction);
+    }
+    // MultiGradient carries only stops + direction; radial/conic center and start angle not in
+    // struct, use geometry center defaults.
+    try cx.display_list.append(.{
+        .fill_path = .{
+            .header = header,
+            .geometry = geom,
+            .color = fill_color,
+            .offset_x = 0,
+            .offset_y = 0,
+            .opacity = 1.0,
+            .gradient_direction = g_dir,
+            .gradient_stop_colors = g_colors,
+            .gradient_stop_positions = g_positions,
+            .gradient_stop_count = g_cnt,
+            .gradient_center_x = 0.5,
+            .gradient_center_y = 0.5,
+            .gradient_start_angle = 0,
+        },
+    });
+}
+
+fn appendVectorStroke(cx: *render_context_mod.RenderContext, lo: *const @import("../node_layout_output.zig").NodeLayoutOutput, header: display_list_mod.ItemHeader, draw_opacity: f32) !void {
+    const geom = if (lo.vector.stroke.geometry) |*g| g else return;
+    if (lo.vector.stroke.color.a == 0 or lo.vector.stroke.width <= 0) return;
+    try cx.display_list.append(.{
+        .stroke_path = .{
+            .header = header,
+            .geometry = geom,
+            .color = geometry.modulateColorOpacity(lo.vector.stroke.color, draw_opacity),
+            .width = lo.vector.stroke.width,
+            .line_join = lo.vector.stroke.line_join,
+            .offset_x = 0,
+            .offset_y = 0,
+            .opacity = 1.0,
+        },
+    });
+}
+
+/// A box with a path paint shape (`Node.setShapePath`): its background fills the shape; shadows,
+/// noise and inset shadows only have a rectangle model and are not drawn (a rectangular shadow
+/// under a path is an artifact).
+fn appendShapePathBackground(cx: *render_context_mod.RenderContext, node: *Node, lo: *const @import("../node_layout_output.zig").NodeLayoutOutput, shape: *const @import("../node_layout_output.zig").NodeShape, header: display_list_mod.ItemHeader, draw_opacity: f32) !void {
+    try appendVectorFill(cx, node, header, &shape.fill, draw_opacity);
+    try appendVectorStroke(cx, lo, header, draw_opacity);
 }
 
 pub fn appendNodeBorder(
@@ -446,6 +449,19 @@ pub fn appendNodeBorderBorrowed(
         (border_widths[types.Border.SIDE_BOTTOM] > 0 and border_colors[types.Border.SIDE_BOTTOM].a > 0) or
         (border_widths[types.Border.SIDE_LEFT] > 0 and border_colors[types.Border.SIDE_LEFT].a > 0);
     if (!border_has_visible) return;
+    // A path-shaped box strokes its border along the shape (one closed contour: the border never
+    // breaks), uniform width and colour (the top side's when they differ).
+    if (node.layoutOutputPtr()) |lo| if (lo.vector.shape) |shape| {
+        const centre = if (shape.border) |*b| b else &shape.fill;
+        try cx.display_list.append(.{ .stroke_path = .{
+            .header = header,
+            .geometry = centre,
+            .color = computeEffectiveBackdropBorderColor(node, border_colors[types.Border.SIDE_TOP], draw_opacity),
+            .width = border_widths_raw[types.Border.SIDE_TOP],
+            .line_join = .round,
+        } });
+        return;
+    };
 
     const colors_uniform =
         types.Color.eql(border_colors[types.Border.SIDE_TOP], border_colors[types.Border.SIDE_RIGHT]) and
@@ -660,12 +676,12 @@ pub fn appendNodeMediaBorrowed(
             try cx.display_list.append(.{
                 .image_quad = .{
                     .header = header,
-                    .x = node.style.padding.left,
-                    .y = node.style.padding.top,
-                    .w = @max(0, local_rect.w - node.style.padding.left - node.style.padding.right),
-                    .h = @max(0, local_rect.h - node.style.padding.top - node.style.padding.bottom),
+                    .x = node.style.contentInsets().left,
+                    .y = node.style.contentInsets().top,
+                    .w = @max(0, local_rect.w - node.style.contentInsets().left - node.style.contentInsets().right),
+                    .h = @max(0, local_rect.h - node.style.contentInsets().top - node.style.contentInsets().bottom),
                     .texture_id = im.texture_id,
-                    .tint = im.tint,
+                    .tint = im.paintTint(if (im.tint_current_color) node.resolveTextColor() else null),
                     .corner_radius = node.style.effectiveRadius(),
                     .opacity = draw_opacity,
                 },
@@ -687,11 +703,11 @@ pub fn appendNodeMediaBorrowed(
                     .icon_id = ic.icon_id,
                     .rep_size = ic.rep.size,
                     .rep = ic.rep,
-                    .x = node.style.padding.left,
-                    .y = node.style.padding.top,
-                    .w = @max(0, local_rect.w - node.style.padding.left - node.style.padding.right),
-                    .h = @max(0, local_rect.h - node.style.padding.top - node.style.padding.bottom),
-                    .tint = ic.tint,
+                    .x = node.style.contentInsets().left,
+                    .y = node.style.contentInsets().top,
+                    .w = @max(0, local_rect.w - node.style.contentInsets().left - node.style.contentInsets().right),
+                    .h = @max(0, local_rect.h - node.style.contentInsets().top - node.style.contentInsets().bottom),
+                    .tint = ic.paintTint(if (ic.tint_current_color) node.resolveTextColor() else null),
                     .corner_clip_radius = node.style.effectiveRadius(),
                     .opacity = draw_opacity,
                     // Same rule as text: continuous positions under transform

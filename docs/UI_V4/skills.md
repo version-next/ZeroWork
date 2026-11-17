@@ -8,6 +8,6 @@
 
 正文默认收起；点“查看”读取并在对应技能行内展开，按钮切换为“收起”，再次点击关闭预览、恢复紧凑行高。正文绑定技能 ID 与 revision；移除技能或替换版本后，不把旧正文显示给其他项目。MCP 测试详情同样归属对应服务行，不使用列表外的共用预览区。卡片底部仅在出错时显示具体错误；导入、查看和配置更改成功后不显示说明或成功提示。
 
-不增加技能文件数量或大小限制，保留原来的批量导入、流式复制、按需读取和全局保存／撤销事务。实现位于 `src/config/ai_extensions_settings.zig`，列表尺寸复用 `src/config/settings_mcp_styles.zig`。
+不增加技能文件数量或大小限制，保留原来的批量导入、流式复制、按需读取和全局保存／撤销事务。实现位于 `src/features/settings/view/ai_extensions_settings.zig`，列表尺寸复用 `src/features/settings/view/settings_mcp_styles.zig`。
 
 定向验证使用 `e2e/ai_extensions_native.ts`：检查集合导入、错误、查看、菜单重新导入、移除后的详情归属，以及 1280 × 900／860 × 480 下的控件边界。`ZW_SKILLS_PICKER_HANDOFF=1` 写出 `picker-handoff.json`，由真实 UI 驱动完成取消、目录导入和 SKILL.md 重新导入，观察结果后向各阶段 `done` 路径写入 `done`；默认使用原生拖入事件，明确不覆盖系统选择器。`ZW_SKILLS_THEME=reference-light` 选择浅色，`ZW_SKILLS_UI_ONLY=1` 仅检查技能交互。完整运行同时检查 MCP 行内详情与保存／撤销、技能读取到 MCP 调用的原生链路。截图和报告保存在仓库外的临时目录。

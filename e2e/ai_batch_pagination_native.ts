@@ -1,9 +1,13 @@
 /** One real batch execution; continuation survives a later conversation turn. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,readFile,writeFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-pagination-build');
 const out=resolve(process.argv[2]??'/tmp/zw-batch-pagination-native');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-batch-pagination-'),data=join(iso,'data'),rpc=join(iso,'rpc');await mkdir(data);await mkdir(rpc);
@@ -16,7 +20,7 @@ const expected='BEGIN\n'+Array.from({length:1500},(_,i)=>'你好-'+String(i+1).p
 const report:any={status:'running',checks:[],pages:0};
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"batch-pagination-fixture"}]}');
- let raw='';for await(const c of req)raw+=c;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);res.writeHead(200,{'content-type':'text/event-stream'});
  const userIndex=body.messages.findLastIndex((m:any)=>m.role==='user');
  const results=new Map(body.messages.slice(userIndex+1).filter((m:any)=>m.role==='tool').map((m:any)=>[m.tool_call_id,payload(m.content)]));
  const call=(id:string,name:string,args:any)=>res.end(frame({tool_calls:[{index:0,id,type:'function',function:{name,arguments:JSON.stringify(args)}}]})+'data: [DONE]\n\n');
@@ -62,14 +66,14 @@ const click=async(id:string)=>{report.lastAction=id;await visible(id);assert((aw
 const text=(n:any):string=>Array.isArray(n)?n.map(text).join(' '):n?[n.text??'',...(n.children??[]).map(text)].join(' '):'';
 const send=async(value:string)=>{await click('ai.prompt');await h.type_(value);await click('ai.send');};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await click('toolbar.ai');
- await send('INITIAL_BATCH');await click('ai.approval.accept');
+ await h.waitForServerReady(60000);await h.resizeWindow(1200,900);await click('workspace.empty.local');await click(await aiToggleId());
+ await send('INITIAL_BATCH');await click('ai.interaction.approve');
  await h.waitFor(async()=>failure||text(await h.query('ai.conversation')).includes('FIRST_PAGE_AVAILABLE')||null,30000);assert.equal(failure,null);
  await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,10000);
  await send('CONTINUE_PREVIOUS_OUTPUT');
  await h.waitFor(async()=>failure||text(await h.query('ai.conversation')).includes('ALL_BATCH_PAGES_VERIFIED')||null,30000);assert.equal(failure,null);
  await h.waitFor(async()=>!(await h.query('ai.stop')).some(shown)||null,10000);
- await send('OVERFLOW_BATCH');await click('ai.approval.accept');
+ await send('OVERFLOW_BATCH');await click('ai.interaction.approve');
  await h.waitFor(async()=>failure||text(await h.query('ai.conversation')).includes('OVERFLOW_RETAINED_LIMIT_VERIFIED')||null,30000);assert.equal(failure,null);
  assert(report.pages>1);assert((await h.screenshot(join(out,'complete.png'))).ok);
  report.checks=['one real native batch execution despite several output pages','stdout, stderr and Chinese UTF-8 text reassemble exactly','read-only continuation survives a later turn without another approval or command replay','capture overflow preserves a valid UTF-8 prefix, reports the retention limit, and lets the command complete'];report.status='passed';

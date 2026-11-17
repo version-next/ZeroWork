@@ -1,6 +1,8 @@
 /** Actual Local PTY/Metal integration. Requires a fresh -Dtest-mode=true build.
  * Cleanup termination is reported separately and is never normal-close proof.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -8,6 +10,9 @@ import { mkdir, mkdtemp, open, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { waitForServerReady, waitFor, tree, query, clickTestId, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import * as harness from "../zig-out/share/zenit/harness/client.ts";
+import { closeWorkspaceTab, openSessionDetails } from "./workspace_tab_actions.ts";
+import { chooseTheme } from "./theme_settings_entry.ts";
 
 const args = process.argv.slice(2);
 const options: Record<string, string> = {};
@@ -44,7 +49,7 @@ async function visible(id: string): Promise<Node> {
   return await waitFor(async () => (await query(id)).find((node) => node.hidden !== true && (node.effective_opacity ?? 1) > 0 && node.rect.w > 0 && node.rect.h > 0) ?? null);
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -69,7 +74,7 @@ async function capture(name: string): Promise<void> {
   await sleep(250);
   assert((await screenshot(join(output, `${name}.png`))).ok);
   const projection: Record<string, unknown> = {};
-  for (const id of ["local.statusbar", "tabs.strip", "status.detail", "status.theme", "local.close.confirmation"]) {
+  for (const id of ["local.statusbar", "tabs.strip", "status.detail", "settings.appearance.themes", "local.close.confirmation"]) {
     const result = await query(id);
     assert(Array.isArray(result), `Invalid query result for ${id}: ${JSON.stringify(result)}`);
     projection[id] = result;
@@ -87,7 +92,6 @@ try {
   await visible("terminal.surface");
   await visible("local.status.identity");
   await visible("tabs.tab.1");
-  await visible("tabs.close.1");
   assert.equal((await query("workspace.statusbar")).filter((node) => node.hidden !== true && (node.effective_opacity ?? 1) > 0 && node.rect.w > 0 && node.rect.h > 0).length, 0, "Local must not reveal the SSH statusbar");
   await waitFor(async () => descendants().some((process) => process.command.endsWith("/zsh")) || null);
   const activePtyDescriptors = ptyDescriptors();
@@ -101,75 +105,59 @@ try {
   });
   checks.push("Real shell output reaches the VT projection and rendered grapheme nodes");
   await capture("local-output");
-  const verifyGrid = async (): Promise<string> => {
-    const label = text(await visible("local.status.grid"));
-    const match = label.match(/(\d+)×(\d+)/);
-    assert(match, `Missing actual grid: ${label}`);
-    const expected = `__GRID_${match[2]} ${match[1]}__`;
+  const readGrid = async (captureName?: string): Promise<string> => {
+    const detail = await openSessionDetails(harness, "tabs.tab.1");
+    const match = text(detail).match(/(\d+)\s*×\s*(\d+)/);
+    assert(match, "Session details must publish the actual terminal grid");
+    if (captureName) {
+      const viewport = await harness.screenPos("workspace.shell");
+      assert(detail.rect.x >= viewport.x && detail.rect.x + detail.rect.w <= viewport.x + viewport.w);
+      assert(detail.rect.y >= viewport.y && detail.rect.y + detail.rect.h <= viewport.y + viewport.h);
+      await capture(captureName);
+    }
+    await clickTestId("status.detail.close");
+    await waitFor(async () => !(await query("status.detail")).some(node => node.visible !== false && node.hidden !== true && node.rect.w > 0 && node.rect.h > 0) || null);
+    return `${match[1]}×${match[2]}`;
+  };
+  const verifyGrid = async (captureName: string): Promise<string> => {
+    const grid = await readGrid(captureName);
+    const [cols, rows] = grid.split("×");
+    const expected = `__GRID_${rows} ${cols}__`;
+    await clickTestId("terminal.surface");
     await type_("printf '__GRID_%s__\\n' \"$(stty size)\"");
     await key("enter");
     await waitFor(async () => {
       const surface = (await query("terminal.surface"))[0];
       return surface && text(surface).includes(expected) || null;
     });
-    return match[0];
+    return grid;
   };
-  const originalGrid = await verifyGrid();
+  const originalGrid = await verifyGrid("local-grid");
   await resizeWindow(860, 480);
-  await waitFor(async () => {
-    const button = (await query("local.status.grid"))[0];
-    return button && !text(button).includes(originalGrid) || null;
-  });
-  const compactGrid = await verifyGrid();
+  await waitFor(async () => (await readGrid()) !== originalGrid || null);
+  const compactGrid = await verifyGrid("local-compact-grid");
+  assert.notEqual(compactGrid, originalGrid);
   report.pty_grid = { original: originalGrid, compact: compactGrid };
-  checks.push("Status grid and real stty winsize agree before and after actual window resize");
+  checks.push("The active tab’s session details stay inside the window and agree with the real stty winsize at both sizes");
   await capture("local-compact");
-  await clickTestId("local.status.grid");
-  await visible("status.detail");
-  await capture("local-compact-grid");
-  const compactDetail = await visible("status.detail");
-  const compactBar = await visible("local.statusbar");
-  assert.equal(compactDetail.rect.w, 360);
-  assert(compactDetail.rect.x >= 8 && compactDetail.rect.x + compactDetail.rect.w <= 852);
-  assert(Math.abs(compactBar.rect.y - compactDetail.rect.y - compactDetail.rect.h - 6) <= 1, "Compact detail stays 6pt above the statusbar");
-  checks.push("Actual compact grid detail is 360pt wide, stays inside the window and anchors 6pt above the statusbar");
-  await clickTestId("status.detail.close");
   await resizeWindow(1440, 900);
-  await waitFor(async () => {
-    const button = (await query("local.status.grid"))[0];
-    return button && text(button).includes(originalGrid) || null;
-  });
-  await clickTestId("local.status.grid");
-  await visible("status.detail");
-  await capture("local-grid");
-  await clickTestId("status.detail.close");
-  await clickTestId("local.status.theme");
-  await visible("status.theme");
-  await clickTestId("status.theme.item.nord");
-  await waitFor(async () => {
-    const feedback = (await query("status.theme.feedback"))[0];
-    return feedback && text(feedback).includes("已") || null;
-  });
+  await waitFor(async () => (await readGrid()) === originalGrid || null);
+  // title-click: the theme is chosen in 设置 › 外观与主题 (菜单栏“显示 › 外观…”), not a title bar popover.
+  await chooseTheme(harness, "nord", join(data, "config.toml"));
   const savedConfig = await readFile(join(data, "config.toml"), "utf8");
   assert(/theme\s*=\s*"nord"/.test(savedConfig), "Global theme must be persisted by the real Config transaction");
-  await waitFor(async () => text(await visible("local.status.grid")).includes(originalGrid) || null);
-  const themedGrid = await verifyGrid();
+  const themedGrid = await verifyGrid("local-grid-nord");
   assert.equal(themedGrid, originalGrid, "Changing only the theme must preserve terminal font geometry");
   checks.push("Global Nord selection is acknowledged and persisted through the real settings transaction without changing the PTY grid");
   await capture("local-theme-nord");
-  await clickTestId("status.theme.close");
   for (const theme of ["light", "sauber", "dark"]) {
-    await clickTestId("local.status.theme");
-    await visible("status.theme");
-    await clickTestId(`status.theme.item.${theme}`);
-    await waitFor(async () => new RegExp(`theme\\s*=\\s*"${theme}"`).test(await readFile(join(data, "config.toml"), "utf8")) || null);
-    await clickTestId("status.theme.close");
+    await chooseTheme(harness, theme, join(data, "config.toml"));
     await capture(`local-${theme}-standard`);
     await resizeWindow(860, 480);
-    await waitFor(async () => !text(await visible("local.status.grid")).includes(originalGrid) || null);
+    await waitFor(async () => (await readGrid()) === compactGrid || null);
     await capture(`local-${theme}-compact`);
     await resizeWindow(1440, 900);
-    await waitFor(async () => text(await visible("local.status.grid")).includes(originalGrid) || null);
+    await waitFor(async () => (await readGrid()) === originalGrid || null);
   }
   checks.push("Dark, Light and Sauber are selected through the real global palette and captured at standard and minimum sizes for separate visual review");
   await clickTestId("terminal.surface");
@@ -178,14 +166,14 @@ try {
   const running = await waitFor(async () => descendants().find((process) => process.command.endsWith("/sleep")) ?? null);
   report.foreground_pid = running.pid;
   await sleep(400);
-  await clickTestId("tabs.close.1");
+  await closeWorkspaceTab(harness, "tabs.tab.1");
   await visible("local.close.confirmation");
   await capture("local-close-risk");
   await clickTestId("local.close.cancel");
   await waitFor(async () => (await query("local.close.confirmation")).filter((node) => node.hidden !== true && (node.effective_opacity ?? 1) > 0 && node.rect.w > 0 && node.rect.h > 0).length === 0 || null);
   assert(descendants().some((process) => process.pid === running.pid));
   checks.push("Cancel closes the risk modal while the same real foreground process continues");
-  await clickTestId("tabs.close.1");
+  await closeWorkspaceTab(harness, "tabs.tab.1");
   await visible("local.close.confirmation");
   await clickTestId("local.close.accept");
   await waitFor(async () => !descendants().some((process) => process.pid === running.pid) || null);

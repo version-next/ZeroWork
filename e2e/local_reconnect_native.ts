@@ -1,4 +1,7 @@
 /** Real Local PTY exit/reconnect in one tab, with isolated data and shell setup. */
+import { closeWorkspaceTab } from './workspace_tab_actions.ts';
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -28,7 +31,7 @@ const visible = async (id: string) => h.waitFor(async () => (await h.query(id)).
 const hidden = async (id: string) => h.waitFor(async () => !(await h.query(id)).some(shown) || null);
 const output = async (value: string) => h.waitFor(async () => (await h.query("terminal.surface")).some((n: any) => text(n).includes(value)) || null);
 function shells(): number[] {
-  return execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).split("\n").flatMap(line => {
+  return psCompat(["-axo", "pid=,ppid=,comm="]).split("\n").flatMap(line => {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return m && Number(m[2]) === app.pid && m[3].endsWith("/zsh") ? [Number(m[1])] : [];
   });
@@ -93,7 +96,7 @@ try {
   checks.push("A nonzero exit also reconnects repeatedly in the original tab without accumulating live shells");
   await h.resizeWindow(1440, 900);
   await capture("reconnected");
-  await h.clickTestId("tabs.close.1");
+  await closeWorkspaceTab(h, "tabs.tab.1");
   await visible("workspace.empty.local");
   await h.waitFor(async () => shells().length === 0 || null);
   checks.push("Closing the reconnected tab releases the replacement shell");

@@ -1,4 +1,5 @@
 /** Production recovery renderer, isolated snapshots; manager dispatch is covered by Zig tests. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, open, writeFile } from 'node:fs/promises';
@@ -63,5 +64,6 @@ for (const fixture of ['unknown', 'cooldown', 'context']) {
     await log.close();
   }
 }
+report.status = 'passed'; // every fixture above ran to its end (an assertion throws before this line)
 await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report));

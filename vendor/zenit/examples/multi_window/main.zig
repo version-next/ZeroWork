@@ -14,7 +14,9 @@
 /// Each window's UI is in view.yix (`WindowUi`, props distinguish A/B).
 ///
 /// Smoke test: ZENIT_SMOKE_FRAMES=N runs N frames then auto-exits (exit 0), so scripts/CI can
-/// assert "both windows truly rendered" without manual close.
+/// assert "both windows truly rendered" without manual close. It also checks frame-first
+/// delivery across real windows: a background thread's `Inbox.notify` wakes a loop blocked on a
+/// long idle wait and only the inbox's window renders (ZENIT_SMOKE_INBOX=1, `verifyInboxWake`).
 const std = @import("std");
 const ui = @import("ui");
 const zenit_app = @import("zenit_app");
@@ -27,6 +29,96 @@ fn mountWindowA(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
 
 fn mountWindowB(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
     return ui.view.render(scope, cx, WindowUi(.{ .tag = "B", .heading = "zenit multi-window: B", .button = "Click me (B)" }));
+}
+
+const InboxProbe = struct {
+    var inbox_a: ui.Inbox = .none;
+    var inbox_b: ui.Inbox = .none;
+    var hits_a: u32 = 0;
+    var hits_b: u32 = 0;
+
+    const Hit = struct {
+        hits: *u32,
+        fn run(self: *Hit) void {
+            self.hits.* += 1;
+        }
+    };
+
+    fn mountA(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
+        const hit = try scope.createState(Hit, .{ .hits = &hits_a });
+        inbox_a = try cx.createInbox(scope, cx.on(Hit, hit, Hit.run));
+        return mountWindowA(cx, scope);
+    }
+
+    fn mountB(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
+        const hit = try scope.createState(Hit, .{ .hits = &hits_b });
+        inbox_b = try cx.createInbox(scope, cx.on(Hit, hit, Hit.run));
+        return mountWindowB(cx, scope);
+    }
+
+    fn notifyLater(io: std.Io, inbox: ui.Inbox, delay_ms: u64) void {
+        std.Io.sleep(io, .fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
+        inbox.notify();
+    }
+};
+
+fn elapsedMs(io: std.Io, start: std.Io.Timestamp) i96 {
+    return @divTrunc(std.Io.Clock.awake.now(io).nanoseconds - start.nanoseconds, std.time.ns_per_ms);
+}
+
+/// Real windows, real event loop: both windows idle, the loop blocked in its native wait; a
+/// background thread notifies A's inbox. The blocked wait must end at once, A's callback run and
+/// only A render (an occluded A delivers without rendering).
+fn verifyInboxWake(allocator: std.mem.Allocator, io: std.Io) !void {
+    var application = MultiWindowApp.init(allocator, .{});
+    defer application.deinit();
+    const config: zenit_app.runtime.Config = .{ .io = io, .window = .{ .width = 360, .height = 240, .title = "zenit inbox" }, .idle_wait_ms = 3_000 };
+    var config_b = config;
+    config_b.window.title = "zenit inbox B";
+    const a = try application.createWindowWith(config, InboxProbe.mountA);
+    const b = try application.createWindowWith(config_b, InboxProbe.mountB);
+    // Settle until an idle tick really blocks in the native wait (first frames, display links
+    // stopping, idle trims and other deadlines all past).
+    var idle_tick_ms: i96 = 0;
+    for (0..60) |_| {
+        const tick_start = std.Io.Clock.awake.now(io);
+        _ = try application.tick();
+        idle_tick_ms = elapsedMs(io, tick_start);
+        if (idle_tick_ms >= 300 and !a.cx.wantsFrame() and !b.cx.wantsFrame()) break;
+    }
+    if (idle_tick_ms < 300) return error.InboxProbeLoopNeverBlocks;
+    const a_frames = a.renderer.frame_count;
+    const b_frames = b.renderer.frame_count;
+
+    const start = std.Io.Clock.awake.now(io);
+    const thread = try std.Thread.spawn(.{}, InboxProbe.notifyLater, .{ io, InboxProbe.inbox_a, 100 });
+    var ticks: usize = 0;
+    while (InboxProbe.hits_a == 0 and ticks < 20) : (ticks += 1) _ = try application.tick();
+    thread.join();
+    const elapsed_ms = elapsedMs(io, start);
+    if (InboxProbe.hits_a != 1) return error.InboxNotDelivered;
+    // The blocked wait ended with the notify (~100 ms), not at its deadline; with display-link
+    // pacing the frame (and so the delivery) is the next vsync after the woken tick.
+    if (elapsed_ms > 1_000 or elapsed_ms * 2 > idle_tick_ms) {
+        std.log.err("[multi_window] inbox wake late: idle tick {d} ms, delivered after {d} ms in {d} ticks, wake handler set={}", .{ idle_tick_ms, elapsed_ms, ticks, a.cx.inbox_hub.wake != null });
+        return error.InboxWakeTooLate;
+    }
+    if (a.renderer.frame_count <= a_frames and !a.occluded) return error.InboxWindowDidNotRender;
+    // Only the inbox's window rendered.
+    if (b.renderer.frame_count != b_frames or InboxProbe.hits_b != 0) return error.InboxWokeOtherWindow;
+    std.log.info("[multi_window] inbox ok: idle tick blocked {d} ms; notify at 100 ms delivered after {d} ms in {d} ticks, A frames {d}->{d} (occluded={}), B frames {d}->{d}", .{ idle_tick_ms, elapsed_ms, ticks, a_frames, a.renderer.frame_count, a.occluded, b_frames, b.renderer.frame_count });
+
+    // Windows gone: a late notify from another thread does nothing. A native close may complete
+    // on a later pump; the inboxes close when the window is torn down.
+    _ = application.closeWindow(a.windowId());
+    _ = application.closeWindow(b.windowId());
+    var pumps: usize = 0;
+    while (application.windowCount() != 0 and pumps < 200) : (pumps += 1) _ = application.tick() catch break;
+    if (application.windowCount() != 0) return error.InboxProbeWindowsDidNotClose;
+    if (InboxProbe.inbox_a.isOpen() or InboxProbe.inbox_b.isOpen()) return error.InboxOpenAfterClose;
+    const late = try std.Thread.spawn(.{}, InboxProbe.notifyLater, .{ io, InboxProbe.inbox_a, 0 });
+    late.join();
+    std.log.info("[multi_window] inbox closed ok", .{});
 }
 
 fn verifyApplicationQuitContract(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -71,6 +163,13 @@ pub fn main(init: std.process.Init) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // ZENIT_SMOKE_INBOX=1: only the frame-first delivery check (verifyInboxWake).
+    if (@import("zenit_environment").getBorrowed("ZENIT_SMOKE_INBOX") != null) {
+        try verifyInboxWake(allocator, init.io);
+        if (MultiWindowApp.nativeWindowCount() != 0) return error.InboxProbeCleanupFailed;
+        return;
+    }
 
     const smoke_frames: ?u64 = blk: {
         const env = @import("zenit_environment").getBorrowed("ZENIT_SMOKE_FRAMES") orelse break :blk null;

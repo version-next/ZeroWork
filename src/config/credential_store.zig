@@ -162,6 +162,11 @@ pub const Transaction = struct {
     }
 };
 
+/// test-mode 应用（自动化、e2e）选用私有数据目录里的文件后端（`test_mode_credentials.zig`），
+/// 永不调用原生钥匙串。只由组合根在 `application_test_mode` 为真时调用。
+pub fn useTestModeBackend(value: Backend) void {
+    selected_backend = value;
+}
 /// Injectable owned fixture. It never touches user data or native Keychain.
 pub const MemoryBackend = struct {
     values: std.StringHashMapUnmanaged([]u8) = .empty,

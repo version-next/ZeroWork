@@ -3,6 +3,7 @@
 //! range.  We intentionally retain a small, dependency-free parser because
 //! theme import is a local settings action and must not execute XML code.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 
 pub const Theme = struct {
     name: []const u8,
@@ -61,10 +62,8 @@ pub fn loadManaged(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, id
 pub fn save(io: std.Io, dir: std.Io.Dir, path: []const u8, source: []const u8) !void {
     var theme = try parse(std.heap.page_allocator, source, std.fs.path.basename(path));
     defer theme.deinit(std.heap.page_allocator);
-    var atomic = try dir.createFileAtomic(io, path, .{ .make_path = true, .replace = true });
-    defer atomic.deinit(io);
-    try atomic.file.writePositionalAll(io, source, 0);
-    try atomic.replace(io);
+    // 用户导入的主题文件：沿用进程默认权限，不 fsync（与改造前一致）。
+    try persist.writeAtomic(io, dir, path, source, .{ .make_path = true, .permissions = null, .durability = .flush_only });
 }
 
 pub fn load(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !Theme {

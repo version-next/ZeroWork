@@ -1,0 +1,321 @@
+//! Runtime approval: stable handles and membership epochs, never a live fan-out.
+const std = @import("std");
+const Handle = @import("../../../host/identity.zig").SessionHandle;
+pub const Fact = struct {
+    handle: Handle,
+    membership_revision: u64,
+    writable: bool = true,
+    mode_revision: u64 = 1,
+    input_revision: u64 = 0,
+    capability_revision: u64 = 1,
+    pub fn same(self: Fact, other: Fact) bool {
+        return self.handle.eql(other.handle) and self.membership_revision == other.membership_revision and self.capability_revision == other.capability_revision;
+    }
+};
+pub const Target = struct { fact: Fact, selected: bool = true, last_event: u64 = 0, member_event: u64 = 0, result: enum { skipped, accepted, failed } = .skipped };
+pub const Approval = struct {
+    group_id: u32,
+    group_revision: u64,
+    source: Fact,
+    targets: []Target,
+    enabled: bool = false,
+    source_selected: bool = true,
+    source_event: u64 = 0,
+    pub fn deinit(self: *Approval, allocator: std.mem.Allocator) void {
+        allocator.free(self.targets);
+    }
+    pub fn approve(self: *Approval, revision: u64, facts: []const Fact) !void {
+        if (self.enabled) return;
+        if (revision != self.group_revision or !valid(self.source, facts)) return error.StaleApproval;
+        for (self.targets) |target| if (target.selected and !valid(target.fact, facts)) return error.StaleApproval;
+        if (self.effective(facts) == 0) return error.NoRecipients;
+        self.enabled = true;
+    }
+    pub fn valid(fact: Fact, facts: []const Fact) bool {
+        for (facts) |live| if (fact.same(live) and live.writable) return true;
+        return false;
+    }
+    pub fn effective(self: *const Approval, facts: []const Fact) usize {
+        var count: usize = 0;
+        for (self.targets) |target| if (target.selected and valid(target.fact, facts)) {
+            count += 1;
+        };
+        return count;
+    }
+    /// Selection only narrows the captured recipient set. New generations or members
+    /// cannot enter an existing approval through the presentation layer.
+    pub fn select(self: *Approval, owner: Handle, selected: bool, facts: []const Fact) !void {
+        for (self.targets) |*target| if (target.fact.handle.eql(owner)) {
+            if (selected and !valid(target.fact, facts)) return error.StaleApproval;
+            target.selected = selected;
+            return;
+        };
+        return error.UnknownRecipient;
+    }
+    /// Explicit member controls capture the current generation; neither reconnects
+    /// nor new members silently join an already running broadcast.
+    pub fn setMember(self: *Approval, allocator: std.mem.Allocator, owner: Handle, selected: bool, facts: []const Fact) !void {
+        // Turning off a member needs no live snapshot and never changes peers.
+        if (!selected) {
+            if (self.source.handle.session_id == owner.session_id) {
+                self.source_selected = false;
+                return;
+            }
+            for (self.targets) |*target| if (target.fact.handle.session_id == owner.session_id) {
+                target.selected = false;
+                return;
+            };
+            return;
+        }
+        const live = for (facts) |fact| {
+            if (fact.handle.eql(owner) and (!selected or fact.writable)) break fact;
+        } else return error.InvalidSource;
+        if (self.source.handle.session_id == owner.session_id) {
+            if (!self.source.same(live)) self.source_event = 0;
+            self.source = live;
+            self.source_selected = selected;
+        } else {
+            for (self.targets) |*target| if (target.fact.handle.session_id == owner.session_id) {
+                if (!target.fact.same(live)) target.member_event = 0;
+                target.fact = live;
+                target.selected = selected;
+                self.enabled = true;
+                return;
+            };
+            const old_len = self.targets.len;
+            self.targets = try allocator.realloc(self.targets, old_len + 1);
+            self.targets[old_len] = .{ .fact = live, .selected = selected };
+        }
+        self.enabled = true;
+    }
+    pub fn participates(self: *const Approval, owner: Handle, facts: []const Fact) bool {
+        if (!self.enabled) return false;
+        if (self.source.handle.eql(owner)) return self.source_selected and valid(self.source, facts);
+        for (self.targets) |target| if (target.fact.handle.eql(owner)) return target.selected and valid(target.fact, facts);
+        return false;
+    }
+    pub fn participantCount(self: *const Approval, facts: []const Fact) usize {
+        if (!self.enabled) return 0;
+        return self.effective(facts) + @as(usize, if (self.enabled and self.source_selected and valid(self.source, facts)) 1 else 0);
+    }
+    /// Every selected member can originate input; forwarded input never re-enters
+    /// this path. Sequence numbers belong to each source, not the whole group.
+    pub fn dispatchMembers(self: *Approval, owner: Handle, event: u64, facts: []const Fact, context: *anyopaque, send: *const fn (*anyopaque, Handle) anyerror!void) !void {
+        if (event == 0 or !self.participates(owner, facts)) return;
+        const watermark = if (self.source.handle.eql(owner)) &self.source_event else blk: {
+            for (self.targets) |*target| if (target.fact.handle.eql(owner)) break :blk &target.member_event;
+            return;
+        };
+        if (event <= watermark.*) return;
+        watermark.* = event;
+        var failure: ?anyerror = null;
+        if (!self.source.handle.eql(owner) and self.participates(self.source.handle, facts)) send(context, self.source.handle) catch |err| {
+            failure = err;
+        };
+        for (self.targets) |target| {
+            if (target.fact.handle.eql(owner) or !self.participates(target.fact.handle, facts)) continue;
+            send(context, target.fact.handle) catch |err| {
+                if (failure == null) failure = err;
+            };
+        }
+        if (failure) |err| return err;
+    }
+    pub fn dispatch(self: *Approval, source: Fact, event: u64, facts: []const Fact, context: *anyopaque, send: *const fn (*anyopaque, Handle) anyerror!void) !void {
+        if (!self.enabled or event == 0) return;
+        if (!self.source.same(source) or !valid(self.source, facts)) return error.StaleSource;
+        var failure: ?anyerror = null;
+        for (self.targets) |*target| {
+            if (event <= target.last_event) continue;
+            target.last_event = event;
+            target.result = .skipped;
+            if (!target.selected or !valid(target.fact, facts)) continue;
+            send(context, target.fact.handle) catch |err| {
+                target.result = .failed;
+                if (failure == null) failure = err;
+                continue;
+            };
+            target.result = .accepted;
+        }
+        if (failure) |err| return err;
+    }
+};
+pub fn prepare(allocator: std.mem.Allocator, group: u32, revision: u64, source: Fact, facts: []const Fact) !Approval {
+    if (!Approval.valid(source, facts)) return error.InvalidSource;
+    var targets: std.ArrayList(Target) = .empty;
+    errdefer targets.deinit(allocator);
+    for (facts) |fact| {
+        if (fact.handle.session_id == source.handle.session_id or !fact.writable) continue;
+        try targets.append(allocator, .{ .fact = fact });
+    }
+    return .{ .group_id = group, .group_revision = revision, .source = source, .targets = try targets.toOwnedSlice(allocator) };
+}
+test "approval excludes new members reconnects rejoin and duplicate events; zero targets remains on" {
+    const a: Fact = .{ .handle = .{ .session_id = @fromBackingInt(1) }, .membership_revision = 1 };
+    const b: Fact = .{ .handle = .{ .session_id = @fromBackingInt(2) }, .membership_revision = 2 };
+    var approval = try prepare(std.testing.allocator, 7, 2, a, &.{ a, b });
+    defer approval.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StaleApproval, approval.approve(3, &.{ a, b }));
+    try approval.approve(2, &.{ a, b });
+    const Fake = struct {
+        count: usize = 0,
+        fn send(raw: *anyopaque, _: Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var c = b;
+    c.handle.session_id = @fromBackingInt(3);
+    try approval.dispatch(a, 1, &.{ a, b, c }, &fake, Fake.send);
+    try approval.dispatch(a, 1, &.{ a, b, c }, &fake, Fake.send);
+    try std.testing.expectEqual(@as(usize, 1), fake.count);
+    var reconnect = b;
+    reconnect.handle.generation += 1;
+    try approval.dispatch(a, 2, &.{ a, reconnect, c }, &fake, Fake.send);
+    var rejoin = b;
+    rejoin.membership_revision += 1;
+    try approval.dispatch(a, 3, &.{ a, rejoin, c }, &fake, Fake.send);
+    try std.testing.expectEqual(@as(usize, 1), fake.count);
+    try std.testing.expect(approval.enabled);
+    try std.testing.expectEqual(@as(usize, 0), approval.effective(&.{ a, reconnect }));
+}
+
+test "recipient failure does not suppress healthy targets and skipped events never replay" {
+    const source: Fact = .{ .handle = .{ .session_id = @fromBackingInt(100) }, .membership_revision = 1 };
+    var facts: [301]Fact = undefined;
+    facts[0] = source;
+    for (facts[1..], 0..) |*fact, index| fact.* = .{ .handle = .{ .session_id = @fromBackingInt(200 + index) }, .membership_revision = 2 + index };
+    var approval = try prepare(std.testing.allocator, 7, 2, source, &facts);
+    defer approval.deinit(std.testing.allocator);
+    try approval.approve(2, &facts);
+    const Fake = struct {
+        count: usize = 0,
+        fn send(raw: *anyopaque, handle: Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            if (@backingInt(handle.session_id) == 200) return error.InputFull;
+        }
+    };
+    var fake: Fake = .{};
+    facts[2].writable = false;
+    try std.testing.expectError(error.InputFull, approval.dispatch(source, 1, &facts, &fake, Fake.send));
+    try std.testing.expectEqual(@as(usize, 299), fake.count);
+    try std.testing.expectEqual(.failed, approval.targets[0].result);
+    try std.testing.expectEqual(.skipped, approval.targets[1].result);
+    try std.testing.expectEqual(.accepted, approval.targets[2].result);
+    facts[2].writable = true;
+    try approval.dispatch(source, 1, &facts, &fake, Fake.send);
+    try std.testing.expectEqual(@as(usize, 299), fake.count);
+    var replacement = source;
+    replacement.handle.generation += 1;
+    try std.testing.expectError(error.StaleSource, approval.dispatch(replacement, 2, &facts, &fake, Fake.send));
+}
+
+test "recipient selection never replays input or admits a new generation" {
+    const a: Fact = .{ .handle = .{ .session_id = @fromBackingInt(1) }, .membership_revision = 1 };
+    const b: Fact = .{ .handle = .{ .session_id = @fromBackingInt(2) }, .membership_revision = 2 };
+    const c: Fact = .{ .handle = .{ .session_id = @fromBackingInt(3) }, .membership_revision = 3 };
+    var approval = try prepare(std.testing.allocator, 1, 1, a, &.{ a, b, c });
+    defer approval.deinit(std.testing.allocator);
+    try approval.select(b.handle, false, &.{ a, b, c });
+    try approval.approve(1, &.{ a, b, c });
+    const Sent = struct {
+        count: usize = 0,
+        fn send(raw: *anyopaque, owner: Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(c.handle.session_id, owner.session_id);
+            self.count += 1;
+        }
+    };
+    var sent: Sent = .{};
+    try approval.dispatch(a, 1, &.{ a, b, c }, &sent, Sent.send);
+    try std.testing.expectEqual(@as(usize, 1), sent.count);
+    try approval.select(b.handle, true, &.{ a, b, c });
+    try approval.dispatch(a, 1, &.{ a, b, c }, &sent, Sent.send);
+    try std.testing.expectEqual(@as(usize, 1), sent.count);
+    var replacement = b;
+    replacement.handle.generation += 1;
+    try std.testing.expectError(error.UnknownRecipient, approval.select(replacement.handle, true, &.{ a, replacement, c }));
+    try std.testing.expectError(error.StaleApproval, approval.select(b.handle, true, &.{ a, replacement, c }));
+    try approval.select(c.handle, false, &.{ a, replacement, c });
+    try std.testing.expectEqual(@as(usize, 0), approval.effective(&.{ a, replacement, c }));
+}
+
+test "member broadcast independent selection bidirectional input and direct reconnect enable" {
+    const a: Fact = .{ .handle = .{ .session_id = @fromBackingInt(1) }, .membership_revision = 1 };
+    const b: Fact = .{ .handle = .{ .session_id = @fromBackingInt(2) }, .membership_revision = 2 };
+    var group = try prepare(std.testing.allocator, 1, 1, a, &.{ a, b });
+    defer group.deinit(std.testing.allocator);
+    group.source_selected = false;
+    group.targets[0].selected = false;
+    try group.setMember(std.testing.allocator, a.handle, true, &.{ a, b });
+    try std.testing.expectEqual(@as(usize, 1), group.participantCount(&.{ a, b }));
+    try group.setMember(std.testing.allocator, b.handle, true, &.{ a, b });
+    const Sink = struct {
+        count: usize = 0,
+        last: ?Handle = null,
+        fn send(raw: *anyopaque, owner: Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            self.last = owner;
+        }
+    };
+    var sink: Sink = .{};
+    try group.dispatchMembers(a.handle, 1, &.{ a, b }, &sink, Sink.send);
+    try std.testing.expect(sink.last.?.eql(b.handle));
+    try group.dispatchMembers(b.handle, 1, &.{ a, b }, &sink, Sink.send);
+    try std.testing.expect(sink.last.?.eql(a.handle));
+    try group.dispatchMembers(b.handle, 1, &.{ a, b }, &sink, Sink.send);
+    try std.testing.expectEqual(@as(usize, 2), sink.count);
+    try group.setMember(std.testing.allocator, a.handle, false, &.{ a, b });
+    try std.testing.expect(!group.participates(a.handle, &.{ a, b }));
+    try std.testing.expect(group.participates(b.handle, &.{ a, b }));
+    var reconnected = a;
+    reconnected.handle.generation += 1;
+    try group.setMember(std.testing.allocator, reconnected.handle, true, &.{ reconnected, b });
+    try group.dispatchMembers(reconnected.handle, 1, &.{ reconnected, b }, &sink, Sink.send);
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    const c: Fact = .{ .handle = .{ .session_id = @fromBackingInt(3) }, .membership_revision = 3 };
+    try std.testing.expect(!group.participates(c.handle, &.{ reconnected, b, c }));
+    try group.setMember(std.testing.allocator, c.handle, true, &.{ reconnected, b, c });
+    try std.testing.expectEqual(@as(usize, 3), group.participantCount(&.{ reconnected, b, c }));
+}
+
+test "member broadcast on off is idempotent and preserves other members including offline deselection" {
+    const a: Fact = .{ .handle = .{ .session_id = @fromBackingInt(1) }, .membership_revision = 1 };
+    const b: Fact = .{ .handle = .{ .session_id = @fromBackingInt(2) }, .membership_revision = 2 };
+    const c: Fact = .{ .handle = .{ .session_id = @fromBackingInt(3) }, .membership_revision = 3 };
+    const facts = [_]Fact{ a, b, c };
+    var group = try prepare(std.testing.allocator, 1, 1, a, &facts);
+    defer group.deinit(std.testing.allocator);
+    group.source_selected = false;
+    for (group.targets) |*target| target.selected = false;
+    try group.setMember(std.testing.allocator, a.handle, true, &facts);
+    try group.setMember(std.testing.allocator, a.handle, true, &facts);
+    try std.testing.expectEqual(@as(usize, 1), group.participantCount(&facts));
+    try std.testing.expect(!group.participates(b.handle, &facts));
+    try std.testing.expect(!group.participates(c.handle, &facts));
+    try group.setMember(std.testing.allocator, b.handle, true, &facts);
+    try group.setMember(std.testing.allocator, c.handle, true, &facts);
+    try group.setMember(std.testing.allocator, a.handle, false, &.{ b, c });
+    try group.setMember(std.testing.allocator, a.handle, false, &.{ b, c });
+    try std.testing.expect(!group.participates(a.handle, &facts));
+    try std.testing.expect(group.participates(b.handle, &facts));
+    try std.testing.expect(group.participates(c.handle, &facts));
+    const Sink = struct {
+        received: usize = 0,
+        fn send(raw: *anyopaque, owner: Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(c.handle.session_id, owner.session_id);
+            self.received += 1;
+        }
+    };
+    var sink: Sink = .{};
+    try group.dispatchMembers(a.handle, 1, &facts, &sink, Sink.send);
+    try std.testing.expectEqual(@as(usize, 0), sink.received);
+    try group.dispatchMembers(b.handle, 1, &facts, &sink, Sink.send);
+    try std.testing.expectEqual(@as(usize, 1), sink.received);
+    try group.setMember(std.testing.allocator, a.handle, true, &facts);
+    try group.setMember(std.testing.allocator, a.handle, true, &facts);
+    try std.testing.expectEqual(@as(usize, 3), group.participantCount(&facts));
+}

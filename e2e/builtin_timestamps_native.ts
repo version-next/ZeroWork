@@ -1,4 +1,5 @@
 /** V3 builtin composite document acceptance through the real Local PTY and native Surface. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,copyFile,readFile,writeFile,open,readdir,rm} from 'node:fs/promises';
@@ -12,7 +13,7 @@ const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-builtin-records-'))),rp
 await writeFile(join(shell,'.zshrc'),"bindkey -e\nPS1='records%# '\n");
 await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_family="Menlo"\nfont_size=14\n');
 await copyFile(source,join(iso,'zerowork'));await copyFile(join(source,'..','zw_ipc.so'),join(iso,'zw_ipc.so'));
-const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');const peer=spawn('python3',['e2e/builtin_records_ssh_peer.py','--out',peerOut],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
+const peerLog=await open(join(out,'peer.log'),'w');const peerOut=join(out,'peer');assert(process.env.ZW_TEST_PYTHON,'ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used');const peer=spawn(process.env.ZW_TEST_PYTHON,['-I','e2e/builtin_records_ssh_peer.py','--out',peerOut],{stdio:['ignore',peerLog.fd,peerLog.fd]});const peerEnded=new Promise(r=>peer.once('close',r));
 const ready=await waitFor(async()=>{try{return JSON.parse(await readFile(join(peerOut,'ready.json'),'utf8'))}catch{return null}},15000);
 await writeFile(join(data,'known_hosts'),ready.known_host);
 await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Owned records SSH"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`);
@@ -31,7 +32,10 @@ async function command(value:string){await palette();await type(value);await pre
 async function outputs(){return (await query('terminal.command.output')).filter(shown).map(content).join('\n')}
 async function records(){return (await query('terminal.command.record')).filter(shown).map(content)}
 try{
- await waitForServerReady();await resizeWindow(1200,800);const host=await vis('sidebar.host');assert((await clickAt(host.rect.x+host.rect.w/2,host.rect.y+host.rect.h/2,2)).ok);
+ await waitForServerReady();await resizeWindow(1200,800);
+ // 侧栏契约（design-r3 A2，fe28ab5b；sidebar_view.zig HostRow.onEvent）：单击主机行只选中，重复点击不连接；
+ // 选中行行尾的原生“连接”按钮（sidebar.host.connect_button）或 Return 才发起连接。
+ await click('sidebar.host');await click('sidebar.host.connect_button');
  await waitFor(async()=>content(await vis('workspace.pane')).includes('sshrecords')||null,30000);await sleep(600);
  for(const [index,cmd] of ['ts','ts','ts'].entries()){await command(cmd);if(index===1){assert.equal((await query('terminal.command.time')).filter(shown).length,2);assert.equal((await query('terminal.timestamp')).filter(shown).length,0);}await sleep(1100)}
  const clocks=(await query('terminal.command.time')).filter(shown);

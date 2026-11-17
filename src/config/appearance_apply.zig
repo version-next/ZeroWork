@@ -2,7 +2,7 @@
 //! Workers own IO/decoding; commit only validates receipts and publishes once.
 const std = @import("std");
 const runtime = @import("runtime_config.zig");
-const controller = @import("settings_controller.zig");
+const controller = @import("../features/settings/model/settings_controller.zig");
 const themes = @import("theme_registry.zig");
 const material = @import("background_asset.zig");
 const schema = runtime.schema;

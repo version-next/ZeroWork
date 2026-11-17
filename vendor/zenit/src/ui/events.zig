@@ -434,6 +434,17 @@ pub const KeyEvent = struct {
     key: KeyCode = .unknown,
     raw_keycode: u16 = 0,
     modifiers: Modifiers = .{},
+    /// The key belongs to the input method: the focused text input was composing (IME preedit)
+    /// when it was routed, and it is not a Cmd / Ctrl chord (cx_input.routeKeyDown). Which keys
+    /// arrive like this depends on the platform -- the macOS bridge keeps Return / Enter / Escape
+    /// for the input method but forwards Space, Tab, arrows and letters; the Windows IME reports
+    /// most of them as VK_PROCESSKEY; the web host drops them -- so a handler must not assume a
+    /// particular key. Such a key is dispatched to the focused input only and nothing else acts
+    /// on it: no action binding, overlay / tooltip Escape, Tab focus traversal or synthesized
+    /// click for Space / Enter. Template capture handlers (onKeyDownCapture) and ancestors'
+    /// `on_key_down` handlers (which cannot see this flag) skip it; `on_event` receives it with
+    /// the flag.
+    composing: bool = false,
 };
 
 /// Text input event
@@ -557,6 +568,12 @@ pub const Modifiers = packed struct {
     _padding: u4 = 0,
 
     pub const NONE = Modifiers{};
+};
+
+/// A key plus exact modifiers, e.g. for `Cx.setReservedKeyChords`.
+pub const KeyChord = struct {
+    key: KeyCode,
+    mods: Modifiers = .{},
 };
 
 /// Event propagation phase

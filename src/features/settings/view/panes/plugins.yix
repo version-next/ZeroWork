@@ -1,0 +1,370 @@
+//! 协议插件（第 5 类）面板正文（F-set-plugins，人工验收反馈第 10 条）：两级导航。
+//!
+//! - 列表页（Pencil `T5k96`，`Location{ .page = 5 }`）：按来源分组的面板（已内置 / 随应用提供），每个插件一行
+//!   （`R.DrillRow`：图标、名称、清单说明、版本、箭头），点一行进入该插件的详情页；最后是“计划中”面板，只列路线条目
+//!   （`host/plugin_roadmap.zig`：名称 + “{目标版本} 版本待实施”，不可点击，没有能力数、版本与箭头）。
+//! - 详情页（`KUKQ5`，`Location{ .page = 5, .sub = <注册表下标> }`）：头部卡片（图标、名称、说明、来源标签 `W.Tag`）与
+//!   管理说明；“插件信息”（版本、权限：值 + 原生“?”提示全文）；插件自带的偏好字段（原生开关 / 输入框 / 选择框，
+//!   生效时机是原生“?”式提示按钮）。页头后退 / 前进、搜索、滚动位置走设置窗口的两级导航机制。
+//!
+//! - 状态（Q5，Pencil XqqLV 稿 2）：只有随应用提供的插件有。开关是原生 `W.Switch`，待重启 / 已禁用提示是原生 `W.Alert`
+//!   （“立即重启”是 Alert 的原生动作行），状态标签是原生 `W.Tag`。
+//!
+//! 插件是运行时数据：行、文案、test_id 都由 view-model 从注册表派生（`m.plugin_pane`、`vm.plugin*`），本文件只摆结构。
+//! 只展示注册的元数据，不为插件编造能力；“计划中”只来自有设计文档的路线条目。
+const std = @import("std");
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const P = @import("plugins.yss");
+const D = m.plugin_pane;
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn popup(vm: *m.ViewModel, id: []const u8) bool {
+    return vm.popupOpen(id);
+}
+fn setPopup(vm: *m.ViewModel, id: []const u8, open: bool) void {
+    vm.dispatch(m.Intent.popupChanged(id, open));
+}
+
+// ── 列表页 ──
+
+fn groupId(group: m.PluginGroup) []const u8 {
+    return D.groupId(group);
+}
+fn groupHeaderId(group: m.PluginGroup) []const u8 {
+    return D.groupHeaderId(group);
+}
+fn groupMetaId(group: m.PluginGroup) []const u8 {
+    return D.groupMetaId(group);
+}
+fn groupTitle(group: m.PluginGroup) []const u8 {
+    return D.groupTitle(group);
+}
+fn groupShown(vm: *m.ViewModel, group: m.PluginGroup) bool {
+    return vm.pluginGroupShown(group);
+}
+fn items(vm: *m.ViewModel, group: m.PluginGroup) []const m.DrillItem {
+    return vm.pluginItems(group);
+}
+fn listEmpty(vm: *m.ViewModel) bool {
+    return vm.pluginListEmpty();
+}
+
+/// 一个来源分组（`RvB77` / `hhc8s`）：Pane Header（标题 + “3 个协议 · 随应用管理”）+ 行卡片。
+fn Group(vm: *m.ViewModel, group: m.PluginGroup) View {
+    return (
+        <box testId={groupId(group)} style={S.pane} visible={groupShown(vm, group)}>
+            <box testId={groupHeaderId(group)} style={S.pane_header}>
+                <text style={S.pane_title}>{groupTitle(group)}</text>
+                <spacer />
+                <text testId={groupMetaId(group)} style={S.pane_meta} box={S.pane_meta_box}>{vm.pluginGroupMeta(group)}</text>
+            </box>
+            <box style={S.pane_body}>
+                {for (items(vm, group)) |item| <R.DrillRow key={item.key} vm={vm} item={item} />}
+            </box>
+        </box>
+    );
+}
+
+fn plannedShown(vm: *m.ViewModel) bool {
+    return vm.pluginPlannedShown();
+}
+fn plannedItems(vm: *m.ViewModel) []const m.PlannedItem {
+    return vm.pluginPlannedItems();
+}
+fn plannedIcon(item: m.PlannedItem) ui.SvgAsset {
+    return ui.icons.get(item.icon) orelse ui.icons.plug;
+}
+
+/// 计划行（`Wlmxe`）：图标底 + 名称 / “0.5 版本待实施”，行间发丝线同 `DrillRow`；不可点击。
+fn PlannedRow(item: m.PlannedItem) View {
+    return (
+        <box testId={item.row_id} style={P.planned_row}>
+            <box style={S.overview_tile}>
+                <icon src={plannedIcon(item)} style={P.planned_icon} />
+            </box>
+            <box style={S.DrillInner.of(.{ .last = item.last })}>
+                <box style={S.drill_copy}>
+                    <text testId={item.title_id} style={P.planned_title} box={S.drill_text_box}>{item.title}</text>
+                    <text testId={item.summary_id} style={S.drill_summary} box={S.drill_text_box}>{item.summary}</text>
+                </box>
+            </box>
+        </box>
+    );
+}
+
+/// “计划中”（`g3bxO3`）：页头只有标题，没有计数。
+fn Planned(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.plugins.planned" style={S.pane} visible={plannedShown(vm)}>
+            <box testId="settings.plugins.planned.header" style={S.pane_header}>
+                <text style={S.pane_title}>{D.planned_title}</text>
+            </box>
+            <box style={S.pane_body}>
+                {for (plannedItems(vm)) |item| <PlannedRow key={item.key} item={item} />}
+            </box>
+        </box>
+    );
+}
+
+fn List(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.plugins.groups" style={P.panes}>
+            <Group vm={vm} group={.builtin} />
+            <Group vm={vm} group={.bundled} />
+            <box testId="settings.plugins.empty" visible={listEmpty(vm)}>
+                <W.Empty icon={ui.icons.get("puzzle").?} title="没有已注册的插件" description="已内置与随应用提供的插件会列在这里。" />
+            </box>
+            <Planned vm={vm} />
+        </box>
+    );
+}
+
+// ── 详情页 ──
+
+fn detailIndex(vm: *m.ViewModel) u8 {
+    return vm.pluginDetail() orelse 0;
+}
+fn detailShown(vm: *m.ViewModel) bool {
+    return vm.pluginDetailShown();
+}
+fn pid(vm: *m.ViewModel, index: u8, part: m.PluginPart) []const u8 {
+    return vm.pluginId(index, part);
+}
+fn icon(vm: *m.ViewModel, index: u8) ui.SvgAsset {
+    return ui.icons.get(vm.pluginIcon(index)) orelse ui.icons.plug;
+}
+
+/// 概要（`B57vb`）：头部卡片 + 管理说明。
+fn Summary(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box style={P.summary_pane}>
+            <box testId={pid(vm, index, .header)} style={P.head_card}>
+                <box style={P.head_tile}>
+                    <icon src={icon(vm, index)} style={P.head_icon} />
+                </box>
+                <box style={P.head_copy}>
+                    <text style={P.head_name} box={P.head_text_box}>{vm.pluginName(index)}</text>
+                    <text testId={pid(vm, index, .summary)} style={P.head_summary} box={P.head_text_box}>{vm.pluginDescription(index)}</text>
+                </box>
+                {if (vm.pluginStateTagShown(index)) <W.Tag testId={pid(vm, index, .state)} label={vm.pluginStateTag(index)} color={stateColor(vm, index)} size={.sm} />}
+                <W.Tag testId={pid(vm, index, .origin)} label={vm.pluginOriginTag(index)} size={.sm} />
+            </box>
+            <box style={P.note_wrap}>
+                <text testId={pid(vm, index, .version_message)} style={P.note} box={P.note_box}>{vm.pluginNote(index)}</text>
+            </box>
+        </box>
+    );
+}
+
+// ── 状态（随应用插件的启用开关，PLUGIN_ARCH_PLAN 6.2.1 Q5；Pencil XqqLV 稿 2） ──
+
+fn stateColor(vm: *m.ViewModel, index: u8) W.TagColor {
+    return if (vm.pluginPending(index)) .warning else .neutral;
+}
+fn toggleShown(vm: *m.ViewModel, index: u8) bool {
+    return vm.pluginToggleShown(index);
+}
+fn setEnabled(vm: *m.ViewModel, index: u8, value: bool) void {
+    vm.dispatch(m.Intent.setPluginEnabled(index, value));
+}
+fn restart(vm: *m.ViewModel) void {
+    vm.dispatch(m.Intent.runCommand(.restart_app));
+}
+fn enabledA11y(vm: *m.ViewModel, index: u8) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = vm.pluginToggleLabel(index), .checked = vm.pluginEnabledDraft(index), .disabled = vm.isSaving() };
+}
+
+/// “状态”分组（41 号说明稿）：Pane Header“状态”+ 右侧“重启后生效”，一行 Setting（标签 + 说明 + 原生 `W.Switch`）。
+/// 只有随应用提供的插件有这一组（Q5a）。拨动开关是“改了未保存”（SH1gb，沿用保存栏）；保存后与本次启动的状态不同时显示
+/// 原生 warning `W.Alert` 与“立即重启”（NHr2L / DzPbO）；本次没有加载时显示原生 info `W.Alert`（B0QXg6 / IeCzY）。
+fn Status(vm: *m.ViewModel, index: u8) View {
+    const a11y = computed(enabledA11y(vm, index));
+    return (
+        <box testId={pid(vm, index, .status)} style={S.pane} visible={toggleShown(vm, index)}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>{D.status_title}</text>
+                <spacer />
+                <text style={S.pane_meta} box={S.pane_meta_box}>{D.status_meta}</text>
+            </box>
+            <box style={S.pane_body}>
+                <box style={S.SettingRow.of(.{ .last = true })}>
+                    <box style={S.setting_line}>
+                        <box style={S.setting_copy}>
+                            <text style={S.setting_label}>{vm.pluginToggleLabel(index)}</text>
+                            <text testId={pid(vm, index, .enabled_hint)} style={S.setting_hint} box={P.toggle_hint_box}>{D.toggle_hint}</text>
+                        </box>
+                        <W.Switch testId={pid(vm, index, .enabled)} checked={vm.pluginEnabledDraft(index)} disabled={vm.isSaving()} a11y={a11y} onChange={|v| setEnabled(vm, index, v)} />
+                    </box>
+                    <text testId={pid(vm, index, .enabled_error)} style={S.setting_error} visible={vm.pluginEnableInvalid(index)}>{vm.pluginEnableProblem(index)}</text>
+                </box>
+            </box>
+            <box testId={pid(vm, index, .notice)} style={P.notice} visible={vm.pluginPending(index)}>
+                <W.Alert variant={.warning} title={vm.pluginPendingTitle(index)} message={vm.pluginPendingMessage(index)} actionLabel={D.restart_label} actionIconAsset={ui.icons.rotate_ccw} actionTestId={pid(vm, index, .restart)} onAction={restart(vm)} />
+            </box>
+            <box testId={pid(vm, index, .disabled)} style={P.notice} visible={vm.pluginDisabledShown(index)}>
+                <W.Alert variant={.info} title={vm.pluginDisabledTitle(index)} message={vm.pluginDisabledMessage(index)} />
+            </box>
+        </box>
+    );
+}
+
+/// 权限的“?”：原生 ghost 图标按钮 + 原生 Tooltip（上方、450ms，悬停 / 聚焦 / 点击打开；整窗 Escape 先收起它）。
+fn PermissionTip(vm: *m.ViewModel, index: u8) View {
+    const tip = computed(pid(vm, index, .permissions_tip));
+    const button = computed(pid(vm, index, .permissions));
+    return (
+        <box style={S.help_slot} onFocus={setPopup(vm, tip, true)} onBlur={setPopup(vm, tip, false)}>
+            <W.Tooltip text={vm.pluginPermissions(index)} position={.top} width={292} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                <W.Button testId={button} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.circle_help} iconSize={14} a11yLabel={vm.pluginPermissions(index)} onClick={setPopup(vm, tip, true)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+/// 插件信息：版本、权限（旧详情的事实行；版本对话框的“插件随应用更新”在概要的管理说明里）。
+fn Facts(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box testId="settings.plugins.info" style={S.pane}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>插件信息</text>
+            </box>
+            <box testId={vm.pluginBodyId(index)} style={S.pane_body}>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={S.setting_line}>
+                        <text style={S.setting_label} box={S.info_label_box}>版本</text>
+                        <text testId={pid(vm, index, .version)} style={S.info_value} box={S.info_value_box}>{vm.pluginVersion(index)}</text>
+                    </box>
+                </box>
+                <box style={S.SettingRow.of(.{ .last = true })}>
+                    <box style={S.setting_line}>
+                        <box style={S.setting_heading}>
+                            <text style={S.setting_label}>权限</text>
+                            <PermissionTip vm={vm} index={index} />
+                        </box>
+                        <text testId={pid(vm, index, .permissions_value)} style={S.info_value} box={S.info_value_box}>{D.permissions_value}</text>
+                    </box>
+                </box>
+            </box>
+        </box>
+    );
+}
+
+// ── 偏好字段 ──
+
+fn prefs(vm: *m.ViewModel, index: u8) []const m.PluginPrefItem {
+    return vm.pluginPrefItems(index);
+}
+fn hasPrefs(vm: *m.ViewModel, index: u8) bool {
+    return vm.pluginHasPrefs(index);
+}
+fn fid(vm: *m.ViewModel, index: u8, field: u8, part: m.PluginPrefPart) []const u8 {
+    return vm.pluginPrefId(index, field, part);
+}
+fn isKind(vm: *m.ViewModel, index: u8, field: u8, kind: m.PluginPrefKind) bool {
+    return vm.pluginPrefKind(index, field) == kind;
+}
+fn timingIcon(vm: *m.ViewModel, index: u8, field: u8) ?ui.SvgAsset {
+    return if (vm.pluginPrefNextConnection(index, field)) ui.icons.clock_3 else ui.icons.circle_check;
+}
+fn boolText(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+fn setBool(vm: *m.ViewModel, index: u8, field: u8, value: bool) void {
+    vm.dispatch(m.Intent.setPluginPreference(index, field, boolText(value)));
+}
+fn setText(vm: *m.ViewModel, index: u8, field: u8, text: []const u8) void {
+    vm.dispatch(m.Intent.setPluginPreference(index, field, text));
+}
+fn pick(vm: *m.ViewModel, index: u8, field: u8, value: ?[]const u8) void {
+    vm.dispatch(m.Intent.setPluginPreference(index, field, value orelse return));
+}
+fn switchA11y(vm: *m.ViewModel, index: u8, field: u8) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = vm.pluginPrefLabel(index, field), .checked = vm.pluginPrefChecked(index, field), .disabled = vm.isSaving() };
+}
+fn selectValue(vm: *m.ViewModel, index: u8, field: u8) ?[]const u8 {
+    return vm.pluginPrefText(index, field);
+}
+/// 选择框的选项（注册表里的选项换成原生 `W.SelectOption`；一个详情页同时只挂一个插件的字段，按字段分槽）。
+var option_buffer: [D.max_preferences][D.max_options]W.SelectOption = undefined;
+fn options(vm: *m.ViewModel, index: u8, field: u8) []const W.SelectOption {
+    const count = vm.pluginPrefOptionCount(index, field);
+    const list = &option_buffer[field];
+    for (0..count) |option| list[option] = .{ .value = vm.pluginPrefOptionValue(index, field, option), .label = vm.pluginPrefOptionLabel(index, field, option) };
+    return list[0..count];
+}
+
+/// 生效时机：原生 ghost 图标按钮 + 原生 Tooltip（“下次连接生效” / “保存后生效”；同旧 `controls.inlineHint`）。
+fn TimingTip(vm: *m.ViewModel, index: u8, field: u8) View {
+    const tip = computed(fid(vm, index, field, .timing_tip));
+    const button = computed(fid(vm, index, field, .timing));
+    return (
+        <box style={S.help_slot} onFocus={setPopup(vm, tip, true)} onBlur={setPopup(vm, tip, false)}>
+            <W.Tooltip text={vm.pluginPrefTiming(index, field)} position={.top} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                <W.Button testId={button} variant={.ghost} size={.xs} iconOnly={true} iconAsset={timingIcon(vm, index, field)} iconSize={14} a11yLabel={vm.pluginPrefTiming(index, field)} onClick={setPopup(vm, tip, true)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+/// 一个偏好字段行：标签 + 生效时机，右侧是按字段类型的原生控件；被拒绝的编辑在行下提示原因。
+fn PrefRow(vm: *m.ViewModel, index: u8, field: u8, last: bool) View {
+    const control = computed(fid(vm, index, field, .control));
+    const switch_a11y = computed(switchA11y(vm, index, field));
+    return (
+        <box testId={fid(vm, index, field, .row)} style={S.SettingRow.of(.{ .last = last })}>
+            <box style={S.setting_line}>
+                <box style={S.setting_copy}>
+                    <box style={S.setting_heading}>
+                        <text style={S.setting_label}>{vm.pluginPrefLabel(index, field)}</text>
+                        <TimingTip vm={vm} index={index} field={field} />
+                    </box>
+                </box>
+                {if (isKind(vm, index, field, .boolean)) <W.Switch testId={control} checked={vm.pluginPrefChecked(index, field)} disabled={vm.isSaving()} a11y={switch_a11y} onChange={|v| setBool(vm, index, field, v)} /> else if (isKind(vm, index, field, .string)) <W.Input value={vm.pluginPrefText(index, field)} width={180} invalid={vm.pluginPrefInvalid(index, field)} disabled={vm.isSaving()} onChange={|t| setText(vm, index, field, t)} onSubmit={|t| setText(vm, index, field, t)} parts={.{ .input_container = control }} /> else <W.Select panelWidth={.trigger} options={options(vm, index, field)} value={selectValue(vm, index, field)} width={180} disabled={vm.isSaving()} open={popup(vm, control)} onOpenChange={|o| setPopup(vm, control, o)} onChange={|v| pick(vm, index, field, v)} parts={.{ .trigger = control }} />}
+            </box>
+            <text testId={fid(vm, index, field, .err)} style={S.setting_error} visible={vm.pluginPrefInvalid(index, field)}>{vm.pluginPrefProblem(index, field)}</text>
+        </box>
+    );
+}
+
+/// 插件自带的设置（旧详情面板里的偏好行）。
+fn Preferences(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box testId="settings.plugins.preferences" style={S.pane} visible={hasPrefs(vm, index)}>
+            <box style={S.pane_header}>
+                <text style={S.pane_title}>偏好设置</text>
+            </box>
+            <box style={S.pane_body}>
+                {for (prefs(vm, index)) |item| <PrefRow key={item.key} vm={vm} index={index} field={item.field} last={item.last} />}
+            </box>
+        </box>
+    );
+}
+
+fn Detail(vm: *m.ViewModel, index: u8) View {
+    return (
+        <box testId={pid(vm, index, .detail)} style={P.panes}>
+            <Summary vm={vm} index={index} />
+            <Status vm={vm} index={index} />
+            <Facts vm={vm} index={index} />
+            <Preferences vm={vm} index={index} />
+        </box>
+    );
+}
+
+pub fn PluginsPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.plugins" style={S.category_panes}>
+            {if (detailShown(vm)) <Detail vm={vm} index={detailIndex(vm)} /> else <List vm={vm} />}
+        </box>
+    );
+}
+
+comptime {
+    _ = std;
+}

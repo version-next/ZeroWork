@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from PIL import Image, ImageChops
 
 ROOT = Path(__file__).resolve().parents[1]
-DEST = ROOT / "src/ui/assets/host-os"
+DEST = ROOT / "src/shared/ui/assets/host-os"
 SOURCES = {
     "ubuntu": ("https://ubuntu.com/static/favicons/COF-favicon-48x48.png?v=fa3c63f", "https://ubuntu.com/"),
     "sugon": ("https://www.sugon.com/style/home/images/favicon.ico", "https://www.sugon.com/"),

@@ -1,16 +1,16 @@
 //! Provider-owned SSH attempt: frozen configuration, authentication, IO and release ledger.
 const std = @import("std");
 const applog = @import("../../platform/applog.zig");
-const lifecycle = @import("../../ui/session_lifecycle.zig");
+const lifecycle = @import("../../host/session_lifecycle.zig");
 const hosts_mod = @import("../../config/hosts.zig");
 const config_mod = @import("../../config/config.zig");
 const OperationKey = @import("../../host/operation.zig").OperationKey;
 const HostSnapshot = lifecycle.Snapshot(hosts_mod.HostConfig);
 const ConfigSnapshot = lifecycle.Snapshot(config_mod.Config);
-const SessionRuntime = @import("../../ui/session_runtime.zig").SessionRuntime;
-const RuntimeReleaseReceipt = @import("../../ui/session_runtime.zig").ReleaseReceipt;
+const SessionRuntime = @import("../../features/workspace/host/session_runtime.zig").SessionRuntime;
+const RuntimeReleaseReceipt = @import("../../features/workspace/host/session_runtime.zig").ReleaseReceipt;
 const ResourceLedger = @import("../../proto/ssh/session.zig").ResourceLedger;
-const host_key_confirmation = @import("../../ui/host_key_confirmation.zig");
+const host_key_confirmation = @import("../../host/host_key_confirmation.zig");
 const host_key_policy = @import("../../proto/ssh/connection_policy.zig");
 const auth_challenge = @import("../../proto/ssh/auth_challenge.zig");
 /// A job owns everything used by its worker: identity, host config,
@@ -36,10 +36,19 @@ pub const ConnectJob = struct {
     progress_history: std.ArrayList(struct { key: OperationKey, journal: @import("../../proto/ssh/connection_progress.zig").Journal.Snapshot }) = .empty,
     progress_history_dropped: usize = 0,
     progress_dismissed: bool = false,
-    retained_cleanup: @import("../../ui/session_runtime.zig").DeferredRelease = .{},
+    retained_cleanup: @import("../../features/workspace/host/session_runtime.zig").DeferredRelease = .{},
     err: ?anyerror = null,
     connection_attempts: u8 = 1,
     automatic_retry_deadline_ns: ?i128 = null,
+    /// Length of the current automatic wait, for the countdown presentation.
+    automatic_retry_delay_ns: i128 = 0,
+    /// The user stopped automatic retries for this attempt chain ("停止重试").
+    /// A manual retry starts a fresh chain and clears it.
+    automatic_retry_stopped: bool = false,
+    /// "重新输入凭据": the next manual attempt asks for the secret instead of
+    /// using the saved password / key passphrase. Latched by the retry itself.
+    credential_prompt_requested: bool = false,
+    prompt_credentials: bool = false,
     host_key_bridge: host_key_confirmation.Bridge = .{},
     auth_bridge: auth_challenge.InteractiveBridge = .{},
     request_counter: auth_challenge.RequestCounter = .{},
@@ -95,7 +104,7 @@ pub const ConnectJob = struct {
     /// ApplicationHost supplies its owned hop configs here. Direct callers
     /// use the same durable IDs; display names never select a transport.
     pub fn resolvedHops(allocator: std.mem.Allocator, host: hosts_mod.HostConfig, registry: []const hosts_mod.HostConfig) ![]hosts_mod.HostConfig {
-        return @import("../../ui/session_runtime.zig").resolveHostRoute(allocator, host, registry);
+        return @import("../../features/workspace/host/session_runtime.zig").resolveHostRoute(allocator, host, registry);
     }
 
     /// Called only after the worker has been joined (or never started).
@@ -113,7 +122,7 @@ pub const ConnectJob = struct {
             job.destroy_mutex.unlock();
             return;
         }
-        job.retained_cleanup.finish(&job.resource_ledger, @import("../../ui/session_runtime.zig").drainRetainedResources);
+        job.retained_cleanup.finish(&job.resource_ledger, @import("../../features/workspace/host/session_runtime.zig").drainRetainedResources);
         if (!job.resource_ledger.snapshot().released()) {
             job.deferred_shared_destroy = true;
             job.destroy_mutex.unlock();
@@ -133,13 +142,22 @@ pub const ConnectJob = struct {
 
     pub fn failedCleanupReceipt(job: *ConnectJob) RuntimeReleaseReceipt {
         if (job.resource_ledger.snapshot().released()) return .released;
-        return job.retained_cleanup.request(&job.resource_ledger, @import("../../ui/session_runtime.zig").drainRetainedResources);
+        return job.retained_cleanup.request(&job.resource_ledger, @import("../../features/workspace/host/session_runtime.zig").drainRetainedResources);
+    }
+
+    /// Total attempts of one initial connection, including the first.
+    pub const automatic_attempt_limit: u8 = 3;
+    /// 首连自动重试（共享 `Backoff`，线性 0.5 s 步长）。与断线重连是两套参数：重连见 `vt/reconnect.zig`。
+    pub const automatic_retry: @import("../../shared/base/retry.zig").Backoff = .{ .max_retries = automatic_attempt_limit - 1, .schedule = .{ .linear = .{ .step_ms = 500 } } };
+    /// Wait before automatic attempt `attempts + 1` (attempts already made).
+    pub fn automaticRetryDelayMs(attempts: u8) u32 {
+        return @intCast(automatic_retry.schedule.linear.step_ms * attempts);
     }
 
     /// Retry only network setup before authentication/shell creation. Ordinary
     /// successors use host-issued operations; owned retries retain creation.
     pub fn canAutomaticallyRetry(job: *ConnectJob) bool {
-        if (job.connection_attempts >= 3 or job.runtime != null or job.cancelled.load(.acquire) or job.cleanup_unknown or job.shared_connection != null or job.bootstrap != null) return false;
+        if (job.automatic_retry_stopped or job.connection_attempts >= automatic_attempt_limit or job.runtime != null or job.cancelled.load(.acquire) or job.cleanup_unknown or job.shared_connection != null or job.bootstrap != null) return false;
         const progress = job.progress.snapshot();
         if (progress.dropped != 0 or progress.completed) return false;
         // A downstream transport failure must not replay authentication on an
@@ -209,7 +227,7 @@ pub fn connectThread(job: *ConnectJob) void {
     const runtime = SessionRuntime.initForHost(std.heap.c_allocator, job.io_instance.io(), job.config_snapshot.value, runtimeTarget(job)) catch |err| {
         applog.err(.workspace, "connect FAILED session={d}: {s}", .{ job.ticket.session_id, @errorName(err) });
         job.err = err;
-        job.retained_cleanup.finish(&job.resource_ledger, @import("../../ui/session_runtime.zig").drainRetainedResources);
+        job.retained_cleanup.finish(&job.resource_ledger, @import("../../features/workspace/host/session_runtime.zig").drainRetainedResources);
         return;
     };
     if (job.cancelled.load(.acquire)) {
@@ -238,8 +256,8 @@ fn sharedGraphReleased(raw: *anyopaque) void {
     job.destroy_mutex.unlock();
     if (destroy) job.destroy();
 }
-pub fn runtimeTarget(job: *ConnectJob) @import("../../ui/session_runtime.zig").HostTarget {
-    var target = @import("../../ui/session_runtime.zig").targetFromHost(job.host_snapshot.value, job.jump_snapshot.value);
+pub fn runtimeTarget(job: *ConnectJob) @import("../../features/workspace/host/session_runtime.zig").HostTarget {
+    var target = @import("../../features/workspace/host/session_runtime.zig").targetFromHost(job.host_snapshot.value, job.jump_snapshot.value);
     target.shared_connection = job.shared_connection;
     target.bootstrap = if (job.bootstrap) |prepared| &prepared.plan else null;
     target.connection_lifetime = .{ .context = job, .retain = sharedGraphRetained, .call = sharedGraphReleased };
@@ -252,5 +270,10 @@ pub fn runtimeTarget(job: *ConnectJob) @import("../../ui/session_runtime.zig").H
     target.host_key_store = &job.host_key_store;
     target.cancel_token = &job.cancelled;
     target.initial_input = job.initial_input orelse "";
+    if (job.prompt_credentials) {
+        // Display/auth metadata only: the saved secret stays in the registry.
+        target.password = null;
+        target.key_passphrase = null;
+    }
     return target;
 }

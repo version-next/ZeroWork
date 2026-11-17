@@ -1,0 +1,137 @@
+//! 通知历史（标题栏铃铛的“提醒”弹层）：原生组件默认外观（NATIVE_AUDIT 清单 4 · Notification / Toast）。
+//!
+//! - 弹层：原生 `W.Popover`（手动开合，锚在铃铛按钮下方右对齐；点外面 / Escape 收起，默认面板外观）。
+//! - 头部：共享 `PanelHeader`（panel-heads：铃铛图标、“提醒”、待处理“N 条”、统一关闭按钮——打开时焦点在这里）。
+//! - 筛选：“待处理 / 最近提醒”两颗原生 `W.Button`，选中的用 `secondary`、另一颗 `ghost`（只换 variant）。
+//! - 空状态：原生 `W.Empty`（图标、标题、说明）。
+//! - 列表：原生 `W.ScrollArea`，每条记录一张原生 `W.Card`：严重度图标、标题（换行）、相对时间、来源摘要、
+//!   展开后的详情（有界滚动）与多来源列表、动作按钮（原生 `W.Button`，来源已结束时禁用）、展开 / 收起。
+//! - 底部：有已结束记录时“清除已结束”；动作不可用时一条原生 `W.Alert`（warning）。
+//! - 铃铛角标（`Unread`）：原生 `W.Badge`，有待处理显示数量，只有未读显示一个点。
+//! 状态都在 `history/model/view_model.zig`；这里只读它、把点击交给它。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../history/model/view_model.zig");
+const S = @import("notification_history.yss");
+const P = @import("../../../shared/ui/components/panel_header/panel_header.yix");
+/// 浮层规则的唯一来源（OverlayHost `panel`）：焦点进入、Tab 圈住、Esc / 点外部关闭、焦点归还。
+const O = @import("../../../shared/ui/overlay/overlay_host.zig");
+
+fn pendingCount(vm: *m.ViewModel) ?u32 {
+    return @intCast(@min(vm.pendingCount(), 1_000_000));
+}
+fn dotOnly(vm: *m.ViewModel) bool {
+    return vm.pendingCount() == 0;
+}
+fn anchorOf(node: *ui.Node) W.popover.Anchor {
+    return .{ .node = node };
+}
+fn focusRequest(vm: *m.ViewModel) ui.view.FocusRequest {
+    const seq = vm.focusSeq();
+    return if (seq == 0) .{} else .{ .id = m.ids.close, .seq = seq };
+}
+fn filterVariant(on: bool) W.ButtonVariant {
+    return if (on) .secondary else .ghost;
+}
+fn severityIcon(severity: m.Severity) ui.SvgAsset {
+    return switch (severity) {
+        .info => ui.icons.info,
+        .success => ui.icons.circle_check,
+        .warning => ui.icons.triangle_alert,
+        .failure => ui.icons.circle_alert,
+    };
+}
+fn tone(severity: m.Severity) S.Tone {
+    return switch (severity) {
+        .info => .info,
+        .success => .success,
+        .warning => .warning,
+        .failure => .danger,
+    };
+}
+fn expandIcon(expanded: bool) ui.SvgAsset {
+    return if (expanded) ui.icons.chevron_up else ui.icons.chevron_down;
+}
+fn expandLabel(expanded: bool) []const u8 {
+    return if (expanded) "收起通知详情" else "展开通知详情";
+}
+fn hasFooter(row: m.Row) bool {
+    return row.actions.len > 0 or row.expandable;
+}
+
+/// 铃铛按钮上的角标，挂进铃铛按钮自己（绝对定位在右上角，不占位、不挡点击）。
+pub fn Unread(vm: *m.ViewModel) View {
+    return (
+        <box style={S.badge_slot} hitTest={false} visible={vm.badgeShown()}>
+            <W.Badge testId={m.ids.unread} count={pendingCount(vm)} dot={dotOnly(vm)} size={.sm} />
+        </box>
+    );
+}
+
+/// 宿主拿弹层内容根（`notifications.history`）：挂载后写进 `panelSlot`。
+fn keepPanel(slot: *?*ui.Node, panel: *ui.view.Ref(*ui.Node)) void {
+    slot.* = panel.get();
+}
+
+pub fn History(vm: *m.ViewModel, anchor: *ui.Node, panelSlot: *?*ui.Node) View {
+    const panel = ref();
+    onMount(keepPanel(panelSlot, panel));
+    return (
+        <box style={S.popover_anchor}>
+            <W.Popover trigger={.manual} open={vm.isOpen()} onOpenChange={|o| vm.setOpen(o)} anchor={anchorOf(anchor)} position={.bottom_end} offset={.{ .static = 8 }} width={360} constrainWidthToViewport={true} shiftMainAxis={true} closeOnEscape={O.panel.escape} closeOnOutsideClick={O.panel.outside} consumeOutsideClick={O.consume_outside_click} trapFocus={O.panel.trap_focus}>
+                <col ref={panel} testId={m.ids.panel} style={S.panel} focusRequest={focusRequest(vm)}>
+                    <P.PanelHeader icon={ui.icons.bell} title="提醒" headerTestId={m.ids.header} subtitle={vm.countText()} inset={.flush} subtitleTestId={m.ids.count} closeLabel="关闭通知列表" closeTestId={m.ids.close} closeTooltipTestId="notifications.history.close.tooltip" closeFocusId={m.ids.close} onClose={vm.setOpen(false)} />
+                    <row style={S.filters}>
+                        <W.Button testId={m.ids.pending} label="待处理" variant={filterVariant(vm.pendingOnly())} size={.xs} onClick={vm.showPending()} />
+                        <W.Button testId={m.ids.recent} label="最近提醒" variant={filterVariant(!vm.pendingOnly())} size={.xs} onClick={vm.showRecent()} />
+                    </row>
+                    <W.ScrollArea direction={.vertical} testId={m.ids.viewport} style={S.viewport} parts={.{ .content = .{ .style = S.list } }}>
+                        {for (vm.records()) |row| <Record vm={vm} row={row} /> else <Empty vm={vm} />}
+                    </W.ScrollArea>
+                    <row testId={m.ids.footer} style={S.footer} visible={vm.hasEnded()}>
+                        <W.Button testId={m.ids.clear} label="清除已结束" variant={.secondary} size={.xs} onClick={vm.clear()} />
+                    </row>
+                    {if (vm.failed()) <W.Alert variant={.warning} message="该操作已不可用，请回到会话查看。" />}
+                </col>
+            </W.Popover>
+        </box>
+    );
+}
+
+fn Empty(vm: *m.ViewModel) View {
+    return (
+        <box testId={m.ids.empty} style={S.empty}>
+            <W.Empty icon={ui.icons.bell} title={vm.emptyText()} description={vm.emptyHint()} />
+        </box>
+    );
+}
+
+fn Record(vm: *m.ViewModel, row: m.Row) View {
+    return (
+        <W.Card testId={m.ids.record} padded={true}>
+            <col style={S.record}>
+                <row style={S.record_main}>
+                    <icon style={S.Severity.of(.{ .tone = tone(row.severity) })} src={severityIcon(row.severity)} />
+                    <text testId={m.ids.title} style={S.record_title}>{row.title}</text>
+                    <text style={S.age}>{row.age}</text>
+                </row>
+                {if (row.summary.len != 0) <row style={S.indented}><text testId={m.ids.summary} style={S.secondary}>{row.summary}</text></row>}
+                {if (row.details)
+                    <W.ScrollArea direction={.vertical} testId={m.ids.details} style={S.details} parts={.{ .content = .{ .test_id = m.ids.message, .style = S.details_content } }}>
+                        {if (row.detail.len != 0) <text style={S.Detail.of(.{ .failure = row.failure })}>{row.detail}</text>}
+                        {for (row.sources) |source| <row style={S.source}>
+                            <text style={S.source_label}>{source.label}</text>
+                            {for (source.locate) |action| <W.Button testId={m.ids.action} label={action.label} variant={.secondary} size={.xs} disabled={action.disabled} onClick={vm.invoke(action.fact_id, action.index)} />}
+                        </row>}
+                    </W.ScrollArea>
+                }
+                {if (hasFooter(row))
+                    <row testId={m.ids.actions} style={S.actions}>
+                        {for (row.actions) |action| <W.Button testId={m.ids.action} label={action.label} variant={.secondary} size={.xs} disabled={action.disabled} onClick={vm.invoke(action.fact_id, action.index)} />}
+                        {if (row.expandable) <W.Button testId={m.ids.expand} variant={.ghost} size={.xs} iconOnly={true} iconAsset={expandIcon(row.expanded)} a11yLabel={expandLabel(row.expanded)} onClick={vm.toggleExpand(row.id)} />}
+                    </row>
+                }
+            </col>
+        </W.Card>
+    );
+}

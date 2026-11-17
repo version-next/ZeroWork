@@ -1,0 +1,13 @@
+//! 连接编辑器里可点的行：原生 `W.Pressable` 的 `look`，随主题由 zenit 按行自身状态（disabled / selected / expanded、
+//! 悬停 / 按下）解析；颜色只用 token，不在挂载时取成定值。行内的文字与图标是视图自己的内容。
+const ui = @import("ui");
+
+/// 高级选项开关（hb6dT b7EPH）：整宽 15 高，标题 · 摘要 · 箭头紧排，透明底；外框行画顶部分隔线，开关本身没有悬停底色。
+style advanced_toggle { width: fill; height: 15; flex-shrink: 0; direction: row; align-items: center; justify: start; gap: 0; padding: 0; background: transparent; }
+/// 检测路线的节点卡片（Bridge 358:1328872 / 1328884）：146×76，内边距 10，纵向间距 3，圆角 9，岛面底色；
+/// 被选为日志筛选条件时用选中底色。
+style test_hop { width: 146; height: 76; flex-shrink: 0; direction: column; gap: 3; padding: 10; corner-radius: 9; background: zw-island-rest; :selected { background: selection-bg; } }
+/// 核对页的“返回”行（zp7WE QgEGN）：整宽 37 高，右 4，间距 12，透明底；第一行以外顶部一条 bg-active 分隔线。
+style back_row($first: bool) { width: fill; height: 37; padding: 0 4 0 0; gap: 12; background: transparent; border-width: 0; corner-radius: 0; border-top-width: 1; border-top-color: bg-active; when $first { border-top-width: 0; } }
+/// 检测卡片的标题行：整宽 18 高，间距 6，下方留 8。
+style test_toggle { width: fill; height: 18; gap: 6; margin: 0 0 8 0; }

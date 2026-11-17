@@ -1,6 +1,7 @@
-/** Production saved-route SFTP rejection must be visible before a tab exists.
+/** Production saved-route SFTP rejection must be visible without opening a live file workspace.
  * Endpoints use reserved invalid names: the supported failure occurs before network I/O.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,readFile,writeFile,copyFile,open,rm,realpath} from 'node:fs/promises';
@@ -37,6 +38,7 @@ port=22
 user="fixture"
 route=[1]
 `,{mode:0o600});
+await writeFile(join(data,'config.toml'),'[updates]\nauto_check=false\n',{mode:0o600});
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const env={...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0'};
 const log=await open(join(out,'app.log'),'w'),app=spawn(executable,[],{cwd:process.cwd(),env,stdio:['ignore',log.fd,log.fd]});
@@ -50,11 +52,21 @@ try{
  await resizeWindow(1440,900);
  const row=await waitFor(async()=>(await query('sidebar.host')).find(n=>shown(n)&&text(n).includes('Route SFTP rejection'))??null,15000);
  assert((await clickAt(row.rect.x+row.rect.w/2,row.rect.y+row.rect.h/2)).ok);
- const notice=await waitFor(async()=>(await query('notifications.presenter')).find(n=>shown(n)&&text(n).includes('独立 SFTP 会话暂不支持跳板链'))??null,15000);
- assert(text(notice).includes('ProxyJumpTransportUnavailable'));
- assert(!(await query('files.workspace')).some(shown));assert(!(await query('plugin.challenge.title')).some(shown));
- report.checks.push('Production saved SFTP route rejected visibly without a file tab or network authentication; explicit unsupported-route reason');
- for(const [w,h]of[[1440,900],[860,480]]){await resizeWindow(w,h);const nodes=await query('notifications.presenter');await writeFile(join(out,`error-${w}.json`),JSON.stringify(nodes,null,2));assert((await screenshot(join(out,`error-${w}.png`))).ok);report.screenshots.push(`error-${w}.png`);}
+ // Selecting a host only reveals its connection action. Use that same row's button to attempt the saved route.
+ const connect=await waitFor(async()=>{
+  const target=(await query('sidebar.host')).find(n=>shown(n)&&text(n).includes('Route SFTP rejection'));
+  return flat(target).find(n=>n.test_id==='sidebar.host.connect_button'&&n.focusable)??null;
+ },15000);
+ assert((await clickAt(connect.rect.x+connect.rect.w/2,connect.rect.y+connect.rect.h/2)).ok);
+ const failure=await waitFor(async()=>(await query('connection.progress.failure')).find(shown)??null,15000);
+ assert.match(text(failure),/Route SFTP rejection/);
+ assert.match(text(failure),/target\.invalid:22/);
+ assert.match(text(failure),/配置检查/);
+ assert.match(text(failure),/ProxyJumpTransportUnavailable/);
+ assert(!(await query('files.workspace')).some(shown),'No live file workspace is opened');
+ assert(!(await query('plugin.challenge.title')).some(shown),'The route is rejected before network authentication');
+ report.checks.push('Saved SFTP route shows a configuration failure with the selected endpoint and the explicit unsupported-route code, before a file workspace or authentication');
+ for(const [w,h]of[[1440,900],[860,480]]){await resizeWindow(w,h);const nodes=await query('connection.progress.failure');assert(nodes.some(shown));await writeFile(join(out,`error-${w}.json`),JSON.stringify(nodes,null,2));assert((await screenshot(join(out,`error-${w}.png`))).ok);report.screenshots.push(`error-${w}.png`);}
  report.status='passed';
 }catch(error){report.status='failed';report.error=String(error);try{await writeFile(join(out,'failure-tree.json'),JSON.stringify(await query('sidebar.host'),null,2));await screenshot(join(out,'failure.png'));}catch{}}
 finally{app.kill('SIGTERM');await Promise.race([ended,sleep(2000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended;}await log.close();await rm(iso,{recursive:true,force:true});await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));}

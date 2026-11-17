@@ -2,12 +2,18 @@
 """Production host/worker sharing and reconnect against an owned loopback peer."""
 import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 p = argparse.ArgumentParser()
 p.add_argument('--runner', required=True)
 p.add_argument('--output', required=True)
 p.add_argument('--jump', action='store_true')
 p.add_argument('--scenario', choices=['baseline', 'owned-session', 'owned-saved', 'details', 'reconnect-fallback', 'source-first', 'child-first', 'interleaved', 'simultaneous-live', 'simultaneous-broken', 'close-during-reconnect', 'cancel-open', 'cancel-pty', 'cancel-shell', 'timeout-open', 'timeout-pty', 'timeout-shell', 'eof-loss', 'jump-forwards'], default='baseline')
 a = p.parse_args()
+build_mode_guard.assert_runner_binary(a.runner)
 out = Path(a.output).resolve(); out.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='zw-shared-acceptance-') as directory:
     root = Path(directory)

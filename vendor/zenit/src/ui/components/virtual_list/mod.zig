@@ -59,8 +59,6 @@ pub const VirtualListProps = struct {
     data_version: Source(u64) = .{ .value = 0 },
     /// Fixed height of each item (px)
     item_height: f32 = 32,
-    /// False when an enclosing ScrollArea owns the content translation.
-    translate_content: bool = true,
     /// Container width
     width: ?f32 = null,
     /// Container height
@@ -75,6 +73,12 @@ pub const VirtualListProps = struct {
     scroll_speed: f32 = 1,
     /// Scroll direction (default vertical)
     scroll_direction: ScrollDirection = .vertical,
+    /// Nested scrolling at the edges, thumb visibility and the scroller gutter, as on the list's ScrollArea
+    /// (`ScrollAreaProps.overscroll_y` / `overscroll_x` / `scrollbars` / `scrollbar_gutter`).
+    overscroll_y: scroll_area.OverscrollBehavior = .auto,
+    overscroll_x: scroll_area.OverscrollBehavior = .auto,
+    scrollbars: scroll_area.ScrollbarVisibility = .auto,
+    scrollbar_gutter: scroll_area.ScrollbarGutter = .none,
     /// Content width (for horizontal scrolling, null = determined by layout)
     content_width: ?f32 = null,
     /// Optional: returns height (px) per item. When set, enters **variable-height mode**.
@@ -119,6 +123,42 @@ pub const VirtualListProps = struct {
     item_label_fn: ?*const fn (index: usize, buf: []u8, user_context: ?*anyopaque) []const u8 = null,
     /// Context passed to `item_label_fn` (null = reuse render's user_context).
     item_label_context: ?*anyopaque = null,
+    /// Move the content node by the scroll offset (`translate_y`). false: the list never writes the
+    /// content node's `translate_y` (updateVisibleItems and the programmatic scroll entries
+    /// alike) because an outer scroll owner (e.g. an enclosing ScrollArea) moves the rows; the
+    /// list still computes the visible range from `scroll_state.scroll_y`.
+    translate_content: bool = true,
+    /// **Embedded mode**: the list lives inside `scroll_owner`'s content (an enclosing ScrollArea,
+    /// usually next to other content: a header, a live tail) and that ScrollArea is the only
+    /// scroll / clip owner. The list then builds no ScrollArea of its own: its container is a plain
+    /// box as tall as the whole list, and each pass derives the visible window from where the
+    /// container sits in the owner's viewport. Everything that would move the list's own scroll
+    /// offset moves the owner's instead: measurement compensation (the owner's `scroll_y` and
+    /// `content_height` are corrected in the same pass, so rows measured above the reader do not
+    /// shift what is on screen), `scrollToIndex` / `scrollIndexIntoView` / `ensureVisible`, and the
+    /// assistive-technology scroll. `width` / `padding` / `background` apply to the container;
+    /// `height`, `scroll_speed`, `scroll_direction`, `content_width` and `translate_content` have
+    /// no effect (the content never carries a scroll translate).
+    ///
+    /// Ownership: the container must be mounted (at any depth) inside `scroll_owner.content`, so
+    /// the owner outlives the list. The list never touches the owner's nodes, hooks or events; it
+    /// only reads the owner's rects and calls `scroll_area.setScrollY` on it.
+    scroll_owner: ?scroll_area.ScrollAreaResult = null,
+    /// `measure_items` mode: keep measuring the rows that are shown. By default a row is measured
+    /// once and its slot is then locked to that height until `invalidateMeasurement` /
+    /// `refreshRange` -- right for rows whose height only changes when the caller re-renders
+    /// them. true: shown rows are never locked; every pass reads their laid-out height again and
+    /// the geometry (and the scroll position, by the re-measure anchoring rule) follows in the
+    /// same frame. For rows that change height on their own: a disclosure inside the row, text
+    /// that re-wraps when the list gets a new width, content that streams in.
+    observe_item_resize: bool = false,
+    /// `measure_items` mode: called from the per-frame pass whenever layout records a row's height
+    /// for the first time or with a new value. For a caller that keeps measured heights across
+    /// mounts of the same data (see `seedItemEstimate`). Must be cheap and must not change the
+    /// list.
+    on_item_measured: ?*const fn (index: usize, height: f32, user_context: ?*anyopaque) void = null,
+    /// Context passed to `on_item_measured` (null = reuse render's user_context).
+    on_item_measured_context: ?*anyopaque = null,
 };
 
 /// Item render callback: user populates item node content via this function.
@@ -127,6 +167,18 @@ pub const VirtualListProps = struct {
 /// - cx: UI context
 pub const RenderItemFn = *const fn (node: *Node, index: usize, cx: *Cx) void;
 pub const RenderItemWithContextFn = *const fn (node: *Node, index: usize, cx: *Cx, user_context: ?*anyopaque) void;
+/// Item render callback that also receives the list's own scope (`mountScoped`). That scope owns
+/// the pool slots and is retired with the list container, so content mounted under it (e.g. via
+/// `ui.view.renderInto`) is released with its slot on recycle *and* with the list when the list
+/// itself is freed -- never left behind in a longer-lived caller scope.
+pub const RenderItemScopedFn = *const fn (node: *Node, index: usize, scope: *Scope, cx: *Cx, user_context: ?*anyopaque) void;
+
+/// How the list populates a slot (exactly one callback form per list).
+const RenderCallback = union(enum) {
+    plain: RenderItemFn,
+    with_context: RenderItemWithContextFn,
+    scoped: RenderItemScopedFn,
+};
 
 /// VirtualList internal state (lifecycle managed via Scope)
 pub const VirtualListState = struct {
@@ -145,12 +197,16 @@ pub const VirtualListState = struct {
     item_count: usize,
     /// Applied data version
     shown_version: u64 = 0,
-    render_fn: RenderItemFn,
-    render_with_context_fn: ?RenderItemWithContextFn = null,
+    render: RenderCallback,
     render_user_context: ?*anyopaque = null,
+    /// The list's own scope (bound to the container): owner of the pool slots and of everything
+    /// the scoped render callback mounts into them.
+    scope: *Scope,
     cx: *Cx,
 
-    /// ScrollArea's scroll state pointer
+    /// ScrollArea's scroll state pointer. Embedded mode (`scroll_owner`): the list's own record of
+    /// its window (`scroll_y` = how far the list's top is above the owner's viewport top,
+    /// `viewport_height` = the owner's), refreshed by every pass; no node or event reads it.
     scroll_state: *ScrollState,
 
     /// ScrollArea's outer container (viewport)
@@ -318,8 +374,83 @@ pub const VirtualListState = struct {
         return .{ .start = start, .end = end };
     }
 
+    /// `translate_content = false`: the content translate an outer scroll owner wrote, to put
+    /// back after a scroll_area programmatic entry (which writes it) moved only `scroll_y`.
+    fn keepContentTranslate(self: *const VirtualListState) ?f32 {
+        return if (self.props.translate_content) null else self.content_node.style.translate_y;
+    }
+
+    /// Embedded mode: the owner's viewport (container less padding) in window coordinates.
+    fn ownerViewport(owner: scroll_area.ScrollAreaResult) a11y_collection.Rect {
+        const viewport = owner.content.parent orelse owner.container;
+        const r = viewport.globalRect();
+        const pad = viewport.style.contentInsets();
+        return .{ .x = r.x + pad.left, .y = r.y + pad.top, .w = @max(0, r.w - pad.horizontal()), .h = @max(0, r.h - pad.vertical()) };
+    }
+
+    /// Embedded mode: the list's top in the owner's content coordinates (the owner `scroll_y`
+    /// that puts the list's first row at the top of the owner's viewport).
+    fn ownerOffset(self: *const VirtualListState, owner: scroll_area.ScrollAreaResult) f32 {
+        return self.container_node.globalRect().y - owner.content.globalRect().y;
+    }
+
+    /// What a pass needs to hand the list's scroll corrections to the owner afterwards.
+    const OwnerWindow = struct {
+        owner: scroll_area.ScrollAreaResult,
+        /// Distance of the list's top above the owner's viewport top (>= 0), before the pass.
+        relative: f32,
+        total_before: f32,
+        /// `scroll_y` the pass started from (`relative` clamped to the list's own range).
+        before: f32,
+    };
+
+    /// Embedded mode: read the window from the owner (null: not embedded, or the owner has no
+    /// laid-out viewport yet -- the pass then keeps the previous window).
+    fn readOwnerWindow(self: *VirtualListState) ?OwnerWindow {
+        const owner = self.props.scroll_owner orelse return null;
+        const viewport = ownerViewport(owner);
+        if (!(viewport.h > 0)) return null;
+        const relative = @max(@as(f32, 0), viewport.y - self.container_node.globalRect().y);
+        const total_before = self.totalContentHeight();
+        const before = std.math.clamp(relative, 0, @max(@as(f32, 0), total_before - viewport.h));
+        self.scroll_state.viewport_height = viewport.h;
+        self.scroll_state.scroll_y = before;
+        self.scroll_state.bonus_y = 0;
+        self.scroll_state.bonus_velocity = 0;
+        return .{ .owner = owner, .relative = relative, .total_before = total_before, .before = before };
+    }
+
+    /// Embedded mode: the pass changed the list's geometry above the reader (measurement
+    /// compensation, or the list's end moved while the reader is at / below it): move the owner by
+    /// the same amount, in the same pass, so what is on screen stays where it is.
+    fn writeOwnerWindow(self: *VirtualListState, window: OwnerWindow) void {
+        const total = self.totalContentHeight();
+        // Reader below the whole list (in content that follows it): the list's entire height
+        // change is above the reader. Otherwise the list's own anchoring decided (`scroll_y`).
+        const adjustment = if (window.relative >= window.total_before)
+            total - window.total_before
+        else
+            self.scroll_state.scroll_y - window.before;
+        if (!(@abs(adjustment) > 0.1)) return;
+        const owner = window.owner;
+        // The owner re-reads its content height from layout after this pass; clamp against the
+        // new height now so a correction at the end of the content is not lost.
+        owner.state.content_height = @max(@as(f32, 0), owner.state.content_height + total - window.total_before);
+        scroll_area.setScrollY(owner.state, owner.content, @max(@as(f32, 0), owner.state.scroll_y + adjustment));
+    }
+
+    fn restoreContentTranslate(self: *VirtualListState, keep: ?f32) void {
+        if (keep) |y| self.content_node.style.translate_y = y;
+    }
+
     /// Core: update visible items each frame
     pub fn updateVisibleItems(self: *VirtualListState) void {
+        const window = self.readOwnerWindow();
+        self.updateWindow();
+        if (window) |w| self.writeOwnerWindow(w);
+    }
+
+    fn updateWindow(self: *VirtualListState) void {
         // Dynamic measurement: backfill true item heights from **prior layout** into
         // ledger, then compute geometry. Order is critical—must precede totalContentHeight()
         // or this frame still uses stale heights, spacer and content mismatch, scroll
@@ -376,9 +507,9 @@ pub const VirtualListState = struct {
         // Quantize to physical pixel grid like scroll event layer, else per-frame
         // sub-pixel translate causes text jitter/blur on Retina.
         const desired_translate_y = -self.scroll_state.snapToPixel(effective_y);
-        if (self.props.translate_content and self.content_node.style.translate_y != desired_translate_y) {
+        if (self.props.translate_content and self.props.scroll_owner == null and self.content_node.style.translate_y != desired_translate_y) {
             self.content_node.style.translate_y = desired_translate_y;
-            self.content_node.markCompositePropDirty();
+            self.content_node.markHitLayerMotionPropDirty();
         }
 
         const range = self.visibleRange();
@@ -470,11 +601,10 @@ pub const VirtualListState = struct {
                 .collection_item = @intCast(@min(item_idx, std.math.maxInt(u32))),
             };
             // Call user render function to populate content
-            if (self.render_with_context_fn) |render_with_context| {
-                render_with_context(node, item_idx, self.cx, self.render_user_context);
-            } else {
-                self.render_fn(node, item_idx, self.cx);
-            }
+            self.renderSlot(node, item_idx);
+            // The row callback may write the slot with any entry (raw or not): invalidate it
+            // so no cross-frame cache replays its previous binding.
+            node.markRenderDirty();
         }
 
         // Bound rows must also lock height: rebind_incomplete spans several frames of
@@ -539,8 +669,19 @@ pub const VirtualListState = struct {
     /// shifted up by scroll_y.
     fn a11yViewport(ctx: *anyopaque) a11y_collection.Rect {
         const self = fromCtx(ctx);
-        const r = self.container_node.globalRect();
-        const pad = self.container_node.style.padding;
+        const viewport = if (self.props.scroll_owner != null) self.container_node else self.content_node.parent orelse self.container_node;
+        const r = viewport.globalRect();
+        const pad = viewport.style.contentInsets();
+        if (self.props.scroll_owner != null) {
+            // Embedded: the rows are laid out from the container's top and the owner scrolls
+            // them, so "the viewport at offset 0" is the container's top plus the list's offset.
+            return .{
+                .x = r.x + pad.left,
+                .y = r.y + pad.top + self.scroll_state.scroll_y,
+                .w = @max(0, r.w - pad.horizontal()),
+                .h = self.normalizedViewportHeight(),
+            };
+        }
         return .{
             .x = r.x + pad.left,
             .y = r.y + pad.top,
@@ -587,7 +728,15 @@ pub const VirtualListState = struct {
     /// Pump-safe call: snap to offset (native scrollRowToVisible has no animation).
     fn a11yApplyScroll(ctx: *anyopaque, offset: f32) void {
         const self = fromCtx(ctx);
+        if (self.props.scroll_owner) |owner| {
+            scroll_area.setScrollY(owner.state, owner.content, @max(@as(f32, 0), self.ownerOffset(owner) + offset));
+            self.content_node.markLayoutDirty();
+            self.cx.requestRedraw();
+            return;
+        }
+        const keep = self.keepContentTranslate();
         scroll_area.setScrollY(self.scroll_state, self.content_node, offset);
+        self.restoreContentTranslate(keep);
         self.content_node.markLayoutDirty();
     }
 
@@ -633,7 +782,7 @@ pub const VirtualListState = struct {
     /// Measurement mode: lock already-measured bound rows from .fit to px. Return
     /// whether any locked.
     fn pinMeasuredHeights(self: *VirtualListState) bool {
-        if (!self.isMeasured()) return false;
+        if (!self.isMeasured() or self.props.observe_item_resize) return false;
         var pinned_any = false;
         for (self.pool_bindings, 0..) |binding, slot| {
             const idx = binding orelse continue;
@@ -680,8 +829,12 @@ pub const VirtualListState = struct {
             // to 0" in ledger, or row locks to 0 height permanently and never re-measures.
             if (!(h > 0)) continue;
 
+            const known = m.hasMeasurement(idx);
             const out = m.applyMeasurement(idx, h, cur_y, self.scroll_direction);
             total_adjust += out.scroll_adjustment;
+            if (self.props.on_item_measured) |report| if (out.changed or (!known and m.hasMeasurement(idx))) {
+                report(idx, h, self.props.on_item_measured_context orelse self.render_user_context);
+            };
         }
 
         if (total_adjust != 0) {
@@ -712,7 +865,7 @@ pub const VirtualListState = struct {
         // content while the ledger reserves space per callback (e.g. 40px reserved, 10px rendered).
         if (self.isMeasured()) {
             const m = self.measured.?;
-            if (m.hasMeasurement(index)) {
+            if (m.hasMeasurement(index) and !self.props.observe_item_resize) {
                 node.style.height = .{ .px = m.sizeOf(index) };
             } else {
                 // Never measured: let content set height, read true value post-layout.
@@ -726,6 +879,15 @@ pub const VirtualListState = struct {
 
     /// Reclaim slot must destroy old subtree, prevent user render only resetting
     /// children.len from leaking.
+    /// Populate a (cleared) pool slot through the list's render callback.
+    fn renderSlot(self: *VirtualListState, node: *Node, index: usize) void {
+        switch (self.render) {
+            .plain => |f| f(node, index, self.cx),
+            .with_context => |f| f(node, index, self.cx, self.render_user_context),
+            .scoped => |f| f(node, index, self.scope, self.cx, self.render_user_context),
+        }
+    }
+
     fn clearSlotNode(self: *VirtualListState, node: *Node) void {
         while (node.children.items.len > 0) {
             const child = node.children.items[node.children.items.len - 1];
@@ -889,13 +1051,15 @@ pub fn VirtualListRows(comptime Ctx: type, comptime row_fn: anytype) type {
 
         pub fn viewMount(self: Self, scope: *Scope, cx: *Cx) !core.ViewParts {
             const st = try State.create(scope, self.ctx);
-            const r = try self.builder.mountWithContext(scope, cx, @ptrCast(st), null, render);
+            const r = try self.builder.mountScoped(scope, cx, @ptrCast(st), render);
             return .{ .root = r.container };
         }
 
-        fn render(node: *Node, index: usize, cx: *Cx, user: ?*anyopaque) void {
+        /// Row scopes open under the list's own scope (`list_scope`), not the caller's: freeing
+        /// the list container retires every bound row with it.
+        fn render(node: *Node, index: usize, list_scope: *Scope, cx: *Cx, user: ?*anyopaque) void {
             const st: *State = @ptrCast(@alignCast(user.?));
-            view.renderInto(st.scope, cx, node, row_fn, st.ctx, .{index}, what) catch {
+            view.renderInto(list_scope, cx, node, row_fn, st.ctx, .{index}, what) catch {
                 _ = markPoolNodeRenderIncomplete(node);
             };
         }
@@ -943,6 +1107,30 @@ pub const VirtualListBuilder = struct {
         render_fn: ?RenderItemFn,
         render_with_context_fn: ?RenderItemWithContextFn,
     ) !MountResult {
+        const render: RenderCallback = if (render_with_context_fn) |f| .{ .with_context = f } else .{ .plain = render_fn orelse noopRenderItem };
+        return self.mountImpl(scope, cx, user_context, render);
+    }
+
+    /// Mount with a scoped render callback: the callback receives the list's own scope, which
+    /// owns the slots. Use it whenever slot content carries scope-owned state (effects, signal
+    /// subscriptions, resources), so that state is retired with the list as well as with the slot.
+    pub fn mountScoped(
+        self: VirtualListBuilder,
+        scope: *Scope,
+        cx: *Cx,
+        user_context: ?*anyopaque,
+        render_fn: RenderItemScopedFn,
+    ) !MountResult {
+        return self.mountImpl(scope, cx, user_context, .{ .scoped = render_fn });
+    }
+
+    fn mountImpl(
+        self: VirtualListBuilder,
+        scope: *Scope,
+        cx: *Cx,
+        user_context: ?*anyopaque,
+        render: RenderCallback,
+    ) !MountResult {
         const my_scope = try scope.childScope();
         errdefer my_scope.dispose();
         var resources_owned = false;
@@ -986,37 +1174,27 @@ pub const VirtualListBuilder = struct {
         else
             @as(f32, @floatFromInt(count0)) * p.item_height;
 
-        // Use ScrollArea as outer container (reuse scroll physics)
-        const sa = try scroll_area.ScrollArea(.{
-            .width = p.width,
-            .height = p.height,
-            .direction = p.scroll_direction,
-            .content_height = total_h,
-            .content_width = p.content_width,
-            .scroll_speed = p.scroll_speed,
-            .padding = p.padding,
-            .background = p.background,
-        }).mount(my_scope, cx);
+        // Standalone: ScrollArea as outer container (reuse scroll physics). Embedded
+        // (`scroll_owner`): a plain box as tall as the list; the owner scrolls and clips.
+        const sa: Shell = if (p.scroll_owner != null)
+            try mountEmbeddedShell(my_scope, cx, p, total_h)
+        else
+            try mountScrollShell(my_scope, cx, p, total_h);
 
         errdefer cx.freeNode(sa.container);
 
         sa.container.meta.ownership.meta.component_name = "VirtualList";
-        sa.container.frame_state.state_bits.flags.disable_render_cache = true;
         // a11y: container inferred as AXScrollArea from scroll container; content node
         // after state setup declared as table (semantic collection, see content a11y below).
 
-        // Extract ScrollState from ScrollArea's event_context
-        const scroll_event_ctx: *scroll_area.ScrollEventCtx = @ptrCast(@alignCast(
-            sa.container.behavior.events.event_context.?,
-        ));
-        const scroll_state_ptr = scroll_event_ctx.state;
+        const scroll_state_ptr = sa.state;
         scroll_state_ptr.external_content_height = true;
         sa.content.style.height = .{ .px = total_h };
         sa.content.style.flex_shrink = 0;
-        if (p.content_width) |cw| {
+        if (p.scroll_owner == null) if (p.content_width) |cw| {
             scroll_state_ptr.external_content_width = true;
             sa.content.style.width = .{ .px = cw };
-        }
+        };
 
         // Create top/bottom spacer (pool nodes appended after them, see pre-create below)
         var top_spacer: *Node = undefined;
@@ -1083,9 +1261,9 @@ pub const VirtualListBuilder = struct {
             .props = p,
             .item_count = count0,
             .shown_version = p.data_version.peek(),
-            .render_fn = render_fn orelse noopRenderItem,
-            .render_with_context_fn = render_with_context_fn,
+            .render = render,
             .render_user_context = user_context,
+            .scope = my_scope,
             .cx = cx,
             .scroll_state = scroll_state_ptr,
             .container_node = sa.container,
@@ -1134,6 +1312,11 @@ pub const VirtualListBuilder = struct {
         // frame tick, attach early is no-op; markPoolNodeRenderIncomplete uses it for identity
         // check).
         sa.content.meta.per_frame.hooks.before_render.main = vlBeforeRender;
+        // The hook only moves `content` (translate), resizes spacers/slots (layout-dirty) and
+        // rebinds pool slots, and every rebound slot is marked render-dirty after the row callback
+        // ran (updateVisibleItems / refreshRange), so whatever the callback wrote is never replayed stale. Rows
+        // that stay bound are untouched and reusable across frames while scrolling.
+        sa.content.frame_state.state_bits.flags.before_render_hook_descendants_cache_safe = true;
 
         // Semantic collection: content node as table exposes all data rows to assistive tech
         // (AXTable > AXRow > AXCell), decoupled from pool rendering. Collection bound to content,
@@ -1151,6 +1334,55 @@ pub const VirtualListBuilder = struct {
 };
 
 fn noopRenderItem(_: *Node, _: usize, _: *Cx) void {}
+
+/// The list's node frame: container (what the caller places), content (spacers + pool slots,
+/// carries the per-frame hook and the semantic collection) and the scroll record.
+const Shell = struct { container: *Node, content: *Node, state: *ScrollState };
+
+fn mountScrollShell(my_scope: *Scope, cx: *Cx, p: VirtualListProps, total_h: f32) !Shell {
+    const sa = try scroll_area.ScrollArea(.{
+        .width = p.width,
+        .height = p.height,
+        .direction = p.scroll_direction,
+        .content_height = total_h,
+        .content_width = p.content_width,
+        .scroll_speed = p.scroll_speed,
+        .padding = p.padding,
+        .background = p.background,
+        .overscroll_y = p.overscroll_y,
+        .overscroll_x = p.overscroll_x,
+        .scrollbars = p.scrollbars,
+        .scrollbar_gutter = p.scrollbar_gutter,
+    }).mount(my_scope, cx);
+    // Extract ScrollState from ScrollArea's event_context
+    const scroll_event_ctx: *scroll_area.ScrollEventCtx = @ptrCast(@alignCast(
+        sa.container.behavior.events.event_context.?,
+    ));
+    return .{ .container = sa.container, .content = sa.content, .state = scroll_event_ctx.state };
+}
+
+/// Embedded mode (`scroll_owner`): no ScrollArea, no scrollbars, no wheel handler -- a box as
+/// tall as its content, and a scroll record nothing but the list reads.
+fn mountEmbeddedShell(my_scope: *Scope, cx: *Cx, p: VirtualListProps, total_h: f32) !Shell {
+    const state = try my_scope.createState(ScrollState, .{ .content_height = total_h });
+    var content: *Node = undefined;
+    const container = try view.render(my_scope, cx, view.box(.{ .style = core.BoxStyle{
+        .direction = .column,
+        .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
+        .height = .{ .fit = .{} },
+        .flex_shrink = 0,
+        .background = p.background,
+        .padding = p.padding,
+    } }, .{
+        view.capture(&content, view.box(.{ .style = core.BoxStyle{
+            .direction = .column,
+            .width = .{ .grow = .{} },
+            .height = .{ .px = total_h },
+            .flex_shrink = 0,
+        } }, {})),
+    }));
+    return .{ .container = container, .content = content, .state = state };
+}
 
 /// content node's on_before_render callback
 fn vlBeforeRender(content_node: *Node) void {
@@ -1199,9 +1431,15 @@ pub fn updateItemCount(state: *VirtualListState, new_count: usize) void {
 /// Scroll to index (item top aligns viewport top)
 pub fn scrollToIndex(state: *VirtualListState, index: usize) void {
     const target_y = state.offsetOf(index);
+    if (state.props.scroll_owner) |owner| {
+        scroll_area.setScrollY(owner.state, owner.content, @max(@as(f32, 0), state.ownerOffset(owner) + target_y));
+        return;
+    }
     // Unified via scroll_area's programmatic scroll entry: clamp + momentum/bounce
     // reset + pixel snap (previously hand-written here, missed snapToPixel + bounce cancel).
+    const keep = state.keepContentTranslate();
     scroll_area.setScrollY(state.scroll_state, state.content_node, target_y);
+    state.restoreContentTranslate(keep);
 }
 
 /// Scroll item at index into view per alignment mode (scroll_area.ScrollAlign semantics).
@@ -1212,7 +1450,13 @@ pub fn scrollIndexIntoView(
 ) void {
     const top = state.offsetOf(index);
     const ih = state.itemHeight(index);
+    if (state.props.scroll_owner) |owner| {
+        scroll_area.scrollRectIntoView(owner.state, owner.content, state.ownerOffset(owner) + top, ih, alignment);
+        return;
+    }
+    const keep = state.keepContentTranslate();
     scroll_area.scrollRectIntoView(state.scroll_state, state.content_node, top, ih, alignment);
+    state.restoreContentTranslate(keep);
 }
 
 /// Call after `item_height_fn` return values change so geometry catches up.
@@ -1262,6 +1506,36 @@ fn syncContentHeight(state: *VirtualListState) void {
         state.scroll_state.scroll_y = max_scroll;
     }
     state.content_node.markLayoutDirty();
+}
+
+/// `measure_items` mode: give the row at `index` its own estimate -- a height kept by the caller
+/// from an earlier mount of the same data (see `on_item_measured`) -- so the list starts from
+/// that geometry instead of the common `estimate_item_height`. It is an estimate only: layout
+/// measures the row when it is shown and corrects the geometry (with scroll compensation) if the
+/// height differs, so a stale value is harmless. Not reported through `on_item_measured`. Call it
+/// right after mount, before the first frame. No-op outside `measure_items` mode, for a row
+/// that is already measured, an out-of-range index or a non-positive height.
+pub fn seedItemEstimate(state: *VirtualListState, index: usize, height: f32) void {
+    if (!state.isMeasured()) return;
+    const m = state.measured orelse return;
+    if (m.hint(index, height)) syncContentHeight(state);
+}
+
+/// `measure_items` mode: all rows may have changed height at once (the list got a new width, a
+/// font setting changed). Every row keeps its current height as its estimate, so nothing moves
+/// now, and is measured again when it is next laid out -- the shown rows in the next frame --
+/// with scroll compensation for what changes above the reader. Unlike
+/// `invalidateAllMeasurements`, the geometry does not fall back to the common estimate.
+pub fn remeasureAll(state: *VirtualListState) void {
+    if (!state.isMeasured()) return;
+    const m = state.measured orelse return;
+    m.demoteAll();
+    for (state.pool_bindings, 0..) |binding, slot| {
+        if (binding == null) continue;
+        state.pool_nodes[slot].style.height = .{ .fit = .{} };
+        state.pool_nodes[slot].markLayoutDirty();
+    }
+    syncContentHeight(state);
 }
 
 /// Invalidate the measured height of the row at index; it is re-measured next frame.
@@ -1323,6 +1597,16 @@ pub fn markPoolNodeRenderIncomplete(node: *Node) bool {
     return state.markSlotRenderIncomplete(node);
 }
 
+/// Whether `node` is a VirtualList's content node: its children (spacers and pool slots) are the
+/// per-frame projection of the visible rows, re-derived by every pass. A row that failed to
+/// render (OOM in the callback, pool growth or reordering) is unbound and retried by a later
+/// pass rather than failing the mount (see `markPoolNodeRenderIncomplete`); test support
+/// comparing mounts (oom_sweep) treats this subtree accordingly.
+pub fn isVirtualContent(node: *const Node) bool {
+    const hook = node.meta.per_frame.hooks.before_render.main orelse return false;
+    return hook == vlBeforeRender;
+}
+
 /// Refresh bound items in range (row count unchanged, content may change)
 pub fn refreshRange(state: *VirtualListState, start: usize, end: usize) void {
     for (state.pool_bindings, 0..) |binding, slot| {
@@ -1340,11 +1624,7 @@ pub fn refreshRange(state: *VirtualListState, start: usize, end: usize) void {
                     state.pool_nodes[slot].style.height = .{ .fit = .{} };
                 }
                 state.clearSlotNode(state.pool_nodes[slot]);
-                if (state.render_with_context_fn) |render_with_context| {
-                    render_with_context(state.pool_nodes[slot], idx, state.cx, state.render_user_context);
-                } else {
-                    state.render_fn(state.pool_nodes[slot], idx, state.cx);
-                }
+                state.renderSlot(state.pool_nodes[slot], idx);
                 // Content changed -> rect often unchanged: skip mark-dirty -> damage-tracking
                 // renderer
                 // won't redraw, IME input shows no text but cursor advances (cursor/selection
@@ -1372,6 +1652,24 @@ test {
     // green (repo hit this pit).
     testing.refAllDecls(@This());
     _ = measurements;
+}
+
+test "VirtualList: overscroll_y / overscroll_x / scrollbars reach the list's ScrollArea" {
+    const allocator = testing.allocator;
+    var ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try VirtualList(.{ .item_count = 100, .item_height = 20, .width = 300, .height = 100, .overscroll_y = .contain, .scrollbars = .always }).mount(scope, ctx, struct {
+        fn render(_: *Node, _: usize, _: *Cx) void {}
+    }.render);
+    try root.appendChild(allocator, result.container);
+    const ev: *const scroll_area.ScrollEventCtx = @ptrCast(@alignCast(result.container.behavior.events.event_context.?));
+    try testing.expectEqual(scroll_area.OverscrollBehavior.contain, ev.overscroll_y);
+    try testing.expectEqual(scroll_area.OverscrollBehavior.auto, ev.overscroll_x);
+    try testing.expect(ev.state.scrollbar_fade.persistent);
 }
 
 test "VirtualList: item_height = 0 / 负数时 mount 不 panic" {
@@ -2956,4 +3254,716 @@ test "VirtualList: 回调报 markPoolNodeRenderIncomplete 后该行解绑并在�
     try testing.expectEqual(@as(usize, 7), Probe.calls);
     // Not this VL's current bound pool node -> false (root not pool node)
     try testing.expect(!markPoolNodeRenderIncomplete(root));
+}
+
+test "review regression 3: generic default row geometry stays 32" {
+    const p: VirtualListProps = .{};
+    try std.testing.expectEqual(@as(f32, 32), p.item_height);
+    try std.testing.expectEqual(@as(f32, 32), p.estimate_item_height);
+}
+
+test "LC3C VirtualList accessibility viewport includes layout border" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const result = try VirtualList(.{ .item_count = 20, .item_height = 20, .width = 300, .height = 200 }).mount(scope, cx, struct {
+        fn render(_: *Node, _: usize, _: *Cx) void {}
+    }.render);
+    cx.root = result.container;
+    result.container.style.padding = core.Padding.all(10);
+    result.container.style.border = .{ .width = 5 };
+    cx.layout();
+    scroll_area.scrollbarBeforeRender(result.container);
+    const viewport = VirtualListState.a11yViewport(result.state);
+    try testing.expectEqual(@as(f32, 15), viewport.x);
+    try testing.expectEqual(@as(f32, 15), viewport.y);
+    try testing.expectEqual(@as(f32, 270), viewport.w);
+    try testing.expectEqual(@as(f32, 170), viewport.h);
+    result.container.style.border.overlay = true;
+    result.container.markLayoutDirty();
+    cx.layout();
+    scroll_area.scrollbarBeforeRender(result.container);
+    const overlay = VirtualListState.a11yViewport(result.state);
+    try testing.expectEqual(@as(f32, 10), overlay.x);
+    try testing.expectEqual(@as(f32, 10), overlay.y);
+    try testing.expectEqual(@as(f32, 280), overlay.w);
+    try testing.expectEqual(@as(f32, 180), overlay.h);
+}
+
+// ---- Hit index under scrolling (core/hit_runtime.zig HitBlock): each pool slot is a block ----
+
+const VlHitRig = struct {
+    cx: *Cx,
+    scope: *Scope,
+    state: *VirtualListState,
+    container: *Node,
+
+    /// Data index of the last clicked row (row click handlers carry their index).
+    var clicked: ?usize = null;
+    /// Bumped to make every row render differently (data change).
+    var generation: usize = 0;
+
+    const row_h: f32 = 28;
+    const view_h: f32 = 280;
+
+    fn rowHeight(index: usize, measured: bool) f32 {
+        return if (measured) 20 + @as(f32, @floatFromInt(index % 4)) * 9 else row_h;
+    }
+
+    fn renderRow(node: *Node, index: usize, cx: *Cx, measured: bool) void {
+        const row = box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = rowHeight(index, measured) } }, .{}) catch return;
+        row.behavior.events.on_click = .{ .callback = onClick, .context = @ptrFromInt(index + 1 + generation * 100_000) };
+        node.appendChild(cx.allocator, row) catch cx.freeNode(row);
+    }
+
+    fn onClick(ctx: *anyopaque) void {
+        clicked = (@intFromPtr(ctx) - 1) % 100_000;
+    }
+
+    fn init(rig: *VlHitRig, count: usize, comptime measured: bool) !void {
+        clicked = null;
+        generation = 0;
+        rig.cx = try Cx.init(testing.allocator, testing.io);
+        errdefer rig.cx.deinit();
+        rig.cx.setViewport(400, 300);
+        try rig.cx.setTestFrameStep(16);
+        rig.cx.caret_flip_host = true;
+        rig.scope = try Scope.init(testing.allocator, null, rig.cx.owner);
+        const root = try box(rig.cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+        rig.cx.root = root;
+        const render = if (measured) struct {
+            fn f(node: *Node, index: usize, cx: *Cx) void {
+                renderRow(node, index, cx, true);
+            }
+        }.f else struct {
+            fn f(node: *Node, index: usize, cx: *Cx) void {
+                renderRow(node, index, cx, false);
+            }
+        }.f;
+        const result = if (measured)
+            try VirtualList(.{ .item_count = count, .measure_items = true, .estimate_item_height = 30, .width = 300, .height = view_h, .overscan = 2 }).mount(rig.scope, rig.cx, render)
+        else
+            try VirtualList(.{ .item_count = count, .item_height = row_h, .width = 300, .height = view_h, .overscan = 2 }).mount(rig.scope, rig.cx, render);
+        try root.appendChild(testing.allocator, result.container);
+        rig.state = result.state;
+        rig.container = result.container;
+        try rig.settle();
+    }
+
+    fn deinit(rig: *VlHitRig) void {
+        rig.scope.dispose();
+        rig.cx.deinit();
+    }
+
+    fn settle(rig: *VlHitRig) !void {
+        var frames: usize = 0;
+        while (rig.cx.wantsFrame() and frames < 600) : (frames += 1) {
+            rig.cx.advanceFrameClock();
+            rig.cx.layout();
+            _ = rig.cx.render();
+        }
+        try testing.expect(!rig.cx.wantsFrame());
+    }
+
+    /// Data index of the row painted at content-space y (what the user sees there).
+    fn expectedIndex(rig: *VlHitRig, y: f32) ?usize {
+        const content_y = y - rig.container.rectFromWorldOrFallback().y - rig.state.content_node.style.translate_y;
+        if (content_y < 0 or content_y >= rig.state.totalContentHeight()) return null;
+        var lo: usize = 0;
+        var hi: usize = rig.state.item_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (rig.state.offsetOf(mid + 1) <= content_y) lo = mid + 1 else hi = mid;
+        }
+        // Only rows rendered at their full measured height are unambiguous.
+        const top = rig.state.offsetOf(lo);
+        if (content_y - top < 2 or top + rig.state.itemHeight(lo) - content_y < 2) return null;
+        return lo;
+    }
+
+    /// Data index of the row the hit index resolves at (x, y), through the pool slot it hit.
+    fn hitIndex(rig: *VlHitRig, x: f32, y: f32) ?usize {
+        var node = rig.cx.hitTest(x, y);
+        while (node) |n| : (node = n.parent) {
+            for (rig.state.pool_nodes, 0..) |slot, i| {
+                if (slot == n) return rig.state.pool_bindings[i];
+            }
+        }
+        return null;
+    }
+
+    fn click(rig: *VlHitRig, x: f32, y: f32) ?usize {
+        clicked = null;
+        rig.cx.handleMouseDown(x, y, .{});
+        rig.cx.handleMouseUp(x, y);
+        return clicked;
+    }
+
+    /// Every probed point resolves (hit test and click) to the row painted there.
+    fn expectHitsMatchPaint(rig: *VlHitRig) !void {
+        var y: f32 = 3;
+        while (y < view_h) : (y += 11) {
+            const want = rig.expectedIndex(y) orelse continue;
+            try testing.expectEqual(@as(?usize, want), rig.hitIndex(100, y));
+        }
+        const probe_y: f32 = 137;
+        if (rig.expectedIndex(probe_y)) |want| try testing.expectEqual(@as(?usize, want), rig.click(100, probe_y));
+    }
+
+    fn scroll(rig: *VlHitRig, dy: f32) void {
+        rig.cx.handleScroll(.{ .x = 100, .y = 137, .dx = 0, .dy = dy });
+    }
+};
+
+test "VirtualList hit: rows rebound by scrolling are hit at once, only they are rebuilt" {
+    var rig: VlHitRig = undefined;
+    try rig.init(1000, false);
+    defer rig.deinit();
+    const cx = rig.cx;
+    const deltas = [_]f32{ -28, -7, -50, -28, -90, 13, -28, -28, 40, -200, -3 };
+    for (0..4) |round| {
+        for (deltas) |dy| {
+            var bindings_before: [max_pool_size]?usize = undefined;
+            @memcpy(bindings_before[0..rig.state.pool_size], rig.state.pool_bindings);
+            const blocks_before = cx.interaction_index.stat_build_blocks;
+            cx.input_perf = .{};
+            // Event time, no frame in between: the hit scene commits the rebind first.
+            rig.scroll(dy);
+            try rig.expectHitsMatchPaint();
+            try testing.expectEqual(@as(u32, 0), cx.input_perf.in_hit_full_rebuilds);
+            var rebound: u32 = 0;
+            for (rig.state.pool_bindings, 0..) |b, i| {
+                if (!std.meta.eql(b, bindings_before[i])) rebound += 1;
+            }
+            // Rebuilt hit blocks: the rebound slots, plus the two spacers that resized.
+            try testing.expect(cx.interaction_index.stat_build_blocks - blocks_before <= rebound + 2);
+            if (round % 2 == 1) try rig.settle();
+        }
+    }
+    try rig.settle();
+    try rig.expectHitsMatchPaint();
+}
+
+test "VirtualList hit: fast scroll and both ends hit the painted rows" {
+    var rig: VlHitRig = undefined;
+    try rig.init(1000, false);
+    defer rig.deinit();
+    rig.scroll(-5000);
+    try rig.expectHitsMatchPaint();
+    try rig.settle();
+    try rig.expectHitsMatchPaint();
+    // Past the end: the last row is at the bottom.
+    rig.scroll(-1_000_000);
+    try rig.settle();
+    try rig.expectHitsMatchPaint();
+    try testing.expectEqual(@as(?usize, 999), rig.hitIndex(100, VlHitRig.view_h - 5));
+    try testing.expectEqual(@as(?usize, 999), rig.click(100, VlHitRig.view_h - 5));
+    // Back to the top in one event.
+    rig.scroll(1_000_000);
+    try rig.expectHitsMatchPaint();
+    try rig.settle();
+    try testing.expectEqual(@as(?usize, 0), rig.hitIndex(100, 5));
+    try testing.expectEqual(@as(?usize, 0), rig.click(100, 5));
+}
+
+test "VirtualList hit: measured variable-height rows hit where they are painted" {
+    var rig: VlHitRig = undefined;
+    try rig.init(400, true);
+    defer rig.deinit();
+    const deltas = [_]f32{ -30, -61, -200, 45, -17, -900, 300, -2 };
+    for (deltas) |dy| {
+        rig.cx.input_perf = .{};
+        rig.scroll(dy);
+        try rig.settle();
+        try rig.expectHitsMatchPaint();
+        try testing.expectEqual(@as(u32, 0), rig.cx.input_perf.in_hit_full_rebuilds);
+    }
+}
+
+test "VirtualList hit: data change rebinds visible rows and the hit index follows" {
+    var rig: VlHitRig = undefined;
+    try rig.init(1000, false);
+    defer rig.deinit();
+    rig.scroll(-300);
+    try rig.settle();
+    const old_row = rig.cx.hitTest(100, 137).?;
+    VlHitRig.generation = 1;
+    updateItemCount(rig.state, 600);
+    // Event-time query straight after the data change: new row nodes, same painted indices.
+    try rig.expectHitsMatchPaint();
+    try testing.expect(rig.cx.hitTest(100, 137).? != old_row);
+    try rig.settle();
+    try rig.expectHitsMatchPaint();
+    // Shrink below the scroll position: the list clamps and the hits follow.
+    updateItemCount(rig.state, 5);
+    try rig.settle();
+    try rig.expectHitsMatchPaint();
+    try testing.expectEqual(@as(?usize, 4), rig.hitIndex(100, 4 * VlHitRig.row_h + 10));
+    try testing.expectEqual(@as(?usize, null), rig.hitIndex(100, 5 * VlHitRig.row_h + 10));
+}
+
+fn mountTranslateRig(ctx: *Cx, scope: *Scope, root: *Node, translate: bool) !VirtualListBuilder.MountResult {
+    const result = try VirtualList(.{
+        .item_count = 1000,
+        .item_height = 32,
+        .width = 300,
+        .height = 200,
+        .overscan = 2,
+        .translate_content = translate,
+    }).mount(scope, ctx, struct {
+        fn render(_: *Node, _: usize, _: *Cx) void {}
+    }.render);
+    try root.appendChild(ctx.allocator, result.container);
+    result.state.scroll_state.viewport_height = 200;
+    return result;
+}
+
+test "VirtualList: translate_content (default) moves the content node with the scroll offset" {
+    const allocator = testing.allocator;
+    var ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try mountTranslateRig(ctx, scope, root, true);
+    const st = result.state;
+    st.scroll_state.scroll_y = 100 * 32;
+    st.updateVisibleItems();
+    try testing.expectEqual(@as(f32, -3200), st.content_node.style.translate_y);
+    try testing.expectEqual(@as(usize, 98), st.visibleRange().start);
+    scrollToIndex(st, 10);
+    try testing.expectEqual(@as(f32, -320), st.content_node.style.translate_y);
+}
+
+test "VirtualList: translate_content=false leaves the content translate to the outer scroll owner" {
+    const allocator = testing.allocator;
+    var ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try mountTranslateRig(ctx, scope, root, false);
+    const st = result.state;
+    const content = st.content_node;
+    try testing.expectEqual(@as(f32, 0), content.style.translate_y);
+    // The outer owner's translate (here 7) survives every internal path; the range still follows
+    // scroll_y.
+    content.style.translate_y = 7;
+    st.scroll_state.scroll_y = 100 * 32;
+    st.updateVisibleItems();
+    try testing.expectEqual(@as(f32, 7), content.style.translate_y);
+    try testing.expectEqual(@as(usize, 98), st.visibleRange().start);
+    vlBeforeRender(content);
+    updateItemCount(st, 900);
+    try testing.expectEqual(@as(f32, 7), content.style.translate_y);
+    scrollToIndex(st, 10);
+    try testing.expectEqual(@as(f32, 320), st.scroll_state.scroll_y);
+    try testing.expectEqual(@as(f32, 7), content.style.translate_y);
+    scrollIndexIntoView(st, 500, .start);
+    try testing.expectEqual(@as(f32, 500 * 32), st.scroll_state.scroll_y);
+    try testing.expectEqual(@as(f32, 7), content.style.translate_y);
+    for (0..4) |_| {
+        ctx.frame_count += 1;
+        ctx.frame_time_ms += 16;
+        _ = ctx.render();
+    }
+    try testing.expectEqual(@as(usize, 498), st.visibleRange().start);
+    try testing.expectEqual(@as(f32, 7), content.style.translate_y);
+}
+
+/// Embedded-mode rig: an owner ScrollArea (300 x 200 at the window origin) whose content is a
+/// 50pt header, the list (measured rows, estimate 30, real 20 / 29 / 38 / 47) and a tail.
+const VlEmbeddedRig = struct {
+    cx: *Cx,
+    scope: *Scope,
+    owner: scroll_area.ScrollAreaResult,
+    list: VirtualListBuilder.MountResult,
+    tail: *Node,
+    live: usize = 0,
+
+    const header_h: f32 = 50;
+    const view_h: f32 = 200;
+
+    fn release(rig: *VlEmbeddedRig) void {
+        rig.live -= 1;
+    }
+
+    fn renderRow(node: *Node, index: usize, list_scope: *Scope, cx: *Cx, raw: ?*anyopaque) void {
+        const rig: *VlEmbeddedRig = @ptrCast(@alignCast(raw.?));
+        view.renderInto(list_scope, cx, node, struct {
+            fn row(r: *VlEmbeddedRig, i: usize, row_scope: *Scope, c: *Cx) !*Node {
+                const n = try box(c, .{ .width = .{ .grow = .{} }, .height = .{ .px = VlHitRig.rowHeight(i, true) + vl_rig_extra } }, .{});
+                errdefer c.freeNode(n);
+                try row_scope.onCleanup(VlEmbeddedRig, r, release);
+                r.live += 1;
+                return n;
+            }
+        }.row, rig, .{index}, "embedded row") catch {
+            _ = markPoolNodeRenderIncomplete(node);
+        };
+    }
+
+    fn init(rig: *VlEmbeddedRig, count: usize, tail_h: f32) !void {
+        return rig.initWith(count, tail_h, false);
+    }
+
+    fn initWith(rig: *VlEmbeddedRig, count: usize, tail_h: f32, observe: bool) !void {
+        rig.live = 0;
+        rig.cx = try Cx.init(testing.allocator, testing.io);
+        errdefer rig.cx.deinit();
+        rig.cx.setViewport(400, 300);
+        try rig.cx.setTestFrameStep(16);
+        rig.scope = try Scope.init(testing.allocator, null, rig.cx.owner);
+        errdefer rig.scope.dispose();
+        const root = try box(rig.cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = .column }, .{});
+        rig.cx.root = root;
+        rig.owner = try scroll_area.ScrollArea(.{ .width = 300, .height = view_h, .rubber_band_y = false }).mount(rig.scope, rig.cx);
+        try root.appendChild(testing.allocator, rig.owner.container);
+        const header = try box(rig.cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = header_h }, .flex_shrink = 0 }, .{});
+        try rig.owner.content.appendChild(testing.allocator, header);
+        rig.list = try VirtualList(.{ .item_count = count, .measure_items = true, .estimate_item_height = 30, .overscan = 2, .scroll_owner = rig.owner, .observe_item_resize = observe }).mountScoped(rig.scope, rig.cx, rig, renderRow);
+        try rig.owner.content.appendChild(testing.allocator, rig.list.container);
+        rig.tail = try box(rig.cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = tail_h }, .flex_shrink = 0 }, .{});
+        try rig.owner.content.appendChild(testing.allocator, rig.tail);
+        rig.frames(8);
+    }
+
+    fn deinit(rig: *VlEmbeddedRig) void {
+        rig.scope.dispose();
+        rig.cx.deinit();
+    }
+
+    fn frames(rig: *VlEmbeddedRig, count: usize) void {
+        for (0..count) |_| {
+            rig.cx.advanceFrameClock();
+            rig.cx.layout();
+            _ = rig.cx.render();
+        }
+    }
+
+    fn scrollTo(rig: *VlEmbeddedRig, y: f32) void {
+        scroll_area.setScrollY(rig.owner.state, rig.owner.content, y);
+        rig.cx.requestRedraw();
+        rig.frames(8);
+    }
+
+    /// Window y of the bound row `index` (null: not bound).
+    fn rowTop(rig: *VlEmbeddedRig, index: usize) ?f32 {
+        const st = rig.list.state;
+        for (st.pool_bindings, st.pool_nodes) |binding, node| if (binding == index) return node.globalRect().y;
+        return null;
+    }
+
+    fn bound(rig: *VlEmbeddedRig) usize {
+        var n: usize = 0;
+        for (rig.list.state.pool_bindings) |binding| n += @intFromBool(binding != null);
+        return n;
+    }
+};
+
+test "VirtualList scroll_owner: no ScrollArea of its own; the window follows the owner's scroll" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(1000, 100);
+    defer rig.deinit();
+    const st = rig.list.state;
+    const container = rig.list.container;
+    // A plain box: only the content node, no scrollbars, no wheel handler, no clip.
+    try testing.expectEqual(@as(usize, 1), container.children.items.len);
+    try testing.expectEqual(st.content_node, container.children.items[0]);
+    try testing.expect(container.behavior.events.on_event == null);
+    try testing.expect(!container.style.overflow_hidden);
+    // As tall as the whole list, inside the owner's content after the header.
+    try testing.expectApproxEqAbs(st.totalContentHeight(), container.globalRect().h, 0.01);
+    try testing.expectApproxEqAbs(VlEmbeddedRig.header_h, container.globalRect().y, 0.01);
+    try testing.expectEqual(@as(usize, 0), st.visibleRange().start);
+    try testing.expect(rig.bound() < 20);
+    try testing.expectEqual(rig.bound(), rig.live);
+
+    rig.scrollTo(12000);
+    try testing.expectEqual(@as(f32, 0), st.content_node.style.translate_y);
+    const range = st.visibleRange();
+    try testing.expect(range.start > 300);
+    try testing.expect(range.end - range.start < 20);
+    try testing.expectEqual(rig.bound(), rig.live);
+    // A bound row is really in the owner's viewport.
+    var seen = false;
+    for (range.start..range.end) |i| if (rig.rowTop(i)) |y| {
+        if (y >= 0 and y < VlEmbeddedRig.view_h) seen = true;
+    };
+    try testing.expect(seen);
+    // The list's own record mirrors the owner: offset = owner scroll less the header.
+    try testing.expectApproxEqAbs(rig.owner.state.scroll_y - VlEmbeddedRig.header_h, st.scroll_state.scroll_y, 0.6);
+    try testing.expectEqual(VlEmbeddedRig.view_h, st.scroll_state.viewport_height);
+}
+
+test "VirtualList scroll_owner: rows measured above the reader move the owner, not the screen" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(1000, 100);
+    defer rig.deinit();
+    const st = rig.list.state;
+    rig.scrollTo(12000);
+    // A row inside the viewport; scroll up in steps so unmeasured rows (estimate 30, real
+    // 20..47) enter above it. Each step must move it by exactly the step.
+    var tracked: usize = st.visibleRange().start;
+    while (tracked < st.visibleRange().end) : (tracked += 1) {
+        if (rig.rowTop(tracked)) |y| if (y >= 60) break;
+    }
+    var moved: f32 = 0;
+    for (0..6) |_| {
+        const before = rig.rowTop(tracked).?;
+        const from = rig.owner.state.scroll_y;
+        rig.scrollTo(from - 25);
+        moved += 25;
+        if (rig.rowTop(tracked)) |after| try testing.expectApproxEqAbs(before + 25, after, 0.6) else break;
+    }
+    try testing.expect(moved >= 50);
+}
+
+test "VirtualList scroll_owner: a reader in the content after the list keeps its place when the list's height settles" {
+    var rig: VlEmbeddedRig = undefined;
+    // Tail taller than the viewport: at the end the viewport is entirely below the list.
+    try rig.init(1000, 400);
+    defer rig.deinit();
+    const st = rig.list.state;
+    const estimated = st.totalContentHeight();
+    scroll_area.setScrollY(rig.owner.state, rig.owner.content, rig.owner.state.maxScrollY());
+    rig.cx.requestRedraw();
+    rig.frames(1);
+    const tail_y = rig.tail.globalRect().y;
+    // Whether or not the frame runs the hook of a list that is entirely outside the owner's clip,
+    // a pass there binds and measures the list's last rows.
+    for (0..4) |_| {
+        st.updateVisibleItems();
+        rig.frames(2);
+    }
+    try testing.expect(st.visibleRange().end == 1000);
+    // The last rows were measured (the list's height changed) ...
+    try testing.expect(@abs(st.totalContentHeight() - estimated) > 1);
+    // ... and the tail did not move on screen: the owner took the whole change.
+    try testing.expectApproxEqAbs(tail_y, rig.tail.globalRect().y, 0.6);
+    try testing.expectApproxEqAbs(VlEmbeddedRig.view_h, rig.tail.globalRect().y + 400, 0.6);
+}
+
+test "VirtualList scroll_owner: programmatic and assistive scrolling move the owner" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(1000, 100);
+    defer rig.deinit();
+    const st = rig.list.state;
+    scrollToIndex(st, 500);
+    rig.cx.requestRedraw();
+    rig.frames(8);
+    try testing.expectEqual(@as(f32, 0), st.content_node.style.translate_y);
+    try testing.expectApproxEqAbs(@as(f32, 0), rig.rowTop(500).?, 0.6);
+    // Already visible: `.nearest` does not move.
+    const at = rig.owner.state.scroll_y;
+    ensureVisible(st, 501);
+    try testing.expectEqual(at, rig.owner.state.scroll_y);
+    scrollIndexIntoView(st, 520, .start);
+    rig.cx.requestRedraw();
+    rig.frames(8);
+    try testing.expectApproxEqAbs(@as(f32, 0), rig.rowTop(520).?, 0.6);
+
+    // Semantic collection: item rects resolve to where the rows are, and its scroll goes to the
+    // owner.
+    const provider = st.content_node.behavior.interaction.a11y.?.collection.?;
+    const viewport = provider.vtable.viewport(provider.ctx);
+    const offset = provider.vtable.scroll_offset(provider.ctx);
+    const item = provider.vtable.item_rect(provider.ctx, 520);
+    try testing.expectApproxEqAbs(rig.rowTop(520).?, viewport.y + item.y - offset, 0.6);
+    try testing.expectEqual(VlEmbeddedRig.view_h, viewport.h);
+    provider.vtable.apply_scroll(provider.ctx, st.offsetOf(40));
+    rig.frames(8);
+    try testing.expectApproxEqAbs(@as(f32, 0), rig.rowTop(40).?, 0.6);
+}
+
+test "VirtualList scroll_owner: the list freed alone releases its rows and leaves the owner intact" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(1000, 100);
+    defer rig.deinit();
+    try testing.expect(rig.live > 0);
+    const owner_hook = rig.owner.container.meta.per_frame.hooks.before_render.main;
+    const owner_events = rig.owner.container.behavior.events.on_event;
+    try testing.expect(owner_events != null);
+    rig.scrollTo(3000);
+    const container = rig.list.container;
+    rig.cx.detachChild(rig.owner.content, container);
+    rig.cx.freeNode(container);
+    try testing.expectEqual(@as(usize, 0), rig.live);
+    // The owner is untouched: its hook, its wheel handler, its other content.
+    try testing.expectEqual(owner_hook, rig.owner.container.meta.per_frame.hooks.before_render.main);
+    try testing.expectEqual(owner_events, rig.owner.container.behavior.events.on_event);
+    try testing.expectEqual(@as(usize, 2), rig.owner.content.children.items.len);
+    rig.frames(4);
+}
+
+test "VirtualList scroll_owner: disposing the scope the list was mounted in releases its rows" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(10, 100);
+    defer rig.deinit();
+    const owned = try rig.scope.childScope();
+    var second: VlEmbeddedRig = rig;
+    second.live = 0;
+    const list = try VirtualList(.{ .item_count = 500, .measure_items = true, .estimate_item_height = 30, .overscan = 2, .scroll_owner = rig.owner }).mountScoped(owned, rig.cx, &second, VlEmbeddedRig.renderRow);
+    try rig.owner.content.appendChild(testing.allocator, list.container);
+    rig.frames(8);
+    try testing.expect(second.live > 0);
+    owned.dispose();
+    try testing.expectEqual(@as(usize, 0), second.live);
+    rig.cx.detachChild(rig.owner.content, list.container);
+    rig.cx.destroyDetached(list.container);
+    rig.frames(4);
+    try testing.expect(rig.live > 0);
+}
+
+/// Rows of the embedded rig read their extra height from here (a "width change" for all rows).
+var vl_rig_extra: f32 = 0;
+
+test "VirtualList: seedItemEstimate starts from known heights; on_item_measured reports what layout records" {
+    const Report = struct {
+        var count: usize = 0;
+        var last: [64]f32 = @splat(0);
+        fn measured(index: usize, height: f32, raw: ?*anyopaque) void {
+            testing.expect(raw != null) catch unreachable;
+            count += 1;
+            if (index < last.len) last[index] = height;
+        }
+    };
+    Report.count = 0;
+    Report.last = @splat(0);
+    var rig: VlEmbeddedRig = undefined;
+    try rig.init(4, 100);
+    defer rig.deinit();
+    const list = try VirtualList(.{ .item_count = 60, .measure_items = true, .estimate_item_height = 30, .overscan = 2, .height = 200, .width = 300, .on_item_measured = Report.measured }).mountScoped(rig.scope, rig.cx, &rig, VlEmbeddedRig.renderRow);
+    const st = list.state;
+    try testing.expectEqual(@as(f32, 60 * 30), st.totalContentHeight());
+    // Row 50 is known to be 38 (index % 4 == 2 in the rig); row 51 (really 47) is seeded stale.
+    seedItemEstimate(st, 50, 38);
+    seedItemEstimate(st, 51, 100);
+    seedItemEstimate(st, 60, 10);
+    seedItemEstimate(st, 5, 0);
+    try testing.expectEqual(@as(f32, 60 * 30 + 8 + 70), st.totalContentHeight());
+    try testing.expectEqual(@as(f32, 60 * 30 + 8 + 70), st.scroll_state.content_height);
+    try testing.expectEqual(@as(f32, 38), st.itemHeight(50));
+    try testing.expect(!st.measured.?.hasMeasurement(50));
+    try testing.expectEqual(@as(usize, 0), Report.count);
+    try rig.cx.root.?.appendChild(testing.allocator, list.container);
+    rig.frames(6);
+    // The rows on screen were measured and reported once each (real heights 20 / 29 / 38 / 47).
+    const first = Report.count;
+    try testing.expect(first >= 5);
+    try testing.expectEqual(@as(f32, 20), Report.last[0]);
+    try testing.expectEqual(@as(f32, 29), Report.last[1]);
+    try testing.expectEqual(@as(f32, 47), Report.last[3]);
+    rig.frames(6);
+    try testing.expectEqual(first, Report.count);
+    // Shown: a seed is only an estimate. Both rows are measured and reported; the stale one is
+    // corrected.
+    scrollToIndex(st, 48);
+    rig.cx.requestRedraw();
+    rig.frames(6);
+    try testing.expectEqual(@as(f32, 38), Report.last[50]);
+    try testing.expectEqual(@as(f32, 47), Report.last[51]);
+    try testing.expectEqual(@as(f32, 47), st.itemHeight(51));
+    try testing.expect(st.measured.?.hasMeasurement(51));
+}
+
+test "VirtualList observe_item_resize: a shown row that changes height on its own is followed in the next frame" {
+    vl_rig_extra = 0;
+    var rig: VlEmbeddedRig = undefined;
+    try rig.initWith(200, 100, true);
+    defer rig.deinit();
+    const st = rig.list.state;
+    rig.scrollTo(900);
+    const range = st.visibleRange();
+    // A row inside the viewport and the one after it.
+    var index = range.start;
+    while (index < range.end) : (index += 1) if (rig.rowTop(index)) |y| {
+        if (y >= 40) break;
+    };
+    const top = rig.rowTop(index).?;
+    const next = rig.rowTop(index + 1).?;
+    const total = st.totalContentHeight();
+    const before = st.itemHeight(index);
+    // Its content grows by 60 without the list being told.
+    const slot = for (st.pool_bindings, st.pool_nodes) |binding, node| {
+        if (binding == index) break node;
+    } else unreachable;
+    const row = slot.children.items[0];
+    row.style.height = .{ .px = before + 60 };
+    row.markLayoutDirty();
+    rig.cx.requestRedraw();
+    rig.frames(3);
+    try testing.expectEqual(before + 60, st.itemHeight(index));
+    try testing.expectApproxEqAbs(total + 60, st.totalContentHeight(), 0.01);
+    // The row stays, what follows it moves down by the growth: no overlap, no stale slot.
+    try testing.expectApproxEqAbs(top, rig.rowTop(index).?, 0.6);
+    try testing.expectApproxEqAbs(next + 60, rig.rowTop(index + 1).?, 0.6);
+    try testing.expectApproxEqAbs(st.totalContentHeight(), rig.list.container.globalRect().h, 0.01);
+}
+
+test "VirtualList: without observe_item_resize a measured row stays locked until it is invalidated" {
+    var rig: VlEmbeddedRig = undefined;
+    try rig.initWith(200, 100, false);
+    defer rig.deinit();
+    const st = rig.list.state;
+    const before = st.itemHeight(1);
+    const slot = for (st.pool_bindings, st.pool_nodes) |binding, node| {
+        if (binding == 1) break node;
+    } else unreachable;
+    slot.children.items[0].style.height = .{ .px = before + 60 };
+    slot.children.items[0].markLayoutDirty();
+    rig.cx.requestRedraw();
+    rig.frames(3);
+    try testing.expectEqual(before, st.itemHeight(1));
+    invalidateMeasurement(st, 1);
+    rig.cx.requestRedraw();
+    rig.frames(3);
+    try testing.expectEqual(before + 60, st.itemHeight(1));
+}
+
+test "VirtualList remeasureAll: nothing moves at the call; rows are measured again and the reader keeps its place" {
+    vl_rig_extra = 0;
+    defer vl_rig_extra = 0;
+    var rig: VlEmbeddedRig = undefined;
+    try rig.initWith(400, 100, true);
+    defer rig.deinit();
+    const st = rig.list.state;
+    rig.scrollTo(4000);
+    // Scroll up a little so rows above the reader are measured too.
+    rig.scrollTo(3800);
+    const range = st.visibleRange();
+    // The first row that starts inside the viewport: everything before it is "above the reader".
+    var tracked = range.start;
+    while (tracked < range.end) : (tracked += 1) if (rig.rowTop(tracked)) |y| {
+        if (y >= 0) break;
+    };
+    try testing.expect(tracked >= range.start + 2);
+    const top = rig.rowTop(tracked).?;
+    const total = st.totalContentHeight();
+    const measured_before = st.itemHeight(tracked);
+    // "New width": every row is 12 taller from now on.
+    vl_rig_extra = 12;
+    remeasureAll(st);
+    // Same geometry at the call; no row counts as measured.
+    try testing.expectEqual(total, st.totalContentHeight());
+    try testing.expectEqual(measured_before, st.itemHeight(tracked));
+    try testing.expect(!st.measured.?.hasMeasurement(tracked));
+    // The shown rows are rendered again by the caller's own change (here: refreshRange).
+    refreshRange(st, range.start, range.end);
+    rig.cx.requestRedraw();
+    rig.frames(6);
+    try testing.expectEqual(measured_before + 12, st.itemHeight(tracked));
+    // Rows above the reader grew, the owner was moved by the same amount: the tracked row stays.
+    try testing.expectApproxEqAbs(top, rig.rowTop(tracked).?, 0.6);
+    // Scrolling up into rows measured before the change: each is measured again as it comes in,
+    // and each step still moves the tracked row by exactly the step.
+    for (0..5) |_| {
+        const before = rig.rowTop(tracked) orelse break;
+        rig.scrollTo(rig.owner.state.scroll_y - 25);
+        const after = rig.rowTop(tracked) orelse break;
+        try testing.expectApproxEqAbs(before + 25, after, 0.6);
+    }
 }

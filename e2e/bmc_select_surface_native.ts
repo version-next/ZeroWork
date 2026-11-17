@@ -1,4 +1,5 @@
 /** BMC Select surface acceptance: private synthetic preview, no BMC transport. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
@@ -32,7 +33,7 @@ try {
     const base = await mkdtemp("/tmp/bmc-select-surface-"), rpc = join(base, "rpc"), data = join(base, "data");
     await mkdir(rpc); await mkdir(data); process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
     const log = await open(join(out, `${theme}.log`), "w");
-    const app = spawn(binary, [`--theme=${theme}`, "--state=controlled"], { env: { ...process.env,
+    const app = spawn(binary, [`--theme=${theme}`, "--state=management"], { env: { ...process.env,
       ZENIT_E2E_BACKGROUND: "1", ZENIT_E2E_ISOLATE_POINTER: "1", ZENIT_E2E_ISOLATE_KEYBOARD: "1", ZEROWORK_DATA_DIR: data },
       stdio: ["ignore", log.fd, log.fd] });
     const exited = new Promise<void>(done => app.once("close", () => done()));
@@ -56,7 +57,7 @@ try {
         assert(lastBefore, "eight native options published");
         const inside = async (id: string) => {
           const item = await visible(id), viewport = await visible("bmc.boot.target.dropdown");
-          assert(item.rect.y >= viewport.rect.y + 4 && item.rect.y + item.rect.h <= viewport.rect.y + viewport.rect.h - 4, `keyboard row visible ${theme} ${width} ${id}`);
+          assert(item.rect.y >= viewport.rect.y + 4 - 0.5 && item.rect.y + item.rect.h <= viewport.rect.y + viewport.rect.h - 4 + 0.5, `keyboard row visible ${theme} ${width} ${id}`);
         };
         await key("end"); await sleep(220); await inside("bmc.boot.option.none");
         await capture(`${theme}-${width}x${height}-keyboard-end`, ["bmc.boot.target.dropdown", "bmc.boot.option.none"]);
@@ -72,9 +73,13 @@ try {
         const x = dropdown.rect.x + dropdown.rect.w / 2, y = dropdown.rect.y + dropdown.rect.h / 2;
         assert((await scrollAt(x, y, 0, -600)).ok); await sleep(150);
         const lastAfter = await visible("bmc.boot.option.none");
-        assert(lastAfter.rect.y + lastAfter.rect.h <= dropdown.rect.y + dropdown.rect.h - 4);
-        assert(lastAfter.rect.y >= dropdown.rect.y + 4);
-        if (width === 860) assert(lastAfter.rect.y < pointerScrollStart.rect.y - 10, "small-window list scrolls to last option");
+        // The native Select list keeps its 4 point inset at both ends (layout is f32: compare within half a point).
+        assert(lastAfter.rect.y + lastAfter.rect.h <= dropdown.rect.y + dropdown.rect.h - 4 + 0.5, `last option inside the list ${theme} ${width}`);
+        assert(lastAfter.rect.y >= dropdown.rect.y + 4 - 0.5, `last option below the list top ${theme} ${width}`);
+        // The wheel scrolls the list only when its options overflow it (zenit's default rows may all fit).
+        const overflowed = pointerScrollStart.rect.y + pointerScrollStart.rect.h > dropdown.rect.y + dropdown.rect.h - 4 + 0.5;
+        if (overflowed) assert(lastAfter.rect.y < pointerScrollStart.rect.y - 10, "an overflowing list scrolls to its last option");
+        run.checks.push(`${width}x${height}: list ${overflowed ? "overflowed and scrolled" : "holds all options"}`);
         const before = await request("GET", "/app/bmc-fixture/menus"); assert.equal(before.open[4], true);
         await click("bmc.boot.option.none"); await closed("bmc.boot.target.dropdown");
         assert.equal((await request("GET", "/app/bmc-fixture/menus")).open[4], true, "local selection preserves boot panel");

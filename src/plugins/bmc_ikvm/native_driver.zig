@@ -1224,7 +1224,7 @@ pub const NativeDriver = struct {
                 self.transaction = null;
                 const response = &self.completed.?.response;
                 if (response.status == 401 or response.status == 403) self.diagnostics.management_available = false;
-                const retry = if (response.header("Retry-After")) |text| (std.fmt.parseInt(u64, text, 10) catch 0) *| 1000 else null;
+                const retry = if (response.header("Retry-After")) |text| (@import("../../shared/base/retry.zig").parseRetryAfterSeconds(text) orelse 0) *| 1000 else null;
                 return .{ .sequence = self.completed.?.sequence, .status = response.status, .body = response.body(), .etag = response.header("ETag"), .location = response.header("Location"), .retry_after_ms = retry };
             }
         }

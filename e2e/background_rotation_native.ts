@@ -1,4 +1,5 @@
 /** Disposable local directory; native settings, real one-minute rotation and restart. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdir,mkdtemp,readFile,writeFile,realpath,open,rm} from 'node:fs/promises';

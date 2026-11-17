@@ -1,4 +1,5 @@
 /** Verify local failure routing in the complete native application, with an isolated data directory. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,readFile,writeFile,rm,realpath} from 'node:fs/promises';
@@ -16,7 +17,7 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const absent=(id:string)=>h.waitFor(async()=>!(await h.query(id)).some(shown)||null,10000);
 const click=async(id:string)=>{const n=await visible(id);assert((await h.clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok,id);};
 const report:any={status:'running',binary,sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),checks:[],limits:['Real local shell and production app; no remote connection, remote command, or OS permission change.']};
-async function capture(name:string){await h.sleep(250);assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.tree(),null,2));}
+async function capture(name:string){await h.sleep(250);assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2));}
 try{
  await h.waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1280,720);
  await click('workspace.empty.local');await visible('terminal.surface');await h.sleep(1000);

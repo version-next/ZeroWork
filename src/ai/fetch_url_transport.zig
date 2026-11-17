@@ -5,6 +5,7 @@ const std = @import("std");
 const Io = std.Io;
 const provider = @import("provider.zig");
 const darwin = @import("../platform/darwin_url_network.zig");
+const net_connect = @import("../platform/net_connect.zig");
 const proxy_config = @import("../platform/darwin_url_proxy.zig");
 const proxy_tunnel = @import("fetch_url_proxy.zig");
 pub const Code = enum(c_int) { ok, invalid, not_allowed, capability, proxy_configuration, proxy_unsupported, proxy_connect, proxy_auth, denied, approval, scope_changed, dns, connect, tls, timeout, redirect, too_large, unsupported, http, cancelled, network, memory };
@@ -335,7 +336,7 @@ const Job = struct {
                 error.UnsupportedProxy => .proxy_unsupported,
                 error.UnknownHostName, error.NoAddressReturned, error.NameServerFailure => .dns,
                 error.TlsInitializationFailed, error.CertificateBundleLoadFailure => .tls,
-                error.ConnectionRefused, error.HostUnreachable, error.NetworkUnreachable => .connect,
+                error.ConnectionRefused, error.HostUnreachable, error.NetworkUnreachable, error.AccessDenied, error.NetworkDown => .connect,
                 error.ResponseTooLarge, error.HttpHeadersOversize => .too_large,
                 error.UnsupportedContentType, error.HttpContentEncodingUnsupported => .unsupported,
                 else => .network,
@@ -466,7 +467,10 @@ fn fetchInner(a: std.mem.Allocator, supplied_io: ?Io, policy: Policy, url: []con
         result.code = .capability;
         return result;
     };
-    var job: Job = .{ .a = a, .network = .{ .base = io }, .policy = policy, .result = &result };
+    // The public-network gates sit on top of net_connect, so a sandbox / firewall
+    // EPERM dial is reported as a connect failure, not an errnoBug abort (REQUESTS #53).
+    var dialer: net_connect.Guarded = .{ .base = io };
+    var job: Job = .{ .a = a, .network = .{ .base = dialer.io() }, .policy = policy, .result = &result };
     var future = Io.concurrent(io, Job.run, .{&job}) catch {
         result.code = .capability;
         return result;

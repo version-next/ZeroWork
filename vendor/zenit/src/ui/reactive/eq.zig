@@ -20,10 +20,17 @@ const testing = std.testing;
 /// itself: owned text (`scope.createText`) is double-buffered; next write or resize overwrites /
 /// frees previous buffer, saved old slice dangles. Other types are values themselves.
 pub fn EqKey(comptime T: type) type {
+    // An optional slice (`?[]const u8`, e.g. a Select value derived from owned text) dangles the
+    // same way: keep an optional hash.
+    if (comptime isOptionalSlice(T)) return ?u64;
     return if (isSlice(T)) u64 else T;
 }
 
 pub fn eqKey(comptime T: type, v: T) EqKey(T) {
+    if (comptime isOptionalSlice(T)) {
+        const s = v orelse return null;
+        return eqKey(@typeInfo(T).optional.child, s);
+    }
     if (comptime isSlice(T)) {
         const Child = @typeInfo(T).pointer.child;
         var h = std.hash.Wyhash.init(0);
@@ -37,6 +44,13 @@ pub fn eqKey(comptime T: type, v: T) EqKey(T) {
         return h.final();
     }
     return v;
+}
+
+fn isOptionalSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |o| isSlice(o.child),
+        else => false,
+    };
 }
 
 fn isSlice(comptime T: type) bool {
@@ -195,4 +209,14 @@ test "eqlValue: alias slice fast path" {
     const b: []const u8 = buf;
     try testing.expect(a.ptr == b.ptr);
     try testing.expect(eqlValue([]const u8, a, b));
+}
+
+test "eqKey: optional slice keys by content hash (old buffer overwritten in place)" {
+    var buf = [_]u8{ 't', '2' };
+    const old: ?[]const u8 = buf[0..];
+    const k_old = eqKey(?[]const u8, old);
+    buf[1] = '1'; // the double buffer is rewritten with the next value
+    const k_new = eqKey(?[]const u8, @as(?[]const u8, "t1"));
+    try testing.expect(!eqlValue(EqKey(?[]const u8), k_old, k_new));
+    try testing.expect(eqlValue(EqKey(?[]const u8), eqKey(?[]const u8, null), eqKey(?[]const u8, null)));
 }

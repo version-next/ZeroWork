@@ -29,11 +29,26 @@ pub const NodeStroke = struct {
     line_join: types.LineJoin = .miter,
 };
 
+/// A box whose paint shape is a path (`Node.setShapePath`, docs/design/joined-surface.md §4.2):
+/// its background fills `fill`, its border strokes `border` (or `fill`), and an `.auto` hit shape
+/// follows `fill`. Independent of the style, so restyling never drops it; independent of
+/// `NodeGeometries.path`, which icons and images use as hit geometry only.
+/// Heap-owned by the node (`NodeVector.shape`), freed with its geometry.
+pub const NodeShape = struct {
+    fill: PathGeometry,
+    /// Border centre line (usually the outline inset by half the border width); null strokes
+    /// `fill` itself.
+    border: ?PathGeometry = null,
+};
+
 pub const NodeVector = struct {
     /// Fill/clip path geometries (path + custom_clip)
     fill: NodeGeometries = .{},
     /// Vector stroke (separate from fill.path, can coexist)
     stroke: NodeStroke = .{},
+    /// Path paint shape of the box (null = the box's rounded rectangle). A pointer keeps the
+    /// sparse layout header within its budget; most nodes never have one.
+    shape: ?*NodeShape = null,
 };
 
 pub const LayoutArtifacts = struct {

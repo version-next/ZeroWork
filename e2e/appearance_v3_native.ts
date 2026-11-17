@@ -3,6 +3,8 @@
  * Seeds ordinary isolated config + a valid PNG; this does NOT test a native picker.
  * Uses public Harness input/query APIs and real Metal screenshots, never the full tree.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -12,7 +14,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 const prefix = process.env.ZW_APPEARANCE_TEST_PREFIX ?? "/tmp/zw-appearance-v3";
-const { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep, scrollAt } = await import(join(prefix, "share/zenit/harness/client.ts"));
+const { waitForServerReady, waitFor, query, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep, scrollAt, request } = await import(join(prefix, "share/zenit/harness/client.ts"));
+// Two-level Settings window (overview → subpage; panes no longer fold; Cmd+W closes; leaving a subpage
+// with a draft asks first): shared navigation.
+import { settingsNav, clickLabel } from "./settings_nav.ts";
+const nav = settingsNav();
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -55,6 +61,9 @@ alignment_y = "center"
 transparency = 25
 `;
 await writeFile(configPath, baseline);
+// The regression runner's isolation guard appends `[updates] auto_check=false` to any config.toml it
+// sees written: the committed file is what is actually on disk.
+const committedBaseline = await readFile(configPath, "utf8");
 await writeFile(join(output, "config-before.toml"), baseline);
 process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
 const log = await open(join(output, "app.log"), "w");
@@ -92,8 +101,10 @@ async function click(id: string): Promise<void> {
   // The public click API brings the target into its real ScrollArea viewport.
   assert((await clickTestId(id)).ok, `Click ${id}`);
 }
+// Committed numeric fields are now shown in their canonical format (line height "1.80"): compare numbers.
+const sameValue = (buffer: string, value: string) => buffer === value || (/^-?[0-9.]+$/.test(value) && /^-?[0-9.]+$/.test(buffer) && Number(buffer) === Number(value));
 async function expectInput(id: string, value: string): Promise<void> {
-  await waitFor(async () => (await inputState(id)).buffer === value || null);
+  await waitFor(async () => sameValue((await inputState(id)).buffer, value) || null);
 }
 async function edit(id: string, value: string): Promise<void> {
   await click(id);
@@ -102,16 +113,27 @@ async function edit(id: string, value: string): Promise<void> {
   assert((await key("return")).ok);
   await expectInput(id, value);
 }
+// Floating Save Bar (H-save): it shows "未保存" / "有设置需要修正" (was "请修正设置中的错误") while a draft exists
+// and hides once the draft is saved or there is none (was a persistent "已保存" footer).
+const footerText: Record<string, string> = { "请修正设置中的错误": "有设置需要修正" };
 async function footer(value: string): Promise<void> {
-  await waitFor(async () => (await visible("settings.footer.state")).text === value || null);
+  if (value === "已保存") { await waitFor(async () => !(await query("settings.footer")).some(shown) || null); return; }
+  const want = footerText[value] ?? value;
+  await waitFor(async () => (await visible("settings.footer.state")).text === want || null);
 }
-async function openSettings(): Promise<void> {
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  await visible("settings.appearance.font.header");
+async function openSettings(sub: "theme" | "font" = "theme"): Promise<void> {
+  await nav.toSub("appearance", sub);
+  await visible(sub === "theme" ? "settings.appearance.materials" : "settings.appearance.font");
+}
+/** Cmd+W asks to close the Settings window (the old settings.close button). */
+async function requestClose(): Promise<void> { assert((await key("w", { cmd: true })).ok, "Cmd+W"); }
+/** Leave the current subpage with a draft: the prompt decides (`cancel` keeps editing). */
+async function leaveWith(choice: "cancel" | "discard" | "save"): Promise<void> {
+  await click("settings.nav.appearance"); await visible("settings.confirmation");
+  await click(`settings.confirmation.${choice}`); await hidden("settings.confirmation");
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -124,7 +146,7 @@ function descendants(): { pid: number; parent: number; command: string }[] {
   return all.filter((process) => process.pid !== child.pid && owned.has(process.pid));
 }
 const evidenceIds = [
-  "settings.header.title", "settings.close", "settings.footer.state", "settings.appearance.font.header", "settings.background.preview", "settings.background.material.surface", "settings.background.material.layer", "settings.font.preview.caret", "settings.theme.remove.current", "settings.theme.import",
+  "settings.page.title", "settings.panel", "settings.footer.state", "settings.appearance.font", "settings.background.preview", "settings.background.material.surface", "settings.background.material.layer", "settings.font.preview.caret", "settings.theme.remove.current", "settings.theme.import",
   "settings.field.font_family", "settings.field.font_size", "settings.field.line_height",
   "settings.font.status", "settings.background.state", "settings.field.transparency",
   "settings.field.blur_px", "settings.materials.preview.actions", "settings.confirmation",
@@ -148,27 +170,51 @@ function configValue(source: string, section: string, field: string): unknown {
   }
   throw new Error(`Missing persisted ${section}.${field}`);
 }
+// The full-window material preview is shown in the owning main window (SettingsHost.setMaterialPreview activates
+// it), but test-mode automation stays bound to the preferences window. Bind the harness to the main window for
+// the preview, then reopen Settings from its toolbar (presentWindow rebinds the harness to the preferences window).
+async function bindMainWindow(): Promise<void> {
+  const snapshot = await request("POST", "/zerowork/windows", { action: "snapshot" });
+  assert((await request("POST", "/zerowork/windows", { action: "select", window: snapshot.windows[0].window })).ok, "bind main window");
+}
+async function boundWindow(): Promise<string | undefined> { return (await request("GET", "/windows")).windows.find((w: any) => w.bound)?.window_id; }
+async function bindSettingsWindow(): Promise<void> {
+  const main = await boundWindow();
+  await click("toolbar.settings");
+  await waitFor(async () => (await boundWindow()) !== main || null);
+  const panel = await visible("settings.panel"), viewport = await visible("settings.viewport");
+  // Returning from the preview keeps the Settings layout inside its 960×780 window (Save Bar reachable).
+  assert(panel.rect.h <= 780.5 && viewport.rect.y + viewport.rect.h <= panel.rect.y + panel.rect.h + 0.5, `settings layout fits its window after the material preview: panel ${JSON.stringify(panel.rect)} viewport ${JSON.stringify(viewport.rect)}`);
+}
 let failure: unknown;
 try {
   await waitForServerReady();
   const owner = JSON.parse(await readFile(join(rpc,"owner.json"),"utf8"));assert.equal(Number(owner.pid),child.pid);
-  assert((await resizeWindow(1440,900)).ok);await openSettings();await click("settings.materials.header");
+  // Panes no longer fold: the materials pane is on the 主题 subpage and is open on arrival.
+  assert((await resizeWindow(1440,900)).ok);await openSettings("theme");await nav.reveal("settings.background.state");
   await waitFor(async()=>(await visible("settings.background.state")).text?.includes("240 × 160")||null);
-  const initialPreview=await visible("settings.background.preview");assert.equal(initialPreview.rect.h,116);
-  const protectedDelete=await visible("settings.theme.remove.current");assert.notEqual(protectedDelete.focusable,true);
+  const initialPreview=await nav.reveal("settings.background.preview");assert.equal(initialPreview.rect.h,116);
+  const protectedDelete=await nav.reveal("settings.theme.remove.current");assert.notEqual(protectedDelete.focusable,true);
   await capture("01-dark-inline");checks.push("Prepared normal-config PNG and inline preview116; builtin current delete protected; text itermcolors entry");
+  await nav.reveal("settings.field.fit");
   await click("settings.field.fit");await click("settings.option.fit.fit");await click("settings.field.alignment");await click("settings.alignment.右下");
   await edit("settings.field.transparency","0");await edit("settings.field.blur_px","0");await click("settings.background.preview");await capture("02-fit-bottom-right");
   await click("settings.field.fit");await click("settings.option.fit.tile");await edit("settings.field.blur_px","12");await edit("settings.field.transparency","42");await click("settings.background.preview");await capture("03-tile-blurred");
-  assert.equal(await readFile(configPath,"utf8"),baseline);assert.equal(createHash('sha256').update(await readFile(image)).digest('hex'),fixtureHash);
+  assert.equal(await readFile(configPath,"utf8"),committedBaseline);assert.equal(createHash('sha256').update(await readFile(image)).digest('hex'),fixtureHash);
   await click("settings.toggle.enabled");await visible("settings.field.transparency");await capture("04-background-off-editable");await click("settings.toggle.enabled");
-  await click("settings.materials.preview.full");await visible("settings.materials.preview.actions");await click("settings.materials.preview.return");await visible("settings.close");
-  await click("settings.appearance.font.header");await edit("settings.field.font_size","18");await click("settings.option.cursor_style.bar");
-  await click("settings.font.preview");const caretStates=new Set<number>();for(let i=0;i<12;i++){const n=(await query("settings.font.preview.caret"))[0] as any;caretStates.add(n?.opacity??n?.effective_opacity??1);await sleep(120);}assert(caretStates.size>1,"caret must blink");await click("settings.font.preview");await capture("05-font-bar");
-  await click("settings.close");await click("settings.confirmation.cancel");await expectInput("settings.field.font_size","18");await click("settings.close");await click("settings.confirmation.discard");await hidden("settings.close");assert.equal(await readFile(configPath,"utf8"),baseline);
-  await openSettings();await expectInput("settings.field.font_size","14");await edit("settings.field.transparency","42");await click("settings.save");await footer("已保存");const saved=await readFile(configPath,"utf8");assert.equal(configValue(saved,"ui.materials.background","transparency"),42);checks.push("Fit, bottom-right, tile, blur12, transparency42, disabled-editability, full-window return, cursor selection/blink, Cancel/Discard and Save checked via real native actions");
-  const settingsBody=await visible("settings.viewport");await scrollAt(settingsBody.rect.x+settingsBody.rect.w/2,settingsBody.rect.y+settingsBody.rect.h/2,0,3000);await sleep(150);if (!(await query("settings.theme.strip")).some(shown)) await click("settings.appearance.themes.header");await click("settings.theme.light");await click("settings.save");await footer("已保存");await click("settings.toggle.enabled");await click("settings.save");await footer("已保存");await click("settings.background.preview");await capture("06-light");
-  assert((await resizeWindow(860,480)).ok);await click("settings.materials.header");await click("settings.materials.header");await visible("settings.background.preview");await click("settings.background.preview");await capture("07-minimum-scrolled");assert.equal((await visible("settings.background.preview")).rect.h,116);
+  await nav.reveal("settings.materials.preview.full");
+  await click("settings.materials.preview.full");await bindMainWindow();await visible("settings.materials.preview.actions");await click("settings.materials.preview.return");await hidden("settings.materials.preview.actions");await bindSettingsWindow();
+  // The material draft belongs to the 主题 subpage: leaving it to reach the font subpage asks; Discard keeps the file.
+  // The terminal preview (settings.font.preview, caret) is now the 预览 pane of the 主题 subpage.
+  await nav.reveal("settings.font.preview.prompt");await nav.reveal("settings.font.preview.command");await click("settings.font.preview.command");const caretStates=new Set<number>();for(let i=0;i<12;i++){const n=(await query("settings.font.preview.caret"))[0] as any;caretStates.add(n?.opacity??n?.effective_opacity??1);await sleep(120);}assert(caretStates.size>1,"caret must blink");await click("settings.font.preview");await capture("05-preview-caret");
+  await leaveWith("discard");assert.equal(await readFile(configPath,"utf8"),committedBaseline);
+  // Cursor shape is a native Tabs (settings.field.cursor_style) on the 字体与排版 subpage.
+  await nav.toSub("appearance","font");await edit("settings.field.font_size","18");await clickLabel("settings.field.cursor_style","下划线");await footer("未保存");await capture("05-font-cursor");
+  await requestClose();await click("settings.confirmation.cancel");await expectInput("settings.field.font_size","18");await requestClose();await click("settings.confirmation.discard");await hidden("settings.panel");/* the preferences window retires at the next safe boundary: reopen after it is gone */await waitFor(async()=>(await request("GET","/windows")).windows.length===1||null);assert.equal(await readFile(configPath,"utf8"),committedBaseline);
+  await openSettings("font");await expectInput("settings.field.font_size","14");await nav.toSub("appearance","theme");await nav.reveal("settings.field.transparency");await edit("settings.field.transparency","42");await click("settings.save");await footer("已保存");const saved=await readFile(configPath,"utf8");assert.equal(configValue(saved,"ui.materials.background","transparency"),42);checks.push("Fit, bottom-right, tile, blur12, transparency42, disabled-editability, full-window return, cursor selection/blink, leave-subpage Discard, Cancel/Discard and Save checked via real native actions");
+  await nav.reveal("settings.theme.light");await click("settings.theme.light");await click("settings.save");await footer("已保存");await nav.reveal("settings.toggle.enabled");await click("settings.toggle.enabled");await click("settings.save");await footer("已保存");await nav.reveal("settings.background.preview");await click("settings.background.preview");await capture("06-light");
+  // Was: fold / unfold the materials pane at the minimum size. Now: scroll the real settings viewport to it.
+  assert((await resizeWindow(860,480)).ok);await sleep(300);await nav.reveal("settings.background.preview");await click("settings.background.preview");await capture("07-minimum-scrolled");assert.equal((await visible("settings.background.preview")).rect.h,116);
   assert.equal(createHash('sha256').update(await readFile(image)).digest('hex'),fixtureHash);checks.push("Saved Light with background off, minimum860×480 native scroll/preview116 and source fixture unchanged");
   report.status = "passed";
 } catch (error) {

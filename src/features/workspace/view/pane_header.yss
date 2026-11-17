@@ -1,0 +1,29 @@
+//! 窗格头部的排版（ZW2 / Pane Header tOrT3：高 30 · 内边距 0 4 0 12 · 间距 6 · 类型图标 14 · 标题 12 · 状态点 6 ·
+//! 路径 11）。按钮、提示、菜单都是原生组件默认外观——这里只写布局、正文文字与状态点。
+const ui = @import("ui");
+
+style header { width: fill; min-width: 0; height: 30; flex-shrink: 0; direction: row; align-items: center; gap: 6; padding: 0 4 0 12; }
+/// 把手的图标（13，fg-secondary）；外层是手写拖动组件 `PaneDrag`。
+style grip_icon { width: 13; height: 13; flex-shrink: 0; icon-color: fg-secondary; hit-behavior: pass-through; }
+/// 类型图标：聚焦窗格（或卡片自己要求，如 AI）用 accent，其余 fg-secondary。
+recipe Type {
+  base { width: 14; height: 14; flex-shrink: 0; hit-behavior: pass-through; }
+  flag accent { icon-color: accent; } else { icon-color: fg-secondary; }
+}
+/// 标题：聚焦窗格 600 / fg-primary，其余 500 / fg-secondary；放不下时省略号。
+recipe Title {
+  base { font-size: 12; line-height: 1.5; wrap: none; text-overflow: ellipsis; selectable: false; }
+  flag focused { font-weight: 600; color: fg-primary; } else { font-weight: 500; color: fg-secondary; }
+}
+style title_slot { width: fit; min-width: 0; flex-shrink: 1; direction: row; align-items: center; overflow: hidden; }
+style title_box { width: fill; min-width: 0; }
+/// 连接状态点 6。
+/// 颜色由 workspace 按连接阶段给（与页签圆点同一个映射，见 `pane_header_view.Spec.dot`），这里只定形状。
+pub fn dot(color: ui.Color, _: *const ui.ThemeTokens) ui.BoxStyle {
+    return .{ .width = .{ .px = 6 }, .height = .{ .px = 6 }, .corner_radius = 3, .flex_shrink = 0, .background = color };
+}
+style spacer { width: fill; min-width: 0; height: 1; flex-shrink: 1; hit-behavior: pass-through; }
+/// 路径 · 列 × 行。
+style meta { flex-shrink: 0; font-size: 11; line-height: 1.4545; color: fg-secondary; wrap: none; text-overflow: ellipsis; selectable: false; }
+/// 按钮的槽（原生 ghost sm 图标按钮），永不收缩。
+style action { width: fit; height: fit; flex-shrink: 0; }

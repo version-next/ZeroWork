@@ -5,6 +5,7 @@
  * Run separately with auto/glm-5.3. Never retries a failed real-model run.
  * Only the isolated Local's one fixed, stdout-only diagnostic may be approved.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
@@ -12,6 +13,8 @@ import {createHash} from 'node:crypto';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 assert(process.env.ZW_AI_TEST_PREFIX,'an explicitly delivered candidate prefix is required');
 assert.match(process.env.ZW_AI_TEST_EXPECTED_SHA256??'',/^[a-f0-9]{64}$/,'the delivered candidate SHA-256 is required');
@@ -136,7 +139,7 @@ const server=createServer(async(req,res)=>{
    res.writeHead(upstream.status,{'content-type':upstream.headers.get('content-type')??'application/json'});res.end(response);return;
   }
   assert.equal(req.method,'POST');assert.equal(req.url,'/v1/chat/completions');
-  let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);observeRequest(body);
+  const raw=await readRequestText(req);const body=JSON.parse(raw);observeRequest(body);
   const upstream=await fetch(gateway+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer local-gateway'},body:raw,signal:AbortSignal.timeout(120000)});
   const contentType=upstream.headers.get('content-type')??'';const response=await upstream.text();
   assert(upstream.ok,`real gateway HTTP ${upstream.status}: ${response.slice(0,500)}`);parseProvider(response,contentType);
@@ -185,7 +188,7 @@ async function normalQuit(){
 }
 try{
  await h.waitForServerReady(60000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await h.sleep(700);await click('toolbar.ai');await click('ai.maximize');await click('ai.prompt');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await h.sleep(700);await click(await aiToggleId());await click('ai.maximize');await click('ai.prompt');
  const prompt=`这是一次获准的本机只读诊断，只有本轮隔离 Local 终端可用。请先批量调用 host.get_current_context 和 host.list_sessions，从真实结果取得引用和可信 PTY 状态。auto 模式优先直接使用本轮已创建的 Local；若实际策略必须 task-owned，才创建一个真实 group，刷新上下文，然后用来源 Local 的 source_ref、new_only 打开一个工作会话并等待就绪。不需要为了形式创建组。只允许调用一次 host.run_in_terminal，命令必须逐字为：\n${command}\n本次仅批准这个只向标准输出打印随机标记并以 false 结束的固定命令；禁止其他命令、run_command、输入、重跑、重连、关闭。随机标记只能从实际执行输出读取，禁止编造。run 返回后用 host.get_execution 或 host.wait_execution 按真实 execution_ref 获取前台进程、退出码、输出与保存回执；未结束时继续有界只读等待，unknown 必须如实报告，不得用新 key 重放。工具 status=succeeded 只说明查询成功，不代表前台 exit 0。最终只输出 JSON：marker、foreground_finished、exit_code、interval_saved、output_scope、output_attribution、explanation。各字段根据实际回执填写；explanation 用中文说明前台结果、观测片段是否保存，以及该输出范围对同 PTY 输出归属和前台结束后后台输出的限制，不能声称完整专属输出。`;
  await h.type_(prompt);await click('ai.send');const approved=new Set<string>(),started=performance.now();
  while(performance.now()-started<240000){
@@ -217,14 +220,14 @@ try{
  const answer=JSON.parse(fence?.[1]??lastAnswer);report.answer_format_deviation=!!fence&&lastAnswer.trim()!==fence[0].trim();assert.equal(answer.marker,markers[0]);assert.equal(answer.foreground_finished,true);assert.equal(answer.exit_code,1);assert.equal(answer.interval_saved,true);assert.equal(answer.output_scope,'session_interval');assert.equal(answer.output_attribution,final.body.snapshot.output_attribution);
  assert(/前台/.test(answer.explanation)&&/保存/.test(answer.explanation),'explanation must describe actual foreground and saved interval');assert(/(?:不能|不保证|无法|不代表|不意味着|并不|并非|未保证|不等于)/.test(answer.explanation)&&/(?:专属|独占|归属|混入|其他程序)/.test(answer.explanation),'explanation must preserve output attribution limits');assert(/后台/.test(answer.explanation)&&/(?:完整|全部|继续|覆盖)/.test(answer.explanation),'explanation must preserve limits on later background output');
  report.answer=answer;report.marker=markers[0];report.execution=final;report.execution_observations=observations;
- const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.json'),'utf8'));await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));
+ const journal=JSON.parse(await readFile(join(data,'ai/lifecycle.v4.json'),'utf8'));await writeFile(join(out,'lifecycle-journal.json'),JSON.stringify(journal,null,2));
  const recorded=journal.records.filter((r:any)=>r.tool_id==='host.run_in_terminal'&&r.execution);assert.equal(recorded.length,1);assert.equal(recorded[0].original_call,run.id);assert.equal(recorded[0].stage,'failed','real exit 1 must persist as a failed foreground outcome');
  const receipt=recorded[0].execution_receipt;assert.equal(receipt.sealed,false);assert.equal(receipt.interval_saved,true);assert.equal(receipt.output_scope,'session_interval');assert.equal(receipt.recording_settled,true);assert.equal(receipt.process.exit_code,1);
  let manifest:any=null;for(const file of await readdir(data,{recursive:true})){if(!String(file).endsWith('.json'))continue;try{const doc=JSON.parse(await readFile(join(data,String(file)),'utf8'));if(doc.execution_ranges?.some((r:any)=>'x1:'+r.execution_id===final.body.execution_ref)){manifest={path:String(file),document:doc};break}}catch{}}
  assert(manifest,'the actual execution interval requires its durable recording manifest');const range=manifest.document.execution_ranges.find((r:any)=>'x1:'+r.execution_id===final.body.execution_ref);assert.equal(range.sealed,false);assert.equal(range.interval_saved,true);assert.equal(range.output_scope,'session_interval');assert.equal(range.completion_evidence,'foreground_finished');assert.equal(range.process_receipt.exit_code,1);await writeFile(join(out,'execution-recording-manifest.json'),JSON.stringify(manifest,null,2));
  await capture('completed');report.execution_acceptance_passed=true;
  report.checks.push('Real selected Magpie model discovers current context and real session references; no dynamic session facts are injected.','One exact native approval dispatches one stdout-only shell-generated UUID diagnostic, with independent accepted, native submit, foreground exit 1 and saved-interval evidence.','Actual model get/wait observes session_interval; final JSON echoes the unpredictable PTY output and accurately explains foreground failure, saved interval, unverified attribution and background completeness limits.','Durable journal records the real nonzero foreground outcome as failed and PublicReceipt sealed=false; recording manifest saves the same foreground_finished interval.');
-}catch(error){report.status='failed';report.error=String(error);process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{})}
+}catch(error){report.status='failed';report.error=String(error);process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{})}
 finally{
  // Success always includes a normal code-0 Quit. A signal is cleanup evidence
  // only and can never be presented as passed; all isolation/evidence survives.
@@ -236,7 +239,7 @@ finally{
  else{report.status='failed';report.error??='normal application Quit with code 0 was not achieved';process.exitCode=1}
  report.provider_failure=providerFailure;report.provider_probes=providerProbes;report.requests=requests;report.responses=responses;report.calls=[...calls.values()];report.results=Object.fromEntries(results);report.approvals=approvals;
  server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));await log.close();
- try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.json')))}catch{}
+ try{await writeFile(join(out,'diagnostic-lifecycle-journal.json'),await readFile(join(data,'ai/lifecycle.v4.json')))}catch{}
  report.finished_at=new Date().toISOString();await writeFile(join(out,'provider-wire-summary.json'),JSON.stringify({requests,responses},null,2));await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));
 }
 console.log(JSON.stringify({status:report.status,model,error:report.error,normal_quit:report.normal_quit,cleanup:report.cleanup,isolation:iso,report:join(out,'report.json')}));

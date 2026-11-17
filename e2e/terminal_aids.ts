@@ -3,6 +3,8 @@
  * Uses production settings and public Harness APIs. Does not build the app.
  * Color/font rendering and system clock policies remain separate review items.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -11,6 +13,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForServerReady, waitFor, query, screenPos, inputState, clickTestId, key, type_, resizeWindow, screenshot, sleep, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
+import { settingsNav } from "./settings_nav.ts";
+const nav = settingsNav();
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2), options: Record<string, string> = {};
@@ -26,8 +30,8 @@ const rpc = join(isolated, "rpc"), data = join(isolated, "data"), release = join
 await Promise.all([mkdir(output, { recursive: true }), mkdir(rpc), mkdir(data)]);
 const configPath = join(data, "config.toml");
 // Pick a system monospace face, but omit size/line-height/aids to exercise
-// the actual defaults: 14pt / 22px, timestamps off and input highlight on.
-const baseline = '[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\n[completion]\nenabled = false\n';
+// the actual defaults: 14pt / 21px, timestamps off and input highlight on.
+const baseline = '[meta]\nconfig_revision = 1\n[ui]\ntheme = "dark"\nfont_family = "Menlo"\n[completion]\nenabled = false\n[updates]\nauto_check=false\n';
 await writeFile(configPath, baseline);
 await writeFile(join(output, "config-before.toml"), baseline);
 const markers = ["AIDS_ALPHA_0123456789", "AIDS_BETA_abcdefghij"];
@@ -51,7 +55,7 @@ const report: Record<string, unknown> = {
   status: "running", binary, binary_sha256: binaryHash, pid: child.pid, started_at: new Date().toISOString(),
   storage: "runner-owned temporary config, producer files and file RPC",
   functional: { status: "running", checks },
-  visual: { status: "pending_review", captures, review: "Compare the input row's full-width accent background with highlight on/off. Inspect actual 14/22 glyphs and 9.5/14 timestamps; functional geometry assertions do not certify pixel parity." },
+  visual: { status: "pending_review", captures, review: "Compare the input row's full-width accent background with highlight on/off. Inspect actual 14/21 glyphs and 9.5/21 timestamps; functional geometry assertions do not certify pixel parity." },
   limits: [
     "Public query exposes text and rectangles, not font size, background color or switch checked state. Size 14 is verified through the real setting and saved config; actual row/glyph height 22 and timestamp geometry are asserted. Highlight paint requires the saved PNGs to be viewed.",
     "The 2.2-second historical timestamp check proves only that these displayed output timestamps remain fixed while waiting; it does not prove active-input clock ticks, wall-clock provenance or background deadline cancellation.",
@@ -88,44 +92,46 @@ async function observe(timestamps: boolean): Promise<Observation> {
     const pane = await screenPos("workspace.pane"), surface = await screenPos("terminal.surface");
     const rows = await Promise.all([row(0), row(1), row(2)]);
     near(surface.x, pane.x, "Surface/pane x");
-    near(surface.y, pane.y, "Surface/pane y");
+    const header = await screenPos("pane.header");
+    assert(header.h > 0, "The terminal pane shows its header");
+    near(surface.y, header.y + header.h, "Surface below pane header");
     for (let index = 0; index < 2; index++) {
       const value = rows[index], rect = value.node.rect;
       assert.equal(value.body, markers[index], "The same actual PTY output must survive settings saves");
-      near(rect.x - pane.x, 8, "Row/pane inset x");
-      near(rect.y - pane.y, 8 + index * 22, "Row/pane inset y");
-      near(rect.w, surface.w - 16, "Row width");
-      near(rect.h, 22, "Default visual row height");
-      near(value.glyphs[0].rect.x - rect.x, timestamps ? 68 : 0, "Body/row x");
-      near(value.glyphs[0].rect.x - pane.x, timestamps ? 76 : 8, "Body/pane x");
+      near(rect.x - surface.x, 16, "Terminal inset x");
+      near(rect.y - surface.y, 10 + index * 21, "Terminal inset y");
+      near(rect.w, surface.w - 32, "Row width");
+      near(rect.h, 21, "Default visual row height");
       for (const glyph of value.glyphs) {
-        near(glyph.rect.h, 22, "Default glyph height");
+        near(glyph.rect.h, 21, "Default glyph height");
         near(glyph.rect.y, rect.y, "Glyph baseline row box");
       }
       if (timestamps) {
         const stamp = value.timestamp;
         assert(stamp && timestamp.test(stamp.text!), "One complete HH:mm:ss timestamp per output row");
         assert.equal((value.node.children ?? []).filter((child) => shown(child) && timestamp.test(child.text ?? "")).length, 1);
-        near(stamp.rect.x - rect.x, 12, "Timestamp/row x");
-        near(stamp.rect.x - pane.x, 20, "Timestamp/pane x");
-        near(stamp.rect.y - rect.y, 4, "Timestamp/row y");
-        near(stamp.rect.w, 48, "Timestamp width");
-        near(stamp.rect.h, 14, "Timestamp height");
+        near(stamp.rect.x, rect.x, "Timestamp starts at the row inset");
+        near(stamp.rect.y, rect.y, "Timestamp shares the terminal row baseline box");
+        assert(stamp.rect.w > 0, "A measurable timestamp reserves a gutter");
+        near(stamp.rect.h, rect.h, "Timestamp stays inside its row");
         near(value.glyphs[0].rect.x - (stamp.rect.x + stamp.rect.w), 8, "Timestamp/body gap");
-      } else assert.equal(value.timestamp, undefined, "Disabling timestamps must hide the real time nodes");
+      } else {
+        assert.equal(value.timestamp, undefined, "Disabling timestamps must hide the real time nodes");
+        near(value.glyphs[0].rect.x, rect.x, "Body starts at the row inset without timestamps");
+      }
     }
-    near(rows[2].node.rect.h, 22, "Current input row height");
+    near(rows[2].node.rect.h, 21, "Current input row height");
     return { pane, surface, rows };
   });
 }
+// Two-level settings (settings_nav.ts): 外观与主题 overview → 字体与排版 / 终端与工作区 subpages (panes no longer fold).
 async function openSettings(): Promise<void> {
-  await click("toolbar.settings");
-  await click("settings.nav.appearance");
-  await visible("settings.appearance.aids.header");
+  await nav.toCategory("appearance");
+  await visible("settings.overview.appearance.terminal");
 }
 async function openAids(): Promise<void> {
-  if (!(await query("settings.toggle.timestamp_gutter")).some(shown)) await click("settings.appearance.aids.header");
-  await visible("settings.toggle.timestamp_gutter");
+  await nav.toPane("settings.appearance.aids");
+  await nav.reveal("settings.toggle.timestamp_gutter");
   await visible("settings.toggle.input_line_highlight");
 }
 function configValue(source: string, section: string, field: string): unknown {
@@ -142,16 +148,16 @@ async function save(name: string, timestamps: boolean, highlight: boolean, previ
   await footer("未保存");
   assert.equal(await readFile(configPath, "utf8"), previous, "Editing aids must not publish before Save");
   await click("settings.save");
-  await footer("已保存");
+  await nav.saved(); // saved: the floating Save Bar hides (was the persistent footer state "已保存")
   const saved = await readFile(configPath, "utf8");
   assert.equal(configValue(saved, "ui", "timestamp_gutter"), timestamps);
   assert.equal(configValue(saved, "ui", "input_line_highlight"), highlight);
   assert.equal(configValue(saved, "ui", "font_size"), 14);
-  assert(Math.abs(Number(configValue(saved, "ui", "line_height")) - 11 / 7) < 0.000001, "Aid saves must preserve the exact default line-height multiplier, not write display-rounded 1.57");
+  assert(Math.abs(Number(configValue(saved, "ui", "line_height")) - 1.5) < 0.000001, "Aid saves must preserve the exact default line-height multiplier, not write display-rounded 1.50");
   assert(Number(configValue(saved, "meta", "config_revision")) > Number(configValue(previous, "meta", "config_revision")));
   await writeFile(join(output, `${name}.config.toml`), saved);
-  await click("settings.close");
-  await hidden("settings.close");
+  await nav.close();
+  await hidden("settings.panel");
   await focusTerminal();
   return saved;
 }
@@ -162,7 +168,7 @@ async function capture(name: string, observed: Observation, highlight: boolean):
   captures.push({ name, path, queries: join(output, `${name}.queries.json`), input_highlight_requested: highlight, input_paint: "pending_manual_review" });
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -186,20 +192,20 @@ try {
   assert((await key("enter")).ok);
   const initial = await observe(false);
   await capture("default-timestamps-off-highlight-on", initial, true);
-  checks.push("Real Local PTY output uses 22px row/glyph boxes and body x8 with timestamps omitted from the default config");
+  checks.push("Real Local PTY output uses 21px row/glyph boxes and body at the 16pt terminal inset with timestamps omitted from the default config");
 
   await openSettings();
-  if (!(await query("settings.field.font_size")).some(shown)) await click("settings.appearance.font.header");
+  await nav.toSub("appearance", "font");
   assert.equal((await inputState("settings.field.font_size")).buffer, "14");
   const displayLineHeight = (await inputState("settings.field.line_height")).buffer;
-  assert(Math.abs(Number(displayLineHeight) - 11 / 7) < 0.005, `Default line-height field: ${displayLineHeight}`);
-  report.default_typography = { size_field: 14, line_height_field: displayLineHeight, actual_row_height: initial.rows[0].node.rect.h, expected_multiplier: 11 / 7 };
+  assert(Math.abs(Number(displayLineHeight) - 1.5) < 0.005, `Default line-height field: ${displayLineHeight}`);
+  report.default_typography = { size_field: 14, line_height_field: displayLineHeight, actual_row_height: initial.rows[0].node.rect.h, expected_multiplier: 1.5 };
   await openAids();
   await click("settings.toggle.timestamp_gutter");
   let saved = await save("timestamps-on-highlight-on", true, true, baseline);
   const enabled = await observe(true);
   await capture("timestamps-on-highlight-on", enabled, true);
-  checks.push("Timestamp Save publishes true while keeping highlight true and default typography; actual time/body x12/68 within rows equals pane x20/76, with 48×14 timestamps and an 8px gap");
+  checks.push("Timestamp Save publishes true while keeping highlight true and default typography; measured time precedes text with an exact 8pt gap");
 
   const historyBefore = enabled.rows.slice(0, 2).map((value) => value.timestamp!.text);
   const waitedFrom = performance.now();
@@ -229,7 +235,7 @@ try {
   const restored = await observe(false);
   for (let i = 0; i < 2; i++) near(restored.rows[i].glyphs[0].rect.x, initial.rows[i].glyphs[0].rect.x, "Restored original body origin");
   await capture("timestamps-off-highlight-on-restored", restored, true);
-  checks.push("Saving timestamps off restores body x8 without a reserved time column and preserves both output lines; highlight true and exact 14/22 defaults are restored");
+  checks.push("Saving timestamps off restores body at the 16pt terminal inset without a reserved time column and preserves both output lines; highlight true and exact 14/21 defaults are restored");
   report.status = "passed";
   (report.functional as { status: string }).status = "passed";
 } catch (error) {

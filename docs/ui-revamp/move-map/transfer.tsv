@@ -1,0 +1,28 @@
+old_path	new_path	layer	mixed	note
+src/transfer_confirmation_view_tests.zig	src/features/transfer/tests/transfer_confirmation_view_tests.zig	tests	no	import ui; 测 ui/transfer_panel.zig（该文件将下沉 config，P1 需同步改 import）
+src/transfer_conflict_native_fixture.zig	src/features/transfer/preview/transfer_conflict_native_fixture.zig	preview	no	build.zig:392 transfer-conflict-preview 的根文件；若 V-1 不成立需留 src 根或经 preview.zig 多路复用
+src/transfer_conflict_tests.zig	src/features/transfer/tests/transfer_conflict_tests.zig	tests	no	不 import ui，只测 core transfer/conflict.zig；按任务点名前缀认领，若主 agent 认为应归 root-core 可改派
+src/transfer_conflict_view_tests.zig	src/features/transfer/tests/transfer_conflict_view_tests.zig	tests	no	import ui; 测 ui/transfer_conflict_view.zig
+src/transfer_controls_preview_runner.zig	src/features/transfer/preview/transfer_controls_preview_runner.zig	preview	no	build.zig:400 transfer-controls-preview 的根文件；同时 import ui/status_transfer_view.zig（CONTESTED）与 ui/ai_sessions_view.zig（ai 包）
+src/transfer_events_native_fixture.zig	src/features/transfer/preview/transfer_events_native_fixture.zig	preview	no	build.zig:384 transfer-events-preview 的根文件
+src/transfer_manager_view_tests.zig	src/features/transfer/tests/transfer_manager_view_tests.zig	tests	no	import ui; 46 个 test 块，1883 行
+src/transfer_panel_tests.zig	src/tests_ui.zig	root	no	test-ui 聚合根（build.zig:735），按 §5.1 改名 tests_ui.zig 留 src 根；自身 6 个 test 块全是聚合 import，含 0 条传输面板自有用例（仅 import transfer_manager_view_tests/transfer_confirmation_view_tests/transfer_conflict_tests/transfer_conflict_view_tests/ui/transfer_panel.zig 等）；文件头注释描述已过时
+src/ui/transfer_conflict_styles.zig	src/features/transfer/view/transfer_conflict_styles.zig	view	no	import ui; 跟随 transfer_conflict_view；core 未 import
+src/ui/transfer_conflict_view.zig	src/features/transfer/view/transfer_conflict_view.zig	view	no	import ui; core 未 import；836 行；依赖 file_workspace_icons（files/shared）
+src/ui/transfer_events_styles.zig	src/features/transfer/view/transfer_events_styles.zig	view	no	import ui; 跟随 transfer_events_view；core 未 import
+src/ui/transfer_events_view.zig	src/features/transfer/view/transfer_events_view.zig	view	no	import ui; core 未 import
+src/ui/transfer_manager_view.zig	src/features/transfer/view/transfer_manager_view.zig	view	yes	1842 行，含虚拟列表/行/任务逻辑；import ui；core 未 import（被 ui/workspace.zig、main.zig 使用）；依赖 status_transfer_view（CONTESTED）
+src/ui/transfer_panel.zig	src/config/transfer_panel.zig	core	yes	被 core import: src/config/transfer_defaults.zig:5；但该文件 import ui 并含 Panel 视图（1029 行，Data/ValidationError 模型与 Panel 视图混合），下沉 config 会让 core 依赖 ui，需主 agent 裁决（备选 features/transfer/view/transfer_panel.zig 并将 config->ui 违规留基线）；被 settings_transfer_defaults_tests、transfer_confirmation_view_tests 使用
+src/ui/transfer_styles.zig	src/features/transfer/view/transfer_styles.zig	view	no	import ui; core 未 import；被 transfer_events_view/transfer_panel/transfer_manager_view/status_transfer_view 共用
+src/ui/transfer_toolbar_view.zig	src/features/transfer/view/transfer_toolbar_view.zig	view	no	import ui; core 未 import；test_id 为 toolbar.transfers.*（前缀属 shell），挂载点在 main.zig 工具栏
+# CONTESTED src/ui/status_transfer_styles.zig transfer 前缀 status_* 属 shell，但内容是传输状态条（test_id status.transfer.*）；跟随 status_transfer_view
+# CONTESTED src/ui/status_transfer_view.zig transfer 前缀 status_* 属 shell；被 transfer_manager_view 与 transfer_controls_preview_runner import，被 main.zig 状态条与 ssh_status_host_tests 使用；core 未 import
+# CONTESTED src/settings_transfer_budget_tests.zig settings 不 import transfer_panel，只 import config/settings_* 与 settings_content_view，测设置页的传输预算字段
+# CONTESTED src/settings_transfer_defaults_tests.zig settings 测 config/transfer_defaults（依赖 ui/transfer_panel.zig），也可归 transfer；倾向 settings
+# E2E build.zig 引用了 src/transfer_panel_tests.zig
+# E2E build.zig 引用了 src/transfer_conflict_native_fixture.zig
+# E2E build.zig 引用了 src/transfer_controls_preview_runner.zig
+# E2E build.zig 引用了 src/transfer_events_native_fixture.zig
+# E2E docs/ui-revamp/ARCHITECTURE_PLAN.md 引用了 src/ui/transfer_manager_view.zig 与 src/ui/transfer_panel.zig 与 src/transfer_panel_tests.zig
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/ui/transfer_styles.zig
+# TESTID transfer（transfer.* 70 条）；另 toolbar.transfers.*（toolbar 前缀，shell）、status.transfer.*（status 前缀，shell/CONTESTED）、workspace.* 1 条（transfer_manager_view 内）

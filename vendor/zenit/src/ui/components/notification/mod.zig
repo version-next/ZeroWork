@@ -36,6 +36,8 @@ const drag = @import("../../interaction/drag.zig");
 const events = @import("../../events.zig");
 
 pub const model = @import("model.zig");
+/// In-place text-hint capsule: `W.HintCapsule`.
+pub const inline_hint = @import("inline_hint.zig");
 pub const styles = @import("styles.zig");
 const card_mod = @import("card.zig");
 const glass_box = @import("../glass_box/mod.zig");
@@ -51,8 +53,17 @@ pub const Lead = card_mod.Lead;
 pub const Action = card_mod.Action;
 pub const Progress = card_mod.Progress;
 pub const Strings = card_mod.Strings;
+pub const TestIds = card_mod.TestIds;
+pub const max_actions = card_mod.max_actions;
 pub const NotificationCard = Card;
 pub const Hint = hint_mod.Hint;
+
+/// Template form: `W.NotificationHost` (see host.zig).
+const host_mod = @import("host.zig");
+pub const NotificationHost = host_mod.NotificationHost;
+pub const NotificationHostProps = host_mod.NotificationHostProps;
+pub const NotificationHostResult = host_mod.NotificationHostResult;
+pub const NotificationPost = host_mod.NotificationPost;
 pub const HintMark = hint_mod.Mark;
 pub const HintKeycap = hint_mod.Keycap;
 
@@ -66,13 +77,20 @@ pub const Notification = struct {
     tone: Tone = .info,
     title: []const u8 = "",
     body: []const u8 = "",
+    /// Expandable details (empty = none): the card shows a disclosure button ("Show details" /
+    /// "Hide details", `Strings`) that reveals them in a bounded scroll area. While the user has a
+    /// card's details open, the stack's timers hold (details shown via `detail_expanded` do not).
+    detail: []const u8 = "",
+    /// Details start expanded. An in-place transform keeps the current state unless this is set.
+    detail_expanded: bool = false,
     /// Override semantic tone default glyph (check/X/triangle ...).
     glyph: ?svg_assets.Asset = null,
     /// Override leading icon position default presentation (derived from kind/tone/avatar).
     lead: ?Lead = null,
     /// Personnel message avatar initials.
     avatar: []const u8 = "",
-    /// Monospace buttons below divider (max 2). undo type defaults to "undo".
+    /// Buttons below the divider (at most `card.max_actions` = 3, one row). undo type
+    /// defaults to "undo".
     actions: []const Action = &.{},
     /// Inline reply box (Enter or "send" button submits).
     reply: bool = false,
@@ -89,6 +107,8 @@ pub const Notification = struct {
     /// Notifier.hint.
     hint_mark: HintMark = .none,
     keycap: ?HintKeycap = null,
+    /// Test ids for the card's parts (`TestIds`); copied, reapplied on in-place transforms.
+    test_ids: TestIds = .{},
 };
 
 pub const EventKind = enum {
@@ -102,6 +122,11 @@ pub const EventKind = enum {
     dismissed,
     /// Expired auto-dismiss.
     expired,
+    /// Left without a user action or expiry: the host dismissed it (`dismiss` / `dismissAll`) or
+    /// the on-screen limit pushed it out. Reported on the next frame, so a host can settle what
+    /// the card stood for (an undo window that closes commits) whichever way it left. An id
+    /// re-shown in the meantime is a new card; its own events follow.
+    removed,
 };
 
 pub const Event = struct {
@@ -142,6 +167,8 @@ const PendingOp = union(enum) {
     close: struct { id: Id, seq: u64, revision: u64 },
     /// Badge-adjacent "clear all": all on-screen alerts exit by user close.
     clear_all,
+    /// A card left without a user action or expiry (host dismiss, on-screen limit): `.removed`.
+    removed: Id,
 };
 
 pub const Notifier = struct {
@@ -183,6 +210,9 @@ pub const Notifier = struct {
 
     hovered: bool = false,
     paused: bool = false,
+    /// Host-requested suppression (`setSuppressed`): the stack is invisible, not hittable, and its
+    /// timers hold; cards stay where they are and come back unchanged.
+    suppressed: bool = false,
     expand_value: f32 = 0,
     expand_from: f32 = 0,
     expand_to: f32 = 0,
@@ -352,7 +382,14 @@ pub const Notifier = struct {
             }
         }.cleanup, @ptrCast(self));
         container.meta.per_frame.hooks.slots.anim_state = @ptrCast(self);
-        container.meta.per_frame.hooks.before_render.main = frameHook;
+        // frame() writes the container's descendants only through dirty-marking entries (raw
+        // translate / scale / opacity / size writes followed by markCompositeAnimFrameDirty /
+        // markCompositePropDirty / markSizingDirty / markRenderDirty, text and tint setters,
+        // appendChild / detachChildRetained / freeNode); fresh card nodes are written raw before
+        // they are attached. Declared `.dirty_marking`: the overlay root stays cache-trusted
+        // without per-frame raw-state verification.
+        container.addBeforeRenderScoped(frameHook, .dirty_marking);
+        if (!container.hasScopedBeforeRender(frameHook)) container.meta.per_frame.hooks.before_render.main = frameHook;
         clear_body.behavior.events.on_event = clearAllEvent;
         clear_body.behavior.events.event_context = @ptrCast(self);
         return self;
@@ -380,7 +417,8 @@ pub const Notifier = struct {
         self.removeLayer();
         if (!self.container_alive) return;
         self.container.meta.per_frame.hooks.slots.anim_state = null;
-        self.container.meta.per_frame.hooks.before_render.main = null;
+        self.container.removeBeforeRender(frameHook);
+        if (self.container.meta.per_frame.hooks.before_render.main == frameHook) self.container.meta.per_frame.hooks.before_render.main = null;
         self.releaseCards(true);
         if (self.portaled) {
             if (self.container.parent) |parent| self.cx.detachChildRetained(parent, self.container);
@@ -440,10 +478,22 @@ pub const Notifier = struct {
     pub fn dismiss(self: *Notifier, id: Id) void {
         const card = self.findLive(id) orelse return;
         self.beginLeave(card, false);
+        self.reportRemoved(card.id);
     }
 
     pub fn dismissAll(self: *Notifier) void {
-        for (self.cards.items) |card| if (!card.leaving) self.beginLeave(card, false);
+        for (self.cards.items) |card| if (!card.leaving) {
+            self.beginLeave(card, false);
+            self.reportRemoved(card.id);
+        };
+    }
+
+    /// Queue `.removed` for a card that left without its own event (emitted next frame: the
+    /// caller may be inside a listener or `show`).
+    fn reportRemoved(self: *Notifier, id: Id) void {
+        self.pending.append(self.allocator, .{ .removed = id }) catch return;
+        self.container.markRenderDirty();
+        self.cx.requestRedraw();
     }
 
     /// Position switch without rebuild; changes anchor parameters only; exiting card continues exit
@@ -454,6 +504,20 @@ pub const Notifier = struct {
         // baseline to prevent next frame mistaking anchor-type switch for window-size change pan.
         self.last_anchor_ref = null;
         self.container.markRenderDirty();
+    }
+
+    /// Hide the whole stack without dismissing anything (e.g. while a host surface covers the
+    /// stack's corner): cards fade to invisible, take no pointer input and their timers hold;
+    /// `false` brings them back with the remaining time they had.
+    pub fn setSuppressed(self: *Notifier, on: bool) void {
+        if (self.suppressed == on) return;
+        self.suppressed = on;
+        self.container.markRenderDirty();
+        self.cx.requestRedraw();
+    }
+
+    pub fn isSuppressed(self: *const Notifier) bool {
+        return self.suppressed;
     }
 
     pub fn setListener(self: *Notifier, listener: ?Listener) void {
@@ -501,6 +565,7 @@ pub const Notifier = struct {
             .duration_ms = h.duration_ms,
             .hint_mark = h.mark,
             .keycap = h.keycap,
+            .test_ids = h.test_ids,
         });
     }
 
@@ -568,7 +633,7 @@ pub const Notifier = struct {
         };
 
         // Capsule holds one button only.
-        const owned_actions = try arena.alloc(Action, @min(actions.len, @as(usize, if (is_hint) 1 else 2)));
+        const owned_actions = try arena.alloc(Action, @min(actions.len, @as(usize, if (is_hint) 1 else card_mod.max_actions)));
         for (owned_actions, actions[0..owned_actions.len]) |*dst, src| {
             dst.* = .{
                 .label = try arena.dupe(u8, src.label),
@@ -599,6 +664,7 @@ pub const Notifier = struct {
                 .avatar = try arena.dupe(u8, n.avatar),
                 .title = try arena.dupe(u8, n.title),
                 .body = try arena.dupe(u8, n.body),
+                .detail = if (is_hint) "" else try arena.dupe(u8, n.detail),
                 .actions = owned_actions,
                 .reply = n.reply,
                 .quote = if (n.quote) |q| try arena.dupe(u8, q) else null,
@@ -606,6 +672,18 @@ pub const Notifier = struct {
                 .life_bar = !is_hint and (n.life_bar orelse (!sticky and n.kind != .progress)),
                 .hint_mark = n.hint_mark,
                 .keycap = keycap,
+                .test_ids = .{
+                    .root = try arena.dupe(u8, n.test_ids.root),
+                    .title = try arena.dupe(u8, n.test_ids.title),
+                    .body = try arena.dupe(u8, n.test_ids.body),
+                    .detail = try arena.dupe(u8, n.test_ids.detail),
+                    .detail_frame = try arena.dupe(u8, n.test_ids.detail_frame),
+                    .detail_toggle = try arena.dupe(u8, n.test_ids.detail_toggle),
+                    .footer = try arena.dupe(u8, n.test_ids.footer),
+                    .life_bar = try arena.dupe(u8, n.test_ids.life_bar),
+                    .close = try arena.dupe(u8, n.test_ids.close),
+                    .action = try arena.dupe(u8, n.test_ids.action),
+                },
             },
             .sticky = sticky,
             .duration_ms = duration,
@@ -655,6 +733,7 @@ pub const Notifier = struct {
             .close_sink = onClose,
             .strings = &self.strings,
             .full_width = self.options.width,
+            .detail_open = n.detail_expanded and n.detail.len > 0 and n.kind != .hint,
         };
         self.next_seq +%= 1;
         const params = self.buildParams();
@@ -666,6 +745,7 @@ pub const Notifier = struct {
         complete = true;
         errdefer self.destroyCard(card, true);
         card_mod.rebindButtons(card);
+        card_mod.applyTestIds(card, .{});
         card.positioner.meta.ownership.hooks.on_cleanup = null;
         card.positioner.behavior.interaction.a11y = .{
             .role = if (r.spec.tone == .@"error" or r.spec.tone == .warning) .alert else .status,
@@ -700,6 +780,14 @@ pub const Notifier = struct {
         const old_spec = card.spec;
         card.spec = r.spec;
         const params = self.buildParams();
+        const old_detail_open = card.detail_open;
+        const old_detail_held = card.detail_held;
+        card.detail_open = r.spec.detail.len > 0 and (n.detail_expanded or card.detail_open);
+        card.detail_held = card.detail_open and card.detail_held;
+        errdefer {
+            card.detail_open = old_detail_open;
+            card.detail_held = old_detail_held;
+        }
         const form_changed = (old_spec.kind == .hint) != (r.spec.kind == .hint);
         if (form_changed) card_mod.applyShellForm(card, params);
         const new_content = card_mod.buildContent(card, params) catch |err| {
@@ -711,6 +799,7 @@ pub const Notifier = struct {
         card.content = new_content;
         card.revision +%= 1;
         card_mod.rebindButtons(card);
+        card_mod.applyTestIds(card, old_spec.test_ids);
         card_mod.destroyContent(self.cx, card.surface, &old_content);
         old_arena.deinit();
 
@@ -758,7 +847,9 @@ pub const Notifier = struct {
                 if (card.leaving) continue;
                 if (oldest == null or card.seq < oldest.?.seq) oldest = card;
             }
-            self.beginLeave(oldest orelse return, false);
+            const card = oldest orelse return;
+            self.beginLeave(card, false);
+            self.reportRemoved(card.id);
         }
     }
 
@@ -883,6 +974,10 @@ pub const Notifier = struct {
                         if (self.closed) return;
                     }
                 },
+                .removed => |id| {
+                    self.emit(.{ .id = id, .kind = .removed });
+                    if (self.closed) return;
+                },
                 .button => |b| if (self.findLive(b.id)) |card| {
                     if (card.seq != b.seq or card.revision != b.revision) continue;
                     if (b.index == card_mod.send_index) {
@@ -931,6 +1026,7 @@ pub const Notifier = struct {
             .body = body,
             .quote = owned,
             .duration_ms = model.Durations.reply_settle,
+            .test_ids = card.spec.test_ids,
         }) catch return;
         self.emit(.{ .id = card.id, .kind = .reply, .text = owned });
     }
@@ -944,6 +1040,7 @@ pub const Notifier = struct {
             .title = title,
             .body = body,
             .reply = true,
+            .test_ids = card.spec.test_ids,
         }) catch return;
         if (card.last_reply) |text| {
             if (card.content.reply_value) |v| v.set(text);
@@ -958,6 +1055,7 @@ pub const Notifier = struct {
             .title = card.spec.title,
             .body = card.spec.body,
             .duration_ms = model.Durations.undo_settle,
+            .test_ids = card.spec.test_ids,
         }) catch {};
     }
 
@@ -975,6 +1073,8 @@ pub const Notifier = struct {
             if (nd == card.positioner) break;
             if (nd == card.close) return false;
             if (card.content.footer) |f| if (nd == f) return false;
+            if (card.content.detail_toggle) |t| if (nd == t) return false;
+            if (card.content.detail_frame) |f| if (nd == f) return false;
         }
         return true;
     }
@@ -1076,6 +1176,11 @@ pub const Notifier = struct {
     // Per-frame driving
     // --------
 
+    /// The viewport's before_render hook (tests check its registration).
+    pub fn frameHookForTest() *const fn (*Node) void {
+        return frameHook;
+    }
+
     fn frameHook(node: *Node) void {
         const self: *Notifier = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.anim_state orelse return));
         if (self.closed) return;
@@ -1126,6 +1231,7 @@ pub const Notifier = struct {
                 card.crossfade_at_ms = now;
             }
             card.natural_height = h;
+            self.fitDetails(card, h);
             card.natural_width = if (card.spec.kind == .hint) card.content.root.rectFromWorldOrFallback().w else self.options.width;
         }
 
@@ -1141,6 +1247,7 @@ pub const Notifier = struct {
             if (want != self.hovered) self.setHovered(want, now);
         }
         if (self.hovered and self.count() == 0 and !any_leaving) self.setHovered(false, now);
+        self.syncPause(now);
 
         // 3. Expiration: dismiss by remaining lifetime. Collect first, then callback:
         // callback may show(), appending to self.cards invalidates active slice.
@@ -1204,6 +1311,28 @@ pub const Notifier = struct {
         }
     }
 
+    /// A card with open details never outgrows the stack area: the detail frame's max height
+    /// shrinks (to `detail_min_height`) so the title, body and action row stay on screen.
+    fn fitDetails(self: *Notifier, card: *Card, card_h: f32) void {
+        const detail = card.content.detail_frame orelse return;
+        if (!card.detail_open) return;
+        const vp = self.container.rectFromWorldOrFallback();
+        const ins = self.options.content_insets;
+        const area_h = vp.h - ins.top - ins.bottom - 2 * Spec.edge_inset;
+        if (area_h <= 0) return;
+        const others = card_h - detail.rectFromWorldOrFallback().h;
+        const allowed = std.math.clamp(area_h - others, M.detail_min_height, M.detail_max_height);
+        const ext = detail.style.ensureExtFallible(self.allocator) catch return;
+        if (@abs(ext.max_height - allowed) <= 0.5) return;
+        ext.max_height = allowed;
+        detail.markSizingDirty();
+        if (card.content.detail_area) |area| {
+            (area.style.ensureExtFallible(self.allocator) catch return).max_height = allowed;
+            area.markSizingDirty();
+        }
+        self.cx.requestRedraw();
+    }
+
     fn isAnimating(self: *const Notifier, now: f64) bool {
         if (self.expand_value != self.expand_to) return true;
         if (self.pending.items.len > 0) return true;
@@ -1229,16 +1358,35 @@ pub const Notifier = struct {
         return false;
     }
 
-    fn setHovered(self: *Notifier, hovered: bool, now: f64) void {
-        self.hovered = hovered;
-        // Hit pauses all timing; life bar and ring stop together, resume from stop when moved.
-        if (hovered and !self.paused) {
+    /// Timers hold without hover: a card with its details open, or keyboard focus inside a card
+    /// (a keyboard user reading or reaching an action must not lose the card; WCAG 2.2.1).
+    fn holdsTimers(self: *const Notifier) bool {
+        if (self.suppressed) return true;
+        const focused = self.cx.focus_manager.getFocused();
+        for (self.cards.items) |card| {
+            if (card.leaving) continue;
+            if (card.detail_held) return true;
+            if (focused) |f| if (f == card.positioner or f.isDescendantOf(card.positioner)) return true;
+        }
+        return false;
+    }
+
+    /// Pause / resume every card's life together (life bar and ring stop at the same point and
+    /// resume from it): paused while hovered or while something holds the timers.
+    fn syncPause(self: *Notifier, now: f64) void {
+        const want = self.hovered or self.holdsTimers();
+        if (want and !self.paused) {
             self.paused = true;
             for (self.cards.items) |card| card.life.pause(now);
-        } else if (!hovered and self.paused) {
+        } else if (!want and self.paused) {
             self.paused = false;
             for (self.cards.items) |card| card.life.@"resume"(now);
         }
+    }
+
+    fn setHovered(self: *Notifier, hovered: bool, now: f64) void {
+        self.hovered = hovered;
+        self.syncPause(now);
         const target: f32 = if (hovered and self.options.expand_on_hover) 1 else 0;
         if (target != self.expand_to) {
             self.expand_from = self.expand_value;
@@ -1264,6 +1412,9 @@ pub const Notifier = struct {
     }
 
     fn pointerInWindow(self: *const Notifier) ?struct { x: f32, y: f32 } {
+        // A pointer that left the window or sits under another window keeps its last position;
+        // that position must not keep the stack hovered (paused and expanded).
+        if (!self.cx.pointerLive()) return null;
         const x = self.cx.mouse_x;
         const y = self.cx.mouse_y;
         const vp = self.container.rectFromWorldOrFallback();
@@ -1397,7 +1548,7 @@ pub const Notifier = struct {
             var dx: f32 = entry_offset.x * enter.offset;
             var dy: f32 = entry_offset.y * enter.offset;
             var scale = enter.scale;
-            var alpha = enter.alpha * o.visibility;
+            var alpha = if (self.suppressed) 0 else enter.alpha * o.visibility;
             if (exit) |x| {
                 dy += sign * x.drift;
                 scale *= x.scale;
@@ -1428,7 +1579,7 @@ pub const Notifier = struct {
             };
             const x_pos = base_x + align_dx + dx;
             const y_pos = y + dy;
-            applyCard(card, pal, .{
+            applyCard(card, &pal, .{
                 .x = x_pos,
                 .y = y_pos,
                 .scale_x = o.scale * scale,
@@ -1471,7 +1622,7 @@ pub const Notifier = struct {
             const want: f32 = if (self.hovered and card.spec.kind != .hint and !card.leaving and card.rect_visible and card.content.root.getOpacity() > 0.5) 1 else 0;
             const step = if (self.reducedMotion()) 1 else dt / @as(f32, @floatCast(Spec.close_fade_ms));
             card.close_alpha = if (want > card.close_alpha) @min(want, card.close_alpha + step) else @max(want, card.close_alpha - step);
-            applyClose(card, pal, card == ptr_card);
+            applyClose(card, &pal, card == ptr_card);
         }
 
         self.applyPill(now, dt, shown, base_x, W, stack_min_y, stack_max_y);
@@ -1636,9 +1787,12 @@ fn applyCard(card: *Card, pal: *const styles.Palette, f: Frame) void {
     // alpha==1 and scale==1, zero overhead.
     const p = card.positioner;
     // Only mark dirty if changed: static cards shouldn't regenerate every frame.
+    // Write only a marked move: a sub-0.001 px step left unmarked would be a raw write.
     var moved = @abs(p.style.translate_x - f.x) > 0.001 or @abs(p.style.translate_y - f.y) > 0.001;
-    p.style.translate_x = f.x;
-    p.style.translate_y = f.y;
+    if (moved) {
+        p.style.translate_x = f.x;
+        p.style.translate_y = f.y;
+    }
     if (p.style.ext) |e| {
         const z = @as(i16, 100) - @as(i16, f.rank);
         if (e.z_index != z) {
@@ -1875,6 +2029,7 @@ test {
     _ = @import("model.zig");
     _ = @import("styles.zig");
     _ = @import("hint.zig");
+    _ = @import("inline_hint.zig");
 }
 
 const testing = std.testing;
@@ -1894,6 +2049,10 @@ const TestRig = struct {
         const scope = try Scope.init(testing.allocator, null, ctx.owner);
         // Init on 'previous frame': real app's first real frame always after init clock.
         ctx.frame_time_ms = -16;
+        // Tests place the pointer by writing mouse_x/mouse_y: start from a live pointer over the
+        // content, as after a platform pointer move.
+        ctx.cursor_state.pointer_valid = true;
+        ctx.hover_sync.pointer_over_content = true;
         const n = try Notifier.init(scope, ctx, .{ .position = position });
         if (!n.portaled) try root.appendChild(testing.allocator, n.container);
         return .{ .ctx = ctx, .scope = scope, .root = root, .n = n };
@@ -2039,6 +2198,28 @@ test "Notifier: hovering pauses life and expands; leaving resumes from the froze
     try testing.expectApproxEqAbs(frozen, c.life.remaining(9200), 1e-6);
 }
 
+test "Notifier: a pointer that leaves the window (or is covered) stops hovering at its last position" {
+    var rig = try TestRig.init(.bottom_center);
+    defer rig.deinit();
+    const id = try rig.n.show(.{ .tone = .success, .title = "Saved", .duration_ms = 3000 });
+    rig.step(0);
+    rig.step(1000);
+    const c = rig.card(id);
+    rig.ctx.mouse_x = c.rect_x + 20;
+    rig.ctx.mouse_y = c.rect_y + 20;
+    rig.step(1100);
+    try testing.expect(rig.n.hovered and rig.n.paused);
+    // Platform pointer_left (or a window covering the pointer): the position is unchanged but
+    // no longer describes the pointer, so the stack resumes like a native mouseExited.
+    rig.ctx.handlePointerLeave();
+    rig.step(1200);
+    try testing.expect(!rig.n.hovered and !rig.n.paused);
+    // The next pointer event at the same point hovers again.
+    rig.ctx.handleMouseMove(c.rect_x + 20, c.rect_y + 20);
+    rig.step(1300);
+    try testing.expect(rig.n.hovered and rig.n.paused);
+}
+
 test "Notifier: expiry, screen limit of 6 and upsert-by-id" {
     var rig = try TestRig.init(.bottom_right);
     defer rig.deinit();
@@ -2074,6 +2255,75 @@ test "Notifier: expiry, screen limit of 6 and upsert-by-id" {
     try testing.expect(!rig.card(target).sticky);
 }
 
+test "Notifier: a card that leaves without its own event reports .removed on the next frame" {
+    var rig = try TestRig.init(.bottom_center);
+    defer rig.deinit();
+    const Sink = struct {
+        var removed: [8]Id = undefined;
+        var removed_n: usize = 0;
+        var expired_n: usize = 0;
+        var action_n: usize = 0;
+        fn cb(_: ?*anyopaque, _: *Notifier, e: Event) void {
+            switch (e.kind) {
+                .removed => {
+                    removed[removed_n] = e.id;
+                    removed_n += 1;
+                },
+                .expired => expired_n += 1,
+                .action => action_n += 1,
+                else => {},
+            }
+        }
+    };
+    Sink.removed_n = 0;
+    Sink.expired_n = 0;
+    Sink.action_n = 0;
+    rig.n.setListener(.{ .callback = Sink.cb });
+    // Host dismiss: reported once, on the next frame (not inside the call).
+    const a = try rig.n.hint(.{ .text = "Deleted host", .action = .{ .label = "Undo" } });
+    rig.step(0);
+    rig.step(100);
+    rig.n.dismiss(a);
+    try testing.expectEqual(@as(usize, 0), Sink.removed_n);
+    rig.step(116);
+    try testing.expectEqual(@as(usize, 1), Sink.removed_n);
+    try testing.expectEqual(a, Sink.removed[0]);
+    // Dismissing a card that already left reports nothing more.
+    rig.n.dismiss(a);
+    rig.step(132);
+    try testing.expectEqual(@as(usize, 1), Sink.removed_n);
+    // Pushed out by the on-screen limit.
+    var ids: [7]Id = undefined;
+    for (ids[0..6]) |*slot| slot.* = try rig.n.show(.{ .title = "x", .sticky = true });
+    rig.step(200);
+    ids[6] = try rig.n.show(.{ .title = "x", .sticky = true });
+    rig.step(216);
+    try testing.expectEqual(@as(usize, 2), Sink.removed_n);
+    try testing.expectEqual(ids[0], Sink.removed[1]);
+    // dismissAll reports every live card.
+    rig.n.dismissAll();
+    rig.step(232);
+    try testing.expectEqual(@as(usize, 8), Sink.removed_n);
+    // Expiry and the action button keep their own events (no .removed).
+    rig.step(2000);
+    const e = try rig.n.hint(.{ .text = "Saved", .duration_ms = 500 });
+    _ = e;
+    rig.step(2016);
+    rig.step(2100);
+    rig.step(2700);
+    try testing.expectEqual(@as(usize, 1), Sink.expired_n);
+    const b = try rig.n.hint(.{ .text = "Deleted", .action = .{ .label = "Undo" } });
+    rig.step(2800);
+    rig.step(2900);
+    try testing.expect(rig.n.triggerHintAction());
+    rig.step(2916);
+    rig.step(2932);
+    try testing.expectEqual(@as(usize, 1), Sink.action_n);
+    try testing.expect(rig.card(b).leaving);
+    try testing.expectEqual(@as(usize, 8), Sink.removed_n);
+    try testing.expectEqual(@as(usize, 1), Sink.expired_n);
+}
+
 test "Notifier: undo action settles in place and reports the event" {
     var rig = try TestRig.init(.bottom_center);
     defer rig.deinit();
@@ -2084,7 +2334,7 @@ test "Notifier: undo action settles in place and reports the event" {
         }
     };
     rig.n.setListener(.{ .callback = Sink.cb });
-    const id = try rig.n.show(.{ .kind = .undo, .tone = .info, .title = "Moved 4 items to Trash" });
+    const id = try rig.n.show(.{ .kind = .undo, .tone = .info, .title = "Moved 4 items to Trash", .test_ids = .{ .root = "toast.undo", .action = "toast.undo.action" } });
     rig.step(0);
     rig.step(100);
     try testing.expectEqual(Lead.ring, rig.card(id).spec.lead);
@@ -2092,11 +2342,289 @@ test "Notifier: undo action settles in place and reports the event" {
     Notifier.onButton(rig.card(id), 0);
     rig.step(200);
     try testing.expectEqual(@as(?EventKind, .undo), Sink.last);
+    try testing.expectEqualStrings("toast.undo", rig.card(id).positioner.meta.ownership.meta.test_id.?);
     try testing.expectEqual(Lead.chip, rig.card(id).spec.lead);
     try testing.expect(rig.card(id).content.buttons[0] == null);
     // New lifetime starts when new content layer measures height.
     rig.step(220);
     try testing.expectApproxEqAbs(@as(f64, 2400), rig.card(id).life.remaining(220), 1e-6);
+}
+
+test "Notifier: a card shows up to three action buttons in one row; extra actions are dropped" {
+    var rig = try TestRig.init(.bottom_center);
+    defer rig.deinit();
+    const Sink = struct {
+        var index: u8 = 0xff;
+        var tag: [16]u8 = undefined;
+        var tag_len: usize = 0;
+        fn cb(_: ?*anyopaque, _: *Notifier, e: Event) void {
+            if (e.kind != .action) return;
+            index = e.index;
+            tag_len = @min(e.tag.len, tag.len);
+            @memcpy(tag[0..tag_len], e.tag[0..tag_len]);
+        }
+    };
+    rig.n.setListener(.{ .callback = Sink.cb });
+    const id = try rig.n.show(.{ .title = "Transfer stopped", .sticky = true, .actions = &.{
+        .{ .label = "Retry", .primary = true, .tag = "retry" },
+        .{ .label = "Show", .tag = "show" },
+        .{ .label = "Copy log", .tag = "log" },
+        .{ .label = "Dropped", .tag = "dropped" },
+    } });
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    try testing.expectEqual(@as(usize, 3), c.spec.actions.len);
+    const card_rect = c.glass_root.rectFromWorldOrFallback();
+    var widths: [3]f32 = undefined;
+    for (c.content.buttons, 0..) |maybe, i| {
+        const b = maybe orelse return error.TestUnexpectedResult;
+        const r = b.rectFromWorldOrFallback();
+        widths[i] = r.w;
+        try testing.expect(r.w > 40);
+        try testing.expect(r.x >= card_rect.x and r.x + r.w <= card_rect.x + card_rect.w + 0.5);
+    }
+    // Left to right in declaration order, no overlap.
+    try testing.expect(c.content.buttons[0].?.rectFromWorldOrFallback().x + widths[0] <= c.content.buttons[1].?.rectFromWorldOrFallback().x + 0.5);
+    try testing.expect(c.content.buttons[1].?.rectFromWorldOrFallback().x + widths[1] <= c.content.buttons[2].?.rectFromWorldOrFallback().x + 0.5);
+    Notifier.onButton(c, 2);
+    rig.step(720);
+    try testing.expectEqual(@as(u8, 2), Sink.index);
+    try testing.expectEqualStrings("log", Sink.tag[0..Sink.tag_len]);
+    // Long labels truncate inside the card instead of pushing the row past it.
+    const long_label = "View the complete retained operation result with its original owner and verification details";
+    const long_id = try rig.n.show(.{ .title = "Long", .sticky = true, .actions = &.{ .{ .label = long_label }, .{ .label = long_label }, .{ .label = long_label } } });
+    rig.step(760);
+    rig.step(1500);
+    const lc = rig.card(long_id);
+    const long_rect = lc.glass_root.rectFromWorldOrFallback();
+    for (lc.content.buttons) |maybe| {
+        const r = maybe.?.rectFromWorldOrFallback();
+        try testing.expect(r.x >= long_rect.x - 0.5 and r.x + r.w <= long_rect.x + long_rect.w + 0.5);
+    }
+    // A text hint still holds a single button.
+    const h = try rig.n.hint(.{ .text = "Deleted", .action = .{ .label = "Undo" } });
+    rig.step(740);
+    try testing.expect(rig.card(h).content.buttons[1] == null);
+}
+
+/// Click the center of `node` inside a settled card (cards are placed by translate, so the window
+/// point is the card's visual rect plus the node's layout offset in the positioner).
+fn clickOnCard(rig: *TestRig, c: *Card, node: *Node) void {
+    const base = c.positioner.globalRect();
+    const r = node.globalRect();
+    const x = c.rect_x + (r.x - base.x) + r.w / 2;
+    const y = c.rect_y + (r.y - base.y) + r.h / 2;
+    _ = rig.ctx.render();
+    rig.ctx.handleMouseMove(x, y);
+    rig.ctx.handleMouseDown(x, y, .{});
+    rig.ctx.handleMouseUp(x, y);
+}
+
+test "Notifier: details disclose in a bounded scroll area, hold the timers while open, survive an in-place update" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    var long: [1600]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = if (i % 9 == 8) ' ' else 'x';
+    const id = try rig.n.show(.{ .tone = .warning, .title = "Upload failed", .body = "prod-web-01 · backup.tar.gz", .detail = &long, .duration_ms = 3000 });
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    const toggle = c.content.detail_toggle orelse return error.TestUnexpectedResult;
+    const frame = c.content.detail_frame.?;
+    try testing.expect(!c.detail_open);
+    try testing.expectEqual(core.Display.none, frame.style.display);
+    try testing.expectEqualStrings("Show details", c.content.detail_label.?.peek());
+    const collapsed_h = c.natural_height;
+    // Click the disclosure (pointer over the card hovers the stack; then move away).
+    clickOnCard(&rig, c, toggle);
+    rig.step(720);
+    try testing.expect(c.detail_open);
+    try testing.expectEqual(core.Display.flex, frame.style.display);
+    try testing.expectEqualStrings("Hide details", c.content.detail_label.?.peek());
+    rig.ctx.mouse_x = 5;
+    rig.ctx.mouse_y = 790;
+    rig.step(740);
+    rig.step(760);
+    try testing.expect(!rig.n.hovered);
+    try testing.expect(c.natural_height > collapsed_h + 40);
+    try testing.expect(frame.rectFromWorldOrFallback().h <= styles.Metrics.detail_max_height + 0.5);
+    // The scroll area itself is bounded by the frame (so the text scrolls inside it); a scroll area as
+    // tall as its content would leave everything past the frame clipped and unreachable.
+    const area = frame.children.items[0];
+    try testing.expect(area.rectFromWorldOrFallback().h <= frame.rectFromWorldOrFallback().h + 0.5);
+    try testing.expect(c.content.detail_text.?.rectFromWorldOrFallback().h > area.rectFromWorldOrFallback().h + 40);
+    // Held while open: no expiry long after the deadline.
+    try testing.expect(rig.n.paused);
+    rig.step(20_000);
+    try testing.expect(!c.leaving);
+    // An in-place update without detail_expanded keeps the open state.
+    _ = try rig.n.show(.{ .id = id, .tone = .warning, .title = "Upload failed (2)", .detail = "short", .duration_ms = 3000 });
+    rig.step(20_020);
+    try testing.expect(c.detail_open);
+    try testing.expectEqual(core.Display.flex, c.content.detail_frame.?.style.display);
+    // Collapsing releases the hold (after the morph's cross-fade makes the new content hittable).
+    rig.step(20_400);
+    clickOnCard(&rig, c, c.content.detail_toggle.?);
+    // The click focused the disclosure button; focus inside a card also holds (G51).
+    rig.ctx.focus_manager.clearFocus();
+    rig.ctx.mouse_x = 5;
+    rig.ctx.mouse_y = 790;
+    rig.step(20_420);
+    rig.step(20_440);
+    try testing.expect(!c.detail_open and !rig.n.paused);
+    // detail_expanded opens on show without holding the timers; a hint has no details.
+    const open_id = try rig.n.show(.{ .title = "Failed", .detail = "cause", .detail_expanded = true, .duration_ms = 3000 });
+    const hint_id = try rig.n.hint(.{ .text = "Copied" });
+    rig.step(20_460);
+    try testing.expect(rig.card(open_id).detail_open);
+    try testing.expect(rig.card(hint_id).content.detail_toggle == null);
+    try testing.expect(!rig.n.paused);
+    rig.step(20_460 + 3100);
+    try testing.expect(rig.card(open_id).leaving);
+}
+
+test "Notifier: keyboard focus inside a card holds the timers; moving focus out resumes" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    const outside = try box(rig.ctx, .{ .width = .fixed(40), .height = .fixed(20) }, .{});
+    outside.behavior.interaction.focusable = true;
+    try rig.root.appendChild(testing.allocator, outside);
+    const id = try rig.n.show(.{ .title = "Disconnected", .duration_ms = 3000, .actions = &.{.{ .label = "Show" }} });
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    rig.ctx.mouse_x = 5;
+    rig.ctx.mouse_y = 790;
+    rig.ctx.setFocus(c.content.buttons[0].?);
+    rig.step(720);
+    try testing.expect(!rig.n.hovered);
+    try testing.expect(rig.n.paused);
+    const frozen = c.life.remaining(720);
+    rig.step(9000);
+    try testing.expect(!c.leaving);
+    try testing.expectApproxEqAbs(frozen, c.life.remaining(9000), 1e-6);
+    rig.ctx.setFocus(outside);
+    rig.step(9020);
+    try testing.expect(!rig.n.paused);
+    try testing.expectApproxEqAbs(frozen, c.life.remaining(9020), 1e-6);
+}
+
+test "Notifier: suppression hides the stack, blocks input and holds timers; lifting it restores the cards" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    const id = try rig.n.show(.{ .title = "Saved", .duration_ms = 3000 });
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    rig.ctx.mouse_x = 5;
+    rig.ctx.mouse_y = 790;
+    const before = c.life.remaining(700);
+    rig.n.setSuppressed(true);
+    rig.step(720);
+    try testing.expect(rig.n.isSuppressed() and rig.n.paused);
+    try testing.expectApproxEqAbs(@as(f32, 0), c.draw_alpha, 1e-3);
+    try testing.expect(!c.rect_visible);
+    try testing.expect(!c.positioner.frame_state.state_bits.flags.hit_test_visible);
+    // Pointer over the (invisible) card does not hover it.
+    rig.ctx.mouse_x = c.rect_x + 20;
+    rig.ctx.mouse_y = c.rect_y + 20;
+    rig.step(9000);
+    try testing.expect(!rig.n.hovered and !c.leaving);
+    try testing.expectApproxEqAbs(before - 20, c.life.remaining(9000), 1);
+    rig.ctx.mouse_x = 5;
+    rig.ctx.mouse_y = 790;
+    rig.n.setSuppressed(false);
+    rig.step(9020);
+    rig.step(9040);
+    try testing.expect(!rig.n.paused);
+    try testing.expectApproxEqAbs(@as(f32, 1), c.draw_alpha, 1e-3);
+    try testing.expect(c.positioner.frame_state.state_bits.flags.hit_test_visible);
+    rig.step(9040 + before);
+    try testing.expect(c.leaving);
+}
+
+test "Notifier: part test ids land on the card and survive an in-place transform" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    var root_id = "toast.0".*;
+    const id = try rig.n.show(.{ .title = "Disconnected", .body = "prod-web-01", .detail = "timeout", .sticky = true, .actions = &.{ .{ .label = "Show" }, .{ .label = "Retry" } }, .test_ids = .{
+        .root = &root_id,
+        .title = "toast.title",
+        .body = "toast.body",
+        .detail = "toast.detail",
+        .detail_toggle = "toast.expand",
+        .detail_frame = "toast.detail.frame",
+        .footer = "toast.footer",
+        .life_bar = "toast.life",
+        .close = "toast.close",
+        .action = "toast.action",
+    } });
+    // Copied: the caller's buffer may change.
+    root_id[0] = 'X';
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    try testing.expectEqualStrings("toast.0", c.positioner.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.close", c.close.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.title", c.content.title.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.body", c.content.body.?.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.detail", c.content.detail_text.?.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.expand", c.content.detail_toggle.?.meta.ownership.meta.test_id.?);
+    for (c.content.buttons[0..2]) |b| try testing.expectEqualStrings("toast.action", b.?.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.detail.frame", c.content.detail_frame.?.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.footer", c.content.footer.?.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.life", c.lifebar.meta.ownership.meta.test_id.?);
+    _ = try rig.n.show(.{ .id = id, .title = "Recovered", .sticky = true, .test_ids = .{ .root = "toast.0", .title = "toast.title.2" } });
+    rig.step(720);
+    try testing.expectEqualStrings("toast.0", c.positioner.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("toast.title.2", c.content.title.meta.ownership.meta.test_id.?);
+    try testing.expect(c.close.meta.ownership.meta.test_id == null);
+    const h = try rig.n.hint(.{ .text = "Copied", .action = .{ .label = "Undo" }, .test_ids = .{ .root = "local", .title = "local.text", .action = "local.undo" } });
+    rig.step(740);
+    try testing.expectEqualStrings("local", rig.card(h).positioner.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("local.text", rig.card(h).content.title.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("local.undo", rig.card(h).content.buttons[0].?.meta.ownership.meta.test_id.?);
+}
+
+test "Notifier: a long unbroken token in the body or details wraps inside the card" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    const token: [512]u8 = @splat('x');
+    const id = try rig.n.show(.{ .title = "Copy failed", .body = &token, .detail = "/very/long/path/" ++ token, .detail_expanded = true, .sticky = true });
+    rig.step(0);
+    rig.step(700);
+    const c = rig.card(id);
+    const card_rect = c.glass_root.rectFromWorldOrFallback();
+    for ([_]*Node{ c.content.body.?, c.content.detail_frame.?, c.content.detail_text.? }) |node| {
+        const r = node.rectFromWorldOrFallback();
+        try testing.expect(r.w <= card_rect.w);
+    }
+    try testing.expect(c.content.detail_text.?.rectFromWorldOrFallback().h > styles.Metrics.detail_max_height);
+}
+
+test "Notifier: in a short window open details shrink so the card and its actions stay on screen" {
+    var rig = try TestRig.init(.top_right);
+    defer rig.deinit();
+    rig.ctx.setViewport(1200, 300);
+    rig.root.style.height = .fixed(300);
+    rig.root.markSizingDirty();
+    var long: [1600]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = if (i % 9 == 8) ' ' else 'x';
+    const id = try rig.n.show(.{ .title = "Upload failed", .body = "prod-web-01", .detail = &long, .detail_expanded = true, .sticky = true, .actions = &.{ .{ .label = "Retry" }, .{ .label = "Show" } } });
+    var t: f64 = 0;
+    while (t <= 800) : (t += 16) rig.step(t);
+    const c = rig.card(id);
+    try testing.expect(c.rect_y + c.rect_h <= 300 - Spec.edge_inset + 0.5);
+    const frame = c.content.detail_frame.?.rectFromWorldOrFallback();
+    try testing.expect(frame.h < styles.Metrics.detail_max_height);
+    try testing.expect(frame.h >= styles.Metrics.detail_min_height - 0.5);
+    // Taller window: back to the full detail height.
+    rig.ctx.setViewport(1200, 800);
+    rig.root.style.height = .fixed(800);
+    rig.root.markSizingDirty();
+    while (t <= 1600) : (t += 16) rig.step(t);
+    try testing.expectApproxEqAbs(styles.Metrics.detail_max_height, c.content.detail_frame.?.rectFromWorldOrFallback().h, 0.5);
 }
 
 test "Notifier: hint 胶囊与卡片进同一个堆叠，宽度随内容并居中于卡片列" {
@@ -2404,6 +2932,9 @@ test "Notifier: reply sends in place as a quote and replyFailed restores the tex
     const c = rig.card(id);
     const node = c.positioner;
     try testing.expect(c.sticky);
+    const send = c.content.send_button.?;
+    const label_node = findReviewSendText(send).?;
+    try testing.expectEqual(rig.ctx.tokens.tokens.color.button_primary_fg, paintedTextColor(label_node));
     const state = c.content.reply_state.?;
     _ = state.setText("  Looks good  ");
     Notifier.onButton(c, card_mod.send_index);
@@ -2696,4 +3227,67 @@ test "Notifier: reduced motion preserves lifetime and immediately reclaims dismi
     rig.n.dismiss(id);
     rig.step(1101);
     try testing.expect(rig.n.cardForId(id) == null);
+}
+
+fn findReviewSendText(node: *Node) ?*Node {
+    if (node.getText()) |txt| {
+        if (std.mem.eql(u8, txt.content, "Send")) return node;
+    }
+    for (node.children.items) |child| {
+        if (findReviewSendText(child)) |found| return found;
+    }
+    return null;
+}
+
+/// Text color as painted: the Send label inherits the button's foreground (ControlShell tone).
+fn paintedTextColor(n: *Node) Color {
+    return @import("../../core/render_engine/text_render.zig").resolveNodeLogicalTextProps(n).?.color;
+}
+
+test "Notifier: the reply field keeps its frame through focus, hover and theme changes (acceptance)" {
+    // The reply field is an embedded Input whose shell carries declarative style layers (size
+    // recipe, field tone, the Input frame overlay). Its height, border width and padding must
+    // survive every recompute of those layers, not only the first mount.
+    var rig = try TestRig.init(.bottom_center);
+    defer rig.deinit();
+    const id = try rig.n.show(.{ .title = "Reply", .body = "Message", .reply = true });
+    rig.step(0);
+    rig.step(700);
+    const field = rig.card(id).content.reply_input.?;
+    const expectFrame = struct {
+        fn check(n: *Node) !void {
+            try testing.expectEqual(core.Sizing{ .px = M.reply_height - 2 }, n.style.height);
+            try testing.expectEqual(@as(f32, 0), n.style.border.width);
+            try testing.expectEqual(@as(f32, 0), n.style.padding.top);
+            try testing.expectEqual(@as(f32, 0), n.style.padding.left);
+            try testing.expectEqual(@as(f32, 0), n.style.padding.right);
+            try testing.expectEqual(@as(f32, 0), n.style.padding.bottom);
+        }
+    }.check;
+    try expectFrame(field);
+    rig.ctx.setFocus(field);
+    rig.step(720);
+    try expectFrame(field);
+    if (field.behavior.events.on_hover) |h| h.invoke();
+    rig.step(740);
+    try expectFrame(field);
+    if (field.behavior.events.on_leave) |h| h.invoke();
+    rig.ctx.clearFocus();
+    for ([_]*const core.ThemeTokens{ &core.theme.dark, &core.theme.high_contrast, &core.theme.light }) |t| {
+        rig.ctx.setTheme(t);
+        rig.step(760);
+        try expectFrame(field);
+    }
+}
+
+test "review regression 2: reply Send uses primary foreground in all themes" {
+    for ([_]*const core.ThemeTokens{ &core.theme.light, &core.theme.dark, &core.theme.high_contrast }) |t| {
+        var rig = try TestRig.init(.bottom_center);
+        defer rig.deinit();
+        rig.ctx.setTheme(t);
+        const id = try rig.n.show(.{ .title = "Reply", .body = "Message", .reply = true });
+        rig.step(0);
+        const send = rig.card(id).content.send_button.?;
+        try testing.expectEqual(t.tokens.color.button_primary_fg, paintedTextColor(findReviewSendText(send).?));
+    }
 }

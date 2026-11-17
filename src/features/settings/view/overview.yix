@@ -1,0 +1,73 @@
+//! 分类概览（Pencil `WswfJ`）：hero（`HiaCV`）与每个子页面一行（`IhVlT` / `sxDUF`）。
+//! 行是 `W.Pressable`（行 test_id 在可点击根上、摘要 test_id 在承载文字的节点上）；摘要随草稿由选择器驱动。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const S = @import("styles.yss");
+const subpages = @import("settings_subpages.zig");
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn heroIcon(vm: *m.ViewModel) ui.SvgAsset {
+    return subpages.iconAsset(subpages.categories[vm.pageIndex()].icon);
+}
+fn heroTitle(vm: *m.ViewModel) []const u8 {
+    return m.catalog.title(vm.pageIndex());
+}
+fn heroText(vm: *m.ViewModel) []const u8 {
+    return subpages.categories[vm.pageIndex()].description;
+}
+/// 当前分类的子页面行；行内派生直接读当前分类（`vm.pageIndex()`），见 `m.OverviewItem`。
+fn rows(vm: *m.ViewModel) []const m.OverviewItem {
+    return vm.overviewItems();
+}
+fn subTitle(vm: *m.ViewModel, sub: u8) []const u8 {
+    const page = vm.pageIndex();
+    return subpages.categories[page].subpages[sub].title;
+}
+fn subIcon(vm: *m.ViewModel, sub: u8) ui.SvgAsset {
+    const page = vm.pageIndex();
+    return subpages.iconAsset(subpages.categories[page].subpages[sub].icon);
+}
+fn rowId(vm: *m.ViewModel, sub: u8) []const u8 {
+    const page = vm.pageIndex();
+    return m.ids.overviewRow(page, sub).?.row;
+}
+fn summaryId(vm: *m.ViewModel, sub: u8) []const u8 {
+    const page = vm.pageIndex();
+    return m.ids.overviewRow(page, sub).?.summary;
+}
+fn summary(vm: *m.ViewModel, sub: u8) []const u8 {
+    return vm.overviewSummary(sub);
+}
+fn locked(vm: *m.ViewModel) bool {
+    return vm.controlsLocked();
+}
+
+pub fn Overview(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.overview" style={S.overview_root}>
+            <box testId="settings.overview.hero" style={S.hero}>
+                <box style={S.hero_tile}>
+                    <icon src={heroIcon(vm)} style={.{ S.hero_icon, S.hero_icon_ink }} />
+                </box>
+                <text style={S.hero_title}>{heroTitle(vm)}</text>
+                <text style={S.hero_text} box={S.hero_description_box}>{heroText(vm)}</text>
+            </box>
+            <box testId="settings.overview.list" style={S.overview_list}>
+                {for (rows(vm)) |row| <W.Pressable key={row.key} testId={rowId(vm, row.sub)} a11yLabel={subTitle(vm, row.sub)} disabled={locked(vm)} onClick={send(vm, m.Intent.openSubpage(row.sub))} style={S.OverviewRow.of(.{ .locked = locked(vm) })}>
+                    <box style={S.overview_tile}>
+                        <icon src={subIcon(vm, row.sub)} style={S.overview_tile_icon} />
+                    </box>
+                    <box style={S.OverviewInner.of(.{ .last = row.last })}>
+                        <box style={S.overview_copy}>
+                            <text style={S.overview_label}>{subTitle(vm, row.sub)}</text>
+                            <text testId={summaryId(vm, row.sub)} style={S.overview_summary} box={S.overview_summary_box}>{summary(vm, row.sub)}</text>
+                        </box>
+                        <icon src={ui.icons.chevron_right} style={S.overview_chevron} />
+                    </box>
+                </W.Pressable>}
+            </box>
+        </box>
+    );
+}

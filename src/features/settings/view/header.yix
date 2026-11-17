@@ -1,0 +1,58 @@
+//! 页头（Pencil `zCQxN`；布局照 znote 画板详情页 chrome 的 header 行，第 2 轮验收）：后退 / 前进胶囊、两行标题、帮助胶囊。
+//! 页头浮在内容上：绝对定位在内容列顶部（高 64，竖直中线 32 与红绿灯同高），正文从它下面滚过去，被视口的原生
+//! scroll edge 磨砂（见 `page.yix`）。页头整条是窗口拖动区（窗口用 window chrome，`windowRegion={.drag}`）且拦截命中（`page_bar` 的
+//! `hit-behavior: self_and_children`）：滚到页头下的正文点不到，空白处拖动窗口，胶囊里的按钮照常是控件（S-10）。
+//! 标题照 znote 的身份块：上一级 › 标题（12.5 次要墨色 › 13 / 600 主墨色），下面一行是分类说明（10.5 次要墨色）。
+//! 浮动按钮是 zenit 原生 macOS 26 工具栏按钮组（人工验收反馈 1，S-17 已收回）：后退 / 前进是同一颗 `W.GlassToolbarGroup`
+//! 玻璃胶囊里的两个 `W.GlassToolbarButton`（历史里没有这一步时用按钮自己的禁用态），帮助是单独一颗胶囊里的一个按钮；
+//! 胶囊、按钮底板、悬停 / 按下 / 禁用墨色全是组件默认（36pt 胶囊，同 `W.GlassToolbar` 的 `.buttons` 组）。
+//! 工具栏按钮与 macOS 原生一样不进 Tab 顺序（键盘用整窗快捷键与导航）。
+//! 帮助提示是原生 `W.Tooltip` 默认外观（反馈 11）。状态全部来自 view-model 的选择器，动作全部 `vm.dispatch`。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const S = @import("styles.yss");
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn title(vm: *m.ViewModel) []const u8 {
+    return vm.title();
+}
+fn crumb(vm: *m.ViewModel) []const u8 {
+    return vm.crumb();
+}
+fn help(vm: *m.ViewModel) []const u8 {
+    return vm.helpText();
+}
+fn backDisabled(vm: *m.ViewModel) bool {
+    return !vm.backEnabled();
+}
+fn forwardDisabled(vm: *m.ViewModel) bool {
+    return !vm.forwardEnabled();
+}
+
+pub fn PageIntro(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.page.intro" style={S.page_bar} windowRegion={.drag}>
+            <W.GlassToolbarGroup testId="settings.history" label="历史">
+                <W.GlassToolbarButton testId="settings.history.back" icon={ui.icons.chevron_left} label="返回" disabled={backDisabled(vm)} onClick={send(vm, .back)} />
+                <W.GlassToolbarButton testId="settings.history.forward" icon={ui.icons.chevron_right} label="前进" disabled={forwardDisabled(vm)} onClick={send(vm, .forward)} />
+            </W.GlassToolbarGroup>
+            <box style={S.page_heading}>
+                <box style={S.page_crumb_row}>
+                    <text style={S.page_crumb} box={S.page_crumb_box}>{crumb(vm)}</text>
+                    <icon src={ui.icons.chevron_right} style={S.page_crumb_chevron} />
+                    <text testId="settings.page.title" style={S.page_title} box={S.page_title_box}>{title(vm)}</text>
+                </box>
+                <text style={S.page_subtitle} box={S.page_subtitle_box}>{help(vm)}</text>
+            </box>
+            <spacer />
+            <W.Tooltip text={help(vm)} parts={.{ .content = m.ids.help_content }}>
+                <W.GlassToolbarGroup>
+                    <W.GlassToolbarButton testId={m.ids.help} icon={ui.icons.circle_question_mark} label="分类帮助" />
+                </W.GlassToolbarGroup>
+            </W.Tooltip>
+        </box>
+    );
+}

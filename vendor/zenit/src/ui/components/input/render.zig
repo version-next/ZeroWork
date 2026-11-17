@@ -14,6 +14,20 @@ const virtual_list = @import("../virtual_list/mod.zig");
 const SelectionRect = @import("text_core").text_coordinates.SelectionRect;
 const grapheme = @import("text_core").grapheme;
 
+/// Host-driven horizontal scroll (Web DOM host: the native <input> scrolled its text).
+fn setA11yScroll(context: *anyopaque, x: f32, _: f32) bool {
+    const state: *TextInputState = @ptrCast(@alignCast(context));
+    if (state.multiline) return false;
+    // The browser reports whole pixels: within 1px of the end is the end (else the last
+    // fractional pixel keeps the right fade on).
+    const max = @max(0, state.displayedTextAdvance() - state.input_inner_w);
+    const v = if (x >= max - 1) max else @max(0, x);
+    if (@abs(state.scroll_x - v) < 0.01) return false;
+    state.scroll_x = v;
+    state.markVisualDirty();
+    return true;
+}
+
 fn scrollA11yRange(context: *anyopaque, start: u32, end: u32, align_top: bool) bool {
     const state: *TextInputState = @ptrCast(@alignCast(context));
     const text = state.getText();
@@ -22,7 +36,7 @@ fn scrollA11yRange(context: *anyopaque, start: u32, end: u32, align_top: bool) b
     if ((start < text.len and text[start] & 0xc0 == 0x80) or (end < text.len and text[end] & 0xc0 == 0x80)) return false;
     const first = coordinates.clampByteOffset(text, .{ .value = start }, .backward).value;
     const last = coordinates.clampByteOffset(text, .{ .value = end }, .forward).value;
-    state.a11y_scroll_request = .{ .start = @intCast(first), .end = @intCast(last), .align_top = align_top, .text_hash = std.hash.Wyhash.hash(0, text), .caret = state.cursor_pos, .anchor = state.selection_anchor };
+    state.a11y_scroll_request = .{ .start = @intCast(first), .end = @intCast(last), .align_top = align_top, .text_hash = @import("trace").work_counters.hashText(0, text), .caret = state.cursor_pos, .anchor = state.selection_anchor };
     state.markVisualDirty();
     return true;
 }
@@ -34,7 +48,7 @@ fn applyA11yScroll(state: *TextInputState) void {
     };
     state.a11y_scroll_request = null;
     const text = state.getText();
-    if (request.text_hash != std.hash.Wyhash.hash(0, text) or request.caret != state.cursor_pos or request.anchor != state.selection_anchor) return;
+    if (request.text_hash != @import("trace").work_counters.hashText(0, text) or request.caret != state.cursor_pos or request.anchor != state.selection_anchor) return;
     const position: usize = if (request.align_top) request.start else if (request.end > request.start) grapheme.prevBoundary(text, request.end) else request.end;
     if (state.multiline) {
         const list = state.vl_state orelse return;
@@ -44,6 +58,7 @@ fn applyA11yScroll(state: *TextInputState) void {
         const offset: usize = if (request.align_top) request.start else request.end;
         const x = if (state.cx_ref) |cx| text_utils.visualCaretXWithFont(cx, text, .{ .byte = .{ .value = offset }, .affinity = .downstream }, state.font_size, state.font_weight, state.textFont()) orelse return else text_utils.utf8MeasuredAdvancePrefixCxWithFont(null, text, offset, state.char_width, state.font_size, state.font_weight, state.textFont());
         const width = text_utils.utf8MeasuredAdvanceCxWithFont(state.cx_ref, text, state.char_width, state.font_size, state.font_weight, state.textFont());
+        if (core.host_native_text_fields) return; // the native control scrolls itself
         state.scroll_x = std.math.clamp(x - (if (request.align_top) @as(f32, 0) else state.input_inner_w), 0, @max(@as(f32, 0), width - state.input_inner_w));
     }
 }
@@ -336,6 +351,12 @@ pub fn textInputClient(state: *TextInputState) core.TextInputClient {
                 return input.imeIsComposing();
             }
         }.read,
+        .escape_revert = struct {
+            fn run(context: *anyopaque) bool {
+                const input: *TextInputState = @ptrCast(@alignCast(context));
+                return @import("events.zig").revertState(input);
+            }
+        }.run,
         .set_selection = setA11ySelection,
         .frame_for_range = a11yTextFrame,
         .range_at_point = a11yRangeAtPoint,
@@ -368,6 +389,8 @@ pub fn syncAccessibilityProps(state: *TextInputState, node: *Node) void {
                 .set_selection = setA11ySelection,
                 .set_value = setA11yValue,
                 .scroll_into_view = scrollA11yRange,
+                .scroll_x = if (state.multiline) 0 else state.scroll_x,
+                .set_scroll = setA11yScroll,
                 .line_boundaries = a11yLineBoundaries,
                 .geometry_segments = a11yGeometry,
                 .row_geometry = a11yRowGeometry,
@@ -379,16 +402,82 @@ pub fn syncAccessibilityProps(state: *TextInputState, node: *Node) void {
     }
 }
 
+/// Hand the caret blink to the system compositor (core/compositor_sprite.zig)
+/// while the field is focused without IME preedit: a two-frame loop (lit for
+/// the first half period) timed by the field's own blink clock. The caret is
+/// repainted on every frame, so leaving the sprite needs no overlap frame.
+/// Returns true while the compositor owns the blink.
+fn caretSprite(state: *TextInputState) bool {
+    const cx = state.cx_ref orelse return false;
+    const cursor = state.cursor_node orelse {
+        cx.sprites.unregister(state);
+        return false;
+    };
+    if (!state.focused or state.hasImePreedit()) {
+        cx.sprites.unregister(state);
+        return false;
+    }
+    cx.sprites.registerWith(cx.allocator, cursor.id, caret_period_ms, state, caretDrawAt, caretRepaint, .{
+        .frame_count = 2,
+        .phase = caretPhase,
+        .fresh_on_exit = true,
+    }) catch return false;
+    return cx.sprites.isActive(cursor.id);
+}
+
+const caret_period_ms: f64 = 2 * @as(f64, @floatFromInt(@import("caret_blink.zig").half_period_ns)) / std.time.ns_per_ms;
+
+fn caretDrawAt(ctx: core.DrawContext, context: ?*anyopaque, now_ms: f64) anyerror!void {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return));
+    if (now_ms >= caret_period_ms / 2) return;
+    const dl = ctx.display_list orelse return;
+    const header = ctx.display_header orelse return;
+    try dl.append(.{ .fill_rect = .{
+        .header = header,
+        .x = 0,
+        .y = 0,
+        .w = ctx.local_w,
+        .h = ctx.local_h,
+        .color = state.tokens.tokens.color.fg_primary,
+    } });
+}
+
+fn caretRepaint(context: ?*anyopaque) void {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return));
+    if (state.cursor_node) |cursor| cursor.markRenderDirty();
+}
+
+fn caretPhase(context: ?*anyopaque) f64 {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return 0));
+    const epoch = state.blink.epoch orelse return 0;
+    const now = @import("zenit_time").Instant.now(state.io) catch return 0;
+    const period_ns: u64 = @intFromFloat(caret_period_ms * std.time.ns_per_ms);
+    return @as(f64, @floatFromInt(now.since(epoch) % period_ns)) / std.time.ns_per_ms;
+}
+
 /// Input beforeRender hook: cursor blink, selection highlight, drag handling.
+/// The text, placeholder, caret, selection and IME colors are read from `state.tokens`, which
+/// mount points at the window's tokens. `Cx.setTheme` publishes a new token set and replays this
+/// hook (theme replay runs every before-render hook), so follow the window's current tokens here:
+/// a theme publication repaints the field without the owner rewriting its state, and leaves the
+/// buffer, cursor, selection and an in-progress IME composition untouched.
+pub fn followThemeTokens(state: *TextInputState) void {
+    const cx = state.cx_ref orelse return;
+    if (state.tokens == cx.tokens) return;
+    state.tokens = cx.tokens;
+    state.dirty = true;
+}
+
 pub fn inputBeforeRender(node: *Node) void {
     const state: *TextInputState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
-    // Rendering resolves inherited typography before painting. Use the same
-    // effective font for caret, selection, hit testing and horizontal scrolling.
-    if (!state.multiline) if (state.text_display_node) |display| {
-        const inherited = display.resolveInheritedTextStyle();
-        const text = display.getText();
-        const size = inherited.font_size orelse (if (text) |t| t.font_size else state.font_size);
-        const weight = inherited.font_weight orelse (if (text) |t| t.font_weight else state.font_weight);
+    followThemeTokens(state);
+    // Layout and paint resolve inherited typography (Node.resolveTextProps): an ancestor's
+    // size / weight fills what the display text did not declare. Caret, selection, hit testing
+    // and horizontal scrolling must measure with that same face, including the text's family,
+    // monospace and italic selection. (Multiline rows pin their metrics instead.)
+    if (!state.multiline) if (state.text_display_node) |display| if (display.resolveTextProps()) |painted| {
+        const size = painted.font_size;
+        const weight = painted.font_weight;
         const font = state.textFont();
         if (size != state.font_size or weight != state.font_weight or !std.meta.eql(font, state.measured_font)) {
             const ratio = if (state.font_size > 0) state.line_height / state.font_size else 1.4;
@@ -410,7 +499,10 @@ pub fn inputBeforeRender(node: *Node) void {
 
     const now = @import("zenit_time").Instant.now(state.io) catch null;
     const blink_visible = (!state.hasImePreedit() or state.ime_cursor_visible) and (if (state.focused and now != null) state.blinkVisible(now.?) else state.focused);
-    if (state.focused and now != null) {
+    // While the compositor blinks the caret (see caretSprite) no frame is
+    // scheduled for the phase flips.
+    const blink_composited = caretSprite(state);
+    if (state.focused and now != null and !blink_composited) {
         if (state.cx_ref) |cx| {
             cx.scheduleRedrawAfterNs(state.nextBlinkDelayNs(now.?));
         }
@@ -419,6 +511,9 @@ pub fn inputBeforeRender(node: *Node) void {
         }
     }
     state.last_blink_visible = blink_visible;
+    if (state.focused and !blink_composited) if (state.cx_ref) |cx| {
+        cx.caret_shown = blink_visible;
+    };
 
     // Cache container global x coordinate.
     state.container_x = coords.global_x;
@@ -479,18 +574,18 @@ pub fn inputBeforeRender(node: *Node) void {
     if (state.text_display_node) |text_nd| {
         // Single-line Input: directly update text content (mark dirty only when content actually
         // changes).
-        if (text_nd.getText()) |old_text| {
+        if (text_nd.getText() != null) {
+            // syncDisplayTextContent may write the node's text (releasing what it owned), so the
+            // props are read after it, never carried across it (Node.getText lifetime).
             const content_changed = state.syncDisplayTextContent();
-            var text = text_nd.getText() orelse old_text;
+            var text = text_nd.getText() orelse core.TextProps{};
             const has_content = state.hasVisualValue();
-            // A required-but-empty field still displays a placeholder, not an
-            // invalid entered value. Keep that example visually neutral.
-            const new_color = if (!has_content)
-                (state.placeholder_color orelse state.tokens.tokens.color.fg_secondary)
-            else if (state.has_error)
-                state.tokens.tokens.color.danger
+            const new_color = if (state.disabled)
+                state.tokens.tokens.color.fg_disabled
+            else if (has_content)
+                state.tokens.tokens.color.fg_primary
             else
-                state.tokens.tokens.color.fg_primary;
+                (state.placeholder_color orelse state.tokens.tokens.color.fg_secondary);
             const new_line_height = if (state.font_size > 0 and state.line_height > 0)
                 state.line_height / state.font_size
             else
@@ -504,6 +599,7 @@ pub fn inputBeforeRender(node: *Node) void {
             // syncDisplayTextContent publishes an owned snapshot; retain all
             // of its ownership fields when updating visual properties.
             text.color = new_color;
+            text.color_set = true;
             text.line_height = new_line_height;
             text_nd.setText(text);
             text_nd.style.padding.left = new_padding_left;
@@ -557,11 +653,19 @@ pub fn inputBeforeRender(node: *Node) void {
                 const content_w = state.displayedTextAdvance();
                 const max_scroll = @max(@as(f32, 0), content_w - state.input_inner_w);
                 const eps: f32 = 0.75;
-                const left_on = state.scroll_x > eps;
-                const right_on = state.scroll_x < (max_scroll - eps);
-                if (fade.edges.left != left_on or fade.edges.right != right_on) {
+                const background = if (state.input_container_node) |field| field.getBackground() else Color.TRANSPARENT;
+                // A solid field can cover overflowing glyphs with its own paint.
+                // On transparent/embedded fields retain the hard clip: painting
+                // their translucent tint again would create another dark seam.
+                const can_fade = background.a == 255;
+                const left_on = can_fade and state.scroll_x > eps;
+                const right_on = can_fade and state.scroll_x < (max_scroll - eps);
+                if (fade.edges.left != left_on or fade.edges.right != right_on or
+                    fade.color == null or !Color.eql(fade.color.?, background))
+                {
                     fade.edges.left = left_on;
                     fade.edges.right = right_on;
+                    fade.color = background;
                     node.markRenderDirty();
                 }
             }
@@ -624,19 +728,21 @@ pub fn inputBeforeRender(node: *Node) void {
 
             const cursor_x = @round(container_inner_x + cursor_x_px);
             const cursor_y_px = @round(cursor_y);
-            cursor.setLayoutRect(.{
+            // A composited blink keeps the GPU caret lit: its items are
+            // replaced by the sprite, and must exist for it to stay admitted.
+            syncCursorVisual(cursor, .{
                 .x = cursor_x,
                 .y = cursor_y_px,
                 .w = 1,
                 .h = cursor_h,
-            });
-            cursor.setBackgroundRaw(if (blink_visible) state.tokens.tokens.color.fg_primary else Color.TRANSPARENT);
-            cursor.markRenderDirty();
+            }, if (blink_visible or blink_composited) state.tokens.tokens.color.fg_primary else Color.TRANSPARENT);
 
             // IME cursor rect needs global coordinates.
             if (state.cx_ref) |cx| {
                 const global = node.globalRect();
-                const world_transform = node.frame_state.frame_local.spatial.world.matrix;
+                // Live transform: the hit index stores matrices in hit-layer space (a scrolled
+                // ancestor moves without a rebuild), not world space.
+                const world_transform = node.worldTransform();
                 const has_world_transform = world_transform.a != 1 or world_transform.b != 0 or
                     world_transform.c != 0 or world_transform.d != 1 or world_transform.tx != 0 or world_transform.ty != 0;
                 const caret_world = if (has_world_transform)
@@ -651,9 +757,7 @@ pub fn inputBeforeRender(node: *Node) void {
                 );
             }
         } else {
-            cursor.setLayoutRect(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
-            cursor.setBackgroundRaw(Color.TRANSPARENT);
-            cursor.markRenderDirty();
+            syncCursorVisual(cursor, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, Color.TRANSPARENT);
         }
     }
 
@@ -676,6 +780,18 @@ pub fn inputBeforeRender(node: *Node) void {
     }
 }
 
+/// Write the caret's frame and color, marking it render-dirty only when either changed. The
+/// hook runs every frame; an unconditional mark kept the caret (and through subtree_render every
+/// ancestor up to the window root) dirty on idle frames, so nothing on that path could be reused.
+fn syncCursorVisual(cursor: *Node, rect: core.ComputedRect, color: Color) void {
+    const old_rect = cursor.rectFromWorldOrFallback();
+    const old_color = cursor.getBackground();
+    cursor.setLayoutRect(rect);
+    cursor.setBackgroundRaw(color);
+    const same_rect = old_rect.x == rect.x and old_rect.y == rect.y and old_rect.w == rect.w and old_rect.h == rect.h;
+    if (!same_rect or !std.meta.eql(old_color, color)) cursor.markRenderDirty();
+}
+
 /// Rebuild text_display_node spans per selection / IME preedit state, rebind slice to text.spans.
 fn rebuildSingleLineSpans(state: *TextInputState) void {
     const text_nd = state.text_display_node orelse return;
@@ -683,7 +799,7 @@ fn rebuildSingleLineSpans(state: *TextInputState) void {
 
     var len: u8 = 0;
     const display_text = text_prop.content;
-    const is_password = state.input_type == .password;
+    const is_password = state.masked();
     // In password mode, display_text is mask (N ASCII '*'s); span start/end by mask coordinate =
     // grapheme index. In normal mode, display_text equals buffer, use byte offset.
     const cursor_off_raw = @min(state.cursor_pos, state.getText().len);
@@ -1131,7 +1247,6 @@ fn ensureExtraSelNodes(state: *TextInputState, needed: u8, _: *Node) void {
             .height = .{ .px = 0 },
         }, .{}) catch return;
         overlay.appendChild(cx.allocator, esel) catch return;
-        esel.parent = overlay;
         state.extra_sel_nodes[state.extra_sel_count] = esel;
         state.extra_sel_count += 1;
     }
@@ -1179,7 +1294,7 @@ pub fn countTextareaLines(state: *TextInputState) usize {
 pub fn textareaRenderItem(item_node: *Node, index: usize, cx: *Cx, user_context: ?*anyopaque) void {
     const state: *TextInputState = @ptrCast(@alignCast(user_context orelse return));
     const has_content = state.hasVisualValue();
-    const text_color = if (has_content) state.tokens.tokens.color.fg_primary else state.tokens.tokens.color.fg_secondary;
+    const text_color = if (state.disabled) state.tokens.tokens.color.fg_disabled else if (has_content) state.tokens.tokens.color.fg_primary else state.tokens.tokens.color.fg_secondary;
 
     // WrapMap + TextareaDocument path.
     if (state.textarea_wrap) |wrap| {
@@ -1267,6 +1382,7 @@ test "legacy input frame retries pending wrap without a width change" {
     var state: TextInputState = .{ .io = @import("std").testing.io, .multiline = true, .textarea_doc = &doc, .textarea_wrap = &wm, .allocator = t.allocator, .input_inner_w = 64 };
     defer state.deinit();
     var node: Node = .{ .id = 1, .tag = .box, .style = .{}, .children = .empty };
+    defer @import("../../core/node_lifecycle.zig").releaseStandaloneState(&node);
     node.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 100 });
     node.behavior.events.event_context = &state;
     inputBeforeRender(&node);

@@ -1,6 +1,7 @@
 /** App-owned history through Local zsh -> ede alias -> actual loopback SSH/ZSH.
  * node e2e/completion_nested_ssh_native.ts /absolute/output /absolute/test-binary
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,7 +18,8 @@ await Promise.all([mkdir(rpc), mkdir(data), mkdir(zdot), mkdir(remote)]);
 await mkdir(join(remote, "__pycache__"));
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const peerOut = join(output, "peer"), peerLog = await open(join(output, "peer.log"), "w");
-const peer = spawn("python3", ["e2e/builtin_records_ssh_peer.py", "--out", peerOut], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
+assert(process.env.ZW_TEST_PYTHON, "ZW_TEST_PYTHON (audited interpreter with paramiko) is required; a bare python3 is never used");
+const peer = spawn(process.env.ZW_TEST_PYTHON, ["-I", "e2e/builtin_records_ssh_peer.py", "--out", peerOut], { stdio: ["ignore", peerLog.fd, peerLog.fd] });
 const peerEnded = new Promise(resolve_ => peer.once("close", resolve_));
 const ready = await waitFor(async () => { try { return JSON.parse(await readFile(join(peerOut, "ready.json"), "utf8")); } catch { return null; } }, 15000);
 const knownHosts = join(isolated, "known_hosts");
@@ -91,7 +93,8 @@ try {
     await type("records-"); await sleep(250); await hidden("terminal.completion");
     await press("c", { ctrl: true }); await sleep(200);
     await resizeWindow(860, 480);
-    if ((await query("status.theme")).some(shown)) await click("status.theme.close");
+    // title-click: the title bar theme popover is gone; the only theme surface is the 设置 window (显示 › 外观…).
+    if ((await query("settings.window")).some(shown)) { await press("escape"); await hidden("settings.window"); }
     await click("terminal.surface");
     await type("find");
     const compact = await visible("terminal.completion");

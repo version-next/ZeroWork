@@ -1,4 +1,5 @@
 /** Native V3 tabs: actual hover geometry, menus, closed-loop failure and overflow. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -38,25 +39,37 @@ async function clickNode(n:any,button=0,count=1){
 }
 async function click(id:string){await vis(id);await sleep(200);await clickNode(await vis(id))}
 async function tabs(){const n=await vis('tabs.strip');return flat(n).filter(x=>/^tabs\.tab\.\d+$/.test(x.test_id??''))}
-async function capture(name:string){assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify({tabs:await tabs(),tooltip:await query('tabs.tooltip'),menu:await query('context.menu'),picker:await query('tabs.picker')},null,2));report.captures.push(name)}
+async function capture(name:string){assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify({tabs:await tabs(),tooltip:await query('tabs.tooltip'),menu:await query('context.menu'),overflow:await query('tabs.all.menu')},null,2));report.captures.push(name)}
 async function newLocal(){await click('toolbar.new_session');await vis('session.menu');await click('session.menu.local');await hidden('session.menu');await sleep(180);assert(!(await query('session.menu.local_tooltip')).some(shown))}
 async function hoverTab(id:string){await mouseMove(30,80);await sleep(150);const before=(await tabs()).map(n=>({id:n.test_id,rect:n.rect})),n=await vis(id);await mouseMove(n.rect.x+36,n.rect.y+16);await sleep(700);const tip=await vis('tabs.tooltip');assert(tip.rect.w<=300.5);assert(tip.rect.x>=0&&tip.rect.y>=0);assert.deepEqual((await tabs()).map(n=>({id:n.test_id,rect:n.rect})),before);return tip}
 try{
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await resizeWindow(1440,900);await click('workspace.empty.local');await vis('terminal.surface');await newLocal();
- let all=await tabs();const first=all[0].test_id;assert.equal(all.length,2);for(const n of all)assert.equal(n.rect.h,38);
- await click(first);await clickNode(await vis(first),0,2);await vis('tabs.rename');await sleep(200);await click('tabs.rename.input');await key('a',{cmd:true});await type_('Local-long-name-0123456789012345678901234567890123456789');assert(text(await vis('tabs.rename.input')).includes('Local-long-name-'));await click('tabs.rename.save');await hidden('tabs.rename');assert(text(await vis(first)).includes('Local-long-name-'));
- const tip=await hoverTab(first);assert(text(tip).includes('Local-long-name-')&&text(tip).includes('/bin/zsh')&&text(tip).includes('在线'));await capture('01-hover-long-name');report.checks.push('hover does not resize or overlap neighboring tabs; complete local metadata');
+ let all=await tabs();const first=all[0].test_id;assert.equal(all.length,2);for(const n of all)assert.equal(n.rect.h,n===all[1]?33:30); // 稿 3 / ZW4 Tab: inactive surface 30, the active one 33 (joins the island)
+ await click(first);await sleep(300);await capture('00-first-attached');await clickNode(await vis(first),0,2);await vis('tabs.rename');await sleep(200);await click('tabs.rename.input');await key('a',{cmd:true});await type_('Local-long-name-0123456789012345678901234567890123456789');assert(text(await vis('tabs.rename.input')).includes('Local-long-name-'));await click('tabs.rename.save');await hidden('tabs.rename');
+ await key('escape'); // Harness has no key_up: a key without ⌘ ends the ⌘-held state from ⌘A (else ⌘ ordinals replace the close buttons)
+assert(text(await vis(first)).includes('Local-long-name-'));
+ await click(all[1].test_id);await sleep(300);await capture('01-second-attached');
+ // The active tab's hover shows its connection card instead of a hint.
+ const tip=await hoverTab(first);assert(text(tip).includes('Local-long-name-')&&text(tip).includes('zsh')); // 稿 3: 名称 · 路径 · zsh · 快捷键（在线不重复写）
+ await capture('01b-hover-long-name');report.checks.push('hover does not resize or overlap neighboring tabs; complete local metadata');
  if(pointerChecks){await mouseMove(30,80);await clickNode(await vis(first),1);await vis('context.menu.new_tab');await vis('context.menu.clone_session');await capture('02-local-tab-menu');await key('escape');await hidden('context.menu');
  await click(first);const terminal=await vis('terminal.surface');await clickNode(terminal,2);await vis('context.menu.toggle_timestamp');assert(!(await query('context.menu.new_tab')).some(shown));await capture('03-terminal-middle-menu');await key('escape');report.checks.push('tab right-click and terminal middle-click expose distinct actual menus');}
  for(const close of (layoutOnly?[]:pointerChecks?['x','menu','middle']:['x'])){
-  const count=(await tabs()).length;if(!(await query('sidebar.host')).some(shown))await click('sidebar.restore');const host=await vis('sidebar.host');await clickNode(host);await waitFor(async()=>(await tabs()).length===count+1||null,12000);const failed=(await tabs()).at(-1)!;
-  await waitFor(async()=>{const n=(await query('connection.progress.summary.detail')).find(shown);return n&&text(n).includes('无法建立 TCP')?true:null},45000);await click('connection.progress.close');await hidden('connection.progress');await sleep(200);const failedTip=await hoverTab(failed.test_id);assert(text(failedTip).includes('离线'));await capture('04-failed-'+close);
+  const count=(await tabs()).length;if(!(await query('sidebar.host')).some(shown))await click('sidebar.restore');
+  // design-r3 A2: a row click only selects; the selected row's native 连接 button connects.
+  const host=await vis('sidebar.host');await clickNode(host);await click('sidebar.host.connect_button');await waitFor(async()=>(await tabs()).length===count+1||null,12000);const failed=(await tabs()).at(-1)!;
+  // design-r3 稿 1: the refused attempt becomes the tab's failure view (no dismiss button).
+  await waitFor(async()=>{const n=(await query('connection.progress.failure.alert')).find(shown);return n&&/127\.0\.0\.1/.test(text(n))?true:null},45000);await mouseMove(30,80);await sleep(200);
+  await click(first);await sleep(300); // the active tab's hover shows its connection card; hover the failed tab from another one
+  const failedTip=await hoverTab(failed.test_id);assert(text(failedTip).includes('连接失败'),'failed tab tooltip uses the presenter wording (copy-terms: 连接失败, not 离线)');await capture('04-failed-'+close);
   if(close==='x')await click(failed.test_id.replace('tabs.tab.','tabs.close.'));else if(close==='menu'){await clickNode(await vis(failed.test_id),1);await click('context.menu.close_session')}else await clickNode(await vis(failed.test_id),2);
   await waitFor(async()=>(await tabs()).length===count||null,12000);report.checks.push('failed SSH closes via '+close);
  }
- for(let i=0;i<8;i++)await newLocal();await resizeWindow(860,480);await vis('tabs.all');await mouseMove(30,80);await capture('05-overflow-minimum');const minimumTip=await hoverTab((await tabs()).at(-1).test_id);assert(minimumTip.rect.x+minimumTip.rect.w<=860&&minimumTip.rect.y+minimumTip.rect.h<=480);await capture('05b-hover-minimum');await mouseMove(30,80);
+ for(let i=0;i<8;i++)await newLocal();await resizeWindow(860,480);await vis('tabs.all');await mouseMove(30,80);await capture('05-overflow-minimum');const minimumTip=await hoverTab((await tabs()).filter((n:any)=>Math.abs(n.rect.h-30)<.5).at(-1).test_id); // The active tab shows its connection card.
+ assert(minimumTip.rect.x+minimumTip.rect.w<=860&&minimumTip.rect.y+minimumTip.rect.h<=480);await capture('05b-hover-minimum');await mouseMove(30,80);
  const stripBefore=(await vis('tabs.strip')).rect,viewport=await vis('tabs.viewport');await scrollAt(viewport.rect.x+40,viewport.rect.y+12,0,-200);await sleep(150);assert.deepEqual((await vis('tabs.strip')).rect,stripBefore);report.checks.push('vertical wheel does not turn the tab strip into a vertical scroller');
- await click('tabs.all');const picker=await vis('tabs.picker');assert(picker.rect.x>=8&&picker.rect.y>=8&&picker.rect.x+picker.rect.w<=852&&picker.rect.y+picker.rect.h<=472);await click('tabs.picker.query');await type_('Local-long-name-');await sleep(180);await capture('06-picker-minimum');await key('return');await hidden('tabs.picker');assert((await vis(first)).rect.x>=viewport.rect.x);report.checks.push('overflow picker filters and activates original renamed local session within minimum window');
+ // 稿 3 “⌄ n”: least recently used tabs live in a native Menu; choosing one activates and shows it.
+ await click('tabs.all');const menu=await vis('tabs.all.menu');assert(menu.rect.x>=0&&menu.rect.y>=0&&menu.rect.x+menu.rect.w<=860&&menu.rect.y+menu.rect.h<=480);const item=flat(menu).find((n:any)=>(n.test_id??'')===first.replace('tabs.tab.','tabs.all.item.'))??flat(menu).find((n:any)=>/^tabs\.all\.item\.\d+$/.test(n.test_id??''));assert(item);await capture('06-overflow-menu-minimum');await clickNode(item);await hidden('tabs.all.menu');const picked=item.test_id.replace('tabs.all.item.','tabs.tab.');assert((await vis(picked)).rect.x>=viewport.rect.x);report.checks.push('overflow menu activates a hidden tab and brings it into the strip within minimum window');
  report.status='passed';report.pointer_menus=pointerChecks?'verified':'not_run_requires_cua';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});process.exitCode=1}
 finally{if(app.exitCode===null&&app.signalCode===null){app.kill('SIGTERM');await Promise.race([ended,sleep(3000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await ended}}await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({status:report.status,error:report.error,out}))}

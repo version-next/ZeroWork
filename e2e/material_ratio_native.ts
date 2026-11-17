@@ -1,4 +1,5 @@
 /** Own native window + real Local PTY; validates material/caret popup regressions. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,writeFile,readFile,open} from 'node:fs/promises';
@@ -6,8 +7,10 @@ import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {deflateSync} from 'node:zlib';
+import {settingsNav} from './settings_nav.ts';
+const nav=settingsNav();
 const prefix=process.env.ZW_RATIO_PREFIX??'/private/tmp/zw-material-ratio';
-const {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep}=await import(join(prefix,'share/zenit/harness/client.ts'));
+const {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,sleep,request}=await import(join(prefix,'share/zenit/harness/client.ts'));
 const output=resolve(process.argv[2]);await mkdir(output,{recursive:true});
 const binary=join(prefix,'bin/zerowork');
 function crc32(bytes:Buffer){let c=0xffffffff;for(const b of bytes){c^=b;for(let i=0;i<8;i++)c=(c>>>1)^((c&1)?0xedb88320:0)}return(c^0xffffffff)>>>0}
@@ -49,22 +52,29 @@ try{
    await command('ts');await command('ts');await palette();await placement(name+'-history',item);
    await resizeWindow(860,480);await sleep(250);await placement(name+'-compact',item);await press('escape');
    if(theme==='dark'&&t===75){
-    await resizeWindow(1100,760);await command('grp Material');await vis('groups.waiting');
+    await resizeWindow(1100,760);await command('grp Material');await vis('groups.workspace'); /* 88529dc0: one-member group shows its pane */
     await click('toolbar.new_session');await click('session.menu.local');await vis('terminal.surface');await sleep(1500);await command('grp Material');
     await waitFor(async()=>(await query('terminal.surface')).filter(shown).length===2||null,15000);
     await palette();await placement(name+'-group',item);await press('escape');
    }
    if(t===0){
-    await resizeWindow(1440,900);await click('toolbar.settings');await click('settings.nav.appearance');await click('settings.materials.header');
+    // Two-level settings (settings_nav.ts): 外观与主题 › 主题 holds the materials pane (no folding header any more).
+    await resizeWindow(1440,900);await nav.toPane('settings.appearance.materials');
     for(const [id,value] of [['settings.field.transparency','65'],['settings.field.blur_px','16']]){
-     await click(id);await key('a',{cmd:true});await text(value);await press('return');
+     await nav.reveal(id);await click(id);await key('a',{cmd:true});await text(value);await press('return');
     }
-    await click('settings.materials.preview.open');await vis('settings.materials.preview.actions');await capture(name+'-no-image-draft-preview',item);
-    await click('settings.materials.preview.return');await vis('settings.close');
+    // The material preview hides the Settings window and previews over the main window: the Harness follows it there
+    // (same as appearance.ts), then returns to the Settings window (it has no settings.close button any more).
+    await nav.reveal('settings.materials.preview.open');await click('settings.materials.preview.open');
+    {const snap=await request('POST','/zerowork/windows',{action:'snapshot'});assert((await request('POST','/zerowork/windows',{action:'select',window:snap.windows[0].window})).ok,'bind main window');}
+    await vis('settings.materials.preview.actions');await capture(name+'-no-image-draft-preview',item);
+    await click('settings.materials.preview.return');await waitFor(async()=>!(await query('settings.materials.preview.actions')).some(shown)||null,10000);
+    {const bound=async()=>(await request('GET','/windows')).windows.find((w:any)=>w.bound)?.window_id;const main=await bound();await click('toolbar.settings');await waitFor(async()=>(await bound())!==main||null,10000);}
+    await vis('settings.panel');
     item.noImageDraftPreview=true;
    }
    if(t===100&&b===0){
-    await resizeWindow(1100,760);await click('toolbar.settings');await click('settings.nav.appearance');await capture(name+'-settings',item);
+    await resizeWindow(1100,760);await nav.toSub('appearance','theme');await capture(name+'-settings',item);
    }
    item.status='passed';
   }catch(error){await capture(name+'-failure',item).catch(()=>{});const q:any={};for(const id of ['terminal.input','terminal.surface','terminal.commands','terminal.surface.caret'])q[id]=await query(id);await writeFile(join(output,name+'-failure.json'),JSON.stringify(q,null,2));throw error}

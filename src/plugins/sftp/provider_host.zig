@@ -3,8 +3,8 @@
 //! and transfer connection has its original domain identity and IO owner.
 const std = @import("std");
 const ui = @import("ui");
-const application = @import("../../ui/application_host.zig");
-const Workspace = @import("../../ui/workspace.zig").Workspace;
+const application = @import("../../features/shell/host/application_host.zig");
+const Workspace = @import("../../features/workspace/view/workspace.zig").Workspace;
 const sessions = @import("../../host/session_host.zig");
 const identity = @import("../../host/identity.zig");
 const files = @import("../../host/file_binding_host.zig");
@@ -13,14 +13,14 @@ const transfers = @import("../../host/file_transfer_host.zig");
 const routing = @import("../../transfer/engine_mux.zig");
 const local = @import("../../local/fs_service.zig");
 const ssh = @import("../../proto/ssh/session.zig");
-const authentication = @import("../../ui/file_authentication.zig");
-const presentation = @import("../../ui/file_workspace_presentation.zig");
+const authentication = @import("../../host/file_authentication.zig");
+const presentation = @import("../../features/files/view/file_workspace_presentation.zig");
 const paths_mod = @import("../../config/paths.zig");
 const controller = @import("../../host/file_workspace_controller.zig");
 const hosts = @import("../../config/hosts.zig");
 const auth = @import("../../proto/ssh/auth_challenge.zig");
 const TotpPrefill = @import("../../proto/ssh/totp_prefill.zig");
-const host_key = @import("../../ui/host_key_confirmation.zig");
+const host_key = @import("../../host/host_key_confirmation.zig");
 
 // This is an app-owned local_fs endpoint namespace, not a remote SessionId or
 // a fabricated SessionHost service. Each independent native service gets one.
@@ -34,7 +34,7 @@ pub const TransferHandler = struct {
     export_start: ?*const fn (*anyopaque, controller.FrozenTransfer, sessions.ServiceHandle) anyerror!u64 = null,
     export_poll: ?*const fn (*anyopaque, u64) ExportStatus = null,
     export_cancel: ?*const fn (*anyopaque, u64) void = null,
-    confirm: ?*const fn (*anyopaque, controller.FrozenTransfer, sessions.ServiceHandle, @import("../../ui/file_copy_view.zig").Options) anyerror!void = null,
+    confirm: ?*const fn (*anyopaque, controller.FrozenTransfer, sessions.ServiceHandle, @import("../../features/files/view/file_copy_view.zig").Options) anyerror!void = null,
 };
 
 pub const Host = struct {
@@ -64,7 +64,7 @@ pub const Host = struct {
         errdefer paths.deinit();
         var library = try ssh.Library.init();
         errdefer library.deinit();
-        const home = try @import("../../platform/account.zig").home(allocator);
+        const home = try @import("../../platform/user_dirs.zig").home(allocator);
         errdefer allocator.free(home);
         const adapter = try lifecycle.SftpAdapter.init(allocator, .{ .context = self, .start = transferStart, .poll = transferPoll, .close = transferClose }, .{ .context = self, .install = install, .release = release, .rollback = rollback }, .{});
         self.* = .{ .allocator = allocator, .workspace = workspace, .paths = paths, .library = library, .home = home, .adapter = adapter };
@@ -332,7 +332,7 @@ pub const Host = struct {
         const handler = self.transfer_handler orelse return .failed;
         return if (handler.export_poll) |call| call(handler.context, job) else .failed;
     }
-    fn confirmTransfer(raw: ?*anyopaque, intent: controller.FrozenTransfer, options: @import("../../ui/file_copy_view.zig").Options) !void {
+    fn confirmTransfer(raw: ?*anyopaque, intent: controller.FrozenTransfer, options: @import("../../features/files/view/file_copy_view.zig").Options) !void {
         const self: *Host = @ptrCast(@alignCast(raw orelse return error.FileHostNotBound));
         const domain = self.app.?.sessions;
         const binding = switch (domain.queryService(intent.owner, .transfer)) {

@@ -604,7 +604,7 @@ const DownloadPaths = struct {
 };
 
 /// 墙钟毫秒（0.17 std.time 移除了 milliTimestamp；实现与
-/// src/ui/terminal_view.zig 的 wallClockMs 同源）。
+/// src/features/terminal/view/terminal_view.zig 的 wallClockMs 同源）。
 fn nowMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
@@ -663,20 +663,6 @@ fn joinPath(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-/// 拼接并以 0 结尾（SFTP API 要求 [:0]const u8）。
-fn joinPathZ(allocator: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    for (parts, 0..) |part, i| {
-        if (part.len == 0) continue;
-        try buf.appendSlice(allocator, part);
-        if (i + 1 < parts.len and part[part.len - 1] != '/') try buf.append(allocator, '/');
-    }
-    try buf.append(allocator, 0);
-    const owned = try buf.toOwnedSlice(allocator);
-    return owned[0 .. owned.len - 1 :0];
-}
-
 fn expandLocalHomeWith(allocator: std.mem.Allocator, path: []const u8, home: ?[]const u8) ![]u8 {
     if (!std.mem.eql(u8, path, "~") and !std.mem.startsWith(u8, path, "~/"))
         return allocator.dupe(u8, path);
@@ -688,7 +674,7 @@ fn expandLocalHomeWith(allocator: std.mem.Allocator, path: []const u8, home: ?[]
 
 fn expandLocalHome(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.mem.eql(u8, path, "~") and !std.mem.startsWith(u8, path, "~/")) return allocator.dupe(u8, path);
-    const home = try @import("../platform/account.zig").home(allocator);
+    const home = try @import("../platform/user_dirs.zig").home(allocator);
     defer allocator.free(home);
     return expandLocalHomeWith(allocator, path, home);
 }
@@ -699,15 +685,6 @@ fn uploadLocalPath(allocator: std.mem.Allocator, spec: JobSpec, source: []const 
     const directory = try expandLocalHome(allocator, spec.local_dir);
     defer allocator.free(directory);
     return joinPath(allocator, &.{ directory, source });
-}
-
-fn uploadRemotePath(allocator: std.mem.Allocator, spec: JobSpec, source: []const u8) ![:0]u8 {
-    return joinPathZ(allocator, &.{ spec.remote_dir, spec.rename orelse std.fs.path.basename(source) });
-}
-
-fn downloadRemotePath(allocator: std.mem.Allocator, spec: JobSpec, source: []const u8) ![:0]u8 {
-    if (std.fs.path.isAbsolute(source)) return allocator.dupeSentinel(u8, source, 0);
-    return joinPathZ(allocator, &.{ spec.remote_dir, source });
 }
 
 fn downloadLocalPaths(allocator: std.mem.Allocator, spec: JobSpec, source: []const u8, temp_id: []const u8) !DownloadPaths {
@@ -1453,9 +1430,9 @@ pub const SftpEngine = struct {
         };
         for (seeds, first..) |*seed, index| {
             const source = job.spec.sources[index];
-            const source_path = if (job.spec.direction == .upload) try uploadLocalPath(allocator, job.spec.view(), source) else try downloadRemotePath(allocator, job.spec.view(), source);
+            const source_path = if (job.spec.direction == .upload) try uploadLocalPath(allocator, job.spec.view(), source) else try job.spec.view().allocRemotePath(allocator, source);
             errdefer allocator.free(source_path);
-            const target = if (job.spec.direction == .upload) try uploadRemotePath(allocator, job.spec.view(), source) else blk: {
+            const target = if (job.spec.direction == .upload) try job.spec.view().allocRemotePath(allocator, source) else blk: {
                 const directory = try expandLocalHome(allocator, job.spec.local_dir);
                 defer allocator.free(directory);
                 break :blk try joinPath(allocator, &.{ directory, job.spec.rename orelse std.fs.path.basename(source) });
@@ -1937,7 +1914,7 @@ pub const SftpEngine = struct {
                         break :blk (try file.stat(io)).size;
                     },
                     .download => blk: {
-                        const path = try downloadRemotePath(std.heap.c_allocator, job.spec.view(), source);
+                        const path = try job.spec.view().allocRemotePath(std.heap.c_allocator, source);
                         defer std.heap.c_allocator.free(path);
                         break :blk try job.remote_metadata.size(job.remote_metadata.context, session, path);
                     },
@@ -2154,10 +2131,7 @@ pub const SftpEngine = struct {
             job.verification.clear();
         }
         file.size = rt.source_sizes.?[rt.source_index];
-        file.remote_path = try if (spec.direction == .upload)
-            uploadRemotePath(allocator, spec, source)
-        else
-            downloadRemotePath(allocator, spec, source);
+        file.remote_path = try spec.allocRemotePath(allocator, source);
         if (spec.direction == .upload) {
             file.local_path = try uploadLocalPath(allocator, spec, source);
             file.local = try std.Io.Dir.cwd().openFile(io, file.local_path.?, .{});
@@ -3246,7 +3220,7 @@ test "path builders preserve source directories and derive destination basenames
         .remote_dir = "/srv/files",
         .local_dir = "/tmp/zw",
     };
-    const remote = try downloadRemotePath(allocator, spec, "dir/b.bin");
+    const remote = try spec.allocRemotePath(allocator, "dir/b.bin");
     defer allocator.free(remote);
     try std.testing.expectEqualStrings("/srv/files/dir/b.bin", remote);
 
@@ -3287,11 +3261,11 @@ test "absolute sources with spaces and commas upload basename or explicit rename
     const local = try uploadLocalPath(allocator, spec, spec.sources[0]);
     defer allocator.free(local);
     try std.testing.expectEqualStrings(spec.sources[0], local);
-    const remote = try uploadRemotePath(allocator, spec, spec.sources[0]);
+    const remote = try spec.allocRemotePath(allocator, spec.sources[0]);
     defer allocator.free(remote);
     try std.testing.expectEqualStrings("/opt/deploy/release a,b.tar.gz", remote);
     spec.rename = "release-v2.4.0.tar.gz";
-    const renamed = try uploadRemotePath(allocator, spec, spec.sources[0]);
+    const renamed = try spec.allocRemotePath(allocator, spec.sources[0]);
     defer allocator.free(renamed);
     try std.testing.expectEqualStrings("/opt/deploy/release-v2.4.0.tar.gz", renamed);
     try validateSpec(spec);
@@ -3300,7 +3274,7 @@ test "absolute sources with spaces and commas upload basename or explicit rename
 test "download absolute remote source does not duplicate its parent and local uses basename" {
     const allocator = std.testing.allocator;
     var spec: JobSpec = .{ .direction = .download, .sources = &.{"/var/log/app a,b.log"}, .remote_dir = "/var/log", .local_dir = "/tmp/Downloads" };
-    const remote = try downloadRemotePath(allocator, spec, spec.sources[0]);
+    const remote = try spec.allocRemotePath(allocator, spec.sources[0]);
     defer allocator.free(remote);
     try std.testing.expectEqualStrings("/var/log/app a,b.log", remote);
     const paths = try downloadLocalPaths(allocator, spec, spec.sources[0], "test");
@@ -3342,7 +3316,7 @@ test "rename is a single filename within the selected destination directory" {
 
 test "upload and download resolve local home at their file IO boundary" {
     const allocator = std.testing.allocator;
-    const home = try @import("../platform/account.zig").home(allocator);
+    const home = try @import("../platform/user_dirs.zig").home(allocator);
     defer allocator.free(home);
     var spec: JobSpec = .{ .direction = .upload, .sources = &.{"nested/a b,c"}, .remote_dir = "/srv", .local_dir = "~/Downloads" };
     const expected = try joinPath(allocator, &.{ home, "Downloads/nested/a b,c" });

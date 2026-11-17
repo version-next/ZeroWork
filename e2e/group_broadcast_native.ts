@@ -2,6 +2,7 @@
  * node e2e/group_workspace_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  * --prepare-only 1 writes a plan without starting an app.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,7 +18,7 @@ assert(args["--out"]);
 const output=resolve(args["--out"]); await mkdir(output,{recursive:true}); assert.equal((await readdir(output)).length,0);
 const report:any={theme:args["--theme"]??"dark",status:"prepared_not_run",checks:[],screenshots:[],input:"Synthetic public Harness only",visual_status:"not_reviewed",limits:["Physical pointer, IME, window blur, VoiceOver require separate native acceptance","Runner cleanup SIGTERM is not normal application shutdown proof","Local mixed-group paths only; SSH reconnect/offline and AI impacts require their own fixtures"]};
 const save=()=>writeFile(join(output,"report.json"),JSON.stringify(report,null,2));
-if(args["--prepare-only"]==="1") { report.plan=["Create real source and receiver Local PTYs, record distinct shell PIDs, join same group", "Submit trusted @sync on and verify approval card; Escape causes no fanout", "Approve exact source/receiver and append shell PID to a shared file: exactly one row per approved shell", "Join a third real Local PTY and prove its PID never receives old approval", "@sync off must stop fanout without closing any terminal"]; await save(); process.exit(0); }
+if(args["--prepare-only"]==="1") { report.plan=["Create real source and receiver Local PTYs, record distinct shell PIDs, join same group", "Trusted @sync on enables only the current session without a confirmation card; repeating it is idempotent (status card count and member states unchanged, no duplicate input)", "Enable the receiver from its member checkbox: each enabled shell gets the source input exactly once", "Join a third real Local PTY and prove it is not enabled until selected", "@sync off disables only the current session: no card, no terminal closes, other members keep fanning out"]; await save(); process.exit(0); }
 assert(args["--binary"] && /^[a-f0-9]{64}$/.test(args["--expected-sha"]??""));
 const sourceBinary=resolve(args["--binary"]), binary=join(output,"zerowork-frozen"); await copyFile(sourceBinary,binary); await copyFile(join(dirname(sourceBinary),"zw_ipc.so"),join(output,"zw_ipc.so")); assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"),args["--expected-sha"]);
 assert(["dark","light"].includes(args["--theme"]??"dark"));
@@ -46,7 +47,7 @@ const panes=async()=>{
  for(const tab of await tabs()) { const id=tab.test_id.split(".").at(-1); const rect=await screenPos(`groups.pane.${id}`);if(rect.w>0&&rect.h>0)result.push({test_id:`groups.pane.${id}`,rect}); }
  return result;
 };
-const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);const observed:any={};for(const id of ["tabs.strip","groups.workspace","groups.close.confirm","groups.close.partial","local.close.confirmation","group.broadcast.card","group.broadcast.footer","status.group.broadcast"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
+const capture=async(name:string)=>{await sleep(180);assert((await screenshot(join(output,`${name}.png`))).ok);const observed:any={};for(const id of ["tabs.strip","groups.workspace","groups.close.confirm","groups.close.partial","local.close.confirmation","group.broadcast.card","group.broadcast.footer","status.group.broadcast","toolbar.expand"])observed[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observed,null,2));report.screenshots.push(name);await save()};
 const check=(name:string,detail:any)=>report.checks.push({name,status:"passed",detail});
 async function joinTrustedGroup(label:string):Promise<void>{
  // Shell startup is async and user rc files may take seconds. A real shell
@@ -99,41 +100,74 @@ async function sendMarker(source:string,label:string,expected:string[]):Promise<
 }
 try {
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,"owner.json"),"utf8")).pid),child.pid);await resizeWindow(1440,900);
- await click("workspace.empty.local");await visible("terminal.surface");await joinTrustedGroup("source");await visible("groups.waiting");
+ await click("workspace.empty.local");await visible("terminal.surface");await joinTrustedGroup("source");await visible("groups.workspace"); /* 88529dc0: one-member group shows its pane */
  const source=(await panes())[0].test_id.split(".").at(-1)!;
  await click("toolbar.new_session");await click("session.menu.local");await joinTrustedGroup("receiver");
  await waitFor(async()=>(await panes()).length===2||null,15000);
  const receiver=(await panes()).find(n=>n.test_id!==`groups.pane.${source}`)!.test_id.split(".").at(-1)!;
  const sourcePid=await recordPid(source,"source"),receiverPid=await recordPid(receiver,"receiver");assert.notEqual(sourcePid,receiverPid);
- await focusPane(source);await trustedCommand("sync on");await visible("group.broadcast.card");await capture("01-unapproved");
- await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"cancel-is-zero-fanout",[sourcePid]);
- await trustedCommand("sync on");await visible("group.broadcast.card");await click("group.broadcast.accept");
- await waitFor(async()=>flat(await visible("group.broadcast.card")).some(n=>n.text==="关闭广播")||null,8000);await capture("02-approved");
- await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"approved-source-and-receiver-once",[sourcePid,receiverPid]);
- await click("status.group.broadcast");await visible("group.broadcast.card");await resizeWindow(860,480);await sleep(350);
- const card=await visible("group.broadcast.card"),anchor=await visible("status.group.broadcast");assert(card.rect.x>=0&&card.rect.y>=0&&card.rect.x+card.rect.w<=860&&card.rect.y+card.rect.h<=480);assert(card.rect.y+card.rect.h<=anchor.rect.y+0.5);await capture("02b-compact-anchored");
- if((await query("sidebar.collapse")).some(shown)){await click("sidebar.collapse");await hidden("group.broadcast.card");await click("status.group.broadcast");}await sleep(200);const folded=await visible("group.broadcast.card");assert(folded.rect.x>=0&&folded.rect.y>=0&&folded.rect.x+folded.rect.w<=860&&folded.rect.y+folded.rect.h<=480);await capture("02c-compact-sidebar-folded");
- // No hidden recipient configuration: the one captured receiver can be excluded, then selected again.
- await click(`group.broadcast.member.${receiver}.select`);await waitFor(async()=>flat(await visible("group.broadcast.summary")).some(n=>n.text?.includes("已关闭"))||null,8000);await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"deselected-receiver-excluded",[sourcePid]);
- await click("status.group.broadcast");await click("group.broadcast.accept");await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"reopened-approval-delivers-once",[sourcePid,receiverPid]);
- await resizeWindow(1440,900);if((await query("sidebar.rail.expand")).some(shown))await click("sidebar.rail.expand");
+ // V0.1.6 §2.4 (04750679): `@sync on` idempotently enables only the current session, with no
+ // confirmation card; `off` disables only that session; other members keep their state.
+ const texts=(n:any)=>flat(n).map(x=>x.text).filter(Boolean) as string[];
+ const openStatus=async(name:string,expect:{count:number,running:boolean,states:Record<string,string>})=>{
+  await click("status.group.broadcast");const card=await visible("group.broadcast.card");
+  const want=`${expect.running?"已开启":"已关闭"} · ${expect.count} 个参与会话`;
+  await waitFor(async()=>texts(await visible("group.broadcast.summary")).some(t=>t.includes(want))||null,8000).catch(async()=>{throw new Error(`${name}: summary ${JSON.stringify(texts(await visible("group.broadcast.summary")))} lacks ${want}`)});
+  for(const [member,state] of Object.entries(expect.states)){
+   const row=texts(await visible(`group.broadcast.member.${member}`));
+   assert(row.includes(state),`${name}: member ${member} state ${JSON.stringify(row)} lacks ${state}`);
+  }
+  await capture(name);check(name,{summary:texts(await visible("group.broadcast.summary")),card:card.rect});
+ };
+ const closeStatus=async()=>{await press("escape");await hidden("group.broadcast.card")};
+ const noCard=async(label:string)=>{await sleep(500);assert(!(await query("group.broadcast.card")).some(shown),`${label}: @sync opens no confirmation card`)};
+ await focusPane(source);await trustedCommand("sync on");await noCard("sync-on");
+ // A single enabled member is allowed; it has no other target.
+ await sendMarker(source,"sync-on-source-alone-no-targets",[sourcePid]);
+ await openStatus("01-sync-on-status",{count:1,running:true,states:{[source]:"当前 · 参与",[receiver]:"未参与"}});await closeStatus();
+ await focusPane(source);await trustedCommand("sync on");await noCard("sync-on-again");
+ await openStatus("02-sync-on-idempotent",{count:1,running:true,states:{[source]:"当前 · 参与",[receiver]:"未参与"}});await closeStatus();
+ await sendMarker(source,"idempotent-on-no-duplicate",[sourcePid]);
+ // The receiver joins from its own member checkbox; the next source input reaches each enabled shell once.
+ await click("status.group.broadcast");await visible("group.broadcast.card");await click(`group.broadcast.member.${receiver}.select`);
+ await waitFor(async()=>texts(await visible("group.broadcast.summary")).some(t=>t.includes("2 个参与会话"))||null,8000);await closeStatus();
+ await sendMarker(source,"source-and-receiver-once",[sourcePid,receiverPid]);
+ await focusPane(source);await trustedCommand("sync on");await noCard("sync-on-both");
+ await sendMarker(source,"repeated-on-delivers-once",[sourcePid,receiverPid]);
+ await openStatus("03-both-enabled",{count:2,running:true,states:{[source]:"当前 · 参与",[receiver]:"参与"}});
+ await resizeWindow(860,480);await sleep(350);
+ // The broadcast entry is a title-bar tool; in a narrow window it moves into the "⋯" menu.
+ const broadcastAnchor=async()=>(await query("status.group.broadcast")).find(shown)??await visible("toolbar.expand");
+ const openBroadcast=async()=>{if((await query("status.group.broadcast")).some(shown))await click("status.group.broadcast");else{await click("toolbar.expand");await click("toolbar.more.broadcast");}await visible("group.broadcast.card")};
+ const card=await visible("group.broadcast.card"),anchor=await broadcastAnchor();assert(card.rect.x>=0&&card.rect.y>=0&&card.rect.x+card.rect.w<=860&&card.rect.y+card.rect.h<=480);
+ assert(card.rect.y+card.rect.h<=anchor.rect.y+0.5||card.rect.y>=anchor.rect.y+anchor.rect.h-0.5,`card ${JSON.stringify(card.rect)} must not cover its anchor ${JSON.stringify(anchor.rect)}`);await capture("03b-compact-anchored");
+ if((await query("sidebar.collapse")).some(shown)){await click("sidebar.collapse");await hidden("group.broadcast.card");await openBroadcast();}await sleep(200);const folded=await visible("group.broadcast.card");assert(folded.rect.x>=0&&folded.rect.y>=0&&folded.rect.x+folded.rect.w<=860&&folded.rect.y+folded.rect.h<=480);await capture("03c-compact-sidebar-folded");
+ await closeStatus();await resizeWindow(1440,900); // 侧栏不再随窗口宽度自动收成窄条（191f6aa6），不需要再展开
 
+ // A new member never inherits an earlier enablement.
  await click("toolbar.new_session");await click("session.menu.local");await joinTrustedGroup("unapproved-third");
  await waitFor(async()=>(await panes()).length===3||null,15000);
  const third=(await panes()).find(n=>![`groups.pane.${source}`,`groups.pane.${receiver}`].includes(n.test_id))!.test_id.split(".").at(-1)!;
  const thirdPid=await recordPid(third,"third");assert(![sourcePid,receiverPid].includes(thirdPid));
- await sendMarker(source,"new-member-excluded-from-old-approval",[sourcePid,receiverPid]);await capture("03-third-excluded");
- await trustedCommand("sync off");await trustedCommand("sync on");await visible("group.broadcast.card");
+ await sendMarker(source,"new-member-excluded",[sourcePid,receiverPid]);await capture("04-third-excluded");
+ await click("status.group.broadcast");await visible("group.broadcast.card");await sleep(300);
  const viewport=await visible("group.broadcast.viewport"), footerBefore=(await visible("group.broadcast.footer")).rect;
  const thirdBefore=(await visible(`group.broadcast.member.${third}.select`)).rect;
  assert((await scrollAt(viewport.rect.x+viewport.rect.w/2,viewport.rect.y+viewport.rect.h/2,0,-200)).ok);await sleep(200);
  const footerAfter=(await visible("group.broadcast.footer")).rect, thirdAfter=(await visible(`group.broadcast.member.${third}.select`)).rect;
- assert.deepEqual(footerAfter,footerBefore,"broadcast actions must stay fixed while body scrolls");assert(thirdAfter.y<thirdBefore.y,"overflow body must actually scroll");
- await capture("04-members-scrolled");check("overflow-scroll-keeps-footer-fixed",{footer:footerAfter,member_before:thirdBefore,member_after:thirdAfter});
- await click(`group.broadcast.member.${receiver}.select`);await click("group.broadcast.accept");await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"selected-third-only",[sourcePid,thirdPid]);
- await click("status.group.broadcast");await click(`group.broadcast.member.${receiver}.select`);await press("escape");await hidden("group.broadcast.card");await sendMarker(source,"reselected-member-next-input-once",[sourcePid,receiverPid,thirdPid]);
- await trustedCommand("sync off");await sendMarker(source,"explicit-off-stops-fanout",[sourcePid]);
+ for(const k of ["x","y","w","h"] as const)assert(Math.abs(footerAfter[k]-footerBefore[k])<=0.5,`broadcast actions must stay fixed while body scrolls (${k} ${footerBefore[k]} → ${footerAfter[k]})`);assert(thirdAfter.y<thirdBefore.y,"overflow body must actually scroll");
+ await capture("05-members-scrolled");check("overflow-scroll-keeps-footer-fixed",{footer:footerAfter,member_before:thirdBefore,member_after:thirdAfter});
+ await click(`group.broadcast.member.${third}.select`);await waitFor(async()=>texts(await visible("group.broadcast.summary")).some(t=>t.includes("3 个参与会话"))||null,8000);await closeStatus();
+ await sendMarker(source,"third-selected-once",[sourcePid,receiverPid,thirdPid]);
+ // `@sync off` disables only the current session: no card, no terminal closes, the others stay enabled.
+ await focusPane(source);await trustedCommand("sync off");await noCard("sync-off");
+ await openStatus("06-sync-off-current-only",{count:2,running:true,states:{[source]:"当前 · 未参与",[receiver]:"参与",[third]:"参与"}});await closeStatus();
+ assert.equal((await panes()).length,3,"@sync off closes no terminal");
+ await sendMarker(source,"off-source-no-fanout",[sourcePid]);
+ await sendMarker(receiver,"others-keep-their-state",[receiverPid,thirdPid]);
+ await focusPane(source);await trustedCommand("sync off");await noCard("sync-off-again");
+ await openStatus("07-sync-off-idempotent",{count:2,running:true,states:{[receiver]:"参与",[third]:"参与"}});await closeStatus();
  report.status="passed";
- report.limits.push("Real target-generation reconnect and zero-target running detail are covered by controller contract tests; this Local runner proves real shell IO for approval, cancel, member exclusion/reselection, new-member exclusion and off; minimum-window anchoring and overflow scrolling use actual native layout.");
+ report.limits.push("Real target-generation reconnect and zero-target running detail are covered by controller contract tests; this Local runner proves real shell IO for idempotent @sync on (no confirmation), member checkbox enablement, new-member exclusion and current-session-only @sync off; status display via the group broadcast card; minimum-window anchoring and overflow scrolling use actual native layout.");
 } catch(error) { report.status="failed";report.error=String(error);await capture("failed").catch(()=>{});process.exitCode=1 }
 finally {await save();if(child.exitCode===null)child.kill("SIGTERM");await Promise.race([ended,sleep(3000)]);await log.close()}

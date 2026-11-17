@@ -1,0 +1,50 @@
+//! 命令帮助卡（`@help` 在没有终端输出目标时打开；NATIVE_AUDIT B4，人工验收反馈 8 的用户判定“改用原生 Modal”）。
+//!
+//! - 原生 `W.Modal` 默认外观：默认遮罩（主题 overlay token）、默认面板（不传 background，不覆盖圆角 / 描边 / 阴影，
+//!   不叠窗口材质）、原生标题栏与关闭按钮。Esc、点遮罩、关闭按钮都关闭；焦点陷阱与关闭后的焦点恢复由 Modal 负责。
+//! - 显隐是宿主持有的 `*Signal(bool)`（`AppNavHost.help_open`）：`@help` 置真，Modal 的关闭直接写回它。
+//! - 正文只读：指令目录（`builtin_dispatch.helpEntries()`，与 `@help` 文本输出同源）放在原生 `W.ScrollArea` 里，
+//!   面板受 Modal 默认 `max_height` 限制，窗口矮时列表在面板内滚动；下面两行脚注。
+//! - 脚注右侧一个原生“关闭”按钮（`autoFocus`）：原生标题栏的关闭按钮不可聚焦（缺口 G43），没有可聚焦内容的只读 Modal
+//!   打开后焦点留在遮罩外的终端上，Esc 不经过 Modal、键盘输入仍进终端。有了它，打开即把焦点收进对话框（焦点陷阱），
+//!   Esc / Enter / 点击都能关，关闭后 Modal 把焦点还给终端。旧卡片头部的“Esc 关闭”提示由它和原生关闭按钮取代。
+const ui = @import("ui");
+const W = ui.widgets;
+const dispatch = @import("../model/builtin_dispatch.zig");
+const S = @import("command_help.yss");
+
+pub const ids = struct {
+    pub const body = "terminal.command_help";
+    pub const list = "terminal.command_help.list";
+    pub const row = "terminal.command_help.row";
+    pub const close = "terminal.command_help.close";
+};
+
+fn entries() []const dispatch.HelpEntry {
+    return dispatch.helpEntries();
+}
+
+pub fn CommandHelp(open: Model(bool)) View {
+    return (
+        <box style={S.anchor}>
+            <W.Modal open={open} onOpenChange={|o| open = o} title="❓ 内置指令速查" width={580}>
+                <box testId={ids.body} style={S.body}>
+                    <W.ScrollArea direction={.vertical} testId={ids.list} style={S.list_scroll} parts={.{ .content = .{ .style = S.list } }}>
+                        {for (entries()) |entry| <box key={entry.name} testId={ids.row} style={S.row}>
+                            <box style={S.icon_cell}><text style={S.icon}>{entry.icon}</text></box>
+                            <box style={S.usage_cell}><text style={S.usage}>{entry.usage}</text></box>
+                            <text style={S.description}>{entry.description}</text>
+                        </box>}
+                    </W.ScrollArea>
+                    <box style={S.footer}>
+                        <box style={S.notes}>
+                            <text style={S.note}>在空命令行输入 @ 查看指令。</text>
+                            <text style={S.note}>输入 @@ 可发送普通 @ 字符。</text>
+                        </box>
+                        <W.Button testId={ids.close} label="关闭" variant={.secondary} size={.sm} autoFocus={true} onClick={open = false} />
+                    </box>
+                </box>
+            </W.Modal>
+        </box>
+    );
+}

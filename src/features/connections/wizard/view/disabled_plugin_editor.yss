@@ -1,0 +1,8 @@
+//! 已禁用插件主机的编辑区：只排布局（提示在上，名称一行在下），不写原生组件的外观。
+const ui = @import("ui");
+
+style root { width: fill; direction: column; gap: 16; padding: 16; flex-shrink: 0; min-width: 0; }
+style notice { width: fill; direction: column; flex-shrink: 0; min-width: 0; }
+/// 名称行：标签 + 输入框，gap 12；输入框撑满剩余宽度。
+style field { width: fill; direction: row; align-items: center; gap: 12; min-width: 0; }
+style label { font-size: 13; font-weight: 400; color: fg-secondary; wrap: none; flex-shrink: 0; }

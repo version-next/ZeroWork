@@ -3,7 +3,8 @@ const std = @import("std");
 const asset = @import("../config/background_asset.zig");
 pub const Owner = @import("tool_scope.zig").Owner;
 pub const max_count = 4;
-pub const max_bytes = 10_000_000;
+/// 单张图片源字节上限：10 MiB（1024 进制，10 485 760 B；界面写“10 MiB”）。
+pub const max_bytes = 10 * 1024 * 1024;
 /// Shared by all agent workers. Charge physical encoded+decoded storage once
 /// per immutable snapshot; retaining a queue/history reference adds no pixels.
 pub const max_physical_bytes = 512 * 1024 * 1024;
@@ -166,10 +167,7 @@ pub const Draft = struct {
     next_id: Id = 1,
     items: std.ArrayList(Item) = .empty,
     pub fn init(allocator: std.mem.Allocator, owner: Owner) !Draft {
-        if (switch (owner) {
-            .session => |id| id == 0,
-            .group => |id| id == 0,
-        }) return error.InvalidAttachmentOwner;
+        if (owner.raw() == 0) return error.InvalidAttachmentOwner;
         return .{ .allocator = allocator, .owner = owner };
     }
     pub fn deinit(self: *Draft) void {

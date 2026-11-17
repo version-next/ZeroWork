@@ -1,0 +1,13 @@
+//! Theme-layer probe: names tokens that only the app overlay (tests/tokens/app_overlay.json)
+//! declares. Compiled by build.zig into the cache against the layered provider.
+const ui = @import("ui");
+
+/// An app "island": ground and edge colors and the rail width come from the overlay;
+/// `raised` uses the overlay's overridden accent.
+recipe Island slots(root, rail) {
+  base {
+    root { background: zw-island-ground; border-width: 1; border-color: zw-island-edge; }
+    rail { width: zw-rail; background: zw-island-edge; }
+  }
+  flag raised { root { background: accent; } }
+}

@@ -1,0 +1,83 @@
+//! 快捷键（第 1 类）面板正文（P3 3e 第二批，人工验收反馈第 7 条）：页签与分栏、终端与应用。
+//! 每个动作一行（`R.KeybindingRow`）：点击键帽区（或聚焦后 Enter / Space）行内录制，Esc 取消；冲突给出【交换】【取消】；
+//! 单行恢复默认；改过未保存的行带“未保存”。行的文案 / id / 搜索词在 `model/pane_fields.zig` 的 `keys`，
+//! 判定与键帽在 `model/keybinding_edit.zig`，录制状态是 view-model 的 `key_edit` 信号。
+const ui = @import("ui");
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const F = m.fields.keys;
+
+const tabs = &F.tabs;
+const terminal = &F.terminal;
+const new_tab = F.row(.new_tab);
+const close_tab = F.row(.close_tab);
+const tab_1 = F.row(.tab_1);
+const tab_2 = F.row(.tab_2);
+const tab_3 = F.row(.tab_3);
+const tab_4 = F.row(.tab_4);
+const tab_5 = F.row(.tab_5);
+const tab_6 = F.row(.tab_6);
+const tab_7 = F.row(.tab_7);
+const tab_8 = F.row(.tab_8);
+const tab_9 = F.row(.tab_9);
+const previous_tab = F.row(.previous_tab);
+const next_tab = F.row(.next_tab);
+const recent_tab = F.row(.recent_tab);
+const split_vertical = F.row(.split_vertical);
+const split_horizontal = F.row(.split_horizontal);
+const copy = F.row(.copy);
+const paste = F.row(.paste);
+const search = F.row(.search);
+const completion = F.row(.completion);
+const accept_completion = F.row(.accept_completion);
+const quick_connect = F.row(.quick_connect);
+const reconnect = F.row(.reconnect);
+const sidebar = F.row(.sidebar);
+const ai = F.row(.ai);
+const upload = F.row(.upload);
+const broadcast = F.row(.broadcast);
+
+/// 行只在内容页挂载时命中才建（形态在挂载时定下，搜索词变化会整页重挂）：每行有十几个节点，27 行全建再隐藏会让搜索
+/// 结果页的子树超出自动化查询的结果缓冲（`query result too large`）。
+fn built(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.paneShown(pane) and vm.rowShown(pane, row);
+}
+
+pub fn KeysPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.keys" style={S.category_panes}>
+            <R.Pane vm={vm} pane={tabs}>
+                {if (built(vm, tabs, new_tab)) <R.KeybindingRow vm={vm} pane={tabs} row={new_tab} />}
+                {if (built(vm, tabs, close_tab)) <R.KeybindingRow vm={vm} pane={tabs} row={close_tab} />}
+                {if (built(vm, tabs, tab_1)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_1} />}
+                {if (built(vm, tabs, tab_2)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_2} />}
+                {if (built(vm, tabs, tab_3)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_3} />}
+                {if (built(vm, tabs, tab_4)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_4} />}
+                {if (built(vm, tabs, tab_5)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_5} />}
+                {if (built(vm, tabs, tab_6)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_6} />}
+                {if (built(vm, tabs, tab_7)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_7} />}
+                {if (built(vm, tabs, tab_8)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_8} />}
+                {if (built(vm, tabs, tab_9)) <R.KeybindingRow vm={vm} pane={tabs} row={tab_9} />}
+                {if (built(vm, tabs, previous_tab)) <R.KeybindingRow vm={vm} pane={tabs} row={previous_tab} />}
+                {if (built(vm, tabs, next_tab)) <R.KeybindingRow vm={vm} pane={tabs} row={next_tab} />}
+                {if (built(vm, tabs, recent_tab)) <R.KeybindingRow vm={vm} pane={tabs} row={recent_tab} />}
+                {if (built(vm, tabs, split_vertical)) <R.KeybindingRow vm={vm} pane={tabs} row={split_vertical} />}
+                {if (built(vm, tabs, split_horizontal)) <R.KeybindingRow vm={vm} pane={tabs} row={split_horizontal} />}
+            </R.Pane>
+            <R.Pane vm={vm} pane={terminal}>
+                {if (built(vm, terminal, copy)) <R.KeybindingRow vm={vm} pane={terminal} row={copy} />}
+                {if (built(vm, terminal, paste)) <R.KeybindingRow vm={vm} pane={terminal} row={paste} />}
+                {if (built(vm, terminal, search)) <R.KeybindingRow vm={vm} pane={terminal} row={search} />}
+                {if (built(vm, terminal, completion)) <R.KeybindingRow vm={vm} pane={terminal} row={completion} />}
+                {if (built(vm, terminal, accept_completion)) <R.KeybindingRow vm={vm} pane={terminal} row={accept_completion} />}
+                {if (built(vm, terminal, quick_connect)) <R.KeybindingRow vm={vm} pane={terminal} row={quick_connect} />}
+                {if (built(vm, terminal, reconnect)) <R.KeybindingRow vm={vm} pane={terminal} row={reconnect} />}
+                {if (built(vm, terminal, sidebar)) <R.KeybindingRow vm={vm} pane={terminal} row={sidebar} />}
+                {if (built(vm, terminal, ai)) <R.KeybindingRow vm={vm} pane={terminal} row={ai} />}
+                {if (built(vm, terminal, upload)) <R.KeybindingRow vm={vm} pane={terminal} row={upload} />}
+                {if (built(vm, terminal, broadcast)) <R.KeybindingRow vm={vm} pane={terminal} row={broadcast} />}
+            </R.Pane>
+        </box>
+    );
+}

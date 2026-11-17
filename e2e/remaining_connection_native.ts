@@ -1,4 +1,5 @@
 /** Native production statusbar, isolated loopback SSH, no user data. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,mkdir,writeFile,readFile,open,rm} from 'node:fs/promises';
@@ -12,6 +13,7 @@ process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const peerCode=`import sys,time,stat
 sys.path.insert(0, 'e2e')
 import ssh_aux_download_loopback as peer
+const python=process.env.ZW_TEST_PYTHON;assert(python,'ZW_TEST_PYTHON (audited Python with paramiko, run with -I) is required');
 f=peer.file_fixture
 f.PAYLOAD=b'ZEROWORK_STATUSBAR_REAL_TICKER\\n'+bytes(range(256))*65536
 peer.PAYLOAD=f.PAYLOAD
@@ -32,12 +34,12 @@ def listing(self,path):
 f.Files.list_folder=listing
 peer.main()
 `;
-const peerLog=await open(join(out,'peer.log'),'w');const peer=spawn('python3',['-c',peerCode,'--out',peerDir],{stdio:['ignore',peerLog.fd,peerLog.fd]});
+const peerLog=await open(join(out,'peer.log'),'w');const peer=spawn(python,['-I','-c',peerCode,'--out',peerDir],{stdio:['ignore',peerLog.fd,peerLog.fd]});
 const peerEnded=new Promise<void>(done=>peer.once('close',()=>done()));
 let app:any,appEnded:Promise<void>|undefined;const report:any={checks:[],isolated,binary:resolve(process.argv[3]??'zig-out/bin/zerowork')};const shown=(n:any)=>n.hidden!==true&&n.visible!==false&&(n.effective_opacity??1)>0&&n.rect?.w>0&&n.rect?.h>0;
 const visible=(id:string)=>waitFor(async()=>(await query(id)).find(shown)??null,15000);
 async function click(id:string){await visible(id);assert((await clickTestId(id)).ok);await sleep(150);}
-async function capture(name:string){await sleep(300);assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(['workspace.statusbar','status.transfer','status.connection','connection.details','socks.info','status.theme','transfer.session','settings.footer.state','settings.appearance.font.header','connection.logs','connection.details.node-dialog'].map(async id=>[id,await query(id)]))),null,2));}
+async function capture(name:string){await sleep(300);assert((await screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(['workspace.statusbar','status.transfer','status.connection','connection.details','socks.info','settings.appearance.themes','transfer.session','settings.footer.state','settings.appearance.font.header','connection.logs','connection.details.node-dialog'].map(async id=>[id,await query(id)]))),null,2));}
 const flatten=(n:any):any[]=>n?[n,...(n.children??[]).flatMap(flatten)]:[];
 const content=(n:any)=>flatten(n).map(n=>n.text??'').join(' ');
 const inside=(n:any,id:string)=>flatten(n).find(n=>n.test_id===id&&shown(n));
@@ -64,7 +66,7 @@ try{
  const identity=await visible('status.connection.identity'),bar=await visible('workspace.statusbar'),side=await visible('workspace.sidebar');assert.equal(identity.rect.w,side.rect.w);
  for(const id of ['rtt','encoding','grid']){const n=await visible('status.connection.'+id);assert(!n.focusable,id+' is static');await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2);assert(!(await query('status.ssh.detail')).some(shown));}
  assert(!(await query('status.connection.more')).some(shown));report.checks.push('sidebar width matches','metrics are static','More removed');await capture('01-statusbar');
- await click('status.connection.identity');const panel=await visible('status.connection');assert.equal(panel.rect.w,360);assert.equal(panel.rect.h,208);await capture('02-connection-compact');await key('escape');report.checks.push('Compact connection popover is 360 by 208 and dismisses.');await click('status.connection.chain');await visible('connection.details');await click('connection.details.logs');const logs=await visible('connection.logs');assert(logs.rect.h<=282);await capture('03-content-fit-logs');await click('connection.logs.close');await key('escape');if(!(await query('connection.details')).some(shown))await click('status.connection.chain');await visible('connection.details');await click('connection.details.node.1');await visible('connection.details.node-dialog');await capture('04-content-fit-node');await click('connection.details.node-done');report.status='passed';
+ {const t=await visible('status.connection.identity');assert((await clickAt(t.rect.x+t.rect.w/2,t.rect.y+t.rect.h/2,1,'right')).ok);await click('context.menu.session_identity');}/* title-click: tab menu “会话连接” */const panel=await visible('status.connection');assert.equal(panel.rect.w,360);assert.equal(panel.rect.h,208);await capture('02-connection-compact');await key('escape');report.checks.push('Compact connection popover is 360 by 208 and dismisses.');await click('status.connection.chain');await visible('connection.details');await click('connection.details.logs');const logs=await visible('connection.logs');assert(logs.rect.h<=282);await capture('03-content-fit-logs');await click('connection.logs.close');await key('escape');if(!(await query('connection.details')).some(shown))await click('status.connection.chain');await visible('connection.details');await click('connection.details.node.1');await visible('connection.details.node-dialog');await capture('04-content-fit-node');await click('connection.details.node-done');report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});throw e}
 finally{
  if(app&&app.exitCode===null&&app.signalCode===null){app.kill('SIGTERM');await Promise.race([appEnded,sleep(2000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await appEnded;}}

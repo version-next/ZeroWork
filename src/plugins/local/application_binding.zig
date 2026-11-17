@@ -31,6 +31,7 @@ pub fn Binding(comptime Host: type) type {
                 const tab = self.workspace.sessionTab(candidate.legacy_id) orelse return error.StaleSession;
                 tab.generation = request.handle.generation;
                 candidate.* = .{ .process = self.local_adapter, .handle = request.handle, .create_operation = request.key, .legacy_id = tab.id, .legacy_generation = tab.generation, .tab_id = tab.tab_id, .owner = tab.content_owner, .source = null };
+                self.mappingsChanged();
                 mapping = candidate;
                 self.workspace.updateLocalState(tab.id, .starting, "正在启动 zsh…");
                 break;
@@ -40,6 +41,7 @@ pub fn Binding(comptime Host: type) type {
                 const id = try self.workspace.createLocalSessionDirect(request.handle);
                 const tab = self.workspace.sessionTab(id).?;
                 self.mappings.appendAssumeCapacity(.{ .process = self.local_adapter, .handle = request.handle, .create_operation = request.key, .legacy_id = id, .legacy_generation = tab.generation, .tab_id = tab.tab_id, .owner = tab.content_owner, .source = null });
+                self.mappingsChanged();
                 mapping = &self.mappings.items[self.mappings.items.len - 1];
             }
             const adapter = self.local_adapter.adapter();

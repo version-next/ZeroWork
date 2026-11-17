@@ -1,0 +1,304 @@
+//! ZeroWork settings window, Island B v3 settings revamp (Pencil `p6ZVS`
+//! 外观与主题 overview, `z6LzX` and the other `›` subpages; components
+//! `Bt1FV` Settings Nav, `uk2jl` Glass Nav, `L5zOX` Glass Icon Button,
+//! `QGtx5` Pane Header, `EHLGD` Save Bar). Values are the design's numbers;
+//! colors are zenit semantic tokens plus ZeroWork's zw-* island tokens.
+const ui = @import("ui");
+
+/// Window (`p6ZVS`): focus surface, padding [8, 0, 8, 8]; the floating
+/// Settings Nav sits on the left, content fills the rest. (Legacy shell `settings_shell.card`.)
+style shell { width: fill; height: fill; min-height: 0; direction: row; gap: 0; padding: 8 0 8 8; background: zw-window-surface; overflow: hidden; }
+/// `.yix` 设置窗口（`settings.panel`）：同 `shell`，但上内边距 0——内容列从窗口顶边开始，正文从浮动页头底下滚过
+/// （znote 画板详情页：内容一直铺到窗口顶边）；导航浮层用自己的上外边距 8 保持原位置。
+style panel { width: fill; height: fill; min-height: 0; direction: row; gap: 0; padding: 0 0 8 8; background: zw-window-surface; overflow: hidden; }
+/// Settings Nav (`Bt1FV`) 的原生玻璃容器 `W.GlassBox`（216 宽、圆角 14、内边距 [10, 8]、间距 12 是组件参数，见 nav.yix）：
+/// 高度随父容器是组件参数 `fill={.height}`（G29）；根节点只补“不收缩”。材质、描边、投影全是 GlassBox 默认（人工验收反馈 1）。
+/// 导航列：浮层上方 8 = 原窗口上内边距（内容列改为从窗口顶边开始后，导航浮层位置不变）。这 8 是窗口顶边，属于标题栏：
+/// 一条窗口拖动区（`nav_window_inset`，`windowRegion={.drag}`，见 nav.yix），浮层在它下面占满剩余高度。
+style nav_column { width: 216; height: fill; min-height: 0; flex-shrink: 0; direction: column; align-items: stretch; }
+style nav_window_inset { width: fill; height: 8; flex-shrink: 0; }
+style nav_glass { flex: 1; min-height: 0; }
+/// 导航浮层顶部的窗口标题带：玻璃容器原来的 10 上内边距并进这里（位置不变），整条是窗口拖动区（`windowRegion={.drag}`，见 nav.yix）。
+style nav_title_band { width: fill; flex-shrink: 0; direction: column; align-items: stretch; padding: 10 0 0 0; }
+/// Window top (`ZeTFX`): 28 high, padding [0, 6], gap 12.
+style nav_top { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; gap: space300; padding: 0 space150; }
+/// Categories (`h4aWe`): rows stacked with a 1pt gap.
+style nav_list { width: fill; direction: column; align-items: stretch; gap: 1; }
+/// Category row (`RI5FN` Project Row / normal): 28 high, padding [0, 8], gap 8, radius 6.
+style nav_row { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; justify: start; gap: space200; padding: 0 space200; corner-radius: 6; background: transparent; }
+/// Category row, selected (`p6ZVS` › `VKdwK`): accent fill, white ink.
+style nav_row_active { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; justify: start; gap: space200; padding: 0 space200; corner-radius: 6; background: button-primary-bg; color: button-primary-fg; }
+/// Local note (`wqeax`): 28 high, padding [0, 8], gap 6; lock 13 + 11pt text.
+style nav_note { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; gap: space150; padding: 0 space200; }
+/// Content (`ZFFi6`): fills the window beside the nav; no island.
+style stage { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; padding: 0; background: zw-window-surface; }
+style island { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; background: zw-window-surface; overflow: hidden; }
+
+/// Page intro (`zCQxN`): padding [6, 14, 6, 12], gap 12 — Glass Nav,
+/// heading, spacer, help.
+style page_intro { width: fill; height: 48; flex-shrink: 0; direction: row; align-items: center; gap: space300; padding: 6 14 6 space300; }
+/// `.yix` 内容页（`settings.content`）：页头与标题栏边缘渐变绝对定位在列顶，所以列本身是定位上下文。
+style page_frame { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; position: relative; }
+/// `.yix` 页头（znote 画板详情页 header 行）：绝对定位在列顶、浮在视口与它的 scroll edge 之上；高 64、竖直中线 32（= 红绿灯
+/// 中线），左右内边距 12、元素间距 12。拦截命中：滚到页头下的正文点不到（页头整条是标题栏拖动区，见 `header.yix`）。
+style page_bar { position: absolute; inset: {ui.Inset{ .top = .{ .px = 0 }, .left = .{ .px = 0 } }}; width: fill; height: 64; direction: row; align-items: center; gap: space300; padding: 0 space300; hit-behavior: self_and_children; }
+/// `.yix` 视口内容：概览（`WswfJ`，[4, 24, 24, 24]）或面板（`CAEr8`，[8, 24, 76, 24]，76 让开浮动的 Save Bar）；
+/// 视口从窗口顶边开始、页头浮在上面，所以上内边距再加页头高 64（静止时正文仍从页头下方开始）。
+recipe PageBody {
+  base { width: fill; direction: column; align-items: stretch; gap: 20; padding: 72 24 76 24; }
+  flag overview { padding: 68 24 24 24; }
+}
+/// Page heading（znote header 的身份块）：上一级 › 标题一行，说明一行，行距 1。
+style page_heading { min-width: 0; flex-shrink: 1; direction: column; align-items: start; gap: 1; }
+/// 上一级 › 标题：间距 6，竖直居中。
+style page_crumb_row { min-width: 0; direction: row; align-items: center; gap: 6; }
+/// Panes (`CAEr8`): padding [8, 24, 76, 24], gap 20 (76 keeps the last pane clear of the floating Save Bar).
+style panes { width: fill; direction: column; align-items: stretch; gap: 20; padding: 8 24 76 24; }
+/// Overview (`WswfJ`): padding [4, 24, 24, 24], gap 20.
+style overview { width: fill; direction: column; align-items: stretch; gap: 20; padding: 4 24 24 24; }
+/// Hero (`HiaCV`): padding [8, 40, 4, 40], gap 8, centered.
+style hero { width: fill; direction: column; align-items: center; gap: space200; padding: 8 40 4 40; flex-shrink: 0; }
+/// Hero icon tile (`C6Mjq`): 56, radius 14, hairline.
+style hero_tile { width: 56; height: 56; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 14; background: zw-window-rest; border-overlay: true; border: 1 border; }
+/// Overview list (`IhVlT`): radius 12, padding [0, 14].
+style overview_list { width: fill; direction: column; align-items: stretch; padding: 0 14; corner-radius: 12; background: zw-window-rest; flex-shrink: 0; }
+/// Overview row (`sxDUF`): icon tile + inner, gap 12.
+style overview_row { width: fill; direction: row; align-items: center; gap: space300; padding: 0; corner-radius: 0; background: transparent; flex-shrink: 0; }
+/// Overview row icon tile (`q1AKy`): 30, radius 8, hairline.
+style overview_tile { width: 30; height: 30; flex-shrink: 0; direction: row; align-items: center; justify: center; corner-radius: 8; background: zw-window-surface; border-overlay: true; border: 1 border; }
+/// Overview row inner (`asYm4`): padding [12, 0], gap 12, bottom hairline.
+style overview_inner { width: fill; flex: 1; min-width: 0; direction: row; align-items: center; gap: space300; padding: 12 0; }
+style overview_copy { width: fill; flex: 1; min-width: 0; direction: column; align-items: start; gap: 2; }
+style overview_summary_box { width: fill; min-width: 0; align-self: stretch; }
+
+/// Pane (`v8NDZM`): header above the body card, gap 6.
+style pane { width: fill; direction: column; gap: space150; padding: 0; background: transparent; flex-shrink: 0; min-width: 0; }
+/// Pane Header (`QGtx5` as used by settings): 22 high, padding [0, 10], title then meta at the end.
+style pane_header { width: fill; height: 22; flex-shrink: 0; direction: row; align-items: center; gap: space150; padding: 0 10; background: transparent; }
+/// Pane body card (`V4TNB`): radius 12, padding [0, 14], rest surface.
+style pane_body { width: fill; direction: column; align-items: stretch; gap: 0; padding: 0 14; corner-radius: 12; background: zw-window-rest; overflow: hidden; }
+/// Setting row line (`ow4oe`): label column + control, gap 16, padding [10, 0].
+style setting_line { width: fill; direction: row; align-items: center; gap: space400; padding: 10 0; min-width: 0; flex-shrink: 0; }
+/// Setting copy (`r3YXxg`): label over hint, gap 2.
+style setting_copy { width: fill; flex: 1; min-width: 0; direction: column; align-items: start; gap: 2; }
+
+// ── 面板正文（P3 3e，`components/rows.yix`） ──
+
+/// 一个分类的面板列（旧 `settings_styles.sectionColumn`）：面板之间 20。
+style category_panes { width: fill; height: fit; direction: column; gap: 20; flex-shrink: 0; min-width: 0; }
+/// 分类概览根（`WswfJ`）：hero 与子页面行之间 20。
+style overview_root { width: fill; height: fit; direction: column; gap: 20; flex-shrink: 0; min-width: 0; }
+/// 内容区里一个分类的外壳，本身不占间距。
+style category_block { width: fill; height: fit; direction: column; gap: 0; flex-shrink: 0; min-width: 0; }
+/// 搜索结果（`settings.search.results`）：分类之间 20。
+style search_results { width: fill; height: fit; direction: column; gap: 20; flex-shrink: 0; min-width: 0; }
+style empty_note { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; }
+/// Pane Header 文字（`QGtx5`）：标题 12 / 600，说明 11 次要墨色、单行省略。
+style pane_title { font-size: 12; font-weight: 600; line-height: {16.0 / 12.0}; color: fg-primary; }
+style pane_meta { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+style pane_meta_box { min-width: 0; flex-shrink: 1; }
+/// 设置行根：行 + 校验提示；同一面板里相邻行之间一条发丝线（人工验收反馈 6，设计 `w3r3t`：1pt `border`，
+/// 左右与行内容齐，即卡片内边距 14），最后一行下面没有。
+recipe SettingRow {
+  base { width: fill; direction: column; gap: 0; min-width: 0; flex-shrink: 0; }
+  flag last { } else { border: 0 border; border-bottom-width: 1; }
+}
+/// 标签行：标签 + “?”，gap 4。
+style setting_heading { width: fill; min-width: 0; direction: row; align-items: center; gap: 4; }
+style setting_label { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; color: fg-primary; }
+style setting_hint { font-size: 11.5; font-weight: 400; line-height: 1.4; color: zw-fg-supporting; wrap: word; }
+style setting_hint_box { width: fill; min-width: 0; max-width: 360; align-self: stretch; }
+style setting_error { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: danger; padding: 0 0 8 0; }
+style help_slot { flex-shrink: 0; direction: row; align-items: center; }
+/// 只读 / 动作行的标签占满左侧。
+style info_label_box { width: fill; flex: 1; min-width: 0; }
+/// 只读值（旧 `settings_styles.value`）：右对齐，220 宽；路径单行省略。
+style info_value_box { width: 220; flex-shrink: 0; min-width: 0; direction: row; justify: end; }
+style info_value { font-size: 11.5; font-weight: 400; line-height: {17.0 / 11.5}; color: zw-fg-supporting; text-align: end; wrap: word; }
+style info_path { font-size: 11.5; font-weight: 400; line-height: {17.0 / 11.5}; color: zw-fg-supporting; text-align: end; wrap: none; text-overflow: ellipsis; }
+/// 目录按钮：与原生 secondary / md 控件同尺寸的胶囊（180 × 32，圆角 6，1pt 描边），文件夹图标 + 单行省略的路径。
+recipe DirectoryButton {
+  base {
+    width: 180; height: 32; flex-shrink: 0; min-width: 0; direction: row; align-items: center; gap: space150; padding: 0 space300; corner-radius: 6;
+    background: bg-primary; border: 1 border; color: fg-primary; transition: background 150ms ease-out;
+    :hover { background: bg-hover; }
+    :active { background: bg-active; }
+
+  }
+  flag off { opacity: 0.5; :hover { background: bg-primary; } :active { background: bg-primary; } }
+}
+style directory_icon { width: 14; height: 14; flex-shrink: 0; icon-color: fg-primary; }
+style directory_label { font-size: 12; font-weight: 400; line-height: 1.5; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+style directory_label_box { width: fill; flex: 1; min-width: 0; }
+/// 通知授权行：状态 + 说明“i”，等待中的提示。
+style permission_status { min-width: 0; direction: row; align-items: center; gap: 4; }
+style permission_note { font-size: 11; font-weight: 400; line-height: {16.0 / 11.0}; color: zw-fg-supporting; }
+
+/// Save Bar（`EHLGD`，H-save）：只定位——右 12、下 14 浮在视口上（在内容页里排在视口之后，画在它上面）。
+/// 胶囊本身是原生 `W.GlassBox`（形状、内边距、间距是组件参数），材质、描边、投影全是 GlassBox 默认。
+style save_bar_slot { position: absolute; inset: {ui.Inset{ .right = .{ .px = 12 }, .bottom = .{ .px = 14 } }}; }
+/// 胶囊正文：状态文字 + “撤销” + “保存”排成一行。
+style save_bar_row { direction: row; align-items: center; gap: 8; }
+/// “恢复默认…”行（H-save）：正文最后，右对齐。
+style reset_row { width: fill; flex-shrink: 0; direction: row; justify: end; }
+/// 确认对话框的挂载点：不占位（原生 Modal 自己挂到窗口浮层根上）。
+style confirm_anchor { position: absolute; width: 0; height: 0; }
+/// 确认对话框（原生 `W.Modal` 的正文；面板、遮罩、标题栏都是 Modal 默认）：说明、提示、按钮行。
+style confirm_body { width: fill; direction: column; gap: 8; }
+recipe ConfirmMessage {
+  base { font-size: 13; font-weight: 400; line-height: 1.5; color: fg-primary; wrap: word; }
+  flag problem { color: danger; }
+}
+style confirm_notice { font-size: 12; font-weight: 400; line-height: 1.5; color: zw-fg-supporting; wrap: word; }
+style confirm_text_box { width: fill; }
+style confirm_actions { width: fill; direction: row; align-items: center; gap: 8; padding: 8 0 0 0; }
+
+/// Keycap (`b9XxB`): 22 high, padding [0, 6], radius 5, hairline.
+style keycap { height: 22; min-width: 22; flex-shrink: 0; direction: row; align-items: center; justify: center; padding: 0 space150; corner-radius: 5; background: bg-primary; border: 1 border; }
+
+/// `.yix` 外壳（P3 3d）的样式。颜色全部是 token：不透明窗面是 `zw-window-surface`，次要文字是 `zw-fg-supporting`
+/// （由 `app_theme.widgetTokensFrom` 按调色板发布）；浮层与浮动按钮是原生 `W.GlassBox`，不在这里画。
+/// 原生窗口根（`settings.window`）。`min-height: 0`：不要 flex 的自动最小高度——否则材质 / 主题发布后重新测量，
+/// 长内容页（外观与主题 › 主题）会把根撑到内容高度（1082.6），超出 780 的窗口，Save Bar 跑到窗外（bugfix-2 C）。
+style window_root { width: fill; height: fill; min-height: 0; direction: column; }
+/// 红绿灯占位（`gq9c8`）：三个 12pt 圆点、间距 8。
+style traffic_lights { width: 52; height: 12; flex-shrink: 0; }
+style top_spacer { width: fill; flex: 1; height: 1; }
+/// 搜索槽（`IKREe`）：宿主的搜索框填满 fill × 28。
+style search_slot { width: fill; height: 28; flex-shrink: 0; direction: row; align-items: stretch; }
+/// 分类列表的滚动区（`settings.navigation.scroll`，S-5）：填满导航剩余高度；内容是 `nav_list`。
+style nav_scroll { width: fill; height: fill; flex: 1; min-height: 0; }
+/// 内容视口（`settings.viewport`，S-5）：占满整列（从窗口顶边开始，正文从浮动页头底下滚过）；内容是 `PageBody`。原生回弹（反馈 5）。
+/// 页头底下有滚动区：页头自己是窗口拖动区并拦截命中，滚到它底下的正文不会让空白处变成客户区（YIX_EXCEPTIONS S-10）。
+style viewport { flex: 1; flex-shrink: 1; min-height: 0; }
+/// 搜索框（`IKREe`，S-4）：原生 `W.Input`（sm）填满槽，外观全用组件默认（人工验收反馈 1 / 原生规则：不再覆盖底色、描边与圆角）。
+style search { width: fill; height: 28; min-width: 0; }
+style note_icon { width: 13; height: 13; flex-shrink: 0; }
+/// 岛内的内容列：内容页（`settings.content`）挂在这里。
+style content_column { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; }
+style hero_icon { width: 28; height: 28; }
+style hero_description_box { width: fill; }
+style footer_state_box { min-width: 0; flex-shrink: 1; }
+
+/// 外壳文字（颜色只引用 token；取值与原 `settings_shell` / `settings_styles` 的文字样式逐值相同）。
+/// 窗口标题（`E8ZhR`，设计里禁用，只占位）：13 / 600。
+style window_title { font-size: 13; font-weight: 600; line-height: {18.0 / 13.0}; color: fg-primary; }
+/// 本机说明（`EOp7g`）：11，次要墨色；锁（`NUODf`）13，淡墨。
+style note_text { font-size: 11; font-weight: 400; line-height: {14.0 / 11.0}; color: fg-secondary; }
+style note_icon_ink { icon-color: zw-fg-faint; }
+/// 页头标题（znote header：名称 13 / 600 主墨色）、上一级（12.5 次要墨色）、›（11 次要墨色）、说明（10.5 次要墨色）；单行省略。
+style page_title { font-size: 13; font-weight: 600; line-height: {18.0 / 13.0}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+style page_title_box { min-width: 0; flex-shrink: 1; }
+style page_crumb { font-size: 12.5; font-weight: 400; line-height: {17.0 / 12.5}; color: zw-fg-supporting; wrap: none; }
+style page_crumb_box { flex-shrink: 0; }
+style page_crumb_chevron { width: 11; height: 11; flex-shrink: 0; icon-color: zw-fg-supporting; }
+style page_subtitle { font-size: 10.5; font-weight: 400; line-height: {14.0 / 10.5}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+style page_subtitle_box { min-width: 0; }
+/// Hero 标题（`hObsG`）20 / 700；说明（`WGnxW`）12.5、行高 1.5、居中。
+style hero_title { font-size: 20; font-weight: 700; line-height: {26.0 / 20.0}; color: fg-primary; }
+style hero_text { font-size: 12.5; font-weight: 400; line-height: 1.5; color: zw-fg-supporting; text-align: center; wrap: word; }
+style hero_icon_ink { icon-color: fg-secondary; }
+/// Save Bar 状态（`cJkdi`）：12，次要墨色，单行；校验无效 / 保存失败用危险墨色（H-save）。
+recipe FooterStatus {
+  base { font-size: 12; font-weight: 400; line-height: {16.0 / 12.0}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+  flag danger { color: danger; }
+}
+
+/// 导航行（`RI5FN` / `rQNox`）：`W.Pressable` 根上的外观，与原 ghost `W.Button` 逐状态相同——
+/// 悬停 / 按下 bg-hover；选中是 action accent（悬停按下不变）；保存中（locked = 禁用）ghost 色调把底色清成透明；
+/// 底色 150ms 过渡（ControlShell 的 fade）。
+/// 原实现的两处“隐性”外观照搬（截图逐字节一致）：
+/// - 前景色：ghost 色调把根的墨色（fg-primary；选中 button-primary-fg；禁用 fg-disabled）级联给追加进去的
+///   文字，盖过了它们自己的 fg-secondary（文字总读继承色）——所以文字不写颜色、继承根；
+/// - 左内边距 16：Button 空的 content 槽（宽 0）加一个 gap(8) 把内容右移 8，设计值是 8。
+recipe NavRow {
+  base {
+    width: fill; height: 28; flex-shrink: 0; direction: row; align-items: center; justify: start; gap: space200; padding: 0 space200 0 space400; corner-radius: 6;
+    background: transparent; color: fg-primary; transition: background 150ms ease-out, border-color 150ms ease-out;
+    :hover { background: bg-hover; }
+    :active { background: bg-hover; }
+  }
+  flag selected { background: button-primary-bg; color: button-primary-fg; :hover { background: button-primary-bg; } :active { background: button-primary-bg; } }
+  flag locked { background: transparent; color: fg-disabled; :hover { background: transparent; } :active { background: transparent; } }
+}
+/// 分类图标（`oRKKl`）16，次要墨色；选中行上是主按钮前景色（图标的着色是显式的，不读继承色）。
+recipe NavIcon {
+  base { width: 16; height: 16; flex-shrink: 0; icon-color: fg-secondary; }
+  flag selected { icon-color: button-primary-fg; }
+}
+/// 分类名（`N86Dh`）13；选中行 500。颜色继承行根。
+recipe NavLabel {
+  base { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; }
+  flag selected { font-weight: 500; }
+}
+style nav_label_box { width: fill; flex: 1; min-width: 0; }
+
+/// 概览行（`sxDUF`）：`W.Pressable` 根。悬停 / 按下只降不透明度（0.82 / 0.65），保存中不响应。
+/// 同导航行：根墨色级联给文字（摘要设计里的次要墨色在原实现里没生效）；左内边距 12 = 空 content 槽 + gap(12)。
+recipe OverviewRow {
+  base {
+    width: fill; height: fit; flex-shrink: 0; direction: row; align-items: center; gap: space300; padding: 0 0 0 space300; corner-radius: 0;
+    background: transparent; color: fg-primary; transition: background 150ms ease-out, border-color 150ms ease-out;
+    :hover { opacity: 0.82; }
+    :active { opacity: 0.65; }
+  }
+  flag locked { color: fg-disabled; :hover { opacity: 1; } :active { opacity: 1; } }
+}
+/// 行内（`asYm4`）：除最后一行外底部一条发丝线（bg-active，同面板行分隔线）。
+recipe OverviewInner {
+  base { width: fill; flex: 1; min-width: 0; direction: row; align-items: center; gap: space300; padding: 12 0; }
+  flag last { } else { border: 0 bg-active; border-bottom-width: 1; }
+}
+/// 行图标：方块里的分类图标次要墨色，尾部箭头淡墨（显式着色，不随行根变）。
+style overview_tile_icon { width: 16; height: 16; icon-color: fg-secondary; }
+style overview_chevron { width: 16; height: 16; flex-shrink: 0; icon-color: zw-fg-faint; }
+/// 行标题（`u2A5RP`）13 / 400；摘要（`F6n7A`）11.5，单行省略。颜色继承行根。
+style overview_label { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; }
+style overview_summary { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; wrap: none; text-overflow: ellipsis; }
+
+/// 宿主状态行（岛底部，文字来自 `ViewModel.statusLine`）：10.5，次要墨色，不收缩。
+style status_line { font-size: 10.5; color: fg-secondary; }
+style status_line_box { flex-shrink: 0; }
+
+style info_path_box { width: fill; min-width: 0; }
+
+// ── 两级导航的列表行（F-set-plugins，`components/rows.yix` 的 `DrillRow`；设计 `T5k96` 的协议行） ──
+
+/// 行根（`W.Pressable`）：图标底 + 行内，gap 12；悬停 / 按下只降不透明度（同概览行），保存中不响应。
+recipe DrillRow {
+  base {
+    width: fill; height: fit; flex-shrink: 0; direction: row; align-items: center; gap: space300; padding: 0;
+    background: transparent; color: fg-primary;
+    :hover { opacity: 0.82; }
+    :active { opacity: 0.65; }
+  }
+  flag locked { color: fg-disabled; :hover { opacity: 1; } :active { opacity: 1; } }
+}
+/// 行内（`BsWmh`）：padding [9, 0]、gap 8；除最后一行外底部一条发丝线（bg-active，同概览行与面板行分隔线）。
+recipe DrillInner {
+  base { width: fill; flex: 1; min-width: 0; direction: row; align-items: center; gap: space200; padding: 9 0; }
+  flag last { } else { border: 0 bg-active; border-bottom-width: 1; }
+}
+/// 文案列（`EpTyH`）：标题 13 / 400 主墨色，摘要 11.5 次要墨色单行省略，gap 1。
+style drill_copy { width: fill; flex: 1; min-width: 0; direction: column; align-items: start; gap: 1; }
+recipe DrillTitle {
+  base { font-size: 13; font-weight: 400; line-height: {18.0 / 13.0}; color: fg-primary; wrap: none; text-overflow: ellipsis; }
+  /// 被禁用的插件（UuE31）：标题降为次要色。
+  flag muted { color: fg-secondary; }
+}
+/// 行图标：同 `overview_tile_icon`；被禁用的插件降为淡墨。
+recipe DrillIcon {
+  base { width: 16; height: 16; icon-color: fg-secondary; }
+  flag muted { icon-color: zw-fg-faint; }
+}
+style drill_summary { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: none; text-overflow: ellipsis; }
+style drill_text_box { width: fill; min-width: 0; }
+/// 尾注（`O4lQcV`）：11.5 次要墨色，不收缩。
+style drill_trail { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-supporting; wrap: none; }
+style drill_trail_box { flex-shrink: 0; }
+
+/// 选择行的原地编辑（S-13，`rows.CustomSelectRow`）：选择框与它下面不占位的 `W.Popover` 锚点排成一列
+/// （锚点在选择框左下角，浮层默认 `bottom_start`、放不下时原生翻转）。
+style custom_anchor { direction: column; align-items: start; flex-shrink: 0; }
+/// 浮层正文（原生 `W.Popover` 的默认面板里）：说明 + 原生 `W.Input`。
+style custom_editor { width: fill; direction: column; gap: 8; padding: 12; }

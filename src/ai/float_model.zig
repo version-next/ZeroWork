@@ -2,75 +2,90 @@ const std = @import("std");
 const status = @import("status.zig");
 const error_feedback = @import("error_feedback.zig");
 
-pub const Rect = struct { x: f32, y: f32, width: f32, height: f32 };
-pub const minimum_width: f32 = 520;
+const float_card = @import("../shared/base/float_card.zig");
+
+/// The AI chat card's floating placement is the generic card float (shared/base/float_card.zig,
+/// shared/ui/float_card/float_layer.zig); this file only declares the AI card type's parameters and
+/// keeps the AI-specific presentation state (status, feedback, prompt).
+pub const Rect = float_card.Rect;
+pub const Size = float_card.Size;
+pub const Edge = float_card.Edge;
+pub const Corner = float_card.Corner;
+pub const Origin = float_card.Origin;
+pub const Placement = float_card.Placement;
+pub const floatRegion = float_card.floatRegion;
+/// #52: the width floor (also the resize minimum).
+pub const minimum_width: f32 = 320;
 pub const minimum_height: f32 = 354;
-pub const Edge = enum {
-    n,
-    s,
-    w,
-    e,
-    nw,
-    ne,
-    sw,
-    se,
+/// #52 default size: width = clamp(content.w × 0.42, 320, 420), height = clamp(content.h − 24, 280, 640).
+pub const default_width_ratio: f32 = 0.42;
+pub const default_width_max: f32 = 420;
+pub const default_height_gap: f32 = 24;
+pub const default_height_min: f32 = 280;
+pub const default_height_max: f32 = 640;
 
-    pub fn west(self: Edge) bool {
-        return self == .w or self == .nw or self == .sw;
-    }
-    pub fn east(self: Edge) bool {
-        return self == .e or self == .ne or self == .se;
-    }
-    pub fn north(self: Edge) bool {
-        return self == .n or self == .nw or self == .ne;
-    }
-    pub fn south(self: Edge) bool {
-        return self == .s or self == .sw or self == .se;
-    }
+/// #52 default size for the owner tab's content area.
+pub fn defaultSize(content: Rect) Size {
+    return .{
+        .width = std.math.clamp(content.width * default_width_ratio, minimum_width, default_width_max),
+        .height = std.math.clamp(content.height - default_height_gap, default_height_min, default_height_max),
+    };
+}
+
+/// The `ai.chat` card type's floating declaration: the AI card never opens as its own tab; it floats
+/// and (cards-float) docks into its tab's split (`dock_to_split` derived from the card type's
+/// placements). The header's minimize folds the panel back into the tab's `ai.launcher` (the anchor),
+/// the first open unfolds beside it.
+pub const descriptor: float_card.Descriptor = .{
+    .id = "ai.chat",
+    .interactions = .initMany(&.{ .move, .resize, .maximize, .raise, .close, .fold_to_tab, .open_from_anchor, .remember_position, .minimize }),
+    .min_size = .{ .width = minimum_width, .height = minimum_height },
+    .default_size = defaultSize,
+    .first_open = .beside_anchor,
 };
-pub const Geometry = struct { desired: ?Rect, clamped: ?Rect, restore: ?Rect };
 
-pub fn safeBounds(pane: Rect, window: Rect) Rect {
-    const left = @max(pane.x, window.x) + 8;
-    const top = @max(pane.y, window.y) + 8;
-    return .{ .x = left, .y = top, .width = @max(0, @min(pane.x + pane.width, window.x + window.width) - 8 - left), .height = @max(0, @min(pane.y + pane.height, window.y + window.height) - 8 - top) };
-}
-
-pub fn clampRect(value: Rect, pane: Rect, window: Rect) Rect {
-    const bounds = safeBounds(pane, window);
-    const width = std.math.clamp(value.width, @min(minimum_width, bounds.width), bounds.width);
-    const height = std.math.clamp(value.height, @min(minimum_height, bounds.height), bounds.height);
-    return .{ .x = std.math.clamp(value.x, bounds.x, bounds.x + bounds.width - width), .y = std.math.clamp(value.y, bounds.y, bounds.y + bounds.height - height), .width = width, .height = height };
-}
-
-pub fn resized(start: Rect, edge: Edge, dx: f32, dy: f32, pane: Rect, window: Rect) Rect {
-    const bounds = safeBounds(pane, window);
-    const base = clampRect(start, pane, window);
-    var left = base.x;
-    var right = base.x + base.width;
-    var top = base.y;
-    var bottom = base.y + base.height;
-    const min_width = @min(minimum_width, bounds.width);
-    const min_height = @min(minimum_height, bounds.height);
-    if (edge.west()) left = std.math.clamp(left + dx, bounds.x, right - min_width);
-    if (edge.east()) right = std.math.clamp(right + dx, left + min_width, bounds.x + bounds.width);
-    if (edge.north()) top = std.math.clamp(top + dy, bounds.y, bottom - min_height);
-    if (edge.south()) bottom = std.math.clamp(bottom + dy, top + min_height, bounds.y + bounds.height);
-    return .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
+pub fn defaultRect(origin: Origin, region: Rect) Rect {
+    return float_card.defaultRect(descriptor, origin, region);
 }
 
 pub const Model = struct {
     visible: bool = false,
     expanded: bool = false,
-    maximized: bool = false,
-    desired: ?Rect = null,
-    clamped: ?Rect = null,
-    restore: ?Rect = null,
+    /// Per owner (tab) floating placement; swapped with the owner's presentation.
+    placement: Placement = .{},
+    /// cards-float: the owner tab's split leaf while the AI is docked into its card layout
+    /// (`Workspace.dockCard`); null = floating. Swapped with the owner's presentation.
+    docked_leaf: ?u64 = null,
     status: status.Status = .{},
     feedback: error_feedback.Feedback = .{},
     prompt: []const u8 = "",
     card_count: usize = 0,
-    anchor: enum { pane_top_center, status_chip } = .pane_top_center,
+
+    /// Where the owner tab shows its AI: open or not, where it floats, docked into its split. It
+    /// belongs to the tab, not to the conversation the tab shows (LIFECYCLE.md §1): a tab that
+    /// changes its conversation (restore, new, use a copy) keeps it, and the
+    /// conversation that leaves the tab takes none of it along.
+    pub const OwnerPresentation = struct {
+        visible: bool = false,
+        expanded: bool = false,
+        placement: Placement = .{},
+        docked_leaf: ?u64 = null,
+    };
+
+    pub fn ownerPresentation(self: Model) OwnerPresentation {
+        return .{ .visible = self.visible, .expanded = self.expanded, .placement = self.placement, .docked_leaf = self.docked_leaf };
+    }
+
+    /// This model with `owner` as the tab's presentation; the conversation's own part (status,
+    /// feedback, prompt, card count) stays.
+    pub fn withOwnerPresentation(self: Model, owner: OwnerPresentation) Model {
+        var next = self;
+        next.visible = owner.visible;
+        next.expanded = owner.expanded;
+        next.placement = owner.placement;
+        next.docked_leaf = owner.docked_leaf;
+        return next;
+    }
 
     pub fn toggle(self: *Model) void {
         self.visible = !self.visible;
@@ -85,47 +100,8 @@ pub const Model = struct {
     pub fn setCardCount(self: *Model, count: usize) void {
         self.card_count = count;
     }
-    pub fn rect(self: Model, pane: Rect, window: Rect) Rect {
-        const bounds = safeBounds(pane, window);
-        if (self.maximized) return bounds;
-        if (self.expanded) if (self.desired) |value| return clampRect(value, pane, window);
-        const width: f32 = @min(if (self.expanded) @as(f32, 600) else 100, bounds.width);
-        const height: f32 = @min(if (self.expanded) @as(f32, 456) else 14, bounds.height);
-        const x = std.math.clamp(pane.x + (pane.width - width) / 2, bounds.x, bounds.x + bounds.width - width);
-        const y = std.math.clamp(pane.y + 14, bounds.y, bounds.y + bounds.height - height);
-        return .{ .x = x, .y = y, .width = width, .height = height };
-    }
-
-    /// Bounds changes only re-clamp; they never erase the owner's requested rectangle.
-    pub fn updateBounds(self: *Model, pane: Rect, window: Rect) void {
-        self.clamped = self.rect(pane, window);
-    }
-    pub fn geometry(self: Model) Geometry {
-        return .{ .desired = self.desired, .clamped = self.clamped, .restore = self.restore };
-    }
-    pub fn restoreGeometry(self: *Model, value: Geometry) void {
-        self.desired = value.desired;
-        self.clamped = value.clamped;
-        self.restore = value.restore;
-    }
-    pub fn setRectangle(self: *Model, value: Rect, pane: Rect, window: Rect) void {
-        self.desired = clampRect(value, pane, window);
-        self.updateBounds(pane, window);
-    }
-    pub fn resetPosition(self: *Model, pane: Rect, window: Rect) void {
-        if (self.maximized) return;
-        var value = self.rect(pane, window);
-        value.x = pane.x + (pane.width - value.width) / 2;
-        value.y = pane.y + 14;
-        self.setRectangle(value, pane, window);
-    }
-    pub fn toggleMaximized(self: *Model, pane: Rect, window: Rect) void {
-        if (self.maximized) {
-            self.desired = self.restore orelse self.desired;
-            self.restore = null;
-        } else self.restore = self.desired orelse self.rect(pane, window);
-        self.maximized = !self.maximized;
-        self.updateBounds(pane, window);
+    pub fn rect(self: Model, origin: Origin, region: Rect) Rect {
+        return self.placement.rect(descriptor, origin, region);
     }
 
     pub fn showError(self: *Model, info: @import("error.zig").Info) void {
@@ -164,28 +140,51 @@ pub const Model = struct {
     }
 };
 
-test "AI maximize and restore preserve the default owner pane rectangle" {
-    var model: Model = .{ .expanded = true };
-    const pane: Rect = .{ .x = 240, .y = 62, .width = 1190, .height = 790 };
-    const window: Rect = .{ .x = 0, .y = 0, .width = 1440, .height = 900 };
-    const original = model.rect(pane, window);
-    model.maximized = true;
-    try std.testing.expectEqualDeep(Rect{ .x = 248, .y = 70, .width = 1174, .height = 774 }, model.rect(pane, window));
-    model.maximized = false;
-    try std.testing.expectEqualDeep(original, model.rect(pane, window));
+const test_region = floatRegion(1440, 900, 44, 240);
+const test_content: Rect = .{ .x = 240, .y = 44, .width = 1200, .height = 820 };
+fn testOrigin(corner: Corner) Origin {
+    const x: f32 = if (corner.right()) test_content.x + test_content.width - 24 - 48 else test_content.x + 24;
+    const y: f32 = if (corner.bottom()) test_content.y + test_content.height - 20 - 48 else test_content.y + 20;
+    return .{ .corner = corner, .anchor = .{ .x = x, .y = y, .width = 48, .height = 48 }, .content = test_content };
 }
 
-test "AI default float centers below its own pane strip and clamps within the pane" {
+test "AI default rectangle uses the #52 size and unfolds from the launcher corner" {
     const model: Model = .{ .expanded = true };
-    const window: Rect = .{ .x = 0, .y = 0, .width = 1440, .height = 900 };
-    const pane: Rect = .{ .x = 240, .y = 62, .width = 1190, .height = 790 };
-    const normal = model.rect(pane, window);
-    try std.testing.expectEqualDeep(Rect{ .x = 535, .y = 76, .width = 600, .height = 456 }, normal);
-    const small: Rect = .{ .x = 240, .y = 62, .width = 400, .height = 250 };
-    const clamped = model.rect(small, window);
-    try std.testing.expect(clamped.x >= small.x + 8 and clamped.y >= small.y + 8);
-    try std.testing.expect(clamped.x + clamped.width <= small.x + small.width - 8);
-    try std.testing.expect(clamped.y + clamped.height <= small.y + small.height - 8);
+    for ([_]Corner{ .bottom_right, .bottom_left, .top_right, .top_left }) |corner| {
+        const origin = testOrigin(corner);
+        const r = model.rect(origin, test_region);
+        try std.testing.expectEqual(@as(f32, 420), r.width); // 1200 × 0.42 = 504 → 420
+        try std.testing.expectEqual(@as(f32, 640), r.height); // 820 − 24 = 796 → 640
+        const l = origin.anchor.?;
+        if (corner.right()) try std.testing.expectEqual(l.x + l.width, r.x + r.width) else try std.testing.expectEqual(l.x, r.x);
+        if (corner.bottom()) try std.testing.expectEqual(l.y + l.height, r.y + r.height) else try std.testing.expectEqual(l.y, r.y);
+        try std.testing.expect(r.x >= test_region.x and r.y >= test_region.y and r.x + r.width <= test_region.x + test_region.width and r.y + r.height <= test_region.y + test_region.height);
+    }
+    const small = defaultSize(.{ .x = 0, .y = 0, .width = 500, .height = 290 });
+    try std.testing.expectEqual(@as(f32, 320), small.width);
+    try std.testing.expectEqual(@as(f32, 280), small.height);
+    const mid = defaultSize(.{ .x = 0, .y = 0, .width = 900, .height = 500 });
+    try std.testing.expectEqual(@as(f32, 378), mid.width);
+    try std.testing.expectEqual(@as(f32, 476), mid.height);
+}
+
+test "AI default rectangle stays inside the region in the smallest window" {
+    const region = floatRegion(860, 480, 44, 240);
+    const content: Rect = .{ .x = 240, .y = 44, .width = 620, .height = 400 };
+    for ([_]Corner{ .bottom_right, .bottom_left, .top_right, .top_left }) |corner| {
+        const x: f32 = if (corner.right()) content.x + content.width - 72 else content.x + 24;
+        const y: f32 = if (corner.bottom()) content.y + content.height - 68 else content.y + 20;
+        const r = defaultRect(.{ .corner = corner, .anchor = .{ .x = x, .y = y, .width = 48, .height = 48 }, .content = content }, region);
+        try std.testing.expect(r.width >= minimum_width and r.height >= @min(minimum_height, region.height));
+        try std.testing.expect(r.x >= region.x and r.y >= region.y and r.x + r.width <= region.x + region.width + 0.001 and r.y + r.height <= region.y + region.height + 0.001);
+    }
+}
+
+test "AI card resize keeps the 320 minimum width" {
+    const start: Rect = .{ .x = 600, .y = 180, .width = 700, .height = 500 };
+    const minimum = float_card.resized(descriptor, start, .nw, 1000, 1000, test_region);
+    try std.testing.expectEqual(@as(f32, 320), minimum.width);
+    try std.testing.expectEqual(@as(f32, 354), minimum.height);
 }
 
 test "AI float model toggles and pulses status" {
@@ -224,4 +223,26 @@ test "retained response cards do not reopen a user collapsed AI panel" {
     model.setCardCount(2);
     try std.testing.expect(!model.visible);
     try std.testing.expectEqual(@as(usize, 2), model.card_count);
+}
+
+test "a tab that changes its conversation keeps its own presentation, the conversation keeps its own state" {
+    // The tab's AI is open and docked into its split at leaf 7, floating placement moved.
+    var shown: Model = .{ .visible = true, .expanded = true, .docked_leaf = 7, .placement = .{ .desired = .{ .x = 10, .y = 20, .width = 400, .height = 500 } } };
+    shown.markSuccess("Done");
+    // The conversation that comes in (restored from the list) was last shown floating somewhere else.
+    var incoming: Model = .{ .placement = .{ .maximized = true } };
+    incoming.showError(.{ .kind = .network, .message = "offline" });
+    incoming.visible = false;
+    const next = incoming.withOwnerPresentation(shown.ownerPresentation());
+    try std.testing.expect(next.visible and next.expanded);
+    try std.testing.expectEqual(@as(?u64, 7), next.docked_leaf);
+    try std.testing.expect(!next.placement.maximized);
+    try std.testing.expectEqual(@as(f32, 400), next.placement.desired.?.width);
+    // The conversation's own status and feedback came with it.
+    try std.testing.expectEqual(status.State.failed, next.status.state);
+    try std.testing.expect(next.retryVisible());
+    // The conversation that leaves the tab carries none of the tab's presentation.
+    const left = shown.withOwnerPresentation(.{});
+    try std.testing.expect(!left.visible and !left.expanded and left.docked_leaf == null and left.placement.desired == null);
+    try std.testing.expectEqual(status.State.success, left.status.state);
 }

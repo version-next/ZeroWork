@@ -2,6 +2,7 @@
  * Harness client, without installing into or overwriting the user's zig-out.
  * Secrets are only supplied through an externally created mode-600 JSON file.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,readFile,writeFile,rm,stat} from 'node:fs/promises';
@@ -15,10 +16,12 @@ if(process.env.ZEROWORK_ACCEPTANCE_CONFIG) assert.equal((await stat(process.env.
 const scratch=await mkdtemp(join(tmpdir(),'zw-v02-runner-'));
 try {
  const client=pathToFileURL(resolve('vendor/zenit/e2e/client.ts')).href;
- let contents=(await readFile(resolve('e2e',sources[suite]),'utf8')).replaceAll('../zig-out/share/zenit/harness/client.ts',client);
+ // title-click: local_terminal.ts picks themes through ./theme_settings_entry.ts (设置 › 外观与主题); the copied runner lives in scratch, so point that import at the repo file.
+ let contents=(await readFile(resolve('e2e',sources[suite]),'utf8')).replaceAll('../zig-out/share/zenit/harness/client.ts',client).replaceAll('./theme_settings_entry.ts',pathToFileURL(resolve('e2e/theme_settings_entry.ts')).href);
  if(suite==='local') {
   const start=contents.indexOf('  await clickTestId(\"local.status.grid\");',contents.indexOf('  await capture(\"local-compact\");'));
-  const end=contents.indexOf('  await clickTestId(\"local.status.theme\");',start);
+  // title-click: the title bar theme button (status.connection.theme) is gone; the theme step now starts at chooseTheme(…, "nord", …).
+  const end=contents.indexOf('  await chooseTheme(harness, \"nord\"',start);
   assert(start>0&&end>start);
   contents=contents.slice(0,start)+'  await resizeWindow(1440,900);\n  await waitFor(async()=>text(await visible(\"local.status.grid\")).includes(originalGrid)||null);\n'+contents.slice(end);
  }

@@ -23,6 +23,15 @@ const NodeHandle = core.NodeHandle;
 const Scope = @import("reactive.zig").Scope;
 const overlay_transition = @import("overlay_transition.zig");
 const overlay_layer_refs = @import("overlay_layer_refs.zig");
+const overlay_within = @import("overlay_within.zig");
+
+/// Window areas for overlays (overlay_within.zig): an anchor rect from a node or a callback, a
+/// tracked node reference, and the placement of a barrier layer's content inside an area.
+pub const AnchorRect = overlay_within.AnchorRect;
+pub const VirtualAnchor = overlay_within.VirtualAnchor;
+pub const Anchor = overlay_within.Anchor;
+pub const TrackedNode = overlay_within.TrackedNode;
+pub const WithinPlacement = overlay_within.WithinPlacement;
 // Cx split: Transition / TransitionController extracted to overlay_transition.zig
 // (progress clock + curve table, testable independently). Re-export here maintains
 // existing paths like `overlay_stack_mod.Transition` (popover/sheet/modal all use).
@@ -41,11 +50,11 @@ const layerNeedsCompositedGroup = overlay_transition.layerNeedsCompositedGroup;
 const render_engine = @import("core/render_engine/mod.zig");
 
 fn overlayDebugEnabled() bool {
-    return @import("zenit_environment").has("ZENIT_POPOVER_DEBUG");
+    return @import("zenit_environment").flag("ZENIT_POPOVER_DEBUG");
 }
 
 fn outsideClickDebugEnabled() bool {
-    return @import("zenit_environment").has("ZENIT_DEBUG_OUTSIDE_CLICK");
+    return @import("zenit_environment").flag("ZENIT_DEBUG_OUTSIDE_CLICK");
 }
 
 fn nodeTestId(node: ?*Node) []const u8 {
@@ -159,7 +168,15 @@ pub const DismissConfig = struct {
 /// Backdrop config
 pub const BarrierConfig = union(enum) {
     none,
+    /// Fixed color: kept across `Cx.setTheme`.
     color: Color,
+    /// The theme's `color.overlay` token, re-read on every `Cx.setTheme` (theme replay).
+    theme_overlay,
+
+    /// `override` when set (fixed), else the theme overlay token (follows the theme).
+    pub fn colorOr(override: ?Color) BarrierConfig {
+        return if (override) |c| .{ .color = c } else .theme_overlay;
+    }
 };
 
 /// Focus config
@@ -239,6 +256,11 @@ pub const OverlayLayer = struct {
     /// Last recovered semantics from holding node (including component-applied rewrites); null
     /// means still config.a11y initial value.
     a11y_semantics: ?A11yProps = null,
+
+    /// Whether `node` is in this layer's content or barrier subtree (parent chain).
+    pub fn contains(self: *const OverlayLayer, node: *const Node) bool {
+        return OverlayStack.layerContains(self, node);
+    }
 };
 
 /// Return value of overlay() factory function
@@ -257,13 +279,19 @@ pub const OverlayResult = struct {
 // ========== OverlayStack ==========
 
 pub const OverlayStack = struct {
-    /// Capacity for registered layers, including layers completing their exit animation.
-    /// Tooltip/Popover register on open and release after exit; closed component count
-    /// therefore does not consume this budget. Other retained layer kinds must manage
-    /// their registrations explicitly. Growing the limit is not a substitute for cleanup.
-    const MAX_LAYERS = 256;
+    /// Layer capacity 256. Popover/Tooltip with detached hidden content (the default) register a
+    /// layer only while open or exiting, so closed instances cost no slot; content kept mounted
+    /// while hidden (`detach_hidden_content = false`) still holds one suspended layer from mount,
+    /// which masks its hit testing and accessibility actions. Lifting the limit entirely
+    /// (ArrayList) is deferred with the focus_scope refactor. Per-slot traversal is a null check;
+    /// 256-slot per-frame cost is negligible.
+    pub const MAX_LAYERS = 256;
 
-    layers: [MAX_LAYERS]?OverlayLayer = @as([MAX_LAYERS]?OverlayLayer, @splat(null)),
+    /// Layer slots (stable indices, freed slots set to null), grown on demand
+    /// up to MAX_LAYERS: a full inline table kept ~310 KiB resident per Cx.
+    layers: std.ArrayList(?OverlayLayer) = .empty,
+    /// Cx.init installs its allocator; owners must call deinit.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
     /// hasActiveAnimations generational memo: any entry that might change layer state bumps
     /// anim_gen
     /// (bumpAnimGen), same-generation query returns directly. Single-threaded UI assumption.
@@ -275,12 +303,16 @@ pub const OverlayStack = struct {
     next_z: i16 = 100,
     next_id: u32 = 1,
     next_activation_order: u64 = 1,
+    /// Layer a swallowed outside press dismisses on release (see consumeOutsidePress).
+    consumed_press_layer: ?LayerHandle = null,
     /// commitExit queues previous_focus here if the layer configured focus.restore; Cx (holding
     /// focus_manager) drains it during the frame.
     ///
     /// Why: OverlayStack can't access cx, and focus restoration needs focus_manager. Without the
     /// drain, closing Modal/Sheet loses focus instead of returning to the trigger.
     pending_focus_restore: ?NodeHandle = null,
+    /// The closed layer's content: the restore only applies while focus is still in it (or nowhere).
+    pending_focus_restore_from: ?*Node = null,
     node_registry: ?*core.NodeRegistry = null,
 
     inline fn bumpAnimGen(self: *OverlayStack) void {
@@ -295,9 +327,9 @@ pub const OverlayStack = struct {
     pub fn push(self: *OverlayStack, config: LayerConfig) !LayerHandle {
         self.bumpAnimGen();
         if (self.layer_count >= MAX_LAYERS) {
-            if (@import("zenit_environment").has("ZENIT_DEBUG_OVERLAY")) {
+            if (@import("zenit_environment").flag("ZENIT_DEBUG_OVERLAY")) {
                 std.debug.print("[overlay-dbg] push FAIL count={d}\n", .{self.layer_count});
-                for (&self.layers, 0..) |*slot, i| {
+                for (self.layers.items, 0..) |*slot, i| {
                     if (slot.*) |*layer| {
                         const cname = if (layer.content_node) |cn| (cn.meta.ownership.meta.component_name orelse "?") else "null";
                         std.debug.print("  [{d}] kind={s} state={s} suspended={} content={s}\n", .{
@@ -311,7 +343,7 @@ pub const OverlayStack = struct {
 
         // Mutex group: non_modal layers in same group auto-close
         if (config.group) |group| {
-            for (&self.layers) |*slot| {
+            for (self.layers.items) |*slot| {
                 if (slot.*) |*layer| {
                     if (!layer.suspended and layer.state != .exiting and layer.config.kind != .modal) {
                         if (layer.config.group) |eg| {
@@ -337,12 +369,16 @@ pub const OverlayStack = struct {
         self.next_id += 1;
 
         // Find empty slot
-        const slot = self.findEmptySlot() orelse return error.TooManyLayers;
+        const slot = self.findEmptySlot() orelse blk: {
+            if (self.layers.items.len >= MAX_LAYERS) return error.TooManyLayers;
+            try self.layers.append(self.allocator, null);
+            break :blk self.layers.items.len - 1;
+        };
         const enter_transition = config.enter_transition;
         const initial_state: LayerState = if (enter_transition == .none) .visible else .entering;
         var stored_config = config;
         stored_config.trigger_node = null;
-        self.layers[slot] = OverlayLayer{
+        self.layers.items[slot] = OverlayLayer{
             .handle = handle,
             .config = stored_config,
             .state = initial_state,
@@ -353,7 +389,7 @@ pub const OverlayStack = struct {
             .trigger_node = config.trigger_node,
             .trigger_handle = self.trackNode(config.trigger_node),
         };
-        self.layers[slot].?.enter_ctrl.delay_remaining_ms = config.enter_delay_ms;
+        self.layers.items[slot].?.enter_ctrl.delay_remaining_ms = config.enter_delay_ms;
         self.layer_count += 1;
 
         return handle;
@@ -424,7 +460,11 @@ pub const OverlayStack = struct {
             // only; scroll/inspect keep derived defaults (content still owns scroll; devtools can
             // still
             // select it).
-            ext.hit_roles = .{ .pointer = true };
+            // Merged, not assigned: roles the content declared itself survive every (re)bind.
+            // The wheel over the content's blank area is contained by the layer in
+            // `cx_input.dispatchScroll`, not through a role here.
+            const declared = ext.hit_roles;
+            ext.hit_roles = .{ .pointer = declared.pointer orelse true, .scroll = declared.scroll, .inspect = declared.inspect };
             syncLayerHitTestVisibility(layer);
             self.syncAllLayerVisualOrder();
         }
@@ -437,7 +477,7 @@ pub const OverlayStack = struct {
 
     /// Whether any layer is exiting (test/diagnostic use).
     pub fn anyExiting(self: *const OverlayStack) bool {
-        for (self.layers) |maybe| {
+        for (self.layers.items) |maybe| {
             if (maybe) |layer| {
                 if (layer.state == .exiting) return true;
             }
@@ -490,7 +530,7 @@ pub const OverlayStack = struct {
     pub fn commitExit(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return;
-        if (self.layers[idx]) |*layer| {
+        if (self.layers.items[idx]) |*layer| {
             if (layer.suspended) return; // Already suspended
 
             // Signal callback may sync-dispose scope, removePermanently, free node. Snapshot ptr
@@ -530,6 +570,7 @@ pub const OverlayStack = struct {
             if (layer.config.focus.restore) {
                 if (layer.previous_focus) |prev| {
                     self.pending_focus_restore = prev;
+                    self.pending_focus_restore_from = layer.content_node;
                     layer.previous_focus = null;
                 }
             }
@@ -546,7 +587,7 @@ pub const OverlayStack = struct {
     pub fn removePermanently(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return;
-        self.layers[idx] = null;
+        self.layers.items[idx] = null;
         if (self.layer_count > 0) self.layer_count -= 1;
         if (self.layer_count == 0) self.next_z = 100;
         self.syncAllLayerVisualOrder();
@@ -554,6 +595,16 @@ pub const OverlayStack = struct {
 
     /// Resume suspended layer (called by component Effect on reopen)
     pub fn reactivate(self: *OverlayStack, handle: LayerHandle) void {
+        self.reactivateWith(handle, .{});
+    }
+
+    pub const ReactivateOptions = struct {
+        /// false: show the open state at once, as with an `.none` enter transition (an overlay
+        /// whose component mounted already open is the open result, not an opening).
+        animate: bool = true,
+    };
+
+    pub fn reactivateWith(self: *OverlayStack, handle: LayerHandle, options: ReactivateOptions) void {
         self.bumpAnimGen();
         if (self.findLayer(handle)) |layer| {
             if (!layer.suspended) return;
@@ -573,26 +624,53 @@ pub const OverlayStack = struct {
             // composite/interaction flow; size/content changes before open are already invalidated
             // via
             // sizing/render dirty.
+            const animated = options.animate and layer.config.enter_transition != .none;
             if (layer.content_node) |content| {
-                setManualTransitionFlags(content, layer.config.enter_transition, layer.config.enter_transition != .none);
+                setManualTransitionFlags(content, layer.config.enter_transition, animated);
                 content.markCompositeAnimFrameDirty();
             }
             if (layer.barrier_node) |barrier| {
-                setManualTransitionFlags(barrier, layer.config.enter_transition, layer.config.enter_transition != .none);
+                setManualTransitionFlags(barrier, layer.config.enter_transition, animated);
                 barrier.markCompositeAnimFrameDirty();
             }
 
-            if (layer.config.enter_transition != .none) {
+            if (animated) {
                 layer.state = .entering;
                 layer.enter_ctrl = TransitionController.initWithTime(layer.config.enter_transition, .entering, render_engine.current_frame_time_ms);
                 layer.enter_ctrl.delay_remaining_ms = layer.config.enter_delay_ms;
             } else {
                 layer.state = .visible;
+                // No enter animation will undo what the last exit left (opacity 0, a shrunk
+                // scale, a slid-out translate): land on the settled open state now, or a layer
+                // reopened with `.none` stays invisible or off-screen.
+                settleShown(layer, self.allocator);
             }
             syncLayerHitTestVisibility(layer);
             self.syncAllLayerVisualOrder();
             logOutsideClickLayer("reactivate", layer, null);
         }
+    }
+
+    /// A layer that has not started entering shows its open state at once: its component mounted
+    /// already open (the open result, not an opening), as `reactivateWith(.{ .animate = false })`
+    /// does for a suspended layer. No-op for a suspended layer or one already past `.entering`.
+    pub fn skipInitialEnter(self: *OverlayStack, handle: LayerHandle) void {
+        self.bumpAnimGen();
+        const layer = self.findLayer(handle) orelse return;
+        if (layer.suspended or layer.state != .entering) return;
+        layer.state = .visible;
+        layer.enter_paused = false;
+        if (layer.content_node) |content| {
+            setManualTransitionFlags(content, layer.config.enter_transition, false);
+            content.markCompositeAnimFrameDirty();
+        }
+        if (layer.barrier_node) |barrier| {
+            setManualTransitionFlags(barrier, layer.config.enter_transition, false);
+            barrier.markCompositeAnimFrameDirty();
+        }
+        // A geometry hold may already have drawn the enter's hidden first frame.
+        settleShown(layer, self.allocator);
+        syncLayerHitTestVisibility(layer);
     }
 
     pub fn setEnterPaused(self: *OverlayStack, handle: LayerHandle, paused: bool, allocator: Allocator) void {
@@ -639,7 +717,7 @@ pub const OverlayStack = struct {
     /// Current topmost (skip .exiting and .suspended)
     pub fn topmost(self: *const OverlayStack) ?*const OverlayLayer {
         var best: ?*const OverlayLayer = null;
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
             if (layer.suspended) continue;
             if (layer.state == .exiting) continue;
@@ -660,6 +738,8 @@ pub const OverlayStack = struct {
 
     /// Unified Escape handling: find topmost layer with escape=true and not exiting, close it.
     /// Stop at modal (modal blocks Escape downward). Return true if consumed.
+    /// A tooltip-tier layer whose trigger is covered by another Escape layer is skipped
+    /// (`tooltipCovered`): the overlay the user works in closes first.
     pub fn handleEscape(self: *OverlayStack) bool {
         self.bumpAnimGen();
         if (self.layer_count == 0) return false;
@@ -670,7 +750,8 @@ pub const OverlayStack = struct {
         var i = count;
         while (i > 0) {
             i -= 1;
-            if (self.layers[ordered[i]]) |*layer| {
+            if (self.layers.items[ordered[i]]) |*layer| {
+                if (layerTier(layer) == .tooltip and self.tooltipCovered(layer)) continue;
                 if (layer.config.dismiss.escape) {
                     self.requestDismiss(layer);
                     return true;
@@ -682,6 +763,140 @@ pub const OverlayStack = struct {
         return false;
     }
 
+    /// Whether an open layer other than a hint (tooltip tier) hangs off `subtree`: its trigger or
+    /// anchor target is inside it (a Select / menu / popover opened from a row). Read-only. Part of
+    /// `Cx.isUserRelevant`: while such a layer is open, its focus and pointer live in the portal,
+    /// not in the subtree, yet hiding or recycling the subtree would orphan it.
+    pub fn hasOpenLayerFrom(self: *const OverlayStack, subtree: *const Node) bool {
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (layer.suspended or layer.state == .exiting or layerTier(layer) == .tooltip) continue;
+            const trigger = self.resolveTrigger(layer);
+            const anchor: ?*Node = if (layer.anchor) |a| self.resolveTrackedNode(layer.anchor_target_handle, a.target) else null;
+            for ([_]?*Node{ trigger, anchor }) |candidate| {
+                var cur: ?*const Node = candidate orelse continue;
+                while (cur) |n| : (cur = n.parent) if (n == subtree) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Ask every open layer that hangs off `subtree` to close: a layer whose trigger or anchor
+    /// target is inside it, and (transitively) a layer opened from inside the content of one of
+    /// those (a submenu of a menu opened from the subtree). For an owner about to hide or move
+    /// the subtree: its popovers, menus and hints must not stay behind pointing at a place the
+    /// subtree has left. Each layer closes the way Escape would close it (`on_dismiss_request`
+    /// when set, else its exit), whatever its `dismiss.escape`; suspended and exiting layers are
+    /// already closed. Returns how many layers were asked.
+    pub fn dismissLayersFrom(self: *OverlayStack, subtree: *Node) usize {
+        var asked: [MAX_LAYERS]bool = @splat(false);
+        var count: usize = 0;
+        var grew = true;
+        while (grew) {
+            grew = false;
+            // `requestDismiss` may run application code that pushes / removes layers: index the
+            // slots afresh on every step, never hold a layer pointer across the call.
+            var index: usize = 0;
+            while (index < self.layers.items.len and index < MAX_LAYERS) : (index += 1) {
+                if (asked[index]) continue;
+                const layer = if (self.layers.items[index]) |*l| l else continue;
+                if (layer.suspended or layer.state == .exiting) continue;
+                const trigger = self.resolveTrigger(layer);
+                const anchor: ?*Node = if (layer.anchor) |a| self.resolveTrackedNode(layer.anchor_target_handle, a.target) else null;
+                var hangs = false;
+                for ([_]?*Node{ trigger, anchor }) |candidate| {
+                    const node = candidate orelse continue;
+                    if (node.isDescendantOf(subtree)) hangs = true;
+                    if (hangs) break;
+                    for (self.layers.items, 0..) |*slot, other| {
+                        if (other >= MAX_LAYERS or !asked[other]) continue;
+                        const parent = if (slot.*) |*l| l else continue;
+                        const content = parent.content_node orelse continue;
+                        if (node.isDescendantOf(content)) hangs = true;
+                    }
+                }
+                if (!hangs) continue;
+                asked[index] = true;
+                count += 1;
+                grew = true;
+                self.requestDismiss(layer);
+            }
+        }
+        if (count != 0) self.bumpAnimGen();
+        return count;
+    }
+
+    /// Whether a tooltip-tier layer is covered for Escape: some other active, non-tooltip layer
+    /// that takes Escape (dismiss.escape, or a modal, which blocks it) sits above the tooltip's
+    /// trigger, i.e. the trigger is in base content or in a layer activated before that one.
+    /// The tooltip tier paints above every dialog, but a hint never outranks the overlay the
+    /// user works in: a confirmation opened while the pointer still rests on a hovered tab
+    /// takes the first Escape. A tooltip whose trigger is inside the topmost such layer (a
+    /// hint on a dialog button) is not covered and takes Escape itself.
+    pub fn tooltipCovered(self: *const OverlayStack, hint: *const OverlayLayer) bool {
+        const owner: ?*const OverlayLayer = if (self.resolveTrigger(hint)) |trigger| self.findLayerForNode(trigger) else null;
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (layer == hint or layer.suspended or layer.state == .exiting) continue;
+            if (layerTier(layer) == .tooltip) continue;
+            if (!layer.config.dismiss.escape and layer.config.kind != .modal) continue;
+            if (owner) |o| if (layer == o or layer.activation_order <= o.activation_order) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether a tooltip-tier layer is beneath an overlay the user works in: some other active
+    /// overlay- or dialog-tier layer was activated over the tooltip's trigger (the trigger is in
+    /// base content, or in a layer activated before that one). Such a tooltip steps aside: it
+    /// paints just below the lowest such layer (`syncAllLayerVisualOrder`) and is dismissed on the
+    /// next frame (`tickAnimations`), so a hint never covers a menu, popover or dialog opened over
+    /// its trigger (a host row's hint while that row's context menu is open). A tooltip whose
+    /// trigger is inside such a layer (a hint on a menu row) belongs to it and stays on top.
+    pub fn tooltipBeneathOverlay(self: *const OverlayStack, hint: *const OverlayLayer) bool {
+        return self.lowestCoverOf(hint) != null;
+    }
+
+    fn lowestCoverOf(self: *const OverlayStack, hint: *const OverlayLayer) ?*const OverlayLayer {
+        if (layerTier(hint) != .tooltip or hint.suspended or hint.state == .exiting) return null;
+        // Without a live trigger the tooltip's place is unknown: it keeps the tier rule.
+        const trigger = self.resolveTrigger(hint) orelse return null;
+        const owner: ?*const OverlayLayer = self.findLayerForNode(trigger);
+        var lowest: ?*const OverlayLayer = null;
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (layer == hint or layer.suspended or layer.state == .exiting) continue;
+            const tier = layerTier(layer);
+            if (tier != .overlay and tier != .dialog) continue;
+            if (layer.z_index_override != null or layer.config.z_index != null) continue;
+            if (owner) |o| if (layer == o or layer.activation_order <= o.activation_order) continue;
+            // Lowest paint order: tier first, then activation (the order z is computed in).
+            if (lowest) |current| {
+                const a = layerTier(layer).base();
+                const b = layerTier(current).base();
+                if (a > b or (a == b and layer.activation_order > current.activation_order)) continue;
+            }
+            lowest = layer;
+        }
+        return lowest;
+    }
+
+    /// `tooltipCovered` for the topmost active tooltip-tier layer. With none active (a tooltip
+    /// still inside its open delay has no layer up yet) its trigger is unknown: covered by any
+    /// active layer that takes Escape.
+    pub fn topTooltipCovered(self: *const OverlayStack) bool {
+        var top: ?*const OverlayLayer = null;
+        var any_escape_layer = false;
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (layer.suspended or layer.state == .exiting) continue;
+            if (layerTier(layer) == .tooltip) {
+                if (top == null or layer.activation_order > top.?.activation_order) top = layer;
+            } else if (layer.config.dismiss.escape or layer.config.kind == .modal) any_escape_layer = true;
+        }
+        return if (top) |hint| self.tooltipCovered(hint) else any_escape_layer;
+    }
+
     /// Unified outside-click handling: traverse top-to-bottom, check each non_modal layer if click
     /// outside. Layer pressed was determined by hit at press time (topmost layer with
     /// content/trigger
@@ -691,11 +906,11 @@ pub const OverlayStack = struct {
         const t = target orelse return null;
         if (self.layer_count == 0) return null;
         var ordered: [MAX_LAYERS]usize = undefined;
-        const count = self.collectOrderedLayerIndices(&ordered, true);
+        const count = self.collectPointerLayerIndices(&ordered);
         var i = count;
         while (i > 0) {
             i -= 1;
-            const layer = if (self.layers[ordered[i]]) |*l| l else continue;
+            const layer = if (self.layers.items[ordered[i]]) |*l| l else continue;
             if (layer.suspended) continue;
             if (layer.content_node) |content| {
                 if (t.isDescendantOf(content)) return layer.handle;
@@ -714,20 +929,64 @@ pub const OverlayStack = struct {
     /// `press_owner`: layer recorded at press (see `findPressOwner`). Stop at it; it and below
     /// are not "outside".
     pub fn handleOutsideClickOwned(self: *OverlayStack, has_new_mouse_down: bool, last_mouse_down_target: ?*Node, press_owner: ?LayerHandle) void {
+        self.handleOutsideRelease(has_new_mouse_down, last_mouse_down_target, press_owner, std.math.maxInt(u64));
+    }
+
+    /// Whether a layer shown since `mark` (`activationMark()` taken earlier) now blocks input aimed
+    /// at `node`: a layer with a barrier (what physically stops pointer and wheel below it) that
+    /// does not contain `node` — for a modal one, `allowsSemanticAction` decides, so layers opened
+    /// from inside the modal (a submenu) stay reachable. A barrier-less layer blocks nothing, as in
+    /// wheel routing. Used to end a trackpad gesture latched before such a layer was shown
+    /// (`cx_input`); runs only for latched events with such a layer present.
+    pub fn blocksSince(self: *const OverlayStack, mark: u64, node: *const Node) bool {
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (layer.suspended or layer.state == .exiting or layer.activation_order < mark) continue;
+            if (layer.config.barrier == .none) continue;
+            const reachable = if (layer.config.kind == .modal) self.allowsSemanticAction(node) else layerContains(layer, node);
+            if (!reachable) return true;
+        }
+        return false;
+    }
+
+    /// Whether `node` is in the content or barrier of a layer that is closed (suspended) or closing
+    /// (exiting): input latched to it before has lost its target (`cx_input.dispatchScroll`).
+    pub fn isNodeInClosedLayer(self: *const OverlayStack, node: *const Node) bool {
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (!(layer.suspended or layer.state == .exiting)) continue;
+            if (layerContains(layer, node)) return true;
+        }
+        return false;
+    }
+
+    /// Activation order the next activated layer gets. A press records it so that its release
+    /// dismisses only layers that were already open when the press began.
+    pub fn activationMark(self: *const OverlayStack) u64 {
+        return self.next_activation_order;
+    }
+
+    /// Outside dismissal happens when a press is released (a click), like native controls: a
+    /// click whose own handler unmounts the overlay (navigating away) removes it with its page
+    /// instead of first fading it out. `press_target` / `press_owner` describe where the press
+    /// began; layers activated at or after `opened_before` (opened by this very press) are not
+    /// dismissed by its release.
+    pub fn handleOutsideRelease(self: *OverlayStack, released: bool, press_target: ?*Node, press_owner: ?LayerHandle, opened_before: u64) void {
         self.bumpAnimGen();
-        if (!has_new_mouse_down) return;
+        if (!released) return;
+        const last_mouse_down_target = press_target;
         if (self.layer_count == 0) return;
         const target = last_mouse_down_target;
 
         var ordered: [MAX_LAYERS]usize = undefined;
-        const count = self.collectOrderedLayerIndices(&ordered, true);
+        const count = self.collectPointerLayerIndices(&ordered);
 
         // Press-owning layer no longer in active list (closed itself in click callback): pressed
         // handled inside, not outside any layer.
         if (press_owner) |owner| {
             var present = false;
             for (ordered[0..count]) |idx| {
-                if (self.layers[idx]) |*l| {
+                if (self.layers.items[idx]) |*l| {
                     if (l.handle.id == owner.id) present = true;
                 }
             }
@@ -737,7 +996,7 @@ pub const OverlayStack = struct {
         var i = count;
         while (i > 0) {
             i -= 1;
-            if (self.layers[ordered[i]]) |*layer| {
+            if (self.layers.items[ordered[i]]) |*layer| {
                 logOutsideClickLayer("inspect", layer, target);
                 if (press_owner) |owner| {
                     if (layer.handle.id == owner.id) {
@@ -748,6 +1007,7 @@ pub const OverlayStack = struct {
                 if (layer.suspended) continue;
                 if (layer.state == .exiting) continue;
                 if (layer.skip_outside_click_frame) continue;
+                if (layer.activation_order >= opened_before) continue;
 
                 // Click inside content -> don't close
                 if (layer.config.content_hit_test_visible) {
@@ -807,20 +1067,18 @@ pub const OverlayStack = struct {
         }
     }
 
-    /// mouse-down pre-dispatch: if topmost active overlay configured `.close_and_consume` and click
-    /// outside content/trigger, close it and return true, caller swallows press (and following
-    /// release),
-    /// hit thing not also triggered. Click inside layer content/trigger or topmost not consume-type
-    /// returns false, normal dispatch and renderPhase handleOutsideClick proceed.
+    /// Swallow a press outside the top interactive layer when it requests `.close_and_consume`.
+    /// The matching release dismisses that layer. A passive toast or tooltip owns hits inside its
+    /// content or trigger and leaves presses elsewhere for the layers below it.
     pub fn consumeOutsidePress(self: *OverlayStack, target: ?*Node) bool {
         self.bumpAnimGen();
         if (self.layer_count == 0) return false;
         var ordered: [MAX_LAYERS]usize = undefined;
-        const count = self.collectOrderedLayerIndices(&ordered, true);
+        const count = self.collectPointerLayerIndices(&ordered);
         var i = count;
         while (i > 0) {
             i -= 1;
-            const layer = if (self.layers[ordered[i]]) |*l| l else continue;
+            const layer = if (self.layers.items[ordered[i]]) |*l| l else continue;
             if (layer.suspended or layer.state == .exiting or layer.skip_outside_click_frame) continue;
             if (target) |t| {
                 if (layer.config.content_hit_test_visible) {
@@ -832,17 +1090,34 @@ pub const OverlayStack = struct {
                     if (t.isDescendantOf(trig)) return false;
                 }
             }
+            if (layer.config.dismiss.outside_click == .none and layer.config.barrier == .none) {
+                const tier = layerTier(layer);
+                if (tier == .toast or tier == .tooltip) continue;
+            }
             if (layer.config.dismiss.outside_click != .close_and_consume) return false;
-            logOutsideClickLayer("consume-begin-exit", layer, target);
-            self.requestDismiss(layer);
+            logOutsideClickLayer("consume-press", layer, target);
+            self.consumed_press_layer = layer.handle;
             return true;
         }
         return false;
     }
 
+    /// The release of a press `consumeOutsidePress` swallowed: dismiss the layer it was outside of
+    /// (still open and not already leaving). Also called when that release was lost and the next
+    /// press arrives.
+    pub fn commitConsumedPress(self: *OverlayStack) void {
+        self.bumpAnimGen();
+        const handle = self.consumed_press_layer orelse return;
+        self.consumed_press_layer = null;
+        const layer = self.findLayer(handle) orelse return;
+        if (layer.suspended or layer.state == .exiting) return;
+        logOutsideClickLayer("consume-begin-exit", layer, null);
+        self.requestDismiss(layer);
+    }
+
     /// Update anchor positioning before layout each frame. Geometry only, don't advance animation.
     pub fn updateAnchors(self: *OverlayStack, vp_w: f32, vp_h: f32) void {
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             if (slot.*) |*layer| {
                 if (layer.suspended) continue;
 
@@ -859,8 +1134,9 @@ pub const OverlayStack = struct {
     pub fn tickAnimations(self: *OverlayStack, now_ms: f64, dt: f32, allocator: Allocator) bool {
         self.bumpAnimGen();
         var any_animating = false;
+        self.dismissTooltipsBeneathOverlays();
 
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             if (slot.*) |*layer| {
                 if (layer.suspended) continue;
                 defer layer.skip_outside_click_frame = false;
@@ -995,7 +1271,7 @@ pub const OverlayStack = struct {
         // (hundreds
         // bytes x 256).
         var result = false;
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
             if (layer.suspended) continue;
             switch (layer.state) {
@@ -1012,10 +1288,16 @@ pub const OverlayStack = struct {
         return result;
     }
 
+    pub fn deinit(self: *OverlayStack) void {
+        self.clear();
+        self.layers.deinit(self.allocator);
+        self.layers = .empty;
+    }
+
     /// Clear all layers
     pub fn clear(self: *OverlayStack) void {
         self.bumpAnimGen();
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             slot.* = null;
         }
         self.layer_count = 0;
@@ -1027,13 +1309,16 @@ pub const OverlayStack = struct {
     pub fn findLayer(self: *OverlayStack, handle: LayerHandle) ?*OverlayLayer {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return null;
-        if (self.layers[idx]) |*layer| return layer;
+        if (self.layers.items[idx]) |*layer| return layer;
         return null;
     }
 
-    /// Find overlay layer for content node or descendants.
+    /// Find overlay layer for content node or descendants. Returns the first slot that contains it;
+    /// layers are portaled side by side, so a node belongs to one layer (were two layers ever
+    /// nested in the tree, the outer one would be returned). Hidden / exiting content is not
+    /// hit-testable, so callers starting from a hit never see a suspended layer here.
     pub fn findLayerForNode(self: *const OverlayStack, node: *Node) ?*const OverlayLayer {
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
             if (layer.content_node) |content| {
                 if (node.isDescendantOf(content)) return layer;
@@ -1049,7 +1334,7 @@ pub const OverlayStack = struct {
     /// Portaled children belong through their live trigger chain, not DOM ancestry.
     pub fn allowsSemanticAction(self: *const OverlayStack, node: *const Node) bool {
         var modal: ?*const OverlayLayer = null;
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
             const inside = layerContains(layer, node);
             if (inside and (layer.suspended or layer.state == .exiting)) return false;
@@ -1062,7 +1347,7 @@ pub const OverlayStack = struct {
         const count = self.collectOrderedLayerIndices(&ordered, true);
         var allowed: [MAX_LAYERS]bool = @splat(false);
         for (ordered[0..count], 0..) |index, position| {
-            const layer = &(self.layers[index].?);
+            const layer = &(self.layers.items[index].?);
             if (layer.handle.id == boundary.handle.id) {
                 allowed[position] = true;
                 continue;
@@ -1070,7 +1355,7 @@ pub const OverlayStack = struct {
             if (layer.activation_order <= boundary.activation_order) continue;
             const trigger = self.resolveTrigger(layer) orelse continue;
             for (ordered[0..position], 0..) |parent_index, parent_position| {
-                if (allowed[parent_position] and layerContains(&(self.layers[parent_index].?), trigger)) {
+                if (allowed[parent_position] and layerContains(&(self.layers.items[parent_index].?), trigger)) {
                     allowed[position] = true;
                     break;
                 }
@@ -1100,7 +1385,7 @@ pub const OverlayStack = struct {
     /// and inner (suspended), any suspended ancestor means not visible. Ptr comparison only
     /// (isDescendantOf walks node parent chain), no layer node dereference.
     pub fn isNodeInSuspendedLayer(self: *const OverlayStack, node: *Node) bool {
-        for (&self.layers) |*slot| {
+        for (self.layers.items) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
             if (!layer.suspended) continue;
             if (layer.content_node) |content| {
@@ -1114,7 +1399,7 @@ pub const OverlayStack = struct {
     }
 
     fn findLayerIndex(self: *const OverlayStack, handle: LayerHandle) ?usize {
-        for (&self.layers, 0..) |*slot, i| {
+        for (self.layers.items, 0..) |*slot, i| {
             if (slot.*) |*layer| {
                 if (layer.handle.id == handle.id) return i;
             }
@@ -1123,7 +1408,7 @@ pub const OverlayStack = struct {
     }
 
     fn findEmptySlot(self: *const OverlayStack) ?usize {
-        for (&self.layers, 0..) |*slot, i| {
+        for (self.layers.items, 0..) |*slot, i| {
             if (slot.* == null) return i;
         }
         return null;
@@ -1138,14 +1423,14 @@ pub const OverlayStack = struct {
 
     fn collectOrderedLayerIndices(self: *const OverlayStack, indices: *[MAX_LAYERS]usize, only_active: bool) usize {
         var count: usize = 0;
-        for (&self.layers, 0..) |*slot, idx| {
+        for (self.layers.items, 0..) |*slot, idx| {
             const layer = if (slot.*) |*l| l else continue;
             if (only_active and (layer.suspended or layer.state == .exiting)) continue;
 
             var insert_at = count;
             while (insert_at > 0) : (insert_at -= 1) {
                 const prev_idx = indices[insert_at - 1];
-                const prev_layer = if (self.layers[prev_idx]) |*p| p else break;
+                const prev_layer = if (self.layers.items[prev_idx]) |*p| p else break;
                 if (prev_layer.activation_order <= layer.activation_order) break;
                 indices[insert_at] = indices[insert_at - 1];
             }
@@ -1153,6 +1438,25 @@ pub const OverlayStack = struct {
             count += 1;
         }
         return count;
+    }
+
+    /// Keep activation order for equal z values. Portaled overlay roots carry the paint order,
+    /// including tier, inherited parent elevation, and explicit overrides.
+    fn collectPointerLayerIndices(self: *const OverlayStack, indices: *[MAX_LAYERS]usize) usize {
+        const count = self.collectOrderedLayerIndices(indices, true);
+        std.mem.sort(usize, indices[0..count], self, struct {
+            fn lessThan(stack: *const OverlayStack, left: usize, right: usize) bool {
+                return pointerLayerZ(&stack.layers.items[left].?) < pointerLayerZ(&stack.layers.items[right].?);
+            }
+        }.lessThan);
+        return count;
+    }
+
+    fn pointerLayerZ(layer: *const OverlayLayer) i16 {
+        if (layer.content_node orelse layer.barrier_node) |node| {
+            if (node.style.ext) |ext| return ext.z_index;
+        }
+        return layer.z_index_override orelse layerTier(layer).base();
     }
 
     fn layerTier(layer: *const OverlayLayer) StackTier {
@@ -1170,8 +1474,21 @@ pub const OverlayStack = struct {
         return overlay_layer_refs.resolveTrackedNode(self.node_registry, handle, cached);
     }
 
-    fn resolveTrigger(self: *const OverlayStack, layer: *const OverlayLayer) ?*Node {
+    /// The layer's trigger if it is still alive (generation-checked, see overlay_layer_refs), else
+    /// null. The trigger lives in the caller's subtree and may be freed while the layer is still
+    /// in the stack: read it only through here, never through `layer.trigger_node`.
+    pub fn resolveTrigger(self: *const OverlayStack, layer: *const OverlayLayer) ?*Node {
         return self.resolveTrackedNode(layer.trigger_handle, layer.trigger_node);
+    }
+
+    /// Re-establish the identity of a layer's trigger that its owner knows to be alive. A
+    /// retained detach (`Cx.detachChildRetained`) unregisters the subtree, which retires the
+    /// handle taken at push although the node survives to be attached again; only an owner that
+    /// tracks the trigger's lifetime itself (e.g. through its scope binding) may call this.
+    pub fn retrackTrigger(self: *OverlayStack, handle: LayerHandle, trigger: *Node) void {
+        const layer = self.findLayer(handle) orelse return;
+        if (layer.trigger_node != trigger) return;
+        layer.trigger_handle = self.trackNode(trigger);
     }
 
     pub fn setAnchor(self: *OverlayStack, handle: LayerHandle, anchor: ?AnchorConfig) void {
@@ -1189,7 +1506,7 @@ pub const OverlayStack = struct {
     fn nestedParentZ(self: *const OverlayStack, trigger: *Node, ordered: []const usize, computed: *const [MAX_LAYERS]i16, upto: usize) ?i16 {
         var best: ?i16 = null;
         for (ordered[0..upto]) |idx| {
-            const parent = &(self.layers[idx].?);
+            const parent = &(self.layers.items[idx].?);
             const content = parent.content_node orelse continue;
             const inside = trigger.isDescendantOf(content) or
                 if (parent.barrier_node) |b| trigger.isDescendantOf(b) else false;
@@ -1215,7 +1532,7 @@ pub const OverlayStack = struct {
         // (tooltip always topmost semantically).
         var active_max_below_toast: i16 = 0;
         for (ordered[0..count], 0..) |idx, pos| {
-            if (self.layers[idx]) |*layer| {
+            if (self.layers.items[idx]) |*layer| {
                 const base_z = layer.z_index_override orelse blk: {
                     const tier = layerTier(layer);
                     const seq = &tier_seq[@backingInt(tier)];
@@ -1247,6 +1564,33 @@ pub const OverlayStack = struct {
                 }
             }
         }
+        // A tooltip beneath an overlay opened over its trigger paints just below that overlay
+        // until it closes (`tooltipBeneathOverlay`).
+        for (ordered[0..count]) |idx| {
+            const layer = if (self.layers.items[idx]) |*l| l else continue;
+            if (layer.z_index_override != null) continue;
+            const cover = self.lowestCoverOf(layer) orelse continue;
+            const cover_idx = self.findLayerIndex(cover.handle) orelse continue;
+            if (layer.content_node) |content| writeNodeZIndex(content, computed[cover_idx] -| 1);
+        }
+    }
+
+    /// A tooltip beneath an overlay opened over its trigger closes (through its component when
+    /// it has a dismiss request, like Esc / outside click). Runs once per frame.
+    fn dismissTooltipsBeneathOverlays(self: *OverlayStack) void {
+        var pending: [MAX_LAYERS]LayerHandle = undefined;
+        var count: usize = 0;
+        for (self.layers.items) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            if (self.tooltipBeneathOverlay(layer) and count < pending.len) {
+                pending[count] = layer.handle;
+                count += 1;
+            }
+        }
+        // A dismiss request may close other layers: look each one up again.
+        for (pending[0..count]) |handle| if (self.findLayer(handle)) |layer| {
+            if (self.tooltipBeneathOverlay(layer)) self.requestDismiss(layer);
+        };
     }
 
     fn syncLayerHitTestVisibility(layer: *OverlayLayer) void {
@@ -1308,6 +1652,28 @@ fn holdEnterUntilGeometryStable(layer: *OverlayLayer, allocator: Allocator) bool
 // transitionAffectsOpacity / transitionAffectsTransform / layerNeedsCompositedGroup extracted to
 // overlay_transition.zig (header re-export).
 
+/// Land a layer on its settled open state without an enter animation. Both controllers are
+/// driven to their fully shown end through `apply`, so this undoes exactly what the last exit
+/// wrote (and what an enter cut short by an instant `.none` exit left) with the transitions' own
+/// definition of shown, then lifts commitExit's direct hide as the end of an animated enter does.
+fn settleShown(layer: *OverlayLayer, allocator: Allocator) void {
+    const enter = layer.enter_ctrl.shown();
+    const exit = layer.exit_ctrl.shown();
+    if (layer.content_node) |content| {
+        // `.dropdown` moves its translate by the change from the node's current opacity, so it
+        // must see the hidden opacity: let it go first, before the other controller lifts it.
+        const enter_first = layer.config.enter_transition.anchorSlidePx() != 0;
+        (if (enter_first) enter else exit).apply(content, allocator);
+        (if (enter_first) exit else enter).apply(content, allocator);
+        content.setOpacityRaw(1.0);
+        content.markCompositeAnimFrameDirty();
+    }
+    if (layer.barrier_node) |barrier| {
+        barrier.setOpacityRaw(enter.currentOpacity());
+        barrier.markCompositeAnimFrameDirty();
+    }
+}
+
 fn setManualTransitionFlags(node: *Node, transition: Transition, active: bool) void {
     const next_opacity = active and transitionAffectsOpacity(transition);
     const next_transform = active and transitionAffectsTransform(transition);
@@ -1337,6 +1703,7 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
     if (config.barrier != .none) {
         const color = switch (config.barrier) {
             .color => |c| c,
+            .theme_overlay => t.tokens.color.overlay,
             .none => unreachable,
         };
         barrier_node = try box(cx, .{
@@ -1356,7 +1723,16 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         // says "clicked outside" -> wrong close. With pointer role backdrop blocks all clicks
         // (modal
         // semantics: block background interaction), blank click dismisses.
+        // The wheel over the barrier is contained by the layer (cx_input.dispatchScroll); no
+        // scroll role, so the barrier never becomes a scroll owner that swallows it unreported.
         b_ext.hit_roles = .{ .pointer = true };
+        // Theme replay rewrites only the color: components hide a closed barrier by writing its
+        // size directly, which a whole-style declaration replay would undo.
+        if (config.barrier == .theme_overlay) barrier_node.?.meta.per_frame.hooks.on_theme = struct {
+            fn hook(n: *Node, tokens: *const core.ThemeTokens, _: Allocator) void {
+                n.setBackgroundRaw(tokens.tokens.color.overlay);
+            }
+        }.hook;
         // P6.2: barrier no avoid_opacity_layer; settle children-drop + cache self-contain
         // fixed, nested surface (barrier surface inside dialog surface) engine general rules
         // handle correctly; opacity<0.999 engine auto surface, rest no overhead.
@@ -1547,7 +1923,8 @@ fn writeNodeZIndex(node: *Node, z_index: i16) void {
 // ========== tests ==========
 
 test "OverlayStack: push and z-index monotonic" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const h1 = try stack.push(.{ .kind = .modal });
     const h2 = try stack.push(.{ .kind = .non_modal });
@@ -1562,7 +1939,8 @@ test "OverlayStack: stale trigger and anchor pointers require live handles" {
     const allocator = std.testing.allocator;
     var registry = core.NodeRegistry.init(allocator);
     defer registry.deinit();
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     stack.setRegistry(&registry);
 
     const node = try Node.create(allocator, 92_001, .button, .{});
@@ -1588,7 +1966,8 @@ test "OverlayStack: commitExit tolerates synchronous dismiss disposal" {
     var content_alive = true;
     defer if (content_alive) content.destroy(allocator);
 
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     const handle = try stack.push(.{
         .kind = .non_modal,
         .exit_transition = .none,
@@ -1618,7 +1997,8 @@ test "OverlayStack: commitExit tolerates synchronous dismiss disposal" {
 }
 
 test "OverlayStack: exhausted z-index saturates and resets without trapping" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     stack.next_z = std.math.maxInt(i16) - 1;
 
     const high = try stack.push(.{ .kind = .non_modal });
@@ -1634,7 +2014,8 @@ test "OverlayStack: exhausted z-index saturates and resets without trapping" {
 
 test "OverlayStack: bindFloatingContent updates layer and visual z-index" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const content = try Node.create(allocator, 1, .box, .{ .width = .{ .px = 40 }, .height = .{ .px = 24 } });
@@ -1649,7 +2030,8 @@ test "OverlayStack: bindFloatingContent updates layer and visual z-index" {
 }
 
 test "OverlayStack: beginExit with no exit transition suspends layer" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const h1 = try stack.push(.{ .kind = .non_modal, .exit_transition = .none });
     try std.testing.expectEqual(@as(u8, 1), stack.layer_count);
@@ -1664,7 +2046,8 @@ test "OverlayStack: beginExit with no exit transition suspends layer" {
 }
 
 test "OverlayStack: handleEscape closes topmost" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     _ = try stack.push(.{ .kind = .modal, .dismiss = .{ .escape = true } });
     const h2 = try stack.push(.{ .kind = .non_modal, .dismiss = .{ .escape = true } });
@@ -1683,8 +2066,77 @@ test "OverlayStack: handleEscape closes topmost" {
     }
 }
 
+test "OverlayStack: dismissLayersFrom closes the layers hanging off a subtree, and their own children, and nothing else" {
+    const allocator = std.testing.allocator;
+    var registry = core.NodeRegistry.init(allocator);
+    defer registry.deinit();
+    var stack = OverlayStack{ .allocator = allocator };
+    defer stack.deinit();
+    stack.setRegistry(&registry);
+
+    const root = try Node.create(allocator, 93_000, .box, .{});
+    defer root.destroy(allocator);
+    const surface = try Node.create(allocator, 93_001, .box, .{});
+    const button = try Node.create(allocator, 93_002, .button, .{});
+    const elsewhere = try Node.create(allocator, 93_003, .button, .{});
+    const menu_content = try Node.create(allocator, 93_004, .box, .{});
+    const menu_row = try Node.create(allocator, 93_005, .button, .{});
+    try root.appendChild(allocator, surface);
+    try surface.appendChild(allocator, button);
+    try root.appendChild(allocator, elsewhere);
+    try root.appendChild(allocator, menu_content);
+    try menu_content.appendChild(allocator, menu_row);
+    try registry.rebuild(root);
+
+    // From the surface: a menu (Escape off: still closed) and a layer only anchored there.
+    const menu = try stack.push(.{ .kind = .non_modal, .trigger_node = button, .exit_transition = .none, .dismiss = .{ .escape = false } });
+    stack.findLayer(menu).?.content_node = menu_content;
+    const anchored = try stack.push(.{ .kind = .non_modal, .exit_transition = .none });
+    stack.setAnchor(anchored, .{ .target = button });
+    // A submenu opened from a row of that menu (its trigger is in the menu's content, not in the surface).
+    const submenu = try stack.push(.{ .kind = .non_modal, .trigger_node = menu_row, .exit_transition = .none });
+    // Unrelated: opened from elsewhere, and one without a trigger.
+    const other = try stack.push(.{ .kind = .non_modal, .trigger_node = elsewhere, .exit_transition = .none });
+    const loose = try stack.push(.{ .kind = .modal, .exit_transition = .none });
+
+    try std.testing.expectEqual(@as(usize, 3), stack.dismissLayersFrom(surface));
+    for ([_]LayerHandle{ menu, anchored, submenu }) |h| try std.testing.expect(stack.findLayer(h) == null or stack.findLayer(h).?.suspended);
+    for ([_]LayerHandle{ other, loose }) |h| {
+        const layer = stack.findLayer(h).?;
+        try std.testing.expect(!layer.suspended and layer.state != .exiting);
+    }
+    // Nothing left hanging: a second call asks nobody.
+    try std.testing.expectEqual(@as(usize, 0), stack.dismissLayersFrom(surface));
+}
+
+test "OverlayStack: dismissLayersFrom asks through on_dismiss_request when the layer has one" {
+    const allocator = std.testing.allocator;
+    var registry = core.NodeRegistry.init(allocator);
+    defer registry.deinit();
+    var stack = OverlayStack{ .allocator = allocator };
+    defer stack.deinit();
+    stack.setRegistry(&registry);
+    const surface = try Node.create(allocator, 93_101, .box, .{});
+    defer surface.destroy(allocator);
+    try registry.rebuild(surface);
+    const Ask = struct {
+        var count: usize = 0;
+        fn run(_: *anyopaque) void {
+            count += 1;
+        }
+    };
+    Ask.count = 0;
+    var marker: u8 = 0;
+    const handle = try stack.push(.{ .kind = .non_modal, .trigger_node = surface, .on_dismiss_request = .{ .callback = Ask.run, .context = @ptrCast(&marker) } });
+    try std.testing.expectEqual(@as(usize, 1), stack.dismissLayersFrom(surface));
+    try std.testing.expectEqual(@as(usize, 1), Ask.count);
+    // The owner decides: the layer does not exit by itself.
+    try std.testing.expect(stack.findLayer(handle).?.state != .exiting);
+}
+
 test "OverlayStack: handleEscape blocked by modal" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     _ = try stack.push(.{ .kind = .non_modal, .dismiss = .{ .escape = true } });
     _ = try stack.push(.{ .kind = .modal, .dismiss = .{ .escape = false } });
@@ -1697,7 +2149,8 @@ test "OverlayStack: handleEscape blocked by modal" {
 }
 
 test "OverlayStack: isTopmost" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const h1 = try stack.push(.{ .kind = .modal });
     try std.testing.expect(stack.isTopmost(h1));
@@ -1708,7 +2161,8 @@ test "OverlayStack: isTopmost" {
 }
 
 test "OverlayStack: mutual exclusion group" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const h1 = try stack.push(.{ .kind = .non_modal, .group = "menu" });
     try std.testing.expectEqual(@as(u8, 1), stack.layer_count);
@@ -1730,7 +2184,8 @@ test "OverlayStack: mutual exclusion group" {
 // enter/exit / none instant / enter delay / seedFromProgress).
 
 test "OverlayStack: beginExit with exit transition stays in exiting state" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var test_time: f64 = 0;
 
     const h1 = try stack.push(.{
@@ -1767,7 +2222,8 @@ test "OverlayStack: beginExit with exit transition stays in exiting state" {
 
 test "OverlayStack: reactivate promotes reopened layer to topmost and updates z-order" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const h1 = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const h2 = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
@@ -1792,7 +2248,8 @@ test "OverlayStack: reactivate promotes reopened layer to topmost and updates z-
 
 test "OverlayStack: tooltip tier 恒在 dialog 之上（无关打开顺序）" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     // tooltip first, dialog later: pure sequence would rank dialog top, tier baseline must win.
     const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .enter_transition = .none, .exit_transition = .none });
@@ -1811,7 +2268,8 @@ test "OverlayStack: tooltip tier 恒在 dialog 之上（无关打开顺序）" {
 
 test "OverlayStack: 嵌套继承 —— dialog content 里的 trigger 开 popover 压过 dialog" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const dlg = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none });
     const dlg_content = try Node.create(allocator, 711, .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 } });
@@ -1838,7 +2296,8 @@ test "OverlayStack: 嵌套继承 —— dialog content 里的 trigger 开 popove
 
 test "OverlayStack: 后开的 dialog 压过此前活动的 popover（Top Layer FIFO），但压不过 tooltip" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     // Open tooltip and popover first, then modal without trigger_node (e.g. Modal from popover
     // content, Modal component doesn't pass trigger).
@@ -1861,9 +2320,63 @@ test "OverlayStack: 后开的 dialog 压过此前活动的 popover（Top Layer F
     try std.testing.expect(tip_n.style.z_index() > dlg_n.style.z_index());
 }
 
+test "OverlayStack: Escape skips a tooltip whose trigger is under a later dialog, not one whose trigger is inside it" {
+    const allocator = std.testing.allocator;
+    const closing = struct {
+        fn f(layer: *const OverlayLayer) bool {
+            return layer.suspended or layer.state == .exiting;
+        }
+    }.f;
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
+
+    // Base-content trigger (a hovered tab) with its hint up, then a modal opens.
+    const tab = try Node.create(allocator, 731, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 24 } });
+    defer tab.destroy(allocator);
+    const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .trigger_node = tab, .enter_transition = .none, .exit_transition = .none });
+    const tip_n = try Node.create(allocator, 732, .box, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } });
+    defer tip_n.destroy(allocator);
+    stack.bindFloatingContent(allocator, tip, tip_n);
+    try std.testing.expect(!stack.topTooltipCovered());
+    const dlg = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none });
+    const dlg_n = try Node.create(allocator, 733, .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 120 } });
+    defer dlg_n.destroy(allocator);
+    const button = try Node.create(allocator, 734, .button, .{ .width = .{ .px = 80 }, .height = .{ .px = 24 } });
+    try dlg_n.appendChild(allocator, button);
+    stack.bindFloatingContent(allocator, dlg, dlg_n);
+
+    // The hint steps aside for the dialog opened over its trigger (`tooltipBeneathOverlay`): it
+    // paints below the dialog until a frame dismisses it (this test never ticks).
+    try std.testing.expect(tip_n.style.z_index() < dlg_n.style.z_index());
+    try std.testing.expect(stack.topTooltipCovered());
+    // The hint re-activates under the dialog (its hover delay ran out after the dialog opened):
+    // later in activation order, its trigger is still below the dialog.
+    stack.commitExit(tip);
+    stack.reactivate(tip);
+    try std.testing.expect(stack.findLayer(tip).?.activation_order > stack.findLayer(dlg).?.activation_order);
+    try std.testing.expect(stack.topTooltipCovered());
+    try std.testing.expect(stack.handleEscape());
+    try std.testing.expect(closing(stack.findLayer(dlg).?));
+    try std.testing.expect(!closing(stack.findLayer(tip).?));
+    if (!stack.findLayer(dlg).?.suspended) stack.commitExit(dlg);
+    try std.testing.expect(!stack.topTooltipCovered());
+
+    // A hint on the dialog's own button, opened after the dialog: not covered.
+    stack.reactivate(dlg);
+    const inner = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .trigger_node = button, .enter_transition = .none, .exit_transition = .none });
+    const inner_n = try Node.create(allocator, 735, .box, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } });
+    defer inner_n.destroy(allocator);
+    stack.bindFloatingContent(allocator, inner, inner_n);
+    try std.testing.expect(!stack.topTooltipCovered());
+    try std.testing.expect(stack.handleEscape());
+    try std.testing.expect(closing(stack.findLayer(inner).?));
+    try std.testing.expect(!closing(stack.findLayer(dlg).?));
+}
+
 test "OverlayStack: reactivate preserves prewarmed descendant render caches" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const content = try Node.create(allocator, 310, .box, .{ .width = .{ .px = 120 }, .height = .{ .px = 60 } });
@@ -1897,7 +2410,8 @@ test "OverlayStack: reactivate preserves prewarmed descendant render caches" {
 
 test "OverlayStack: findLayerForNode matches overlay descendants" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const content = try Node.create(allocator, 401, .box, .{ .width = .{ .px = 120 }, .height = .{ .px = 60 } });
@@ -1912,7 +2426,8 @@ test "OverlayStack: findLayerForNode matches overlay descendants" {
 
 test "OverlayStack: bound content gains pointer role without losing inspect" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const content = try Node.create(allocator, 411, .box, .{ .width = .{ .px = 120 }, .height = .{ .px = 60 } });
@@ -1929,7 +2444,8 @@ test "OverlayStack: bound content gains pointer role without losing inspect" {
 
 test "OverlayStack: exiting overlay stops intercepting hits before commitExit" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var registry = core.NodeRegistry.init(allocator);
     defer registry.deinit();
     var runtime = core.InteractionIndex.init(allocator);
@@ -1971,7 +2487,8 @@ test "OverlayStack: exiting overlay stops intercepting hits before commitExit" {
 }
 
 test "OverlayStack: entering state transitions to visible" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var test_time: f64 = 0;
     render_engine.current_frame_time_ms = 0;
 
@@ -2003,7 +2520,8 @@ test "OverlayStack: entering state transitions to visible" {
 
 test "OverlayStack: enter transition pending first tick preserves initial frame" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var test_time: f64 = 0;
     render_engine.current_frame_time_ms = 0;
 
@@ -2058,11 +2576,117 @@ test "OverlayStack: enter transition pending first tick preserves initial frame"
     try std.testing.expect(content.getOpacity() > 0.0);
 }
 
+/// Runs `layer`'s exit to its end (suspended), the way a close does.
+fn finishExitForTest(stack: *OverlayStack, handle: LayerHandle, time: *f64, allocator: Allocator) !void {
+    stack.beginExit(handle);
+    var frames: usize = 0;
+    while (frames < 200 and !stack.findLayer(handle).?.suspended) : (frames += 1) {
+        time.* += 16.0;
+        render_engine.current_frame_time_ms = time.*;
+        _ = stack.tick(time.*, 0.016, 1920, 1080, allocator);
+    }
+    try std.testing.expect(stack.findLayer(handle).?.suspended);
+}
+
+test "OverlayStack: a layer reopened without an enter transition is shown, not left as the exit ended it" {
+    // A sheet remounted while open (language switch) carries enter `.none`; after an animated
+    // close it must reopen exactly at rest: opaque, unscaled, not slid out, no dropdown offset.
+    const allocator = std.testing.allocator;
+    const rest = [2]f32{ 12, 34 };
+    for (std.enums.values(Transition)) |exit| {
+        if (exit != .none) {
+            var stack = OverlayStack{ .allocator = std.testing.allocator };
+            defer stack.deinit();
+            var time: f64 = 0;
+            render_engine.current_frame_time_ms = 0;
+            const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = exit });
+            const content = try Node.create(allocator, 303, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } });
+            defer content.destroy(allocator);
+            content.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 40 });
+            stack.bindFloatingContent(allocator, handle, content);
+            content.setOpacityRaw(1.0);
+            // A host-positioned dropdown (Popover): rest translate plus the slide tracking opacity.
+            const slides = exit == .slide_bottom or exit == .slide_right or exit == .slide_left or exit == .slide_top;
+            if (!slides) {
+                content.style.translate_x = rest[0];
+                content.style.translate_y = rest[1];
+            }
+            stack.findLayer(handle).?.exit_ctrl.slide = .{ 0, -6 };
+
+            try finishExitForTest(&stack, handle, &time, allocator);
+            try std.testing.expect(content.getOpacity() < 0.01);
+
+            stack.reactivateWith(handle, .{ .animate = false });
+            try std.testing.expectEqual(LayerState.visible, stack.findLayer(handle).?.state);
+            try std.testing.expectEqual(@as(f32, 1.0), content.getOpacity());
+            try std.testing.expectEqual(@as(f32, 1.0), content.style.scale_x());
+            try std.testing.expectEqual(@as(f32, 1.0), content.style.scale_y());
+            const want = if (slides) [2]f32{ 0, 0 } else rest;
+            try std.testing.expectApproxEqAbs(want[0], content.style.translate_x, 0.001);
+            try std.testing.expectApproxEqAbs(want[1], content.style.translate_y, 0.001);
+            if (content.style.ext) |ext| {
+                try std.testing.expectEqual([2]f32{ 0, 0 }, ext.motion_offset);
+            }
+        }
+    }
+}
+
+test "OverlayStack: an enter cut short by an instant close reopens shown" {
+    // Enter `.scale_fade` interrupted by a `.none` exit (commits at once): no exit ran, so the
+    // half-entered opacity and scale are what an instant reopen must undo.
+    const allocator = std.testing.allocator;
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
+    render_engine.current_frame_time_ms = 0;
+    const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .scale_fade, .exit_transition = .none });
+    const content = try Node.create(allocator, 304, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } });
+    defer content.destroy(allocator);
+    content.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 40 });
+    stack.bindFloatingContent(allocator, handle, content);
+    var time: f64 = 0;
+    for (0..4) |_| {
+        time += 16.0;
+        render_engine.current_frame_time_ms = time;
+        _ = stack.tick(time, 0.016, 1920, 1080, allocator);
+    }
+    try std.testing.expect(content.style.scale_x() < 1.0);
+    stack.beginExit(handle);
+    try std.testing.expect(stack.findLayer(handle).?.suspended);
+
+    stack.reactivateWith(handle, .{ .animate = false });
+    try std.testing.expectEqual(@as(f32, 1.0), content.getOpacity());
+    try std.testing.expectEqual(@as(f32, 1.0), content.style.scale_x());
+
+    // A normal reopen still animates from the hidden state.
+    stack.beginExit(handle);
+    stack.reactivate(handle);
+    try std.testing.expectEqual(LayerState.entering, stack.findLayer(handle).?.state);
+    time += 16.0;
+    render_engine.current_frame_time_ms = time;
+    _ = stack.tick(time, 0.016, 1920, 1080, allocator);
+    try std.testing.expect(content.getOpacity() < 1.0);
+    try std.testing.expect(content.style.scale_x() < 1.0);
+}
+
 test "OverlayStack: exit transition holds visible frame before fading" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var test_time: f64 = 0;
-    render_engine.current_frame_time_ms = 0;
+    const saved_clock = render_engine.saveFrameClock();
+    const saved_reduced_motion = render_engine.current_reduced_motion;
+    defer {
+        render_engine.restoreFrameClock(saved_clock);
+        render_engine.current_reduced_motion = saved_reduced_motion;
+    }
+    // The first transition tick consumes the frame clock's dt, not tick()'s
+    // dt argument. Isolate this 16 ms frame from preceding tests' clocks.
+    render_engine.setFrameClock(.{
+        .io = std.testing.io,
+        .time_ms = 0,
+        .dt_ms = 16,
+        .dt_seconds = 0.016,
+    });
 
     const handle = try stack.push(.{
         .kind = .non_modal,
@@ -2099,7 +2723,8 @@ test "OverlayStack: exit transition holds visible frame before fading" {
 
 test "OverlayStack: reactivated layer ignores opener outside-click for one frame" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     var test_time: f64 = 0;
 
     const handle = try stack.push(.{
@@ -2132,9 +2757,40 @@ test "OverlayStack: reactivated layer ignores opener outside-click for one frame
     try std.testing.expectEqual(LayerState.exiting, stack.findLayer(handle).?.state);
 }
 
+test "OverlayStack: a press on an older toast stays above a newer popup" {
+    const allocator = std.testing.allocator;
+    for ([_]OutsideClickBehavior{ .close, .close_and_consume }) |outside_click| {
+        var stack = OverlayStack{ .allocator = allocator };
+        defer stack.deinit();
+        const toast = try stack.push(.{ .kind = .toast, .dismiss = .{ .outside_click = .none, .escape = false }, .enter_transition = .none, .exit_transition = .none });
+        const toast_content = try Node.create(allocator, 601, .box, .{});
+        defer toast_content.destroy(allocator);
+        stack.bindFloatingContent(allocator, toast, toast_content);
+        const popup = try stack.push(.{ .kind = .non_modal, .dismiss = .{ .outside_click = outside_click }, .enter_transition = .none, .exit_transition = .fade });
+        const popup_content = try Node.create(allocator, 602, .box, .{});
+        defer popup_content.destroy(allocator);
+        stack.bindFloatingContent(allocator, popup, popup_content);
+        const outside = try Node.create(allocator, 603, .button, .{});
+        defer outside.destroy(allocator);
+
+        try std.testing.expect(toast_content.style.ext.?.z_index > popup_content.style.ext.?.z_index);
+        try std.testing.expect(!stack.consumeOutsidePress(toast_content));
+        const owner = stack.findPressOwner(toast_content) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(toast.id, owner.id);
+        stack.handleOutsideRelease(true, toast_content, owner, stack.activationMark());
+        try std.testing.expectEqual(LayerState.visible, stack.findLayer(popup).?.state);
+
+        const consumed = stack.consumeOutsidePress(outside);
+        try std.testing.expectEqual(outside_click == .close_and_consume, consumed);
+        if (consumed) stack.commitConsumedPress() else stack.handleOutsideRelease(true, outside, null, stack.activationMark());
+        try std.testing.expectEqual(LayerState.exiting, stack.findLayer(popup).?.state);
+    }
+}
+
 test "OverlayStack: non-hit-test overlay content does not block outside-click dismissal below" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const modal_like = try stack.push(.{
         .kind = .non_modal,
@@ -2166,7 +2822,8 @@ test "OverlayStack: non-hit-test overlay content does not block outside-click di
 
 test "OverlayStack: null hit target still counts as outside click" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     const handle = try stack.push(.{
         .kind = .non_modal,
@@ -2183,7 +2840,8 @@ test "OverlayStack: null hit target still counts as outside click" {
 }
 
 test "OverlayStack: clear" {
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
 
     _ = try stack.push(.{ .kind = .modal });
     _ = try stack.push(.{ .kind = .non_modal });
@@ -2204,11 +2862,13 @@ test "OverlayStack: clear" {
 test {
     _ = @import("overlay_transition.zig");
     _ = @import("overlay_layer_refs.zig");
+    _ = @import("overlay_within.zig");
 }
 
 test "OverlayStack: 对话框语义归 layer 所有，多次重绑不丢失、不错挂、不清节点固有语义" {
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     const dialog_semantics: A11yProps = .{ .role = .dialog, .label = "Settings", .modal = true };
     const handle = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none, .a11y = dialog_semantics });
 
@@ -2259,7 +2919,8 @@ test "OverlayStack: 对话框语义归 layer 所有，多次重绑不丢失、�
 
 test "OverlayStack: semantic actions respect modal and portaled trigger chains" {
     const a = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     const background = try Node.create(a, 500, .button, .{});
     defer background.destroy(a);
     const modal = try Node.create(a, 501, .box, .{});
@@ -2305,7 +2966,8 @@ test "OverlayStack: slow clean geometry releases without extra GPU frame holds" 
     const previous_time = render_engine.current_frame_time_ms;
     defer render_engine.current_frame_time_ms = previous_time;
     const allocator = std.testing.allocator;
-    var stack = OverlayStack{};
+    var stack = OverlayStack{ .allocator = std.testing.allocator };
+    defer stack.deinit();
     render_engine.current_frame_time_ms = 0;
     const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .fade, .exit_transition = .none });
     const content = try Node.create(allocator, 390, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } });
@@ -2330,4 +2992,75 @@ test "OverlayStack: slow clean geometry releases without extra GPU frame holds" 
     try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // size changed
     render_engine.current_frame_time_ms = 550;
     try std.testing.expect(!holdEnterUntilGeometryStable(layer, allocator));
+}
+
+test "OverlayStack: a tooltip steps aside for an overlay opened over its trigger (below it, then dismissed)" {
+    const allocator = std.testing.allocator;
+    var stack = OverlayStack{ .allocator = allocator };
+    defer stack.deinit();
+    const row = try Node.create(allocator, 10, .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 30 } });
+    defer row.destroy(allocator);
+    const tip_content = try Node.create(allocator, 11, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 20 } });
+    defer tip_content.destroy(allocator);
+    const menu_content = try Node.create(allocator, 12, .box, .{ .width = .{ .px = 160 }, .height = .{ .px = 90 } });
+    defer menu_content.destroy(allocator);
+    const menu_row = try Node.create(allocator, 13, .box, .{ .width = .{ .px = 150 }, .height = .{ .px = 28 } });
+    try menu_content.appendChild(allocator, menu_row);
+    const inner_tip_content = try Node.create(allocator, 14, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 20 } });
+    defer inner_tip_content.destroy(allocator);
+
+    const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .trigger_node = row, .enter_transition = .none, .exit_transition = .none });
+    stack.bindFloatingContent(allocator, tip, tip_content);
+    // Alone the tooltip is the topmost tier.
+    try std.testing.expect(!stack.tooltipBeneathOverlay(stack.findLayer(tip).?));
+    _ = stack.tickAnimations(0, 0.016, allocator);
+    try std.testing.expect(!stack.findLayer(tip).?.suspended);
+
+    // A context menu opens over the row while its hint is up.
+    const menu = try stack.push(.{ .kind = .non_modal, .trigger_node = row, .enter_transition = .none, .exit_transition = .none });
+    stack.bindFloatingContent(allocator, menu, menu_content);
+    try std.testing.expect(stack.tooltipBeneathOverlay(stack.findLayer(tip).?));
+    // Same frame: the hint already paints below the menu.
+    try std.testing.expect(tip_content.style.z_index() < menu_content.style.z_index());
+    // A hint whose trigger is a menu row belongs to the menu and stays above it.
+    const inner = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .trigger_node = menu_row, .enter_transition = .none, .exit_transition = .none });
+    stack.bindFloatingContent(allocator, inner, inner_tip_content);
+    try std.testing.expect(!stack.tooltipBeneathOverlay(stack.findLayer(inner).?));
+    try std.testing.expect(inner_tip_content.style.z_index() > menu_content.style.z_index());
+    // Next frame: the covered hint closes; the menu and the menu row's hint stay.
+    _ = stack.tickAnimations(16, 0.016, allocator);
+    try std.testing.expect(stack.findLayer(tip).?.suspended);
+    try std.testing.expect(!stack.findLayer(menu).?.suspended);
+    try std.testing.expect(!stack.findLayer(inner).?.suspended);
+
+    // With the menu closed the row's hint may show again on top (the default rule).
+    stack.commitExit(inner);
+    stack.commitExit(menu);
+    stack.reactivate(tip);
+    try std.testing.expect(!stack.tooltipBeneathOverlay(stack.findLayer(tip).?));
+    _ = stack.tickAnimations(32, 0.016, allocator);
+    try std.testing.expect(!stack.findLayer(tip).?.suspended);
+    try std.testing.expect(tip_content.style.z_index() > menu_content.style.z_index());
+
+    // A hint that shows while the menu is already open is beneath it at once and closes.
+    stack.reactivate(menu);
+    stack.commitExit(tip);
+    stack.reactivate(tip);
+    try std.testing.expect(tip_content.style.z_index() < menu_content.style.z_index());
+    _ = stack.tickAnimations(48, 0.016, allocator);
+    try std.testing.expect(stack.findLayer(tip).?.suspended);
+}
+
+test "OverlayStack: toasts and explicit z layers never push a tooltip aside" {
+    const allocator = std.testing.allocator;
+    var stack = OverlayStack{ .allocator = allocator };
+    defer stack.deinit();
+    const button = try Node.create(allocator, 20, .box, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } });
+    defer button.destroy(allocator);
+    const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .trigger_node = button, .enter_transition = .none, .exit_transition = .none });
+    _ = try stack.push(.{ .kind = .toast, .enter_transition = .none, .exit_transition = .none });
+    _ = try stack.push(.{ .kind = .non_modal, .z_index = 500, .enter_transition = .none, .exit_transition = .none });
+    try std.testing.expect(!stack.tooltipBeneathOverlay(stack.findLayer(tip).?));
+    _ = stack.tickAnimations(0, 0.016, allocator);
+    try std.testing.expect(!stack.findLayer(tip).?.suspended);
 }

@@ -337,6 +337,8 @@ pub const Manager = struct {
             // Accepted payloads are owned and immutable until this worker joins.
             // Compaction may call the provider; never hold the inbox lock here.
             const prepared = try loop.prepareMessage(entry.payload.messages[0]);
+            // The UI shows the queue's consumption receipts (LIFECYCLE.md §5.3); after the unlock.
+            defer @import("publication.zig").publishAll();
             inbox.lock();
             defer inbox.unlock();
             if (!inbox.admission) return error.Cancelled;
@@ -623,7 +625,7 @@ pub const Manager = struct {
         const self: *Manager = @ptrCast(@alignCast(raw));
         self.publishTranscriptUsage();
         const engine = self.permissionEngine();
-        self.turn.state = if (try @import("plugin_tools.zig").callNeedsApproval(invocation.parsed, .{ .engine = engine, .full_control = engine.mode == .auto }, invocation.table.captured_scope.owner == .group)) .await_confirm else .executing;
+        self.turn.state = if (try @import("plugin_tools.zig").callNeedsApproval(invocation.parsed, .{ .engine = engine, .full_control = engine.mode == .auto }, invocation.table.captured_scope.contentOf() == .group)) .await_confirm else .executing;
         const host = self.tool_host.?;
         const execute_dynamic = host.execute_dynamic orelse return error.DynamicToolHostUnavailable;
         return execute_dynamic(host.context, invocation, allocator, cancel);
@@ -782,7 +784,7 @@ pub const Manager = struct {
                     .tool = call.tool,
                     .owner = scope.owner,
                     .targets = call.targets,
-                    .verdict = if (call.tool == .run_command) permission.classify(self.permissionEngine(), command, scope.owner == .group) else .allow_auto,
+                    .verdict = if (call.tool == .run_command) permission.classify(self.permissionEngine(), command, scope.contentOf() == .group) else .allow_auto,
                 } });
                 try self.audit_log.append(.{ .timestamp_ms = self.timestamp_ms, .turn_id = self.turn_id, .command = tool.arguments.items, .verdict = "scoped_tool_plan", .target = name, .call_id = tool.call_id });
             } else {
@@ -1021,7 +1023,7 @@ test "retry deadline native HTTP 429 long backoff can be stopped and joined" {
 
 const TestMultiRun = struct {
     const Step = struct { work_ms: u32 = 0, calls: []const []const u8 = &.{}, err: ?anyerror = null };
-    const scope: tool_scope.Scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    const scope: tool_scope.Scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     timing: *TestRetryTiming,
     steps: []const Step,
     provider_calls: usize = 0,
@@ -1239,7 +1241,7 @@ test "tool deadline cancelled answer retry wins over cooldown without touching t
 }
 
 test "tool deadline native pending controller acknowledgement exits on Stop and total timeout" {
-    const Bridge = @import("../ui/ai_tools.zig").Bridge;
+    const Bridge = @import("../features/ai/tools/host/ai_tools.zig").Bridge;
     const Fixture = struct {
         bridge: *Bridge,
         manager: *Manager,
@@ -1327,7 +1329,7 @@ test "turn manager maps provider deltas into cards and audit" {
 test "fragmented tool call produces one plan with model selected targets" {
     var manager = Manager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.scope = .{ .owner = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
+    manager.scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
     Manager.receive(&manager, .{ .tool_plan = .{ .call_id = "call-1", .name = "run_command", .arguments = "{\"session_ids\":[102]," } });
     Manager.receive(&manager, .{ .tool_plan = .{ .call_id = null, .arguments = "\"command\":\"df -h\"}" } });
     try std.testing.expectEqual(@as(usize, 0), manager.cards.count());
@@ -1338,13 +1340,13 @@ test "fragmented tool call produces one plan with model selected targets" {
     try std.testing.expectEqualStrings("df -h", plan.cmd);
     try std.testing.expectEqualStrings("call-1", plan.call_id.?);
     try std.testing.expectEqualSlices(u64, &.{102}, plan.targets.slice());
-    try std.testing.expectEqual(@as(u64, 7), plan.owner.?.group);
+    try std.testing.expectEqual(@as(u64, 7), plan.owner.?.tab);
 }
 
 test "out of scope tool calls never produce an execution plan" {
     var manager = Manager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    manager.scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     Manager.receive(&manager, .{ .tool_plan = .{ .call_id = "call-2", .name = "read_remote_file", .arguments = "{\"session_ids\":[999],\"path\":\"/etc/hosts\"}" } });
     Manager.receive(&manager, .done);
     try std.testing.expect(manager.last_error != null);
@@ -1655,7 +1657,7 @@ test "live context usage empty text in a tool round produces no observer text or
     fixture.usage_mailbox.reset(901);
     var manager = Manager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.scope = .{ .owner = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
+    manager.scope = .{ .owner = .{ .tab = 101 }, .content = .{ .session = 101 }, .members = .{ .ids = .{101} ++ @as([15]u64, @splat(0)), .len = 1 } };
     manager.turn_id = 901;
     manager.tool_host = .{ .context = &fixture, .execute = Fixture.execute };
     manager.observer = .{ .context = &fixture, .reset = Fixture.reset, .delta = Fixture.observe, .context_usage = Fixture.usage };
@@ -1683,8 +1685,8 @@ test "turn manager forwards accepted host results only after the entire batch cl
     const tools = @import("plugin_tools.zig");
     const identity = @import("../host/identity.zig");
     const a = std.testing.allocator;
-    const authority: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
-    const scope: tool_scope.Scope = .{ .owner = authority.binding, .members = .{} };
+    const authority: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
+    const scope: tool_scope.Scope = .{ .owner = authority.binding, .content = authority.content, .members = .{} };
     var table = try tools.RequestTable.initWithHost(a, scope, &.{}, &.{}, authority, &.{.{ .definition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" }, .authority = .conversation_context }});
     defer table.deinit();
     const wire = try tools.providerDefinitions(&table, table.arena.allocator());

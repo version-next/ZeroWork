@@ -1,0 +1,3129 @@
+//! Presentation contract tests using the real Ghostty engine and public zenit
+//! tree, without a window or process. Real PTY integration is test-local.
+const std = @import("std");
+const ui = @import("ui");
+const View = @import("../view/terminal_view.zig").TerminalViewNode;
+const Surface = @import("../view/terminal_surface.zig").Surface;
+const terminal = @import("../../../host/terminal_service.zig");
+const host = @import("../../../host/session_host.zig");
+const identity = @import("../../../host/identity.zig");
+const Adapter = @import("../../../vt/ghostty_adapter.zig").Adapter;
+const Controller = @import("../../../vt/terminal_controller.zig").Controller;
+const Engine = @import("../../../vt/engine.zig").VtEngine;
+const TextSlot = @import("../../../vt/text_slot.zig").TextSlot;
+const a = std.testing.allocator;
+pub const owner: identity.SessionHandle = .{ .session_id = @fromBackingInt(701), .generation = 3 };
+pub const binding: host.ServiceHandle = .{ .resource_owner = .{ .session = owner }, .origin_session = owner, .kind = .terminal, .binding_id = 1, .binding_generation = 1 };
+
+test "terminal metadata survives focus clicks on empty rows" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 28);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07false\r\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07", 100);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(700, 300);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    cx.layout();
+    _ = try view.refreshTerminalService(owner, false);
+    cx.layout();
+    const surface = view.terminal_surface.?;
+    const first = surface.rows.items[0].command_info.?;
+    const second = surface.rows.items[1].command_info.?;
+    const bounds = surface.viewport.globalRect();
+    const x = bounds.x + surface.bodyX() + 5;
+    const empty_y = bounds.y + surface.presentationY(5) + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, empty_y, .left, .{});
+    try std.testing.expect(surface.dragging and surface.selection == null);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(.flex, first.style.display);
+    try std.testing.expectEqual(.flex, second.style.display);
+    cx.handleMouseUpEx(x, empty_y, .left, .{});
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(!surface.dragging and surface.selection == null);
+    try std.testing.expectEqual(.flex, first.style.display);
+    try std.testing.expectEqual(.flex, second.style.display);
+    // Hover still hides only the corresponding command's metadata.
+    cx.handleMouseMoveEx(x, bounds.y + surface.options.row_height * 0.5, .{});
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(.none, first.style.display);
+    try std.testing.expectEqual(.flex, second.style.display);
+}
+
+test "idle terminal surface settles interaction dirtiness after a filled viewport is cleared" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 400);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    for ([_][]const u8{ "abcdefghijklmnop\r\n0123456789\r\nfilled", "\x1b[2J\x1b[Hshort" }, 1..) |bytes, sequence| {
+        try transport.controller.feedOutput(owner, sequence, bytes, @as(i64, @intCast(sequence)) * 100);
+        for (0..4) |_| {
+            cx.requestRedraw();
+            cx.advanceFrameClock();
+            cx.layout();
+            _ = try view.refreshTerminalService(owner, false);
+            _ = cx.render();
+        }
+        try std.testing.expect(!cx.hasPendingSceneWork());
+    }
+}
+
+test "idle terminal surface retries a consumed publication after a busy snapshot" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 400);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    for ([_]anyerror{ error.WorkerBusy, error.SnapshotUnavailable }, 1..) |failure, sequence| {
+        try transport.controller.feedOutput(owner, sequence, "LATEST", @as(i64, @intCast(sequence)) * 100);
+        transport.snapshot_error = failure;
+        cx.next_redraw_scheduled_at = null;
+        cx.next_redraw_delay_ns = null;
+        _ = try view.refreshTerminalService(owner, false);
+        try std.testing.expectEqual(transport.slot.generation.load(.acquire), surface.slot_generation);
+        try std.testing.expect(surface.force_snapshot);
+        try std.testing.expect(cx.nextWakeDelayNs().? <= 8 * std.time.ns_per_ms);
+        transport.snapshot_error = null;
+        _ = try view.refreshTerminalService(owner, false);
+        try std.testing.expect(!surface.force_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, surface.document.items, "LATEST") != null);
+    }
+}
+
+pub const FakeTransport = struct {
+    vt: Adapter,
+    slot: TextSlot,
+    controller: Controller,
+    written: std.ArrayList(u8) = .empty,
+    sequence: u64 = 0,
+    resize_calls: usize = 0,
+    snapshot_calls: usize = 0,
+    scroll_calls: usize = 0,
+    read_only: bool = false,
+    input_leased: bool = false,
+    execution: ?terminal.execution.Snapshot = null,
+    busy: bool = false,
+    receipt_busy: bool = false,
+    outcome_busy: bool = false,
+    cancel_busy: bool = false,
+    cancels: usize = 0,
+    snapshot_error: ?anyerror = null,
+    defer_theme: bool = false,
+    queued_theme: ?terminal.Theme = null,
+    async_search: bool = false,
+    search_job: ?*terminal.SearchTask = null,
+    pub fn init(self: *FakeTransport, rows: u16, cols: u16) !void {
+        self.* = .{ .vt = try Adapter.init(a, rows, cols), .slot = try TextSlot.init(a, TextSlot.default_capacity), .controller = undefined };
+        self.controller = try Controller.init(.{ .owner = owner, .engine = Engine.from(Adapter, &self.vt), .text_slot = &self.slot });
+    }
+    pub fn deinit(self: *FakeTransport) void {
+        if (self.search_job) |task| {
+            task.finish(null, error.Cancelled);
+            task.release();
+        }
+        self.written.deinit(a);
+        self.slot.deinit(a);
+        self.vt.destroy();
+    }
+    pub fn service(self: *FakeTransport) terminal.Service {
+        return .{ .binding = binding, .context = self, .vtable = &vtable };
+    }
+    fn get(raw: *anyopaque) *FakeTransport {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn write(raw: *anyopaque, _: host.ServiceHandle, request: terminal.WriteRequest) !terminal.Submission {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        if (self.read_only) return error.ReadOnlyTerminal;
+        if (self.input_leased) return error.TerminalControlled;
+        if (request.input_sequence <= self.sequence) return error.StaleInput;
+        if (request.mode_revision != self.vt.snapshot().mode_revision) return error.StaleMode;
+        try self.written.appendSlice(a, request.bytes);
+        self.sequence = request.input_sequence;
+        return .{ .input_sequence = request.input_sequence, .queued_bytes = request.bytes.len };
+    }
+    fn resize(raw: *anyopaque, _: host.ServiceHandle, geometry: terminal.Geometry) !void {
+        const self = get(raw);
+        try self.controller.resizeApplied(owner, geometry, 1);
+        self.resize_calls += 1;
+    }
+    fn read(_: *anyopaque, _: host.ServiceHandle, _: []u8) !terminal.Read {
+        return error.ViewMustNotReadRawOutput;
+    }
+    fn receipt(raw: *anyopaque, _: host.ServiceHandle) !?terminal.WriteReceipt {
+        if (get(raw).receipt_busy) return error.WorkerBusy;
+        return null;
+    }
+    fn trustedOutcome(raw: *anyopaque, _: host.ServiceHandle) !?terminal.trusted_edit.Outcome {
+        if (get(raw).outcome_busy) return error.WorkerBusy;
+        return null;
+    }
+    /// Like the Local adapter: the cancel needs the PTY worker's lock and fails while it is held.
+    fn trustedCancel(raw: *anyopaque, _: host.ServiceHandle) !void {
+        const self = get(raw);
+        if (self.cancel_busy) return error.WorkerBusy;
+        self.cancels += 1;
+    }
+    fn status(raw: *anyopaque, _: host.ServiceHandle) !terminal.Status {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        const state = self.controller.status();
+        const scalar = self.vt.snapshot();
+        return .{ .owner = owner, .writable = !self.read_only, .eof_seen = self.read_only, .geometry = state.geometry, .output_sequence = state.output_sequence, .pending_input_bytes = 0, .mode_revision = scalar.mode_revision, .modes = scalar.modes, .applied_theme_revision = if (self.controller.theme) |theme| theme.revision else 0 };
+    }
+    fn text(raw: *anyopaque, _: host.ServiceHandle) !*TextSlot {
+        return &get(raw).slot;
+    }
+    fn snapshot(raw: *anyopaque, _: host.ServiceHandle, allocator: std.mem.Allocator) !terminal.TerminalSnapshot {
+        const self = get(raw);
+        self.snapshot_calls += 1;
+        if (self.snapshot_error) |err| return err;
+        return .{ .owner = owner, .geometry_revision = self.controller.geometry.revision, .input_revision = self.sequence, .read_only = self.read_only, .eof_seen = self.read_only, .projection = try self.controller.copyProjection(owner, allocator), .applied_theme_revision = if (self.controller.theme) |theme| theme.revision else 0 };
+    }
+    fn searchSnapshot(raw: *anyopaque, _: host.ServiceHandle, allocator: std.mem.Allocator) !terminal.SearchSnapshot {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        return .{ .owner = owner, .document = try self.controller.searchSnapshot(owner, allocator) };
+    }
+    fn beginSearch(raw: *anyopaque, _: host.ServiceHandle) !*terminal.SearchTask {
+        const self = get(raw);
+        if (!self.async_search) return error.SearchAsyncUnavailable;
+        if (self.search_job != null) return error.WorkerBusy;
+        const task = try terminal.SearchTask.create(owner);
+        self.search_job = task;
+        return task;
+    }
+    pub fn completeSearch(self: *FakeTransport) !void {
+        const task = self.search_job.?;
+        self.search_job = null;
+        defer task.release();
+        if (task.cancelled.load(.acquire)) {
+            task.finish(null, error.Cancelled);
+            return;
+        }
+        const work = @import("../../../vt/search_task.zig");
+        var p = try self.vt.copyProjection(work.allocator);
+        defer p.deinit(work.allocator);
+        task.finish(.{ .owner = owner, .document = try self.controller.searchSnapshot(owner, work.allocator), .shape = work.Shape.from(&p) }, null);
+    }
+    fn searchTail(raw: *anyopaque, _: host.ServiceHandle, request: terminal.SearchTail, allocator: std.mem.Allocator) !terminal.SearchSnapshot {
+        const self = get(raw);
+        if (!self.async_search) return error.FullSearchRequired;
+        return .{ .owner = owner, .document = try self.vt.searchTail(allocator, request.start_row, request.max_rows, request.version) };
+    }
+    fn prepare(raw: *anyopaque, _: host.ServiceHandle, allocator: std.mem.Allocator, bytes: []const u8) !terminal.Paste {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        const decision = (terminal.PastePolicy{}).inspect(bytes);
+        if (decision == .reject) return error.InvalidPaste;
+        return .{ .binding = binding, .input_revision = self.sequence, .mode_revision = self.vt.snapshot().mode_revision, .text = try allocator.dupe(u8, bytes), .requires_confirmation = decision == .confirm };
+    }
+    fn commit(raw: *anyopaque, _: host.ServiceHandle, paste: terminal.Paste, seq: u64, confirmed: bool) !terminal.Submission {
+        const self = get(raw);
+        if (paste.input_revision != self.sequence) return error.StaleInput;
+        if (paste.requires_confirmation and !confirmed) return error.ConfirmationRequired;
+        return write(raw, binding, .{ .input_sequence = seq, .mode_revision = paste.mode_revision, .bytes = paste.text });
+    }
+    fn key(raw: *anyopaque, _: host.ServiceHandle, request: terminal.KeyRequest) !terminal.Submission {
+        const self = get(raw);
+        const bytes = try self.controller.encodeKey(owner, request.mode_revision, request.event, a);
+        defer a.free(bytes);
+        if (bytes.len == 0) {
+            self.sequence = request.input_sequence;
+            return .{ .input_sequence = request.input_sequence, .queued_bytes = 0 };
+        }
+        return write(raw, binding, .{ .input_sequence = request.input_sequence, .mode_revision = request.mode_revision, .bytes = bytes });
+    }
+    fn mouse(raw: *anyopaque, _: host.ServiceHandle, request: terminal.MouseRequest) !terminal.Submission {
+        const self = get(raw);
+        const bytes = try self.controller.encodeMouse(owner, request.mode_revision, request.geometry_revision, request.event, a);
+        defer a.free(bytes);
+        return write(raw, binding, .{ .input_sequence = request.input_sequence, .mode_revision = request.mode_revision, .bytes = bytes });
+    }
+    fn createAnchor(raw: *anyopaque, _: host.ServiceHandle, point: terminal.Point) !terminal.Anchor {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        return self.controller.createAnchor(owner, point);
+    }
+    fn resolveAnchor(raw: *anyopaque, _: host.ServiceHandle, anchor: terminal.Anchor) !?terminal.AnchorPosition {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        return self.controller.resolveAnchor(anchor);
+    }
+    fn releaseAnchor(raw: *anyopaque, _: host.ServiceHandle, anchor: terminal.Anchor) !void {
+        try get(raw).controller.releaseAnchor(anchor);
+    }
+    fn selectionText(raw: *anyopaque, _: host.ServiceHandle, selection: terminal.Selection, allocator: std.mem.Allocator, limit: usize) ![]u8 {
+        return get(raw).controller.selectionText(selection, allocator, limit);
+    }
+    fn scroll(raw: *anyopaque, _: host.ServiceHandle, request: terminal.Scroll) !void {
+        const self = get(raw);
+        try self.controller.scroll(owner, request, 1);
+        self.scroll_calls += 1;
+    }
+    fn lines(raw: *anyopaque, _: host.ServiceHandle, limits: terminal.LineLimits, allocator: std.mem.Allocator) !terminal.Lines {
+        return get(raw).controller.readLines(owner, limits, allocator);
+    }
+    fn applyTheme(raw: *anyopaque, _: host.ServiceHandle, value: terminal.Theme) !void {
+        const self = get(raw);
+        if (self.busy) return error.WorkerBusy;
+        if (self.defer_theme) {
+            self.queued_theme = value;
+            return;
+        }
+        try self.controller.setTheme(owner, value, 1);
+    }
+    fn executionSnapshot(raw: *anyopaque, _: host.ServiceHandle) !terminal.execution.Snapshot {
+        return get(raw).execution orelse error.ExecutionUnavailable;
+    }
+    const vtable: terminal.Service.VTable = .{ .execution_snapshot = executionSnapshot, .write = write, .resize = resize, .read = read, .receipt = receipt, .status = status, .text_slot = text, .snapshot = snapshot, .prepare_paste = prepare, .commit_paste = commit, .key = key, .mouse = mouse, .create_anchor = createAnchor, .resolve_anchor = resolveAnchor, .release_anchor = releaseAnchor, .selection_text = selectionText, .scroll = scroll, .read_lines = lines, .theme = applyTheme, .search_snapshot = searchSnapshot, .search_async = beginSearch, .search_tail = searchTail, .trusted_outcome = trustedOutcome, .trusted_cancel = trustedCancel };
+};
+
+// Derive the public backend types from Cx's injected SDK; the application test
+// module intentionally has no additional direct SDK dependency.
+const TestSdk = @typeInfo(@typeInfo(@FieldType(ui.Cx, "system_sdk")).optional.child).pointer.child;
+const TestBackendVTable = @typeInfo(@FieldType(TestSdk, "vtable")).pointer.child;
+const TestPump = @typeInfo(@FieldType(TestBackendVTable, "pump_events")).pointer.child;
+const TestClipboard = struct {
+    text: []const u8 = "PASTE",
+    copied: [128]u8 = undefined,
+    copied_len: usize = 0,
+    reads: usize = 0,
+    writes: usize = 0,
+    fail_set: bool = false,
+    fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+    fn pump(_: *anyopaque, _: @typeInfo(TestPump).@"fn".param_types[1].?, _: u32) @typeInfo(TestPump).@"fn".return_type.? {
+        return .{ .should_continue = true };
+    }
+    fn set(raw: *anyopaque, value: []const u8) error{BufferTooSmall}!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.fail_set or value.len > self.copied.len) return error.BufferTooSmall;
+        @memcpy(self.copied[0..value.len], value);
+        self.copied_len = value.len;
+        self.text = self.copied[0..value.len];
+        self.writes += 1;
+    }
+    fn get(raw: *anyopaque, out: []u8) error{BufferTooSmall}![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (out.len < self.text.len) return error.BufferTooSmall;
+        @memcpy(out[0..self.text.len], self.text);
+        self.reads += 1;
+        return out[0..self.text.len];
+    }
+    fn len(raw: *anyopaque) error{}!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.text.len;
+    }
+    const vtable: TestBackendVTable = .{ .name = "terminal-selection-test", .deinit = deinit, .pump_events = pump, .clipboard = .{ .set_text = set, .get_text = get, .get_text_len = len } };
+};
+
+test "terminal surface binds real owned VT projection and preserves over sixty rows with exact gutter" {
+    var transport: FakeTransport = undefined;
+    try transport.init(70, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b[38;2;0;0;0mA界e\u{301}👩‍💻\x1b[48;2;255;255;255m   \r\n", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 1700);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    view.setTimestampGutter(true);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    try std.testing.expectEqual(@as(usize, 70), surface.rows.items.len);
+    const glyph = surface.rows.items[0].glyphs.items[0].node;
+    const stamp = surface.rows.items[0].time.?;
+    // Island B v3 island terminal insets [10, 16, 12, 16] (terminal_styles.contentPadding).
+    try std.testing.expectApproxEqAbs(@as(f32, 16), stamp.globalRect().x, 0.001);
+    // Pencil CC3v4: timestamp gutter sits 8pt before the line text.
+    try std.testing.expectApproxEqAbs(@as(f32, 8), glyph.globalRect().x - stamp.globalRect().x - stamp.globalRect().w, 0.001);
+    try std.testing.expectEqual(@as(f32, 10), glyph.globalRect().y);
+    try std.testing.expectEqual(@as(u8, 0), glyph.getText().?.color.r);
+    try std.testing.expectEqualStrings("界", surface.rows.items[0].glyphs.items[1].node.getText().?.content);
+    try std.testing.expectEqualStrings("e\u{301}", surface.rows.items[0].glyphs.items[2].node.getText().?.content);
+    try std.testing.expectEqualStrings("👩‍💻", surface.rows.items[0].glyphs.items[3].node.getText().?.content);
+    view.unbindTerminalService(try owner.nextGeneration());
+    try std.testing.expect(view.terminal_surface != null);
+    view.unbindTerminalService(owner);
+    try std.testing.expect(view.terminal_surface == null);
+}
+
+test "terminal surface fractional viewport keeps clipped history selection and bottom IME coordinates aligned" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 20);
+    defer transport.deinit();
+    transport.async_search = true;
+    try transport.controller.feedOutput(owner, 1, "old\r\none\r\ntwo\r\n$ ", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    // 3 complete 22px rows plus 11px, inside the Island B v3 terminal insets
+    // (terminal_styles.contentPadding: top 10, bottom 12; Pencil `hMIT7`).
+    cx.setViewport(300, 99);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const viewport = surface.viewport.globalRect();
+    try std.testing.expectEqual(@as(usize, 4), surface.rows.items.len);
+    try std.testing.expectApproxEqAbs(viewport.y - 11, surface.rows.items[0].root.globalRect().y, 0.001);
+    const bottom = surface.rows.items[3].root.globalRect();
+    try std.testing.expectApproxEqAbs(surface.root.globalRect().y + 99 - 12, bottom.y + bottom.h, 0.001);
+    const x = surface.rows.items[0].root.globalRect().x + surface.bodyX();
+    // The visible lower half of the historical row still selects its original text.
+    cx.handleMouseDownEx(x, viewport.y + 2, .left, .{});
+    cx.handleMouseMoveEx(x + 3 * surface.options.cell_width, viewport.y + 2, .{});
+    const copied = (try surface.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings("old", copied);
+    const client = view.root.behavior.interaction.text_input_client.?;
+    var caret: ui.types.A11yRect = undefined;
+    try std.testing.expect(client.frame_for_range.?(client.context, surface.caret_byte, surface.caret_byte, &caret));
+    try std.testing.expectApproxEqAbs(bottom.y, caret.y, 0.001);
+    try std.testing.expectApproxEqAbs(viewport.y + viewport.h, caret.y + caret.height, 0.001);
+    try std.testing.expectEqual(@as(u16, 3), transport.controller.geometry.rows);
+    try std.testing.expectEqual(@as(u64, 0), surface.composite.background_scans + surface.composite.synchronous_scans);
+}
+
+test "terminal surface waits for actual theme receipt before adopting effective VT colors" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "plain \x1b[31mred", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    const first: terminal.Theme = .{ .revision = 1, .foreground = 0x123456ff, .background = 0x060608ff, .cursor = 0x777777ff, .selection = 0x22222240, .ansi = @splat(0x990000ff) };
+    var next = first;
+    next.revision = 2;
+    next.foreground = 0xabcdefFF;
+    next.ansi[1] = 0x12ab34ff;
+    try view.setTerminalTheme(first);
+    cx.needs_redraw = false;
+    try view.setTerminalTheme(first);
+    try std.testing.expect(!cx.needs_redraw);
+    var conflicting = first;
+    conflicting.foreground = 0xffffffff;
+    try std.testing.expectError(error.ConflictingTheme, view.setTerminalTheme(conflicting));
+    try std.testing.expect(!cx.needs_redraw);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    try std.testing.expectEqual(@as(u64, 1), view.terminalSnapshot(owner).?.applied_theme_revision);
+    try std.testing.expectEqual(ui.Color.hex(0x123456), surface.rows.items[0].glyphs.items[0].node.getText().?.color);
+    transport.defer_theme = true;
+    cx.needs_redraw = false;
+    try view.setTerminalTheme(next);
+    try std.testing.expect(cx.needs_redraw);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(u64, 1), view.terminalSnapshot(owner).?.applied_theme_revision);
+    try std.testing.expectEqual(ui.Color.hex(0x123456), surface.rows.items[0].glyphs.items[0].node.getText().?.color);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    try transport.controller.setTheme(owner, transport.queued_theme.?, 2);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(u64, 2), view.terminalSnapshot(owner).?.applied_theme_revision);
+    try std.testing.expectEqual(ui.Color.hex(0xabcdef), surface.rows.items[0].glyphs.items[0].node.getText().?.color);
+    // "plain " and "red" share one run; each colour is a span of it.
+    const run = surface.rows.items[0].glyphs.items[0].node.getText().?;
+    try std.testing.expectEqualStrings("plain red", run.content);
+    try std.testing.expectEqual(@as(usize, 2), run.spans.len);
+    try std.testing.expectEqual(ui.Color.hex(0xabcdef), run.spans[0].color.?);
+    try std.testing.expectEqual(ui.Color.hex(0x12ab34), run.spans[1].color.?);
+    try std.testing.expectEqual(@as(u32, 6), run.spans[1].start);
+    try std.testing.expectError(error.StaleTheme, view.setTerminalTheme(first));
+}
+
+test "terminal surface row query ids stay owned across pool growth shrink and teardown" {
+    var transport: FakeTransport = undefined;
+    try transport.init(70, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "row identity", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 1700);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    const first_id = surface.rows.items[0].root.meta.ownership.meta.test_id.?.ptr;
+    for ([_]u16{ 70, 2, 80 }) |count| {
+        if (count != 70) {
+            try transport.controller.resizeApplied(owner, .{ .revision = transport.controller.geometry.revision + 1, .cols = 16, .rows = count }, 2);
+            _ = try view.refreshTerminalService(owner, false);
+        }
+        try std.testing.expectEqual(@as(usize, count), surface.rows.items.len);
+        try std.testing.expectEqual(first_id, surface.rows.items[0].root.meta.ownership.meta.test_id.?.ptr);
+        for (surface.rows.items, 0..) |row, index| {
+            var buffer: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&buffer, "terminal.surface.row.{d}", .{index});
+            try std.testing.expectEqualStrings(expected, row.root.meta.ownership.meta.test_id.?);
+        }
+    }
+    view.unbindTerminalService(owner);
+    try std.testing.expect(view.terminal_surface == null);
+}
+
+test "terminal surface public Cx wheel moves document viewport once without scrolling PTY" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..40) |index| {
+        var line: [32]u8 = undefined;
+        try output.appendSlice(a, try std.fmt.bufPrint(&line, "ROW_{d:0>3}\r\n", .{index}));
+    }
+    try transport.controller.feedOutput(owner, 1, output.items, 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    // Four complete 22px rows and 16px insets keep this wheel test on row boundaries.
+    cx.setViewport(400, 120);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const bottom = view.terminalSnapshot(owner).?.projection.scrollback.viewport_offset;
+    try std.testing.expect(bottom > 2);
+    const bounds = surface.root.globalRect();
+    // Use the same Cx API as native wheel delivery and the public Harness.
+    // Directly invoking an event callback would miss the scroll-owner bug.
+    cx.handleScroll(.{ .x = bounds.x + bounds.w * 0.6, .y = bounds.y + bounds.h * 0.5, .dx = 0, .dy = 2 * surface.options.row_height });
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(bottom - 2, view.terminalSnapshot(owner).?.projection.scrollback.viewport_offset);
+    try std.testing.expectEqual(@as(usize, 0), transport.scroll_calls);
+    cx.handleScroll(.{ .x = bounds.x + bounds.w * 0.6, .y = bounds.y + bounds.h * 0.5, .dx = 0, .dy = -2 * surface.options.row_height });
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(bottom, view.terminalSnapshot(owner).?.projection.scrollback.viewport_offset);
+    try std.testing.expectEqual(@as(usize, 0), transport.scroll_calls);
+    view.unbindTerminalService(owner);
+    try std.testing.expect(view.terminal_surface == null);
+    cx.handleScroll(.{ .x = bounds.x + bounds.w * 0.6, .y = bounds.y + bounds.h * 0.5, .dx = 0, .dy = 32 });
+    try std.testing.expectEqual(@as(usize, 0), transport.scroll_calls);
+}
+
+test "terminal surface edge drag scrolls stationary selection and copies offscreen rows" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 32);
+    defer transport.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..40) |index| {
+        var line: [32]u8 = undefined;
+        try output.appendSlice(a, try std.fmt.bufPrint(&line, "ROW_{d:0>3}\r\n", .{index}));
+    }
+    try transport.controller.feedOutput(owner, 1, output.items, 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 96); // Preserve the 80px text viewport with 8px insets.
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(false);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    try view.bindTerminalService(transport.service());
+    for (0..3) |_| {
+        _ = cx.render();
+        _ = try view.refreshTerminalService(owner, true);
+    }
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    surface.feedback.publish = struct {
+        fn publish(_: ?*anyopaque, _: *ui.Cx, _: identity.SessionHandle, _: []const u8) !void {}
+    }.publish;
+    const bounds = surface.root.globalRect();
+    const x = bounds.x + surface.contentPadding().left + surface.bodyX();
+    const middle = bounds.y + bounds.h * 0.5;
+    cx.handleMouseDownEx(x, middle, .left, .{});
+    cx.handleMouseMoveEx(x + 7 * surface.options.cell_width, bounds.y - 20, .{});
+    _ = try view.refreshTerminalService(owner, true);
+    const start = surface.selection.?.start;
+    const before = surface.snapshot.?.projection.scrollback.viewport_offset;
+    const first_end = (try surface.service.resolveAnchor(surface.selection.?.end)).?.row;
+    // No additional pointer events: a timed refresh must extend the selection.
+    for (0..6) |_| {
+        cx.frame_time_ms += 40;
+        _ = try view.refreshTerminalService(owner, true);
+    }
+    try std.testing.expect(surface.snapshot.?.projection.scrollback.viewport_offset < before);
+    try std.testing.expectEqual(start, surface.selection.?.start);
+    try std.testing.expect((try surface.service.resolveAnchor(surface.selection.?.end)).?.row < first_end);
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expect(std.mem.count(u8, copied, "ROW_") > 4);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.writes);
+    try std.testing.expectEqual(@as(usize, 0), transport.scroll_calls);
+
+    // Returning to the middle stops scrolling; moving below reverses direction.
+    cx.handleMouseMoveEx(x + 7 * surface.options.cell_width, middle, .{});
+    _ = try view.refreshTerminalService(owner, true);
+    const stopped = surface.composite.top;
+    const stopped_pixel = surface.composite.pixel_offset;
+    cx.frame_time_ms += 100;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(stopped, surface.composite.top);
+    try std.testing.expectEqual(stopped_pixel, surface.composite.pixel_offset);
+    cx.handleMouseMoveEx(x + 7 * surface.options.cell_width, bounds.y + bounds.h + 20, .{});
+    _ = try view.refreshTerminalService(owner, true);
+    for (0..2) |_| {
+        cx.frame_time_ms += 40;
+        _ = try view.refreshTerminalService(owner, true);
+    }
+    try std.testing.expect(surface.composite.top > stopped);
+    cx.handleMouseUpEx(x + 7 * surface.options.cell_width, bounds.y + bounds.h + 20, .left, .{});
+    try std.testing.expect(!surface.dragging and !cx.dispatcher.hasPointerCapture());
+    try std.testing.expectEqual(@as(usize, 1), clipboard.writes);
+    const released = surface.composite.top;
+    cx.frame_time_ms += 100;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(released, surface.composite.top);
+    try std.testing.expect(surface.drag_scroll_ms == null);
+}
+
+test "terminal surface scrolling retains glyph nodes for overlapping document rows" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 16);
+    defer transport.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..40) |index| {
+        var line: [32]u8 = undefined;
+        try output.appendSlice(a, try std.fmt.bufPrint(&line, "ROW_{d:0>3}\r\n", .{index}));
+    }
+    try transport.controller.feedOutput(owner, 1, output.items, 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 220);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(surface.rows.items.len > 2);
+    const retained = surface.rows.items[0].root;
+    const glyph = surface.rows.items[0].glyphs.items[0].node;
+    const content = glyph.getText().?.content.ptr;
+    const spans = glyph.getText().?.spans.ptr;
+    const bounds = surface.root.globalRect();
+    for ([_]f32{ 1, -1, 1 }) |direction| {
+        cx.handleScroll(.{ .x = bounds.x + bounds.w * 0.6, .y = bounds.y + bounds.h * 0.5, .dx = 0, .dy = direction * surface.options.row_height });
+        _ = try view.refreshTerminalService(owner, false);
+        _ = cx.render();
+        const index: usize = if (direction > 0) 1 else 0;
+        try std.testing.expectEqual(retained, surface.rows.items[index].root);
+        try std.testing.expectEqual(glyph, surface.rows.items[index].glyphs.items[0].node);
+        try std.testing.expectEqual(content, glyph.getText().?.content.ptr);
+        try std.testing.expectEqual(spans, glyph.getText().?.spans.ptr);
+    }
+}
+
+test "terminal surface fractional wheel pixels move retained rows and keep selection aligned" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 32);
+    defer transport.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..40) |index| {
+        var line: [32]u8 = undefined;
+        try output.appendSlice(a, try std.fmt.bufPrint(&line, "ROW_{d:0>3}\r\n", .{index}));
+    }
+    try transport.controller.feedOutput(owner, 1, output.items, 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 220);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const retained = surface.rows.items[0].root;
+    const before = retained.globalRect().y;
+    var history = @import("../../history/model/history_replay.zig").Timeline.init(a, 1024 * 1024);
+    defer history.deinit();
+    try history.appendProjection(1, &surface.snapshot.?.projection);
+    const captured = try surface.service.searchSnapshot(a);
+    history.frames.items[0].search = captured.document;
+    history.bytes += captured.document.text.len + captured.document.rows.len * @sizeOf(@import("../../../vt/search_snapshot.zig").Row) + captured.document.spans.len * @sizeOf(@import("../../../vt/search_snapshot.zig").Span);
+    const source_text = captured.document.text.ptr;
+    const bounds = surface.root.globalRect();
+    const wheel_x = bounds.x + bounds.w * 0.6;
+    const wheel_y = bounds.y + bounds.h * 0.5;
+    var displacement: f32 = 0;
+    for ([_]f32{ 0.5, 0.25, 3, 7, -2.25 }) |pixels| {
+        cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = pixels });
+        _ = try view.refreshTerminalService(owner, false);
+        _ = cx.render();
+        try history.replaceLatestProjection(&surface.snapshot.?.projection);
+        try std.testing.expectEqual(@as(usize, 1), history.frames.items.len);
+        try std.testing.expectEqual(source_text, history.frames.items[0].search.?.text.ptr);
+        displacement += pixels;
+        try std.testing.expectApproxEqAbs(before + displacement, retained.globalRect().y, 0.001);
+        try std.testing.expectEqual(@as(usize, 7), surface.rows.items.len);
+        try std.testing.expectEqual(@as(u16, 6), surface.snapshot.?.projection.rows);
+    }
+    // A pointer over the displaced first original row still copies that row.
+    const row = surface.rows.items[1];
+    const cell = surface.options.cell_width;
+    const x = row.root.globalRect().x + surface.bodyX();
+    const y = row.root.globalRect().y + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 7 * cell, y, .{});
+    const copied = (try surface.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expect(std.mem.startsWith(u8, copied, "ROW_"));
+    try std.testing.expectEqual(@as(usize, 7), copied.len);
+    // Boundaries consume excess wheel distance, so reversing reacts at once.
+    cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = -100000 });
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    try std.testing.expect(surface.composite.follow);
+    try std.testing.expectEqual(@as(f32, 0), surface.composite.pixel_offset);
+    cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = 0.5 });
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    try std.testing.expectApproxEqAbs(surface.options.row_height - 0.5, surface.composite.pixel_offset, 0.001);
+    cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = 100000 });
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 0), surface.composite.top);
+    try std.testing.expectEqual(@as(f32, 0), surface.composite.pixel_offset);
+    cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = -0.5 });
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), surface.composite.pixel_offset, 0.001);
+    transport.snapshot_error = error.WorkerBusy;
+    cx.handleScroll(.{ .x = wheel_x, .y = wheel_y, .dx = 0, .dy = -0.25 });
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(surface.pending_scroll != 0);
+    transport.snapshot_error = null;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(f32, 0), surface.pending_scroll);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), surface.composite.pixel_offset, 0.001);
+    try std.testing.expectEqual(@as(usize, 0), transport.scroll_calls);
+}
+
+test "terminal surface prepared registry face keeps glyph IME metrics and grid stable across theme application" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const NativeSystem = @typeInfo(@typeInfo(@TypeOf(@as(ui.Cx, undefined).text.font_system)).optional.child).pointer.child;
+    const FontPointer = @typeInfo(@typeInfo(@TypeOf(NativeSystem.findFont)).@"fn".return_type.?).error_union.payload;
+    var system = try NativeSystem.init(a, std.testing.io);
+    defer system.deinit();
+    const face = try system.findFont(.{ .family = "Menlo", .size = 14, .weight = .regular });
+    defer face.deinit();
+    const FaceProvider = struct {
+        face: FontPointer,
+        calls: usize = 0,
+        family_id: u16 = 0,
+        semantic_mono: bool = true,
+        fn resolve(raw: *anyopaque, options: ui.Cx.ShapeTextOpts) ?FontPointer {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.family_id = options.font_family_id;
+            self.semantic_mono = options.use_monospace;
+            return self.face;
+        }
+    };
+    var provider: FaceProvider = .{ .face = face };
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "MMMM\r\n", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.text.setFontSystem(&system);
+    cx.text.font_resolve_fn = FaceProvider.resolve;
+    cx.text.font_resolve_ctx = &provider;
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    const previous_calls = provider.calls;
+    try view.setTypographyFamily(14, 22.0 / 14.0, 400, "Menlo", 42);
+    try std.testing.expect(provider.calls > previous_calls);
+    try std.testing.expectEqual(@as(u16, 42), provider.family_id);
+    try std.testing.expect(!provider.semantic_mono);
+    const cell_width = face.measureWidth("M");
+    try std.testing.expectApproxEqAbs(cell_width, view.cell_width, 0.001);
+    view.setTimestampGutter(true);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    const old_cols = surface.snapshot.?.projection.cols;
+    const old_geometry = surface.snapshot.?.geometry_revision;
+    const old_resize_calls = transport.resize_calls;
+    surface.setPreedit("MM");
+    try std.testing.expectApproxEqAbs(2 * cell_width, surface.measured("MM"), 0.001);
+    try std.testing.expect(!surface.preedit_node.getText().?.use_monospace_font);
+    try std.testing.expectEqual(@as(u16, 42), surface.preedit_node.getText().?.font_family);
+    try std.testing.expectApproxEqAbs(cell_width, surface.preedit_node.getText().?.monospace_char_width, 0.001);
+    surface.setPreedit("Wi中😀");
+    try std.testing.expectApproxEqAbs(2 * cell_width, surface.measured("Wi"), 0.001);
+    try std.testing.expectApproxEqAbs(cell_width, surface.preedit_node.getText().?.monospace_char_width, 0.001);
+    surface.setPreedit("MM");
+    const glyph = surface.rows.items[0].glyphs.items[0].node;
+    try std.testing.expect(!glyph.getText().?.use_monospace_font);
+    try std.testing.expectEqual(@as(u16, 42), glyph.getText().?.font_family);
+    try std.testing.expect(!surface.rows.items[0].time.?.getText().?.use_monospace_font);
+
+    // This is the same typography tuple main re-publishes on a theme change.
+    try view.setTypographyFamily(14, 22.0 / 14.0, 400, "Menlo", 42);
+    view.setThemeColors(ui.Color.hex(0xd8dee9), ui.Color.hex(0x4c566a), ui.Color.hex(0x88c0d0));
+    try view.setTerminalTheme(.{ .revision = 1, .foreground = 0xd8dee9ff, .background = 0x2e3440ff, .cursor = 0x88c0d0ff, .selection = 0x4c566a80, .ansi = @splat(0x88c0d0ff) });
+    _ = try view.refreshTerminalService(owner, true);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectApproxEqAbs(cell_width, view.cell_width, 0.001);
+    try std.testing.expectEqual(old_cols, surface.snapshot.?.projection.cols);
+    try std.testing.expectEqual(old_geometry, surface.snapshot.?.geometry_revision);
+    try std.testing.expectEqual(old_resize_calls, transport.resize_calls);
+    try std.testing.expectEqualStrings("MM", surface.preedit);
+    try std.testing.expect(!glyph.getText().?.use_monospace_font);
+}
+
+test "terminal surface native input queues once across busy service and exposes actual caret IME range" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "a界\x1b[1;2H", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    cx.setFocus(view.root);
+    const surface = view.terminal_surface.?;
+    transport.busy = true;
+    try surface.queueText("中文");
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    transport.busy = false;
+    try surface.pump();
+    try std.testing.expectEqualStrings("中文", transport.written.items);
+    _ = view.root.behavior.events.on_key_down.?(.tab, .{ .shift = true }, view.root.behavior.events.key_context);
+    try std.testing.expectEqualStrings("中文\x1b[Z", transport.written.items);
+    _ = view.root.behavior.events.on_key_down.?(.c, .{ .ctrl = true }, view.root.behavior.events.key_context);
+    try std.testing.expectEqualStrings("中文\x1b[Z\x03", transport.written.items);
+    _ = view.root.behavior.events.on_event.?(.{ .ime_preedit = .{ .text = "候选" } }, view.root.behavior.events.event_context);
+    try std.testing.expectEqual(@as(usize, "中文\x1b[Z\x03".len), transport.written.items.len);
+    const client = view.root.behavior.interaction.text_input_client.?;
+    var frame: ui.types.A11yRect = undefined;
+    try std.testing.expect(client.frame_for_range.?(client.context, surface.caret_byte, surface.caret_byte, &frame));
+    try std.testing.expectEqual(surface.root.globalRect().x + surface.contentPadding().left + view.cell_width, frame.x);
+    _ = view.root.behavior.events.on_event.?(.{ .ime_commit = .{ .text = "候选" } }, view.root.behavior.events.event_context);
+    try std.testing.expectEqualStrings("中文\x1b[Z\x03候选", transport.written.items);
+    try view.pasteTerminalText(owner, "a\nb");
+    try std.testing.expect(surface.pending_paste != null and surface.modal_open.?.get());
+    const before = transport.written.items.len;
+    transport.read_only = true;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(before, transport.written.items.len);
+    try std.testing.expect(view.terminalSnapshot(owner).?.read_only);
+    try std.testing.expectError(error.ReadOnlyTerminal, surface.queueText("no"));
+}
+
+test "terminal surface retains first text and Return while its first projection is pending" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(surface.snapshot == null);
+    _ = view.root.behavior.events.on_event.?(.{ .text_input = .{ .text = "first" } }, view.root.behavior.events.event_context);
+    _ = view.root.behavior.events.on_key_down.?(.@"return", .{}, view.root.behavior.events.key_context);
+    try std.testing.expectEqual(@as(usize, 2), surface.pending.items.len);
+    try std.testing.expectEqualStrings("", transport.written.items);
+
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqualStrings("first\r", transport.written.items);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+}
+
+test "terminal Option arrows route word navigation and preserve other modifiers and Kitty events" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 24);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    cx.setFocus(view.root);
+    const key_down = view.root.behavior.events.on_key_down.?;
+    const context = view.root.behavior.events.key_context;
+    _ = key_down(.left, .{ .alt = true }, context);
+    _ = key_down(.right, .{ .alt = true }, context);
+    _ = key_down(.left, .{}, context);
+    _ = key_down(.right, .{}, context);
+    _ = key_down(.left, .{ .alt = true, .shift = true }, context);
+    _ = key_down(.right, .{ .alt = true, .ctrl = true }, context);
+    _ = key_down(.right, .{ .alt = true, .super = true }, context);
+    try std.testing.expectEqualStrings("\x1bb\x1bf\x1b[D\x1b[C\x1b[1;4D\x1b[1;7C", transport.written.items);
+    transport.written.clearRetainingCapacity();
+    // Input-method composition must not leak navigation into the shell.
+    const on_event = view.root.behavior.events.on_event.?;
+    const event_context = view.root.behavior.events.event_context;
+    _ = on_event(.{ .ime_preedit = .{ .text = "候选" } }, event_context);
+    _ = key_down(.left, .{ .alt = true }, context);
+    try std.testing.expectEqualStrings("", transport.written.items);
+    _ = on_event(.{ .ime_preedit = .{ .text = "" } }, event_context);
+    try transport.controller.feedOutput(owner, 1, "\x1b[>3u", 1);
+    _ = try view.refreshTerminalService(owner, false);
+    _ = key_down(.left, .{ .alt = true }, context);
+    _ = key_down(.right, .{ .alt = true }, context);
+    _ = on_event(.{ .key_up = .{ .key = .left, .modifiers = .{ .alt = true } } }, event_context);
+    try std.testing.expectEqualStrings("\x1b[1;3:1D\x1b[1;3:1C\x1b[1;3:3D", transport.written.items);
+}
+
+test "terminal surface queued text owns its copy across pump receipt backpressure" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    transport.receipt_busy = true;
+    var first = "echo original".*;
+    try surface.queueText(&first);
+    @memset(&first, 'x');
+    try surface.queueText(" next");
+    try std.testing.expectEqual(@as(usize, 2), surface.pending.items.len);
+    try std.testing.expectEqualStrings("echo original", surface.pending.items[0].bytes);
+    try std.testing.expectEqualStrings(" next", surface.pending.items[1].bytes);
+    try std.testing.expectEqualStrings("", transport.written.items);
+    transport.receipt_busy = false;
+    try surface.pump();
+    try std.testing.expectEqualStrings("echo original next", transport.written.items);
+    try std.testing.expectEqual(@as(u64, 2), transport.sequence);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending_bytes);
+    try surface.pump();
+    try std.testing.expectEqualStrings("echo original next", transport.written.items);
+}
+
+test "terminal surface user input revision excludes focus protocol and unaccepted admission" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    cx.setFocus(view.root);
+    try transport.controller.feedOutput(owner, 1, "\x1b[?1004h", 100);
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    // Actual native focus notification is a VT protocol frame, not user input.
+    try std.testing.expect(std.mem.indexOf(u8, transport.written.items, "\x1b[I") != null);
+    try std.testing.expectEqual(@as(u64, 0), surface.user_input_revision);
+    transport.input_leased = true;
+    const before_rejection = transport.written.items.len;
+    try surface.queueText("rejected-by-real-admission-contract");
+    try std.testing.expectEqual(@as(u64, 0), surface.user_input_revision);
+    try std.testing.expectEqual(before_rejection, transport.written.items.len);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    transport.input_leased = false;
+    transport.receipt_busy = true;
+    try surface.queueText("human");
+    try std.testing.expectEqual(@as(u64, 0), surface.user_input_revision);
+    transport.receipt_busy = false;
+    try surface.pump();
+    try std.testing.expectEqual(@as(u64, 1), surface.user_input_revision);
+    try surface.pump();
+    try std.testing.expectEqual(@as(u64, 1), surface.user_input_revision);
+}
+
+test "terminal surface busy Enter retries before the slower host lifecycle deadline" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b[?12l", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(false);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+
+    const Clock = struct {
+        value: i96,
+        fn now(raw: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock != .awake) return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.value };
+        }
+        fn resolution(_: ?*anyopaque, _: std.Io.Clock) std.Io.Clock.ResolutionError!std.Io.Duration {
+            return .{ .nanoseconds = 1 };
+        }
+    };
+    var clock: Clock = .{ .value = std.Io.Clock.awake.now(std.testing.io).nanoseconds };
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.now = Clock.now;
+    io_vtable.clockResolution = Clock.resolution;
+    cx.io = .{ .userdata = &clock, .vtable = &io_vtable };
+    defer cx.io = std.testing.io;
+
+    const HostPoll = struct {
+        view: *View,
+        problem: ?anyerror = null,
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: u8, _: bool) ui.AfterLayoutResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            _ = self.view.refreshTerminalService(owner, true) catch |err| failed: {
+                self.problem = err;
+                break :failed false;
+            };
+            // A host may have a slower lifecycle deadline; pending input must
+            // schedule its own earlier retry and never depend on another key.
+            self.view.cx.scheduleRedrawAfterNs(33 * std.time.ns_per_ms);
+            return .done;
+        }
+    };
+    var poll: HostPoll = .{ .view = &view };
+    try cx.addAfterLayoutHook(&poll, HostPoll.run);
+    defer cx.removeAfterLayoutHook(&poll);
+    cx.advanceFrameClock();
+    clock.value += 33 * std.time.ns_per_ms;
+    cx.requestRedraw();
+    cx.advanceFrameClock();
+    _ = cx.render();
+    for (0..4) |_| {
+        if (!cx.wantsFrame()) break;
+        cx.advanceFrameClock();
+        _ = cx.render();
+    }
+    try std.testing.expect(poll.calls > 0 and poll.problem == null);
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(!surface.blink_running);
+    try std.testing.expectEqual(@as(?u64, 33 * std.time.ns_per_ms), cx.nextWakeDelayNs());
+    try std.testing.expectEqual(false, cx.wantsFrame());
+
+    transport.busy = true;
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    // Exhaust the immediate input frame, then rely solely on idle deadlines.
+    cx.advanceFrameClock();
+    _ = cx.render();
+    for (0..2) |_| {
+        const before = poll.calls;
+        const delay = cx.nextWakeDelayNs().?;
+        try std.testing.expect(delay > 0 and delay <= 8 * std.time.ns_per_ms);
+        try std.testing.expectEqual(false, cx.wantsFrame());
+        clock.value += delay;
+        try std.testing.expectEqual(true, cx.wantsFrame());
+        cx.advanceFrameClock();
+        _ = cx.render();
+        try std.testing.expect(poll.calls > before and poll.problem == null);
+        try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    }
+    transport.busy = false;
+    clock.value += cx.nextWakeDelayNs().?;
+    try std.testing.expectEqual(true, cx.wantsFrame());
+    cx.advanceFrameClock();
+    _ = cx.render();
+    try std.testing.expectEqualStrings("\r", transport.written.items);
+    try std.testing.expectEqual(@as(u64, 1), transport.sequence);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+
+    // Receipt contention also retains input and retries silently, without
+    // turning an ordinary worker handoff into a user-facing error.
+    transport.receipt_busy = true;
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+    try std.testing.expectEqualStrings("\r", transport.written.items);
+    clock.value += cx.nextWakeDelayNs().?;
+    try std.testing.expectEqual(true, cx.wantsFrame());
+    cx.advanceFrameClock();
+    _ = cx.render();
+    try std.testing.expect(poll.problem == null);
+    try std.testing.expect(surface.error_message == null);
+    try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+    try std.testing.expectEqual(@as(?u64, 8 * std.time.ns_per_ms), cx.nextWakeDelayNs());
+    poll.problem = null;
+    transport.receipt_busy = false;
+    clock.value += cx.nextWakeDelayNs().?;
+    try std.testing.expectEqual(true, cx.wantsFrame());
+    cx.advanceFrameClock();
+    _ = cx.render();
+    try std.testing.expect(poll.problem == null);
+    try std.testing.expectEqualStrings("\r\r", transport.written.items);
+    try std.testing.expectEqual(@as(u64, 2), transport.sequence);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    clock.value += cx.nextWakeDelayNs().?;
+    try std.testing.expectEqual(true, cx.wantsFrame());
+    cx.advanceFrameClock();
+    _ = cx.render();
+    try std.testing.expectEqualStrings("\r\r", transport.written.items);
+    try std.testing.expectEqual(@as(u64, 2), transport.sequence);
+}
+
+test "terminal surface menu paste rejection is visible and writes zero bytes before one valid submission" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    const oversized = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(oversized);
+    @memset(oversized, 'X');
+    for ([_][]const u8{ oversized, "SAFE_A\x1b[201~SAFE_B" }) |rejected| {
+        // This is the exact public entry called by MenuHost/native Cmd-V,
+        // rather than Surface's already-covered keyboard/clipboard catch.
+        try std.testing.expectError(error.InvalidPaste, view.requestPaste(rejected));
+        try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+        try std.testing.expectEqual(@as(u64, 0), transport.sequence);
+        try std.testing.expect(surface.pending_paste == null and surface.paste_requested == null);
+        try std.testing.expectEqual(.none, surface.message_root.style.display);
+        try std.testing.expectEqualStrings("粘贴未插入：请检查 UTF-8、1 MiB 上限及终端控制边界。", surface.error_message.?);
+        _ = cx.render();
+        try std.testing.expectEqual(.none, surface.message.style.display);
+    }
+    try view.requestPaste("ONE_SAFE_INPUT");
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqualStrings("ONE_SAFE_INPUT", transport.written.items);
+    try std.testing.expectEqual(@as(u64, 1), transport.sequence);
+    try std.testing.expect(surface.pending_paste == null and surface.paste_requested == null);
+}
+
+test "terminal surface caret uses 550ms and actual accessibility preferences without idle blink wakeups" {
+    const saved = ui.a11y.preferences.current();
+    defer ui.a11y.preferences.set(saved);
+    ui.a11y.preferences.set(.{});
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b[5;4;58;2;255;0;0mx\x1b[0m\x1b[?12h", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(false);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(surface.snapshot.?.projection.modes.cursor_blinking);
+    cx.frame_time_ms = 100;
+    surface.last_blink = 100;
+    surface.blink = true;
+    cx.next_redraw_scheduled_at = null;
+    cx.next_redraw_delay_ns = null;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(?u64, 550 * std.time.ns_per_ms), cx.next_redraw_delay_ns);
+    cx.frame_time_ms = 649;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.blink);
+    cx.frame_time_ms = 650;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(!surface.blink);
+    try std.testing.expectEqual(.none, surface.caret.style.display);
+    try std.testing.expectEqual(@as(u8, 0), surface.rows.items[0].glyphs.items[0].node.getText().?.color.a);
+    try std.testing.expectEqual(@as(u8, 0), surface.rows.items[0].glyphs.items[0].node.getText().?.spans[0].underline_color.?.a);
+
+    // Set the framework's real native-preference store, not a View-only flag.
+    ui.a11y.preferences.set(.{ .reduce_motion = true });
+    cx.next_redraw_scheduled_at = null;
+    cx.next_redraw_delay_ns = null;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.blink and surface.reduced_motion);
+    try std.testing.expect(surface.rows.items[0].glyphs.items[0].node.getText().?.color.a != 0);
+    try std.testing.expect(surface.caret.style.display != .none);
+    try std.testing.expectEqual(@as(?u64, null), cx.next_redraw_delay_ns);
+
+    ui.a11y.preferences.set(.{});
+    cx.renderer_reduced_motion = true;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.reduced_motion);
+    try std.testing.expectEqual(@as(?u64, null), cx.next_redraw_delay_ns);
+    cx.renderer_reduced_motion = false;
+    try transport.controller.feedOutput(owner, 2, "\r\x1b[0mx\x1b[?12l", 2);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(!surface.blink_running);
+    try std.testing.expectEqual(@as(?u64, null), cx.next_redraw_delay_ns);
+
+    view.setTimestampGutter(true);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(?u64, null), cx.next_redraw_delay_ns);
+    cx.next_redraw_scheduled_at = null;
+    cx.next_redraw_delay_ns = null;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(?u64, null), cx.next_redraw_delay_ns);
+}
+
+test "terminal surface Alt middle click keeps app menu available during mouse tracking" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b[?1000h", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    const Sink = struct {
+        calls: usize = 0,
+        captured: ?identity.SessionHandle = null,
+        x: f32 = 0,
+        y: f32 = 0,
+        fn request(raw: ?*anyopaque, captured: identity.SessionHandle, x: f32, y: f32) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.captured = captured;
+            self.x = x;
+            self.y = y;
+        }
+    };
+    var sink: Sink = .{};
+    view.setTerminalMenuHandler(.{ .context = &sink, .request = Sink.request });
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const event = surface.root.behavior.events.on_event.?;
+    const context = surface.root.behavior.events.event_context;
+    // Canvas owns pointer events; the host also contains editable overlays.
+    try std.testing.expectEqual(.stop, event(.{ .mouse_down = .{ .button = .middle, .x = 213, .y = 47, .modifiers = .{ .alt = true } } }, context));
+    try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    try std.testing.expect(sink.captured.?.eql(owner));
+    try std.testing.expectEqual(@as(f32, 213), sink.x);
+    try std.testing.expectEqual(@as(f32, 47), sink.y);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    try std.testing.expect(!cx.dispatcher.hasPointerCapture());
+}
+
+test "terminal surface right click opens the app menu, or pastes when the app declines" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "abcdef\r\nsecond", 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    const Menu = struct {
+        accept: bool = true,
+        opened: usize = 0,
+        captured: ?identity.SessionHandle = null,
+        fn request(_: ?*anyopaque, _: identity.SessionHandle, _: f32, _: f32) void {}
+        fn secondary(raw: ?*anyopaque, captured: identity.SessionHandle, _: f32, _: f32) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.accept) return false;
+            self.opened += 1;
+            self.captured = captured;
+            return true;
+        }
+    };
+    var menu: Menu = .{};
+    view.setTerminalMenuHandler(.{ .context = &menu, .request = Menu.request, .secondary = Menu.secondary });
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    surface.feedback.publish = struct {
+        fn publish(_: ?*anyopaque, _: *ui.Cx, _: identity.SessionHandle, _: []const u8) !void {}
+    }.publish;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    try std.testing.expectEqual(@as(usize, 1), menu.opened);
+    try std.testing.expect(menu.captured.?.eql(owner));
+    try std.testing.expectEqual(@as(usize, 0), clipboard.reads);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    menu.accept = false;
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    try std.testing.expectEqualStrings("PASTE", transport.written.items);
+    try std.testing.expectEqual(@as(usize, 1), clipboard.reads);
+    // 清屏：与键入 ⌃L 相同的按键路径。
+    try view.clearScreen();
+    try std.testing.expectEqualStrings("PASTE\x0c", transport.written.items);
+}
+
+test "terminal surface selection remains original VT text and waits for applied resize geometry" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "ab界e\u{301}tail\r\nnext", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    view.setTimestampGutter(true);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    try std.testing.expect(!view.hasSelection());
+    const surface = view.terminal_surface.?;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 5 * view.cell_width, y, .{});
+    cx.handleMouseUpEx(x + 5 * view.cell_width, y, .left, .{});
+    try std.testing.expect(view.hasSelection());
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings("ab界e\u{301}", copied);
+    try std.testing.expect(!surface.dragging and !cx.dispatcher.hasPointerCapture());
+    const previous_version = view.terminalSnapshot(owner).?.projection.version;
+    try transport.controller.feedOutput(owner, 2, "\r\nnew output", 2);
+    try @import("../view/terminal_surface_input.zig").renderSelection(surface);
+    try std.testing.expect(surface.force_snapshot);
+    for (surface.rows.items) |row| try std.testing.expectEqual(.none, row.selected.style.display);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(view.terminalSnapshot(owner).?.projection.version > previous_version);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(u64, 1), view.terminalSnapshot(owner).?.geometry_revision);
+    _ = try view.refreshTerminalService(owner, true);
+    const resized = view.terminalSnapshot(owner).?;
+    try std.testing.expectEqual(transport.controller.geometry.revision, resized.geometry_revision);
+    try std.testing.expectEqual(transport.controller.geometry.cols, resized.projection.cols);
+    try std.testing.expectEqual(transport.controller.geometry.rows, resized.projection.rows);
+}
+
+test "terminal surface public Cx drag release copies and right click always pastes" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "abcdef\r\nsecond", 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(false);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    surface.feedback.publish = struct {
+        fn publish(_: ?*anyopaque, _: *ui.Cx, _: identity.SessionHandle, _: []const u8) !void {}
+    }.publish;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, y, .left, .{});
+    try std.testing.expect(!view.hasSelection());
+    cx.handleMouseUpEx(x, y, .left, .{});
+    try std.testing.expect(surface.selection == null);
+    try std.testing.expect(!view.hasSelection() and !cx.dispatcher.hasPointerCapture());
+    try std.testing.expect((try view.copySelectionText(a)) == null);
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    try std.testing.expectEqualStrings("PASTE", transport.written.items);
+    try std.testing.expectEqual(@as(usize, 1), clipboard.reads);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.writes);
+
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 3 * surface.options.cell_width, y, .{});
+    cx.handleMouseUpEx(x + 3 * surface.options.cell_width, y, .left, .{});
+    try std.testing.expect(view.hasSelection());
+    try std.testing.expectEqual(@as(usize, 1), clipboard.writes);
+    try std.testing.expectEqualStrings("abc", clipboard.copied[0..clipboard.copied_len]);
+    try std.testing.expectEqual(.none, surface.message_root.style.display);
+    const text = (try view.copySelectionText(a)).?;
+    defer a.free(text);
+    try std.testing.expectEqualStrings("abc", text);
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    try std.testing.expectEqualStrings("abc", clipboard.copied[0..clipboard.copied_len]);
+    try std.testing.expectEqual(@as(usize, 1), clipboard.writes);
+    try std.testing.expectEqual(@as(usize, 2), clipboard.reads);
+    try std.testing.expectEqualStrings("PASTEabc", transport.written.items);
+    cx.handleKeyDown(.c, .{ .super = true });
+    cx.handleKeyUp(.c, .{ .super = true });
+    try std.testing.expectEqual(@as(usize, 2), clipboard.writes);
+    try std.testing.expectEqualStrings("PASTEabc", transport.written.items);
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseUpEx(x, y, .left, .{});
+    try std.testing.expectEqual(@as(usize, 2), clipboard.writes);
+    try std.testing.expectEqualStrings("abc", clipboard.text);
+    cx.handleKeyDown(.c, .{ .super = true });
+    cx.handleKeyUp(.c, .{ .super = true });
+    try std.testing.expectEqualStrings("PASTEabc\x03", transport.written.items);
+
+    clipboard.fail_set = true;
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 3 * surface.options.cell_width, y, .{});
+    cx.handleMouseUpEx(x + 3 * surface.options.cell_width, y, .left, .{});
+    try std.testing.expect(view.hasSelection());
+    try std.testing.expectEqual(@as(usize, 2), clipboard.writes);
+    try std.testing.expectEqualStrings("abc", clipboard.text);
+    try std.testing.expectEqualStrings("复制失败：剪贴板不可用。", surface.error_message.?);
+}
+
+test "terminal surface copy stays quiet while errors retain original owner feedback" {
+    const Feedback = struct {
+        count: usize = 0,
+        received_owner: ?identity.SessionHandle = null,
+        summary: []const u8 = "",
+        fn publish(raw: ?*anyopaque, _: *ui.Cx, value: identity.SessionHandle, summary: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.count += 1;
+            self.received_owner = value;
+            self.summary = summary;
+        }
+    };
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    const surface = view.terminal_surface.?;
+    var feedback: Feedback = .{};
+    surface.feedback = .{ .context = &feedback, .publish = Feedback.publish };
+    const baseline_timers = cx.timers.items.len;
+    try surface.copySelectionToClipboard("owned selection");
+    try std.testing.expectEqual(@as(usize, 0), feedback.count);
+    try std.testing.expectEqual(.none, surface.message_root.style.display);
+    try std.testing.expectEqual(baseline_timers, cx.timers.items.len);
+    try std.testing.expect(cx.focus_manager.getFocused() == view.root);
+    surface.showError(error.WorkerBusy);
+    try std.testing.expectEqual(@as(usize, 1), feedback.count);
+    try std.testing.expect(feedback.received_owner.?.eql(owner));
+    try std.testing.expectEqualStrings("终端繁忙，请稍后重试。", feedback.summary);
+    try std.testing.expectEqual(.none, surface.message_root.style.display);
+    try surface.copySelectionToClipboard("copied while validation is visible");
+    try std.testing.expectEqual(@as(usize, 1), feedback.count);
+    try std.testing.expectEqualStrings("终端繁忙，请稍后重试。", surface.error_message.?);
+    clipboard.fail_set = true;
+    try std.testing.expectError(error.ClipboardUnavailable, surface.copySelectionToClipboard("not copied"));
+    try std.testing.expectEqual(@as(usize, 1), feedback.count);
+    try std.testing.expectEqualStrings("copied while validation is visible", clipboard.text);
+}
+
+test "terminal surface selection clears invalid anchors and zero width rectangles without treating busy as paste" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "abcdef\r\nsecond", 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(false);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + surface.options.row_height * 0.5;
+    cx.handleMouseDownEx(x, y, .left, .{ .alt = true });
+    cx.handleMouseMoveEx(x, y + surface.options.row_height, .{ .alt = true });
+    cx.handleMouseUpEx(x, y + surface.options.row_height, .left, .{ .alt = true });
+    try std.testing.expect(surface.selection == null and !view.hasSelection());
+    try std.testing.expectEqual(@as(usize, 0), clipboard.writes);
+
+    cx.handleMouseDownEx(x, y, .left, .{ .alt = true });
+    cx.handleMouseMoveEx(x + 2 * surface.options.cell_width, y + surface.options.row_height, .{ .alt = true });
+    cx.handleMouseUpEx(x + 2 * surface.options.cell_width, y + surface.options.row_height, .left, .{ .alt = true });
+    try std.testing.expectEqual(@as(usize, 1), clipboard.writes);
+    try std.testing.expectEqualStrings("ab\nse", clipboard.text);
+    clipboard.text = "PASTE";
+    clipboard.reads = 0;
+    clipboard.writes = 0;
+
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 3 * surface.options.cell_width, y, .{});
+    transport.busy = true;
+    cx.handleMouseUpEx(x + 3 * surface.options.cell_width, y, .left, .{});
+    try std.testing.expect(view.hasSelection());
+    try std.testing.expect(!surface.dragging and !cx.dispatcher.hasPointerCapture());
+    try std.testing.expectError(error.WorkerBusy, surface.hasSelection());
+    try std.testing.expect(view.hasSelection());
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    cx.handleKeyDown(.c, .{ .super = true });
+    cx.handleKeyUp(.c, .{ .super = true });
+    try std.testing.expect(surface.selection != null);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.reads);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.writes);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    transport.busy = false;
+    const start = surface.selection.?.start;
+    try surface.service.releaseAnchor(start);
+    try std.testing.expect(!view.hasSelection());
+    try std.testing.expect(surface.selection == null);
+    for (surface.rows.items) |row| try std.testing.expectEqual(.none, row.selected.style.display);
+    try std.testing.expect((try view.copySelectionText(a)) == null);
+    cx.handleMouseDownEx(x, y, .right, .{});
+    cx.handleMouseUpEx(x, y, .right, .{});
+    try std.testing.expectEqualStrings("PASTE", transport.written.items);
+}
+
+test "terminal surface offset pane uses window logical points for selection mouse and IME" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 64);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "ROW_A_123456789\r\nROW_B_abcdefghij", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1440, 889);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill() }, .{});
+    const pane = try ui.box(cx, .{ .position = .absolute, .inset = .{ .left = .{ .px = 238 }, .top = .{ .px = 60 } }, .width = .{ .px = 1194 }, .height = .{ .px = 794 } }, .{});
+    try cx.root.?.appendChild(a, pane);
+    var view = try View.mount(cx);
+    try pane.appendChild(a, view.root);
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const bounds = surface.root.globalRect();
+    try std.testing.expectEqual(@as(f32, 238), bounds.x);
+    try std.testing.expectEqual(@as(f32, 60), bounds.y);
+    const body_x = bounds.x + surface.contentPadding().left + surface.bodyX();
+    const body_y = bounds.y + surface.contentPadding().top;
+    const cell = surface.options.cell_width;
+    const row_height = surface.options.row_height;
+    const start_x = body_x + 6 * cell;
+    const y = body_y + row_height * 0.5;
+    // These are the same window-logical Cx entry points used by the native
+    // bridge. A root at (0, 0) would hide the parent-local/world mismatch.
+    cx.handleMouseDownEx(start_x, y, .left, .{});
+    cx.handleMouseMoveEx(body_x + 10 * cell, y, .{});
+    cx.handleMouseUpEx(body_x + 10 * cell, y, .left, .{});
+    const selection = surface.selection.?;
+    const start = (try surface.service.resolveAnchor(selection.start)).?;
+    const end = (try surface.service.resolveAnchor(selection.end)).?;
+    try std.testing.expectEqual(@as(u32, 0), start.row);
+    try std.testing.expectEqual(@as(u16, 6), start.col);
+    try std.testing.expectEqual(@as(u32, 0), end.row);
+    try std.testing.expectEqual(@as(u16, 10), end.col);
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings("1234", copied);
+    _ = cx.render();
+    const selected = surface.rows.items[0].selected.globalRect();
+    try std.testing.expectApproxEqAbs(start_x, selected.x, 0.01);
+    try std.testing.expectApproxEqAbs(body_y, selected.y, 0.01);
+    for (surface.rows.items[1..]) |row| try std.testing.expectEqual(.none, row.selected.style.display);
+
+    const client = view.root.behavior.interaction.text_input_client.?;
+    var first: u32 = 0;
+    var last: u32 = 0;
+    try std.testing.expect(client.range_at_point.?(client.context, body_x + 7 * cell, y, &first, &last));
+    try std.testing.expectEqual(@as(u32, 7), first);
+    try std.testing.expectEqual(@as(u32, 8), last);
+    var frame: ui.types.A11yRect = undefined;
+    try std.testing.expect(client.frame_for_range.?(client.context, 6, 6, &frame));
+    try std.testing.expectApproxEqAbs(start_x, frame.x, 0.01);
+    try std.testing.expectApproxEqAbs(body_y, frame.y, 0.01);
+    cx.handleImePreedit("候选", 0);
+    try std.testing.expect(client.frame_for_range.?(client.context, surface.caret_byte, surface.caret_byte, &frame));
+    const cursor = surface.snapshot.?.projection.cursor;
+    try std.testing.expectApproxEqAbs(body_x + @as(f32, @floatFromInt(cursor.col)) * cell, frame.x, 0.01);
+    try std.testing.expectApproxEqAbs(body_y + @as(f32, @floatFromInt(cursor.row)) * row_height, frame.y, 0.01);
+    cx.handleImePreedit("", 0);
+
+    try transport.controller.feedOutput(owner, 2, "\x1b[?1000h\x1b[?1006h", 2);
+    _ = try view.refreshTerminalService(owner, false);
+    transport.written.clearRetainingCapacity();
+    cx.handleMouseDownEx(start_x, y, .left, .{});
+    try std.testing.expectEqualStrings("\x1b[<0;7;1M", transport.written.items);
+    cx.handleMouseUpEx(start_x, y, .left, .{});
+}
+
+test "terminal surface canvas click after hidden textarea restores the host and routes Enter and IME once" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 60);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "click target\r\nprompt$ ", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 180);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill() }, .{});
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    var view = try View.mount(cx);
+    defer view.releaseBuffers(cx);
+    try cx.root.?.appendChild(a, view.root);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    const panel = try ui.box(cx, .{ .position = .absolute, .inset = .{ .left = .{ .px = 180 }, .top = .{ .px = 20 } }, .width = .{ .px = 240 }, .height = .{ .px = 100 }, .z_index = 50 }, .{});
+    const prompt = try scope.createText("assistant draft", .{});
+    const input_widget = try ui.widgets.Textarea(.{ .value = prompt }).mountResult(scope, cx);
+    try panel.appendChild(a, input_widget.wrapper);
+    try cx.root.?.appendChild(a, panel);
+    _ = cx.render();
+    cx.setFocus(input_widget.input);
+    try std.testing.expect(cx.focus_manager.getFocused() == input_widget.input);
+    panel.setDisplay(.none);
+    _ = cx.render();
+    // Reproduce the native report's cleared authority. Hiding alone does not
+    // specify a terminal return target; this test never calls setFocus(view).
+    cx.clearFocus();
+    const surface = view.terminal_surface.?;
+    try std.testing.expectEqualStrings("terminal.input", view.root.meta.ownership.meta.test_id.?);
+    try std.testing.expectEqualStrings("terminal.surface", surface.root.meta.ownership.meta.test_id.?);
+    try std.testing.expect(view.root.behavior.interaction.text_input_client != null);
+    try std.testing.expect(surface.root.behavior.interaction.text_input_client == null);
+    const canvas = surface.root.globalRect();
+    const glyph = surface.rows.items[0].glyphs.items[0].node.globalRect();
+    const targets = [_]struct { x: f32, y: f32, text: []const u8 }{
+        .{ .x = canvas.x + canvas.w / 2, .y = canvas.y + canvas.h / 2, .text = "CANVAS" },
+        .{ .x = glyph.x + glyph.w / 2, .y = glyph.y + glyph.h / 2, .text = "GLYPH" },
+        .{ .x = canvas.x + 6, .y = canvas.y + 6, .text = "INSET" },
+    };
+    for (targets) |target| {
+        cx.clearFocus();
+        cx.handleMouseDown(target.x, target.y, .{});
+        cx.handleMouseUp(target.x, target.y);
+        if (cx.focus_manager.getFocused() != view.root) std.debug.print("focus target={s} point=({d},{d}) canvas={any} glyph={any} focused={?d} expected={d}\n", .{ target.text, target.x, target.y, canvas, glyph, if (cx.focus_manager.getFocused()) |node| node.id else null, view.root.id });
+        try std.testing.expect(cx.focus_manager.getFocused() == view.root);
+        transport.written.clearRetainingCapacity();
+        cx.handleTextInput(target.text);
+        cx.handleKeyDown(.@"return", .{});
+        try std.testing.expectEqualSlices(u8, target.text, transport.written.items[0..target.text.len]);
+        try std.testing.expectEqual(@as(usize, target.text.len + 1), transport.written.items.len);
+        try std.testing.expectEqual(@as(u8, '\r'), transport.written.items[target.text.len]);
+    }
+    transport.written.clearRetainingCapacity();
+    cx.handleImePreedit("候选", "候选".len);
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqualStrings("候选", surface.preedit);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    cx.handleImeCommit("中文");
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqualStrings("中文\r", transport.written.items);
+}
+
+test "assistant card focus return goes back to the terminal it opened from and preserves foreign IME composition" {
+    const CardFocus = @import("../../../shared/ui/overlay/overlay_host.zig").CardFocus;
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 60);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 180);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill() }, .{});
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    var view = try View.mount(cx);
+    defer view.releaseBuffers(cx);
+    try cx.root.?.appendChild(a, view.root);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    const panel = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = 180 }, .height = .{ .px = 80 } }, .{});
+    const ai_text = try scope.createText("assistant draft", .{});
+    const ai_input = try ui.widgets.Textarea(.{ .value = ai_text }).mountResult(scope, cx);
+    try panel.appendChild(a, ai_input.wrapper);
+    try cx.root.?.appendChild(a, panel);
+    const foreign_text = try scope.createText("other editor", .{});
+    const foreign = try ui.widgets.Textarea(.{ .value = foreign_text }).mountResult(scope, cx);
+    foreign.wrapper.setStyleInline(a, .{ .position = .absolute, .inset = .{ .left = .{ .px = 350 }, .top = .{ .px = 20 } }, .width = .{ .px = 200 }, .height = .{ .px = 100 } });
+    try cx.root.?.appendChild(a, foreign.wrapper);
+    const toolbar = try ui.widgets.Button(.{ .label = "AI" }).mount(scope, cx);
+    toolbar.setStyleInline(a, .{ .position = .absolute, .inset = .{ .left = .{ .px = 550 }, .top = .{ .px = 0 } }, .width = .{ .px = 40 }, .height = .{ .px = 30 } });
+    try cx.root.?.appendChild(a, toolbar);
+    for (0..4) |_| _ = cx.render();
+    cx.layout();
+    var card = CardFocus.init(cx, panel);
+
+    // Opened from the terminal, closed with focus in the card: focus goes back to the terminal.
+    cx.setFocus(view.root);
+    card.opened(null);
+    cx.setFocus(ai_input.input);
+    card.closed();
+    try std.testing.expect(cx.focus_manager.getFocused() == view.root);
+    cx.handleTextInput("AFTER_AI");
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqualStrings("AFTER_AI\r", transport.written.items);
+
+    // Opened from the toolbar button: focus goes back to the button.
+    cx.setFocus(toolbar);
+    card.opened(null);
+    cx.setFocus(ai_input.input);
+    card.closed();
+    try std.testing.expect(cx.focus_manager.getFocused() == toolbar);
+
+    // Focus moved to another editor (an outside click) before the close: it stays there, composition intact.
+    cx.setFocus(view.root);
+    card.opened(null);
+    const foreign_rect = foreign.input.globalRect();
+    cx.handleMouseDown(foreign_rect.x + foreign_rect.w - 10, foreign_rect.y + 15, .{});
+    cx.handleMouseUp(foreign_rect.x + foreign_rect.w - 10, foreign_rect.y + 15);
+    try std.testing.expect(cx.focus_manager.getFocused() == foreign.input);
+    cx.handleImePreedit("候选", "候选".len);
+    try std.testing.expect(foreign.state.imeIsComposing());
+    card.closed();
+    try std.testing.expect(cx.focus_manager.getFocused() == foreign.input);
+    try std.testing.expect(foreign.state.imeIsComposing());
+    cx.handleImeCommit("中文");
+    try std.testing.expectEqualStrings("other editor中文", foreign_text.peek());
+
+    // A composition in the card's own input is never interrupted by the close.
+    cx.setFocus(view.root);
+    card.opened(null);
+    cx.setFocus(ai_input.input);
+    cx.handleImePreedit("保留", "保留".len);
+    card.closed();
+    try std.testing.expect(cx.focus_manager.getFocused() == ai_input.input);
+    try std.testing.expect(ai_input.state.imeIsComposing());
+    cx.handleImeCommit("中文");
+    try std.testing.expectEqualStrings("assistant draft中文", ai_text.peek());
+
+    // A hidden return target is not focused.
+    cx.setFocus(view.root);
+    card.opened(null);
+    cx.setFocus(ai_input.input);
+    view.root.setDisplay(.none);
+    card.closed();
+    try std.testing.expect(cx.focus_manager.getFocused() != view.root);
+    view.root.setDisplay(.flex);
+}
+
+test "terminal surface focused search blurs before its event resources are released" {
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    var released = false;
+    defer if (!released) view.releaseBuffers(cx);
+    try view.attachSearch(scope);
+    view.openSearch();
+    _ = cx.render();
+    const Probe = struct {
+        released: bool = false,
+        blur_after_release: bool = false,
+        blurred: bool = false,
+        fn cleanup(self: *@This()) void {
+            self.released = true;
+        }
+        fn blur(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.blurred = true;
+            self.blur_after_release = self.released;
+        }
+    };
+    var probe: Probe = .{};
+    try view.search_scope.?.onCleanup(Probe, &probe, Probe.cleanup);
+    view.search_view.?.input_result.input_container.behavior.events.on_blur = .{ .callback = Probe.blur, .context = &probe };
+    try std.testing.expect(cx.focus_manager.getFocused() == view.search_view.?.input_result.input_container);
+    view.releaseBuffers(cx);
+    released = true;
+    try std.testing.expect(probe.released and probe.blurred);
+    try std.testing.expect(!probe.blur_after_release);
+    try std.testing.expect(cx.focus_manager.getFocused() == null);
+}
+
+test "window teardown order: search scope disposed with its parent before the terminal unbinds" {
+    // Regression (teardown-guard): MultiWindowApp.teardownWindowNow → Cx.deinit
+    // disposes the root scope children-first, so a tab's search scope dies
+    // before the root cleanup that shuts the local session down and reaches
+    // TerminalViewNode.unbindTerminalService → terminal_search.refresh. That
+    // refresh used to set the disposed navigation signal (panic in Debug).
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 32);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "needle one\r\nneedle two", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    const window_scope = try ui.Scope.init(a, null, cx.owner);
+    var window_alive = true;
+    defer if (window_alive) window_scope.dispose();
+    const tab_scope = try window_scope.childScope();
+    try view.attachSearch(tab_scope);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    view.openSearch();
+    _ = cx.render();
+    cx.handleTextInput("needle");
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 2), view.search.count());
+    try std.testing.expect(view.search_view != null and view.search_scope != null);
+    cx.clearFocus();
+
+    // Window teardown: the scope tree goes first, the owner shutdown after.
+    const Probe = struct {
+        view: *View,
+        unbound_after_children: bool = false,
+        fn shutdownOwners(self: *@This()) void {
+            // Root cleanups run after every child scope is gone.
+            self.unbound_after_children = self.view.search_scope == null and self.view.search_view == null;
+            self.view.unbindTerminalService(owner);
+        }
+    };
+    var probe: Probe = .{ .view = &view };
+    try window_scope.onCleanup(Probe, &probe, Probe.shutdownOwners);
+    window_scope.dispose();
+    window_alive = false;
+    try std.testing.expect(probe.unbound_after_children);
+    try std.testing.expect(view.terminal_surface == null);
+    // Releasing the view afterwards must not reach the freed search scope.
+    view.releaseBuffers(cx);
+}
+
+test "terminal surface search drops overwritten hits instead of locating a replacement row" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 32);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "original needle\r\nsecond", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    defer view.releaseBuffers(cx);
+    try view.attachSearch(scope);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    view.openSearch();
+    _ = cx.render();
+    cx.handleTextInput("needle");
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 1), view.search.count());
+    try std.testing.expect(view.search_anchor != null);
+    const previous = view.service_search.?.document.source_version;
+    const scrolls = transport.scroll_calls;
+    try transport.controller.feedOutput(owner, 2, "\x1b[2J\x1b[Hreplacement\r\nsecond", 2);
+    view.terminal_surface.?.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(view.service_search.?.document.source_version > previous);
+    try std.testing.expectEqual(@as(usize, 0), view.search.count());
+    try std.testing.expect(view.search_anchor == null);
+    try std.testing.expectEqualStrings("无匹配", view.search_view.?.count.getText().?.content);
+    for (view.search_marks.items) |mark| try std.testing.expectEqual(.none, mark.style.display);
+    cx.handleKeyDown(.@"return", .{});
+    try std.testing.expectEqual(scrolls, transport.scroll_calls);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+}
+
+test "history search uses complete retained VT source and locates offscreen softwrapped graphemes" {
+    const cast = "{\"version\":2,\"width\":8,\"height\":2}\n" ++
+        "[0,\"o\",\"\\u001b[1;31mabcdef界é👩‍💻XYZ\\u001b[0m\\r\\n\"]\n" ++
+        "[1,\"o\",\"second\\r\\nthird\\r\\nlast\"]\n";
+    var timeline = try @import("../../history/model/history_cast.zig").load(a, cast);
+    defer timeline.deinit();
+    timeline.card_id = .{ .slot = 91, .generation = 1 };
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    defer view.releaseBuffers(cx);
+    try view.attachSearch(scope);
+    view.history.deinit();
+    view.history = timeline;
+    timeline = @import("../../history/model/history_replay.zig").Timeline.init(a, timeline.limit);
+    view.bindArchived();
+    try std.testing.expect(view.openHistory());
+    _ = cx.render();
+    try std.testing.expect(std.mem.indexOf(u8, text_frameForTest(view.history.current().?.wire), "abcdef") == null);
+    view.openSearch();
+    _ = cx.render();
+    cx.handleTextInput("界é👩‍💻");
+    _ = cx.render();
+    try std.testing.expectEqual(@as(usize, 1), view.search.count());
+    try std.testing.expect(view.history.card_id.?.eql(.{ .slot = 91, .generation = 1 }));
+    try std.testing.expect(view.history_reading_top != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_frameForTest(view.history_search_wire.items), "界") != null);
+    const painted_frame = @import("../../../vt/text_frame.zig").decode(view.history_search_wire.items).?;
+    try std.testing.expect(painted_frame.spans.len > 0);
+    try std.testing.expect(painted_frame.spans[0].color != 0);
+    try std.testing.expect(painted_frame.spans[0].bold());
+    try std.testing.expect(view.worker == null and view.terminal_surface == null);
+    cx.handleKeyDown(.escape, .{});
+    try std.testing.expect(!view.search_open and cx.focus_manager.getFocused() == view.root);
+}
+
+fn text_frameForTest(wire: []const u8) []const u8 {
+    return @import("../../../vt/text_frame.zig").decode(wire).?.text;
+}
+
+test "legacy history search locates an original earlier frame from the final frame" {
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    defer view.releaseBuffers(cx);
+    try view.attachSearch(scope);
+    const frame = @import("../../../vt/text_frame.zig");
+    var wire: [frame.header_bytes + 6]u8 = undefined;
+    frame.encodeHeader(wire[0..frame.header_bytes], .{}, 6, 1, 0, 6);
+    @memcpy(wire[frame.header_bytes..], "needle");
+    try view.history.append(1, &wire);
+    @memcpy(wire[frame.header_bytes..], "latest");
+    try view.history.append(2, &wire);
+    view.bindArchived();
+    try std.testing.expect(view.openHistory());
+    _ = cx.render();
+    try std.testing.expectEqual(@as(usize, 1), view.history.selected.?);
+    view.openSearch();
+    _ = cx.render();
+    cx.handleTextInput("needle");
+    _ = cx.render();
+    try std.testing.expectEqual(@as(usize, 1), view.search.count());
+    try std.testing.expectEqual(@as(usize, 0), view.history.selected.?);
+    try std.testing.expectEqualStrings("needle", text_frameForTest(view.history.current().?.wire));
+    try std.testing.expect(view.worker == null and view.terminal_surface == null);
+}
+
+test "terminal surface defers hidden painting without recapturing unchanged tabs and reveals latest output" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 400);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    view.root.setDisplay(.none);
+    try transport.controller.feedOutput(owner, 1, "LATEST", 100);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 0), view.terminal_surface.?.rows.items.len);
+    try std.testing.expect(transport.slot.canPublish());
+    const captured = transport.snapshot_calls;
+    for (0..20) |_| _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(captured, transport.snapshot_calls);
+    // New output still advances the hidden pane's owned snapshot once.
+    try transport.controller.feedOutput(owner, 2, " OUTPUT", 200);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(captured + 1, transport.snapshot_calls);
+    for (0..20) |_| _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(captured + 1, transport.snapshot_calls);
+    view.root.setDisplay(.flex);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(surface.rows.items.len > 0);
+    try std.testing.expectEqualStrings("LATEST OUTPUT", surface.rows.items[0].glyphs.items[0].node.getText().?.content);
+    try std.testing.expect(std.mem.indexOf(u8, surface.document.items, "LATEST OUTPUT") != null);
+    const revealed = transport.snapshot_calls;
+    // Tab activation only repaints the current publication.
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(revealed, transport.snapshot_calls);
+}
+
+test "terminal surface visible grouped inactive pane resizes but hidden group does not" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 320);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 22.0 / 14.0, 400);
+    try view.bindTerminalService(transport.service());
+    view.setGrouped(true);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 1), transport.resize_calls);
+    // Grouped pane insets are top 2 + bottom 10 (Pencil `i3Zme8`): floor((320 - 12) / 22).
+    try std.testing.expectEqual(@as(u16, 14), transport.controller.geometry.rows);
+    view.root.setDisplay(.none);
+    cx.setViewport(800, 500);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 1), transport.resize_calls);
+    view.root.setDisplay(.flex);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expectEqual(@as(usize, 2), transport.resize_calls);
+    try std.testing.expectEqual(@as(u16, 22), transport.controller.geometry.rows);
+}
+
+test "global backdrop survives OSC default backgrounds while explicit ANSI cells keep their color" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.setTerminalTheme(.{ .revision = 1, .foreground = 0xeeeeeeff, .background = 0x112233ff, .cursor = 0xffffffff, .selection = 0x99999940, .ansi = @splat(0xaa3300ff) });
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    try transport.controller.feedOutput(owner, 1, "\x1b]11;#445566\x07plain\x1b[41mX", 1);
+    // The fixture does not run the worker publication clock; explicitly fetch
+    // the new parser state when its text publication is coalesced.
+    view.terminal_surface.?.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    try std.testing.expectEqual(@as(u24, 0x445566), surface.snapshot.?.projection.colors.background);
+    try std.testing.expectEqual(ui.Color.TRANSPARENT, surface.root.getBackground());
+    var found_plain = false;
+    var found_ansi = false;
+    for (surface.rows.items) |row| for (row.glyphs.items) |glyph| {
+        const text = glyph.node.getText().?.content;
+        if (std.mem.eql(u8, text, "plain")) {
+            try std.testing.expectEqual(ui.Color.TRANSPARENT, glyph.node.getBackground());
+            found_plain = true;
+        } else if (std.mem.eql(u8, text, "X")) {
+            // A background change inside a word keeps its own node; the
+            // background itself is a band over exactly that cell.
+            try std.testing.expectEqual(ui.Color.TRANSPARENT, glyph.node.getBackground());
+            var visible: usize = 0;
+            for (row.bands.get(.background).items) |background| {
+                if (background.style.display == .none) continue;
+                visible += 1;
+                try std.testing.expectEqual(ui.Color.hex(0xaa3300), background.getBackground());
+                try std.testing.expectApproxEqAbs(glyph.node.style.ext.?.inset.left.px, background.style.ext.?.inset.left.px, 0.001);
+                try std.testing.expectApproxEqAbs(glyph.node.style.width.px, background.style.width.px, 0.001);
+                var background_index: usize = 0;
+                var selection_index: usize = 0;
+                var text_index: usize = 0;
+                for (row.root.children.items, 0..) |child, index| {
+                    if (child == background) background_index = index;
+                    if (child == row.selected) selection_index = index;
+                    if (child == glyph.node) text_index = index;
+                }
+                try std.testing.expect(background_index < selection_index and selection_index < text_index);
+            }
+            try std.testing.expectEqual(@as(usize, 1), visible);
+            found_ansi = true;
+        }
+    };
+    try std.testing.expect(found_plain and found_ansi);
+    // UI overlays must remain translucent even if a caller supplies a VT RGB.
+    surface.options.background = ui.Color.hex(0x112233);
+    cx.setFocus(view.root);
+    _ = view.root.behavior.events.on_event.?(.{ .ime_preedit = .{ .text = "候选" } }, view.root.behavior.events.event_context);
+    try std.testing.expect(surface.preedit_node.getBackground().a <= 64);
+    surface.showError(error.WorkerBusy);
+    try std.testing.expect(surface.message_root.getBackground().a <= 64);
+}
+
+test "terminal timestamp hides pending wrapped input and freezes Return time with and without builtin records" {
+    const Clock = struct {
+        var now: i64 = 1000;
+        fn read() i64 {
+            return now;
+        }
+    };
+    for ([_]bool{ false, true }) |composed| {
+        var transport: FakeTransport = undefined;
+        try transport.init(12, 16);
+        defer transport.deinit();
+        Clock.now = 1000;
+        transport.vt.wall_clock_ms = Clock.read;
+        try transport.controller.feedOutput(owner, 1, "$ ", Clock.now);
+        const cx = try ui.Cx.init(a, std.testing.io);
+        defer cx.deinit();
+        cx.setViewport(500, 400);
+        var view = try View.mount(cx);
+        cx.root = view.root;
+        defer view.releaseBuffers(cx);
+        view.setTimestampGutter(true);
+        try view.bindTerminalService(transport.service());
+        _ = cx.render();
+        _ = try view.refreshTerminalService(owner, false);
+        const surface = view.terminal_surface.?;
+        if (composed) {
+            const id = try surface.composite.begin("@help", 500);
+            try surface.composite.finish(owner, id, .success, "help");
+        }
+        // The prompt and its wrapped input must both remain unstamped.
+        for ([_][]const u8{ "\x1b[0m", "abcdefghijklmnopqrstuvwx" }, 2..) |bytes, sequence| {
+            Clock.now = 3000;
+            try transport.controller.feedOutput(owner, sequence, bytes, Clock.now);
+            surface.force_snapshot = true;
+            _ = try view.refreshTerminalService(owner, false);
+            for (surface.rows.items, surface.snapshot.?.projection.visible_rows) |row, item| {
+                if (item.application_record_id == 0) try std.testing.expect(row.time == null or row.time.?.style.display == .none);
+            }
+        }
+        Clock.now = 5000;
+        try transport.controller.recordSubmission(owner);
+        surface.force_snapshot = true;
+        _ = try view.refreshTerminalService(owner, false);
+        var stamp: [8]u8 = undefined;
+        const expected = try @import("../view/terminal_surface_input.zig").localTimestamp(&stamp, Clock.now);
+        var submitted_count: usize = 0;
+        for (surface.rows.items, surface.snapshot.?.projection.visible_rows) |row, item| {
+            if (item.application_record_id == 0 and item.submitted_wallclock_ms != null) {
+                try std.testing.expectEqual(@as(?i64, 5000), item.submitted_wallclock_ms);
+                try std.testing.expectEqual(.flex, row.time.?.style.display);
+                try std.testing.expectEqualStrings(expected, row.time.?.getText().?.content);
+                submitted_count += 1;
+            }
+        }
+        try std.testing.expect(submitted_count >= 2);
+        Clock.now = 9000;
+        try transport.controller.feedOutput(owner, 4, "\r\nresult\r\n$ ", Clock.now);
+        _ = try view.refreshTerminalService(owner, false);
+        const projection = surface.snapshot.?.projection;
+        const prompt = surface.rows.items[projection.cursor.row];
+        try std.testing.expect(prompt.time == null or prompt.time.?.style.display == .none);
+        for (surface.rows.items, projection.visible_rows) |row, item| {
+            if (item.submitted_wallclock_ms != null) try std.testing.expectEqualStrings(expected, row.time.?.getText().?.content);
+        }
+    }
+}
+
+test "terminal timestamp skips blank rows and builtin headers preserve distinct execution times" {
+    var transport: FakeTransport = undefined;
+    try transport.init(12, 80);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1000, 600);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTimestampGutter(true);
+    try view.bindTerminalService(transport.service());
+    try transport.controller.feedOutput(owner, 1, "visible\r\n\r\nprompt% ", 1000);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const first = try surface.composite.begin("@ts", 1000123);
+    try surface.composite.finish(owner, first, .success, "开启");
+    const second = try surface.composite.begin("@help", 1002456);
+    try surface.composite.finish(owner, second, .success, "帮助");
+    surface.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    var count: usize = 0;
+    for (surface.rows.items, 0..) |row, i| {
+        const snapshot = surface.snapshot.?.projection;
+        const item = snapshot.visible_rows[i];
+        const cells = snapshot.cells[item.cell_start..][0..item.cell_count];
+        const has_text = for (cells) |cell| {
+            if (std.mem.trim(u8, snapshot.grapheme(cell), " \r\n\t").len > 0) break true;
+        } else false;
+        if (!has_text) try std.testing.expect(row.time == null or row.time.?.style.display == .none);
+        if (row.record_time != null and row.record_time.?.style.display != .none) {
+            try std.testing.expect(item.application_kind == 1);
+            try std.testing.expectEqual(if (count == 0) @as(i64, 1000123) else @as(i64, 1002456), item.received_wallclock_ms.?);
+            const clock_text = row.record_time.?.getText().?;
+            try std.testing.expectEqual(@as(usize, 19), clock_text.content.len);
+            const gutter_text = row.time.?.getText().?;
+            try std.testing.expectEqualStrings(gutter_text.content, clock_text.content[11..]);
+            try std.testing.expect(row.time.?.style.display != .none);
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "terminal surface batches ASCII runs without shifting styled and complex cells" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 80);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "abcdefghijklmnop\x1b[31mRED\x1b[0m界e\u{301}👩‍💻", 100);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(900, 200);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const glyphs = surface.rows.items[0].glyphs.items;
+    for (surface.rows.items) |row| {
+        try std.testing.expect(row.time == null and row.record_time == null);
+        try std.testing.expect(row.article == null and row.marker == null and row.status_icon == null);
+    }
+    // "p|R" changes style inside a word: zenit would shape it as one unit, so
+    // it stays a node boundary (no cross-style ligature).
+    try std.testing.expectEqual(@as(usize, 5), glyphs.len);
+    for (std.enums.values(@import("../view/terminal_surface.zig").BandKind)) |kind| try std.testing.expectEqual(@as(usize, 0), surface.rows.items[0].bands.get(kind).items.len);
+    const texts = [_][]const u8{ "abcdefghijklmnop", "RED", "界", "e\u{301}", "👩‍💻" };
+    const columns = [_]f32{ 0, 16, 19, 21, 22 };
+    for (glyphs, texts, columns) |glyph, expected, column| {
+        try std.testing.expectEqual(@as(usize, 0), glyph.node.getText().?.spans.len);
+        try std.testing.expectEqualStrings(expected, glyph.node.getText().?.content);
+        try std.testing.expectApproxEqAbs(surface.options.cell_width, glyph.node.getText().?.monospace_char_width, 0.001);
+        try std.testing.expectApproxEqAbs(surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX() + column * surface.options.cell_width, glyph.node.globalRect().x, 0.001);
+    }
+    const palette = surface.snapshot.?.projection.colors;
+    try std.testing.expectEqual(ui.Color.hex(palette.palette[1]), glyphs[1].node.getText().?.color);
+    // Repaint the final cell after the rest of the row is unchanged.
+    try transport.controller.feedOutput(owner, 2, "\r\x1b[16CX", 200);
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(std.mem.indexOf(u8, surface.document.items, "abcdefghijklmnopXED") != null);
+}
+
+test "terminal idle render trim preserves live text and normal replay" {
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 200);
+    const node = try ui.text(cx, "owned replay remains readable", .{});
+    cx.root = node;
+    _ = cx.render();
+    const count = cx.display_list.items.items.len;
+    try std.testing.expect(count > 0);
+    try cx.display_list.items.ensureTotalCapacity(cx.display_list.allocator, 5000);
+    const released = cx.trimIdleRenderCapacity(4096);
+    try std.testing.expect(released > 1024 * 1024);
+    try std.testing.expectEqual(count, cx.display_list.items.items.len);
+    const text = for (cx.display_list.items.items) |item| {
+        if (item == .text_run) break item.text_run.content;
+    } else return error.TextMissing;
+    try std.testing.expectEqualStrings("owned replay remains readable", text);
+    try node.setTextContent(a, "reopened with new content");
+    cx.requestRedraw();
+    cx.advanceFrameClock();
+    _ = cx.render();
+    const next = for (cx.display_list.items.items) |item| {
+        if (item == .text_run) break item.text_run.content;
+    } else return error.TextMissing;
+    try std.testing.expectEqualStrings("reopened with new content", next);
+}
+
+test "builtin document hydrates large Unicode results across frames while prompt stays live" {
+    var transport: FakeTransport = undefined;
+    try transport.init(10, 60);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "prompt% ", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(700, 300);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    const id = try surface.composite.begin("@help", 1000);
+    const line = "界你好世界你好世界你好世界你好世界你好世界";
+    const output = line ++ "\n" ++ line ++ "\n" ++ line ++ "\n" ++ line ++ "\n" ++ line ++ "\n" ++ line;
+    try surface.composite.finish(owner, id, .success, output);
+    surface.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(surface.glyphs_pending);
+    try std.testing.expect(surface.snapshot.?.projection.cursor.visible);
+    cx.handleTextInput("Z");
+    try std.testing.expectEqual(@as(u64, 1), surface.input_during_hydration);
+    try std.testing.expect(std.mem.indexOf(u8, transport.written.items, "Z") != null);
+    try transport.controller.feedOutput(owner, 2, "Z", 2);
+    surface.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, false);
+    try std.testing.expect(std.mem.indexOf(u8, surface.document.items, "prompt% Z") != null);
+    const partial = for (surface.rows.items) |row| {
+        if (row.pending_hash != null and row.pending_glyphs > 0) break row.glyphs.items[0].node;
+    } else return error.PartialRowMissing;
+    const partial_version = partial.meta.per_frame.caches.versions.content;
+    var frames: usize = 0;
+    while (surface.glyphs_pending and frames < 20) : (frames += 1) {
+        cx.requestRedraw();
+        cx.advanceFrameClock();
+        cx.layout();
+        _ = try view.refreshTerminalService(owner, false);
+        _ = cx.render();
+        try std.testing.expectEqual(partial_version, partial.meta.per_frame.caches.versions.content);
+    }
+    try std.testing.expect(frames > 0 and frames <= 4);
+    try std.testing.expect(!surface.glyphs_pending);
+    try std.testing.expect(std.mem.indexOf(u8, surface.document.items, line) != null);
+    // Check the actual hydrated text nodes, not just the authoritative copy
+    // used by selection/IME, so a lost continuation column cannot pass.
+    const projection = &surface.snapshot.?.projection;
+    for (projection.visible_rows) |value| {
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(a);
+        var painted: std.ArrayList(u8) = .empty;
+        defer painted.deinit(a);
+        for (projection.cells[value.cell_start..][0..value.cell_count]) |cell| {
+            if (cell.width == .wide_tail) continue;
+            for (projection.grapheme(cell)) |byte| if (byte != ' ') {
+                try expected.append(a, byte);
+            };
+        }
+        for (surface.rows.items[value.viewport_y].glyphs.items) |glyph| {
+            if (glyph.node.style.display == .none) continue;
+            for (glyph.node.getText().?.content) |byte| if (byte != ' ') {
+                try painted.append(a, byte);
+            };
+        }
+        try std.testing.expectEqualStrings(expected.items, painted.items);
+    }
+}
+
+test "terminal surface busy trusted editing and receipts retry Enter without an error banner" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    for ([_]bool{ true, false }) |outcome_busy| {
+        transport.outcome_busy = outcome_busy;
+        transport.receipt_busy = !outcome_busy;
+        cx.handleKeyDown(.@"return", .{});
+        try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+        try std.testing.expect(surface.error_message == null);
+        transport.outcome_busy = false;
+        transport.receipt_busy = false;
+        try surface.pump();
+        try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    }
+    try std.testing.expectEqualStrings("\r\r", transport.written.items);
+}
+
+test "builtin document patches prompt edits without recapturing scrollback and rebuilds on new rows" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 60);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    try transport.controller.feedOutput(owner, 1, "earlier output\r\nprompt% ", 100);
+    var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+    defer doc.deinit();
+    const record = try doc.begin("@help", 1000);
+    try doc.finish(owner, record, .success, "help result");
+    var initial = try doc.service().snapshot(a);
+    initial.deinit(a);
+    const rebuilds = doc.full_rebuilds;
+    for (2..7) |seq| {
+        try transport.controller.feedOutput(owner, seq, "x", @as(i64, @intCast(seq)) * 100);
+        var next = try doc.service().snapshot(a);
+        next.deinit(a);
+    }
+    try std.testing.expectEqual(rebuilds, doc.full_rebuilds);
+    try std.testing.expectEqual(@as(u64, 5), doc.tail_updates);
+    var search = try doc.service().searchSnapshot(a);
+    defer search.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, search.document.text, "prompt% xxxxx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search.document.text, "help result") != null);
+    try transport.controller.feedOutput(owner, 7, "\x1b[31m界e\u{301}👩‍💻\x1b[0m", 700);
+    var unicode = try doc.service().snapshot(a);
+    unicode.deinit(a);
+    try std.testing.expectEqual(rebuilds, doc.full_rebuilds);
+    var unicode_search = try doc.service().searchSnapshot(a);
+    defer unicode_search.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, unicode_search.document.text, "xxxxx界e\u{301}👩‍💻") != null);
+    try transport.controller.feedOutput(owner, 8, "\r\x1b[2Kshort", 800);
+    var shorter = try doc.service().snapshot(a);
+    shorter.deinit(a);
+    try std.testing.expectEqual(rebuilds, doc.full_rebuilds);
+    var short_search = try doc.service().searchSnapshot(a);
+    defer short_search.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, short_search.document.text, "short") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_search.document.text, "xxxxx界") == null);
+    const revision = doc.revision;
+    try transport.controller.feedOutput(owner, 9, "\x1b]2;title only\x07", 900);
+    var title_only = try doc.service().snapshot(a);
+    title_only.deinit(a);
+    try std.testing.expectEqual(revision, doc.revision);
+    try transport.controller.feedOutput(owner, 10, "\r\nnew row", 1000);
+    var changed = try doc.service().snapshot(a);
+    defer changed.deinit(a);
+    try std.testing.expect(doc.full_rebuilds > rebuilds);
+}
+
+test "builtin document clear keeps the native blank viewport below the prompt in large history" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 60);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..50) |_| try output.appendSlice(a, "earlier history\r\n");
+    try transport.controller.feedOutput(owner, 1, output.items, 100);
+    var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+    defer doc.deinit();
+    const record = try doc.begin("@help", 1000);
+    try doc.finish(owner, record, .success, "help result");
+    var initial = try doc.service().snapshot(a);
+    initial.deinit(a);
+    try transport.controller.feedOutput(owner, 2, "\x1b[2J\x1b[Hcleared\r\nprompt%", 200);
+    var cleared = try doc.service().snapshot(a);
+    defer cleared.deinit(a);
+    const wire = try @import("../../../vt/projection_frame.zig").encode(a, &cleared.projection, true);
+    defer a.free(wire);
+    try std.testing.expectEqualStrings("cleared\nprompt%\n\n\n\n", @import("../../../vt/text_frame.zig").decode(wire).?.text);
+    try std.testing.expectEqual(@as(u16, 1), cleared.projection.cursor.row);
+}
+
+test "builtin document async first capture then increments newline and clear tails without full scans" {
+    var transport: FakeTransport = undefined;
+    try transport.init(8, 60);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    transport.async_search = true;
+    try transport.vt.setScrollbackLimit(5000);
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    for (0..1000) |_| try output.appendSlice(a, "retained history abcdefghijklmnop\r\n");
+    try transport.controller.feedOutput(owner, 1, output.items, 100);
+    var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+    defer doc.deinit();
+    const record = try doc.begin("@help", 1000);
+    try doc.finish(owner, record, .success, "help result");
+    var preview = try doc.service().snapshot(a);
+    preview.deinit(a);
+    try std.testing.expect(!doc.source_complete);
+    try std.testing.expectEqual(@as(u64, 0), doc.synchronous_scans);
+    try std.testing.expectEqual(@as(u64, 1), doc.background_scans);
+    const preview_anchor = doc.cached.?.rows[0].id;
+    doc.follow = false;
+    doc.top = 0;
+    try transport.completeSearch();
+    var initial = try doc.service().snapshot(a);
+    initial.deinit(a);
+    try std.testing.expect(doc.source_complete);
+    try std.testing.expectEqual(preview_anchor, doc.cached.?.rows[doc.top].id);
+    doc.follow = true;
+    const full = doc.full_rebuilds;
+    for (2..10) |sequence| {
+        try transport.controller.feedOutput(owner, sequence, "\r\nnext row", @intCast(sequence * 100));
+        var next = try doc.service().snapshot(a);
+        next.deinit(a);
+    }
+    try std.testing.expectEqual(full, doc.full_rebuilds);
+    try std.testing.expectEqual(@as(u64, 8), doc.incremental_rebuilds);
+    try std.testing.expectEqual(@as(u64, 1), doc.background_scans);
+    var authoritative = try transport.controller.searchSnapshot(owner, a);
+    defer authoritative.deinit(a);
+    try std.testing.expectEqualStrings(authoritative.text, doc.source_cache.?.text);
+    try std.testing.expectEqual(authoritative.rows.len, doc.source_cache.?.rows.len);
+    try transport.controller.feedOutput(owner, 10, "\x1b[2J\x1b[HCLEARED\r\nprompt%", 1000);
+    var cleared = try doc.service().snapshot(a);
+    defer cleared.deinit(a);
+    try std.testing.expectEqual(full, doc.full_rebuilds);
+    try std.testing.expectEqual(@as(u64, 9), doc.incremental_rebuilds);
+    const wire = try @import("../../../vt/projection_frame.zig").encode(a, &cleared.projection, true);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.startsWith(u8, @import("../../../vt/text_frame.zig").decode(wire).?.text, "CLEARED\nprompt%\n"));
+    try std.testing.expectEqual(@as(u16, 1), cleared.projection.cursor.row);
+    try transport.vt.setScrollbackLimit(20);
+    var pruned_preview = try doc.service().snapshot(a);
+    pruned_preview.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), doc.background_scans);
+    try std.testing.expect(!doc.source_complete);
+    try transport.completeSearch();
+    var pruned = try doc.service().snapshot(a);
+    pruned.deinit(a);
+    try std.testing.expect(doc.source_complete);
+    var pruned_source = try transport.controller.searchSnapshot(owner, a);
+    defer pruned_source.deinit(a);
+    try std.testing.expectEqualStrings(pruned_source.text, doc.source_cache.?.text);
+    try std.testing.expect(doc.source_cache.?.rows.len < authoritative.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), doc.synchronous_scans);
+}
+
+test "builtin document cancels pending source capture without retaining its UI owner" {
+    var transport: FakeTransport = undefined;
+    try transport.init(8, 60);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    transport.async_search = true;
+    {
+        var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+        defer doc.deinit();
+        _ = try doc.begin("@help", 1000);
+        var preview = try doc.service().snapshot(a);
+        preview.deinit(a);
+        try std.testing.expect(transport.search_job != null);
+    }
+    try transport.completeSearch();
+    try std.testing.expect(transport.search_job == null);
+}
+
+test "builtin document reports background capture failure without retrying unchanged history" {
+    var transport: FakeTransport = undefined;
+    try transport.init(8, 60);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    transport.async_search = true;
+    var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+    defer doc.deinit();
+    _ = try doc.begin("@help", 1000);
+    var preview = try doc.service().snapshot(a);
+    preview.deinit(a);
+    const task = transport.search_job.?;
+    transport.search_job = null;
+    task.finish(null, error.SearchTooLarge);
+    task.release();
+    var failed = try doc.service().snapshot(a);
+    failed.deinit(a);
+    try std.testing.expectError(error.SearchTooLarge, doc.service().searchSnapshot(a));
+    try transport.controller.feedOutput(owner, 1, "x", 1);
+    var typed = try doc.service().snapshot(a);
+    typed.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), doc.background_scans);
+    try transport.controller.resizeApplied(owner, .{ .revision = 2, .rows = 9, .cols = 60 }, 2);
+    var resized = try doc.service().snapshot(a);
+    resized.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), doc.background_scans);
+    try transport.completeSearch();
+    var ready = try doc.service().searchSnapshot(a);
+    ready.deinit(a);
+    try std.testing.expect(doc.source_complete);
+}
+
+test "builtin document sends an oversized wrapped logical tail to the background" {
+    var transport: FakeTransport = undefined;
+    try transport.init(8, 24);
+    defer transport.deinit();
+    transport.controller.feed.text_slot = null;
+    transport.async_search = true;
+    try transport.vt.setScrollbackLimit(5000);
+    var output: [2008]u8 = @splat('x');
+    @memcpy(output[2000..], "\r\nprompt");
+    try transport.controller.feedOutput(owner, 1, &output, 1);
+    var doc = @import("../model/terminal_document.zig").Document.init(a, transport.service(), owner);
+    defer doc.deinit();
+    _ = try doc.begin("@help", 1000);
+    var preview = try doc.service().snapshot(a);
+    preview.deinit(a);
+    try transport.completeSearch();
+    var initial = try doc.service().snapshot(a);
+    initial.deinit(a);
+    try transport.controller.feedOutput(owner, 2, "\r\nnext", 2);
+    var next = try doc.service().snapshot(a);
+    next.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), doc.background_scans);
+    try std.testing.expect(doc.source_complete);
+    try std.testing.expect(doc.source_retry_at_ns != null);
+    doc.full_capture_eligible_at_ns = 0;
+    doc.source_retry_at_ns = 0;
+    var pending = try doc.service().snapshot(a);
+    pending.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), doc.background_scans);
+    try std.testing.expect(doc.source_complete);
+    try transport.completeSearch();
+    var ready = try doc.service().snapshot(a);
+    ready.deinit(a);
+    var source = try transport.controller.searchSnapshot(owner, a);
+    defer source.deinit(a);
+    try std.testing.expectEqualStrings(source.text, doc.source_cache.?.text);
+}
+
+test "terminal surface preserves full SGR native styles reverse blank cells and DECSCUSR" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 30);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 200);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    try view.setTerminalTheme(.{ .revision = 1, .cursor_shape = .bar, .foreground = 0xeeeeeeff, .background = 0x112233ff, .cursor = 0xffffffff, .selection = 0x44444440, .ansi = @splat(0xabcdefFF) });
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    try transport.controller.feedOutput(owner, 1, "\x1b[1;3;9;53mA\x1b[0m\x1b[4:3;58;2;255;0;0mU\x1b[0m\x1b[8mH\x1b[0m\x1b[4 q", 1);
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    // A, U and H are one word: each style change inside it stays a node boundary.
+    const row = &surface.rows.items[0];
+    const bold = row.glyphs.items[0];
+    try std.testing.expectEqualStrings("A", bold.node.getText().?.content);
+    try std.testing.expect(bold.node.getText().?.font_weight >= 700);
+    try std.testing.expect(bold.node.getText().?.use_italic_font);
+    try std.testing.expect(bold.node.getText().?.strikethrough);
+    try std.testing.expect(bold.node.getText().?.spans[0].strikethrough);
+    // The overline is a band over exactly A's cell in A's ink.
+    const overline = row.bands.get(.overline).items[0];
+    try std.testing.expectEqual(.flex, overline.style.display);
+    try std.testing.expectEqual(bold.node.getText().?.color, overline.getBackground());
+    try std.testing.expectApproxEqAbs(bold.node.style.ext.?.inset.left.px, overline.style.ext.?.inset.left.px, 0.001);
+    try std.testing.expectApproxEqAbs(surface.options.cell_width, overline.style.width.px, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), row.bands.get(.overline).items.len);
+    const underline = row.glyphs.items[1].node.getText().?.spans[0];
+    try std.testing.expectEqual(.wavy, underline.underline_style);
+    try std.testing.expectEqual(ui.Color.hex(0xff0000), underline.underline_color.?);
+    try std.testing.expectEqual(@as(u8, 0), row.glyphs.items[2].node.getText().?.color.a);
+    try std.testing.expectEqual(@as(f32, 2), surface.caret.style.height.px);
+    try transport.controller.feedOutput(owner, 2, "\x1b[0 q", 2);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(f32, 2), surface.caret.style.width.px);
+    try transport.controller.feedOutput(owner, 3, "\x1b[2J\x1b[H\x1b[?5h", 3);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.rows.items[1].glyphs.items.len > 0);
+    // DECSCNM: the whole blank row is one reversed background run.
+    try std.testing.expectEqual(ui.Color.hex(0xeeeeee), surface.rows.items[1].bands.get(.background).items[0].getBackground());
+    try std.testing.expectEqual(.flex, surface.rows.items[1].bands.get(.background).items[0].style.display);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(surface.snapshot.?.projection.cols)) * surface.options.cell_width, surface.rows.items[1].bands.get(.background).items[0].style.width.px, 0.001);
+}
+
+test "terminal surface first wheel waits for complete async history instead of consuming delta" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 30);
+    defer transport.deinit();
+    for (1..61) |i| {
+        var buffer: [32]u8 = undefined;
+        _ = try transport.vt.feed(try std.fmt.bufPrint(&buffer, "ASYNC_ROW_{d}\r\n", .{i}));
+    }
+    transport.async_search = true;
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    surface.pending_scroll = -100000;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(f32, -100000), surface.pending_scroll);
+    try std.testing.expect(transport.search_job != null);
+    try transport.completeSearch();
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(f32, 0), surface.pending_scroll);
+    try std.testing.expect(std.mem.indexOf(u8, surface.document.items, "ASYNC_ROW_1") != null);
+    try std.testing.expect(!surface.composite.follow);
+}
+
+test "terminal surface focus click never creates stale selection anchors but a drag still selects" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 30);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 200);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    const surface = view.terminal_surface.?;
+    const event = surface.root.behavior.events.on_event.?;
+    const context = surface.root.behavior.events.event_context;
+    // Worker output advances after painting. A plain focus click must not ask
+    // the new terminal state to resolve a point on that older projection.
+    try transport.controller.feedOutput(owner, 1, "hello world", 1);
+    _ = event(.{ .mouse_down = .{ .button = .left, .x = 20, .y = 20 } }, context);
+    _ = event(.{ .mouse_up = .{ .button = .left, .x = 20, .y = 20 } }, context);
+    try std.testing.expect(surface.selection == null);
+    try std.testing.expect(surface.error_message == null);
+    try std.testing.expect(!cx.dispatcher.hasPointerCapture());
+    _ = try view.refreshTerminalService(owner, false);
+    _ = event(.{ .mouse_down = .{ .button = .left, .x = 20, .y = 20 } }, context);
+    _ = event(.{ .mouse_move = .{ .x = 60, .y = 20 } }, context);
+    try std.testing.expect(surface.selection != null);
+    surface.clearSelection();
+}
+
+test "terminal surface preserves unaccepted text and keys across stale modes and input epochs" {
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 32);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+
+    // Change worker modes after the UI frame, then withhold its next frame.
+    try transport.controller.feedOutput(owner, 1, "\x1b[?2004h\x1b[?1h", 1);
+    transport.snapshot_error = error.WorkerBusy;
+    try surface.queueText("中文");
+    try surface.pending.append(a, .{ .key = .{ .key = .arrow_up } });
+    try surface.queueText(" tail");
+    try std.testing.expectEqual(@as(usize, 3), surface.pending.items.len);
+    try std.testing.expectEqualStrings("", transport.written.items);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(usize, 3), surface.pending.items.len);
+    try std.testing.expect(surface.error_message == null);
+
+    transport.snapshot_error = null;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqualStrings("中文\x1bOA tail", transport.written.items);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending_bytes);
+    try std.testing.expect(surface.error_message == null);
+    try surface.pump();
+    try std.testing.expectEqualStrings("中文\x1bOA tail", transport.written.items);
+
+    // An input epoch can also advance independently of the last UI frame.
+    transport.sequence = 10;
+    try surface.queueText("once");
+    try std.testing.expectEqual(@as(usize, 1), surface.pending.items.len);
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(u64, 11), transport.sequence);
+    try std.testing.expectEqualStrings("中文\x1bOA tailonce", transport.written.items);
+    try std.testing.expect(surface.error_message == null);
+    try surface.pump();
+    try std.testing.expectEqualStrings("中文\x1bOA tailonce", transport.written.items);
+}
+
+test "terminal surface double click selects complete colored filenames and copies once" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 100);
+    defer transport.deinit();
+    const filename = "clusbench-4.5.2-3.20261023+gitf77ff02.x86_64.rpm";
+    try transport.controller.feedOutput(owner, 1, "prefix \x1b[31m" ++ filename ++ "\x1b[0m neighbor\r\n中文文件-e\u{301}.tar.gz next", 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(1100, 220);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    surface.feedback.publish = struct {
+        fn publish(_: ?*anyopaque, _: *ui.Cx, _: identity.SessionHandle, _: []const u8) !void {}
+    }.publish;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + surface.options.row_height * 0.5;
+    // Click the right half of the final '.' cell. Native double-click synthesis
+    // must preserve punctuation, stop at spaces, and publish one clipboard write.
+    const hit = x + 46.8 * surface.options.cell_width;
+    for (0..2) |_| {
+        cx.handleMouseDownEx(hit, y, .left, .{});
+        cx.handleMouseUpEx(hit, y, .left, .{});
+    }
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings(filename, copied);
+    try std.testing.expectEqual(@as(usize, 1), clipboard.writes);
+    try std.testing.expect(!surface.dragging and !cx.dispatcher.hasPointerCapture());
+    try std.testing.expect(surface.rows.items[0].selected.style.display == .flex);
+    try std.testing.expectEqual(@as(i16, 0), surface.rows.items[0].selected.style.z_index());
+    const event = surface.root.behavior.events.on_event.?;
+    _ = event(.{ .double_click = .{ .x = x + 2.8 * surface.options.cell_width, .y = y + surface.options.row_height } }, surface.root.behavior.events.event_context);
+    const unicode = (try view.copySelectionText(a)).?;
+    defer a.free(unicode);
+    try std.testing.expectEqualStrings("中文文件-e\u{301}.tar.gz", unicode);
+    // A regular click still clears the selection.
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseUpEx(x, y, .left, .{});
+    try std.testing.expect(!view.hasSelection());
+}
+
+test "terminal surface double click spans soft wrapped filenames but stops at hard newline" {
+    var transport: FakeTransport = undefined;
+    try transport.init(6, 20);
+    defer transport.deinit();
+    const filename = "clusbench-4.5.2-3.20261023+gitf77ff02.tar.gz";
+    try transport.controller.feedOutput(owner, 1, filename ++ "\r\nnext", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 240);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX() + 3.5 * surface.options.cell_width;
+    const y = surface.root.globalRect().y + surface.contentPadding().top + 1.5 * surface.options.row_height;
+    _ = surface.root.behavior.events.on_event.?(.{ .double_click = .{ .x = x, .y = y } }, surface.root.behavior.events.event_context);
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings(filename, copied);
+}
+
+test "terminal surface AI control tag revalidates its exact grant and never submits terminal input" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 60);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 240);
+    var view = try View.mount(cx);
+    defer view.releaseBuffers(cx);
+    cx.root = view.root;
+    const Handler = struct {
+        calls: usize = 0,
+        task: identity.TaskId,
+        execution: identity.ExecutionId,
+        fn request(raw: *anyopaque, task: identity.TaskId, handle: identity.SessionHandle, execution: identity.ExecutionId) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(handle.eql(owner));
+            try std.testing.expect(task.eql(self.task));
+            try std.testing.expect(execution.eql(self.execution));
+            self.calls += 1;
+        }
+    };
+    var handler: Handler = .{ .task = .generate(), .execution = .generate() };
+    view.setTerminalTakeoverHandler(.{ .context = &handler, .request = Handler.request });
+    try view.bindTerminalService(transport.service());
+    _ = try view.refreshTerminalService(owner, true);
+    const surface = view.terminal_surface.?;
+    try std.testing.expect(surface.control_tag == null);
+    transport.execution = .{ .owner = owner, .execution_id = handler.execution, .state = .running, .input_ready = false, .local_released = false, .grant = .{ .execution_id = handler.execution, .task_id = handler.task, .fence = 2, .input_epoch = 3, .ownership_revision = 1 } };
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+    const tag = surface.control_tag.?;
+    try std.testing.expectEqual(.flex, tag.style.display);
+    // Pencil QT5FH: a 40 pt bar flush with the pane's foot (hairline on top), full width.
+    try std.testing.expectApproxEqAbs(@as(f32, 40), tag.globalRect().h, 0.01);
+    try std.testing.expectApproxEqAbs(surface.root.globalRect().w, tag.globalRect().w, 0.01);
+    try std.testing.expectEqualStrings("AI 控制中 · 只读", tag.children.items[1].getText().?.content);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), surface.control_button.?.globalRect().h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), surface.root.globalRect().x + surface.root.globalRect().w - tag.globalRect().x - tag.globalRect().w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), surface.root.globalRect().y + surface.root.globalRect().h - tag.globalRect().y - tag.globalRect().h, 0.01);
+    const button = surface.control_button.?;
+    const r = button.globalRect();
+    cx.handleMouseDown(r.x + r.w / 2, r.y + r.h / 2, .{});
+    cx.handleMouseUp(r.x + r.w / 2, r.y + r.h / 2);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    try std.testing.expectEqual(@as(u64, 0), surface.user_input_revision);
+    try std.testing.expect(!surface.dragging);
+    // A click read at the old frame cannot act on a fresh lease.
+    transport.execution.?.grant.?.fence += 1;
+    cx.handleMouseDown(r.x + r.w / 2, r.y + r.h / 2, .{});
+    cx.handleMouseUp(r.x + r.w / 2, r.y + r.h / 2);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    _ = try view.refreshTerminalService(owner, true);
+    cx.handleMouseDown(r.x + r.w / 2, r.y + r.h / 2, .{});
+    transport.execution.?.grant.?.task_id = .generate();
+    _ = try view.refreshTerminalService(owner, true);
+    cx.handleMouseUp(r.x + r.w / 2, r.y + r.h / 2);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    transport.execution.?.grant = null;
+    transport.execution.?.input_handed_off = true;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(.none, tag.style.display);
+}
+
+test "terminal surface AI readonly rejects busy keyboard and paste without replay after takeover" {
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 60);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "READONLY_COPY", 1);
+    var clipboard: TestClipboard = .{};
+    var sdk = TestSdk.init(a, &clipboard, &TestClipboard.vtable, .{ .clipboard = true });
+    defer sdk.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setSystemSdk(&sdk);
+    cx.setViewport(600, 240);
+    var view = try View.mount(cx);
+    defer view.releaseBuffers(cx);
+    cx.root = view.root;
+    const Handler = struct {
+        fn request(_: *anyopaque, _: identity.TaskId, _: identity.SessionHandle, _: identity.ExecutionId) !void {}
+    };
+    var ignored: u8 = 0;
+    view.setTerminalTakeoverHandler(.{ .context = &ignored, .request = Handler.request });
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    transport.receipt_busy = true;
+    try surface.queueText("LOCAL_DRAFT_BEFORE_LEASE");
+    cx.handleKeyDown(.@"return", .{});
+    try surface.requestPaste("NEVER_QUEUED_PASTE");
+    try std.testing.expect(surface.pending.items.len == 2 and surface.paste_requested != null);
+    const execution_id = identity.ExecutionId.generate();
+    transport.execution = .{ .owner = owner, .execution_id = execution_id, .state = .running, .input_ready = false, .local_released = false, .grant = .{ .execution_id = execution_id, .task_id = .generate(), .fence = 2, .input_epoch = 3, .ownership_revision = 1 } };
+    transport.input_leased = true;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.control_grant != null);
+    // The existing view adopts recovery as a local editor draft; refresh
+    // never submits it, and the cancelled Enter cannot execute it later.
+    try std.testing.expectEqualStrings("LOCAL_DRAFT_BEFORE_LEASE", view.local_editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), surface.recovered_input.items.len);
+    _ = cx.render();
+    const x = surface.root.globalRect().x + surface.contentPadding().left + surface.bodyX();
+    const y = surface.root.globalRect().y + surface.contentPadding().top + 0.5 * surface.options.row_height;
+    cx.handleMouseDownEx(x, y, .left, .{});
+    cx.handleMouseMoveEx(x + 13 * surface.options.cell_width, y, .{});
+    cx.handleMouseUpEx(x + 13 * surface.options.cell_width, y, .left, .{});
+    const copies = clipboard.writes;
+    cx.handleKeyDown(.c, .{ .super = true });
+    try std.testing.expectEqual(copies + 1, clipboard.writes);
+    try std.testing.expectEqualStrings("READONLY_COPY", clipboard.text);
+    // A failed refresh must retain the known grant and its visible tag.
+    transport.busy = true;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expect(surface.control_grant != null and surface.control_tag.?.style.display == .flex);
+    const sequence = surface.next_input;
+    // The busy receipt comes before write admission, reproducing the window
+    // in which queued read-only input previously survived until handoff.
+    transport.receipt_busy = true;
+    try std.testing.expectError(error.TerminalControlled, surface.queueText("NEVER_BUSY_WRITE"));
+    try std.testing.expectError(error.TerminalControlled, surface.requestPaste("NEVER_BUSY_PASTE"));
+    cx.handleKeyDown(.@"return", .{});
+    cx.handleKeyDown(.c, .{ .ctrl = true });
+    _ = view.root.behavior.events.on_event.?(.{ .ime_preedit = .{ .text = "NEVER_PREEDIT" } }, view.root.behavior.events.event_context);
+    _ = view.root.behavior.events.on_event.?(.{ .ime_commit = .{ .text = "NEVER_IME" } }, view.root.behavior.events.event_context);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), surface.pending_bytes);
+    try std.testing.expect(surface.pending_paste == null and surface.paste_requested == null);
+    try std.testing.expectEqual(@as(usize, 0), surface.preedit.len);
+    try std.testing.expectEqual(sequence, surface.next_input);
+    transport.receipt_busy = false;
+    transport.busy = false;
+    transport.input_leased = false;
+    transport.execution.?.grant = null;
+    transport.execution.?.input_handed_off = true;
+    _ = try view.refreshTerminalService(owner, true);
+    try surface.pump();
+    try std.testing.expectEqualStrings("", transport.written.items);
+    try surface.queueText("HUMAN_AFTER_TAKEOVER");
+    try std.testing.expectEqualStrings("HUMAN_AFTER_TAKEOVER", transport.written.items);
+}
+
+test "terminal cell graphics preserve VT text styles selection and pooled text reuse" {
+    const saved_preferences = ui.a11y.preferences.current();
+    defer ui.a11y.preferences.set(saved_preferences);
+    ui.a11y.preferences.set(.{});
+    var transport: FakeTransport = undefined;
+    try transport.init(4, 40);
+    defer transport.deinit();
+    try transport.controller.feedOutput(owner, 1, "\x1b[38;2;255;190;40m▌│█\x1b[7m▐\x1b[27;2m┃\x1b[22;8m║\x1b[28;5m│\x1b[0m", 1);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(800, 300, 2);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    view.setTypography(14, 1.5, 400);
+    view.setTimestampGutter(false);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+    const surface = view.terminal_surface.?;
+    const glyphs = surface.rows.items[0].glyphs.items;
+    const first = glyphs[0].node;
+    try std.testing.expectEqualStrings("▌", first.getText().?.content);
+    try std.testing.expectEqual(@as(f32, 21), first.globalRect().h);
+    try std.testing.expectEqual(ui.Color.rgb(255, 190, 40), glyphs[0].drawing.?.color);
+    const reversed = surface.rows.items[0].bands.get(.background).items[0];
+    try std.testing.expectEqual(ui.Color.rgb(255, 190, 40), reversed.getBackground());
+    try std.testing.expectApproxEqAbs(glyphs[3].node.style.ext.?.inset.left.px, reversed.style.ext.?.inset.left.px, 0.001);
+    try std.testing.expectApproxEqAbs(glyphs[3].node.style.width.px, reversed.style.width.px, 0.001);
+    try std.testing.expectEqual(@as(u8, 127), glyphs[4].drawing.?.color.a);
+    try std.testing.expectEqual(@as(u8, 0), glyphs[5].drawing.?.color.a);
+    // A visual substitution must never change copied terminal text.
+    surface.selection = .{
+        .start = try surface.service.createAnchor(.{ .row = 0, .col = 0 }),
+        .end = try surface.service.createAnchor(.{ .row = 0, .col = 3 }),
+    };
+    const copied = (try view.copySelectionText(a)).?;
+    defer a.free(copied);
+    try std.testing.expectEqualStrings("▌│█", copied);
+    cx.setFocus(view.root);
+    _ = try view.refreshTerminalService(owner, true);
+    _ = try view.refreshTerminalService(owner, true);
+    surface.blink = true;
+    surface.last_blink = 100;
+    cx.frame_time_ms = 650;
+    _ = try view.refreshTerminalService(owner, true);
+    try std.testing.expectEqual(@as(u8, 0), surface.rows.items[0].glyphs.items[6].drawing.?.color.a);
+    // The same pooled node must return to normal text without stale graphics.
+    try transport.controller.feedOutput(owner, 2, "\x1b[H\x1b[2KEND", 2);
+    surface.force_snapshot = true;
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+    const reused = surface.rows.items[0].glyphs.items[0];
+    try std.testing.expectEqual(first, reused.node);
+    try std.testing.expectEqualStrings("END", reused.node.getText().?.content);
+    try std.testing.expect(reused.node.getText().?.color.a != 0);
+    try std.testing.expectEqual(@as(u21, 0), reused.drawing.?.cp);
+    // Exercise row-pool retirement while the testing allocator checks ownership.
+    view.setTypography(13, 1.35, 400);
+    cx.setWindowMetrics(800, 160, 2);
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, true);
+    _ = cx.render();
+}
+
+test "terminal surface Ctrl-C reaches the PTY while the worker is busy, after the trusted-edit cancel" {
+    // terminal_tab_follow_native: with output streaming the PTY worker holds its lock most of the
+    // time; the cancel used to run synchronously in the key handler, fail with WorkerBusy and drop the
+    // Ctrl-C (a "终端繁忙" toast, the program kept running, `exit` went to it).
+    var transport: FakeTransport = undefined;
+    try transport.init(3, 16);
+    defer transport.deinit();
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 160);
+    var view = try View.mount(cx);
+    cx.root = view.root;
+    defer view.releaseBuffers(cx);
+    try view.bindTerminalService(transport.service());
+    _ = cx.render();
+    _ = try view.refreshTerminalService(owner, false);
+    cx.setFocus(view.root);
+    const surface = view.terminal_surface.?;
+    transport.cancel_busy = true;
+    try std.testing.expectEqual(ui.events.EventResult.stop, view.root.behavior.events.on_key_down.?(.c, .{ .ctrl = true }, view.root.behavior.events.key_context));
+    // Not dropped, not written ahead of the cancel, no error.
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    try std.testing.expect(surface.trusted_cancel_pending);
+    try std.testing.expectEqual(@as(usize, 0), transport.cancels);
+    for (0..3) |_| try surface.pump();
+    try std.testing.expectEqual(@as(usize, 0), transport.written.items.len);
+    // The worker lets go: the cancel runs once, then the Ctrl-C.
+    transport.cancel_busy = false;
+    try surface.pump();
+    try std.testing.expectEqual(@as(usize, 1), transport.cancels);
+    try std.testing.expect(!surface.trusted_cancel_pending);
+    try std.testing.expectEqualStrings("\x03", transport.written.items);
+}

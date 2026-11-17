@@ -123,6 +123,29 @@ const Entry = struct {
     dispatch_pending: ?execution.Request = null,
     stop_intent: enum { none, stop, takeover } = .none,
 };
+/// A fully settled execution kept for its conversation after the worker that ran it is released
+/// (ending a conversation releases its execution driver). Only read-only facts are kept: the final
+/// receipt snapshot and the bounded cached output. Adopted entries never refresh, dispatch or touch
+/// the journal again, and stop / input still require the original Task (`find`), so a restored
+/// conversation can read its own receipts but gains no control.
+pub const Retained = struct {
+    context: host.Context,
+    verification: ?@import("readonly_verification.zig").Anchor = null,
+    invocation_id: u64 = 0,
+    id: identity.ExecutionId,
+    target: identity.SessionHandle,
+    snapshot: execution.Snapshot,
+    final_output: ?execution.Output = null,
+
+    pub fn deinit(self: *Retained, allocator: std.mem.Allocator) void {
+        if (self.final_output) |*output| output.deinit(allocator);
+        self.final_output = null;
+    }
+};
+/// `refresh` is a no-op for these: nothing left to observe, release or record.
+fn settled(entry: Entry) bool {
+    return entry.dispatch_pending == null and terminalState(entry.snapshot.state) and entry.snapshot.recording_settled and entry.snapshot.local_released and entry.snapshot.grant == null;
+}
 /// Wait owns only copied metadata, never an invocation's JSON arena or strings.
 pub const WaitUntil = enum { revision, decision, terminal };
 pub const Wait = struct { until: WaitUntil = .revision, context: host.Context, operation_id: u64, index: usize, after_revision: u64, deadline: i64, output_cursor: u64, max_bytes: usize };
@@ -148,6 +171,37 @@ pub const Controller = struct {
     }
     pub fn initWithJournal(allocator: std.mem.Allocator, journal: JournalAccess, backend: Backend) Controller {
         return .{ .allocator = allocator, .journal = journal, .backend = backend };
+    }
+    /// Copies of this controller's settled executions (outputs owned by `allocator`).
+    pub fn retainSettled(self: *const Controller, allocator: std.mem.Allocator) ![]Retained {
+        var out: std.ArrayList(Retained) = .empty;
+        errdefer {
+            for (out.items) |*item| item.deinit(allocator);
+            out.deinit(allocator);
+        }
+        for (self.entries.items) |entry| if (settled(entry)) {
+            var item: Retained = .{ .context = entry.context, .verification = entry.verification, .invocation_id = entry.invocation_id, .id = entry.id, .target = entry.target, .snapshot = entry.snapshot };
+            if (entry.final_output) |output| item.final_output = .{ .bytes = try allocator.dupe(u8, output.bytes), .start_cursor = output.start_cursor, .next_cursor = output.next_cursor, .gap = output.gap, .truncated = output.truncated };
+            errdefer item.deinit(allocator);
+            try out.append(allocator, item);
+        };
+        return out.toOwnedSlice(allocator);
+    }
+    /// Adopt settled executions retained from an earlier worker of the same conversation
+    /// (copies; the caller keeps ownership of `items`). Unsettled items are ignored.
+    pub fn adoptSettled(self: *Controller, items: []const Retained) !void {
+        for (items) |item| {
+            if (!terminalState(item.snapshot.state) or !item.snapshot.recording_settled or !item.snapshot.local_released or item.snapshot.grant != null) continue;
+            const duplicate = for (self.entries.items) |entry| {
+                if (entry.id.eql(item.id)) break true;
+            } else false;
+            if (duplicate) continue;
+            var output: ?execution.Output = null;
+            if (item.final_output) |value| output = .{ .bytes = try self.allocator.dupe(u8, value.bytes), .start_cursor = value.start_cursor, .next_cursor = value.next_cursor, .gap = value.gap, .truncated = value.truncated };
+            errdefer if (output) |*value| value.deinit(self.allocator);
+            // The journal handle is never used: settled entries do not refresh or update it.
+            try self.entries.append(self.allocator, .{ .context = item.context, .verification = item.verification, .invocation_id = item.invocation_id, .id = item.id, .target = item.target, .journal = .{ .index = std.math.maxInt(usize), .operation_ref = std.mem.zeroes(identity.HostOperationId) }, .journal_revision = 0, .journal_stage = .succeeded, .snapshot = item.snapshot, .next_renew_at = std.math.maxInt(i64), .final_output = output });
+        }
     }
     fn terminalCall(self: *Controller, service: terminal.Service, action: TerminalAction) !TerminalResult {
         if (self.backend.terminal_call) |call| return call(self.backend.context, service, action);
@@ -759,7 +813,7 @@ test "execution authorization rejection retains known unsent facts" {
     var marker: u8 = 0;
     var controller = Controller.init(a, &journal, .{ .context = &marker, .authorize = Mock.authorize, .resolve = Mock.resolve });
     defer controller.deinit();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const json = "{\"session_ref\":\"approved-target\",\"command\":\"pwd\",\"request_key\":\"denied\",\"wait_ms\":2000}";
     const args = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     defer args.deinit();
@@ -780,7 +834,7 @@ test "execution authorization rejection retains known unsent facts" {
 
 test "execution unknown receipt retains its uncertainty and never becomes a successful RPC" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     var result = try ownedResult(a, context, 7, try a.dupe(u8, "{\"state\":\"outcome_unknown\"}"), true, true);
     defer result.deinit(a);
     try result.validate(context, 7);
@@ -818,7 +872,7 @@ test "execution target stop keeps other members running and preserves revocation
     var marker: u8 = 0;
     var controller = Controller.initWithJournal(a, undefined, .{ .context = &marker, .authorize = Mock.authorize, .resolve = Mock.resolve });
     defer controller.deinit();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 9 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 9 }, .content = .{ .group = 9 }, .binding_revision = 1, .grant_revision = 1 };
     const first: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 1 };
     const second: identity.SessionHandle = .{ .session_id = @fromBackingInt(2), .generation = 1 };
     for ([_]identity.SessionHandle{ first, second }) |target| {
@@ -857,7 +911,7 @@ test "execution interval publication retains durable receipt before next input p
     defer tmp.cleanup();
     var journal = try journal_mod.Journal.open(a, std.testing.io, tmp.dir, "publication.json");
     defer journal.deinit();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 1 };
     const id = identity.ExecutionId.generate();
     const operation = try journal.begin(.{ .context = context, .tool_id = "host.run_in_terminal", .request_key = "interval-publication", .canonical_hash = @splat(1), .turn_id = 1, .call_id = "publication-call" });
@@ -973,7 +1027,7 @@ fn testInputReceiptRecovery(stream: bool, cancel_before_input: bool) !void {
     defer tmp.cleanup();
     var journal = try journal_mod.Journal.open(a, std.testing.io, tmp.dir, "inputs.json");
     defer journal.deinit();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 1 };
     const id = identity.ExecutionId.generate();
     const grant: execution.Grant = .{ .execution_id = id, .task_id = context.task_id, .fence = 2, .input_epoch = 1, .ownership_revision = 1 };
@@ -1084,7 +1138,7 @@ test "current-tab read-only execution history crosses related Tasks without gran
     var mock: Mock = .{};
     var controller = Controller.initWithJournal(a, undefined, .{ .context = &mock, .authorize = Mock.authorize, .resolve = Mock.resolve, .authorize_read = Mock.read });
     defer controller.deinit();
-    const original: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const original: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     var later = original;
     later.task_id = .generate();
     later.grant_revision += 1;
@@ -1115,7 +1169,8 @@ test "current-tab read-only execution history crosses related Tasks without gran
     invocation.tool_id = "host.get_execution";
     try std.testing.expectError(error.TargetNotAuthorized, controller.execute(invocation, 1));
     mock.allowed = true;
-    invocation.context.binding = .{ .group = 8 };
+    invocation.context.binding = .{ .tab = 8 };
+    invocation.context.content = .{ .group = 8 };
     try std.testing.expectError(error.TargetNotAuthorized, controller.execute(invocation, 1));
 }
 
@@ -1132,7 +1187,7 @@ test "efficiency execution output honors requested bytes and bounds escaped resp
     var token: u8 = 0;
     var controller = Controller.initWithJournal(a, undefined, .{ .context = &token, .authorize = Mock.authorize, .resolve = Mock.resolve });
     defer controller.deinit();
-    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 1 };
     const id = identity.ExecutionId.generate();
     const bytes = try a.alloc(u8, 48 * 1024);
@@ -1177,4 +1232,69 @@ test "efficiency semantic wait ignores ordinary revisions and stream capabilitie
     snapshot.process = null;
     snapshot.remote_effect_unknown = true;
     try std.testing.expect(waitReady(snapshot, .decision, 1));
+}
+
+test "settled executions survive a released worker for the same conversation as read-only receipts" {
+    const a = std.testing.allocator;
+    const Mock = struct {
+        fn authorize(_: *anyopaque, _: host.Invocation, _: []const u8, _: []const u8, _: [32]u8) !Target {
+            return error.UnexpectedEffect;
+        }
+        fn resolve(_: *anyopaque, _: host.Context, _: identity.SessionHandle) !terminal.Service {
+            return error.UnexpectedLiveRead;
+        }
+        // Same boundary as the app backend: only the conversation that ran it, on its binding.
+        fn read(_: *anyopaque, current: host.Context, original: host.Context, _: identity.SessionHandle, _: identity.ExecutionId) !void {
+            if (!original.conversation_id.eql(current.conversation_id) or !@import("host_queries.zig").sameHistoricalBinding(original, current)) return error.TargetNotAuthorized;
+        }
+    };
+    var marker: u8 = 0;
+    const backend: Backend = .{ .context = &marker, .authorize = Mock.authorize, .resolve = Mock.resolve, .authorize_read = Mock.read };
+    const original: host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 7 }, .content = .{ .session = 44 }, .binding_revision = 1, .grant_revision = 1 };
+    const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(44), .generation = 2 };
+    const stopped = identity.ExecutionId.generate();
+    const running = identity.ExecutionId.generate();
+    const bytes = "stopped by request";
+    var retained: []Retained = undefined;
+    {
+        // The first worker: one settled (stopped) execution, one still running.
+        var first = Controller.initWithJournal(a, undefined, backend);
+        defer first.deinit();
+        try first.entries.append(a, .{ .context = original, .id = stopped, .target = target, .journal = .{ .index = 0, .operation_ref = .generate() }, .journal_revision = 1, .journal_stage = .succeeded, .snapshot = .{ .owner = target, .execution_id = stopped, .state = .interval_recorded, .revision = 4, .local_released = true, .recording_settled = true }, .next_renew_at = 0, .final_output = .{ .bytes = try a.dupe(u8, bytes), .start_cursor = 0, .next_cursor = bytes.len, .gap = false, .truncated = false } });
+        try first.entries.append(a, .{ .context = original, .id = running, .target = target, .journal = .{ .index = 1, .operation_ref = .generate() }, .journal_revision = 1, .journal_stage = .running, .snapshot = .{ .owner = target, .execution_id = running, .state = .running, .revision = 2, .local_released = false }, .next_renew_at = std.math.maxInt(i64) });
+        retained = try first.retainSettled(a);
+    }
+    defer {
+        for (retained) |*item| item.deinit(a);
+        a.free(retained);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    // The restored conversation's new worker (a later Task of the same conversation).
+    var second = Controller.initWithJournal(a, undefined, backend);
+    defer second.deinit();
+    try second.adoptSettled(retained);
+    try second.adoptSettled(retained);
+    try std.testing.expectEqual(@as(usize, 1), second.entries.items.len);
+    var later = original;
+    later.task_id = .generate();
+    later.binding_revision += 1;
+    const reference = try std.fmt.allocPrint(a, "x1:{s}", .{std.fmt.bytesToHex(stopped.bytes, .lower)});
+    defer a.free(reference);
+    const wire = try std.json.Stringify.valueAlloc(a, .{ .execution_ref = reference }, .{});
+    defer a.free(wire);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer parsed.deinit();
+    var invocation: host.Invocation = .{ .context = later, .authority = .execution_control, .operation_id = 1, .turn_id = 1, .call_id = "restored-read", .tool_id = "host.get_execution", .arguments = parsed.value, .arguments_json = wire, .arguments_hash = @splat(0), .canonical_arguments_hash = @splat(0) };
+    var result = (try second.execute(invocation, 1)).result;
+    defer result.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, result.blocks[0].structured, bytes) != null);
+    // Read-only: no control or input through the old execution.
+    invocation.tool_id = "host.stop_execution";
+    try std.testing.expectError(error.ExecutionNotFound, second.execute(invocation, 1));
+    invocation.tool_id = "host.send_execution_input";
+    try std.testing.expectError(error.ExecutionNotFound, second.execute(invocation, 1));
+    // Another tab's conversation still cannot read it.
+    invocation.tool_id = "host.get_execution";
+    invocation.context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 8 }, .content = .{ .session = 45 }, .binding_revision = 1, .grant_revision = 1 };
+    try std.testing.expectError(error.TargetNotAuthorized, second.execute(invocation, 1));
 }

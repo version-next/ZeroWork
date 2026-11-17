@@ -1,0 +1,63 @@
+# 主 agent 的裁决表：对各 M 包 TSV 的覆盖（优先于包内同名行）。列：old_path new_path layer package note
+# 原则：
+#  1. 根目录测试/runner：import 了未下沉的 src/ui/* 或被测对象随 settings 搬走 → 归 UI feature；否则归 core（root-core）。
+#  2. 下沉到 core 的条件：不 import zenit ui，且相对 import 的闭包全部落在 core / shared/base / 其他已下沉文件内；不满足的留在 feature，原有 core→ui 违规继续记在 check-arch 基线。
+#  3. 跨 feature 共用的通用件与跨 feature 的主题/材质/按钮测试归 shared/ui（测试放 src/shared/ui/tests/）。
+# —— 重叠裁决 ——
+src/appearance_apply_tests.zig	src/features/settings/tests/appearance_apply_tests.zig	tests	settings	依赖随 settings 搬走的 settings_controller
+src/appearance_font_tests.zig	src/tests_font.zig	root	settings	test-font 构建根
+src/background_asset_tests.zig	src/config/tests/background_asset_tests.zig	core	root-core	只测 config
+src/chrome_policy_tests.zig	src/shared/ui/tests/chrome_policy_tests.zig	tests	shared-ui	
+src/file_workspace_controller_tests.zig	src/host/tests/file_workspace_controller_tests.zig	core	root-core	被测对象是 host/file_workspace_controller
+src/floating_input_tests.zig	src/shared/ui/tests/floating_input_tests.zig	tests	shared-ui	
+src/notification_coordinator_tests.zig	src/host/tests/notification_coordinator_tests.zig	core	root-core	
+src/notification_platform_tests.zig	src/host/tests/notification_platform_tests.zig	core	root-core	
+src/record_cleanup_tests.zig	src/host/tests/record_cleanup_tests.zig	core	root-core	
+src/transfer_conflict_tests.zig	src/transfer/tests/transfer_conflict_tests.zig	core	root-core	
+src/ui/ai_brand_assets.zig	src/shared/ui/assets/ai_brand_assets.zig	shared_ui	shared-ui	
+src/ui/compact_overlay_layout.zig	src/shared/ui/components/compact_overlay_layout/compact_overlay_layout.zig	shared_ui	shared-ui	
+src/ui/file_workspace_icons_assets.zig	src/features/files/model/file_workspace_icons_assets.zig	model	files	只被 files 使用
+src/ui/floating_input.zig	src/shared/ui/components/floating_input/floating_input.zig	shared_ui	shared-ui	
+src/ui/history_cast.zig	src/features/history/model/history_cast.zig	model	history	依赖 history_replay→history_colors(import ui)，不满足下沉条件；local/recording、vt/ssh_worker 对它的 import 留在基线
+src/ui/layer_materials.zig	src/shared/ui/styles/layer_materials.zig	shared_ui	shared-ui	
+src/ui/log_typography.zig	src/shared/ui/styles/log_typography.zig	shared_ui	shared-ui	
+src/ui/material_geometry.zig	src/shared/ui/styles/material_geometry.zig	shared_ui	shared-ui	
+src/update_tests.zig	src/tests_update.zig	root	update	test-update 构建根
+# —— 下沉目标修正 ——
+src/ui/v3_geometry.zig	src/shared/ui/styles/v3_geometry.zig	shared_ui	shell	使用者都是界面文件（settings 随迁），不进 core
+src/ui/transfer_panel.zig	src/features/transfer/view/transfer_panel.zig	view	transfer	import ui，不下沉；config/transfer_defaults 对它的 import 留在基线；mixed
+src/ui/ai_tools.zig	src/features/ai/tools/host/ai_tools.zig	host	ai	依赖 application_host/workspace，不下沉；ai/turn_manager 对 Bridge 的 import 留在基线；mixed
+src/ui/terminal_document.zig	src/features/terminal/model/terminal_document.zig	model	terminal	没有被 core 直接 import，不下沉
+src/ui/group_close_controller.zig	src/host/group_close_controller.zig	core	workspace	只依赖 host/identity；被 ai/legacy_adapter 使用
+# —— 遗漏补认领 ——
+src/asset_actions_tests.zig	src/config/tests/asset_actions_tests.zig	core	root-core	只依赖 config 与已下沉的 session_lifecycle
+src/button_policy_preview_runner.zig	src/shared/ui/preview/button_policy_preview_runner.zig	preview	shared-ui	跨 feature 按钮策略；构建根
+src/button_policy_tests.zig	src/shared/ui/tests/button_policy_tests.zig	tests	shared-ui	
+src/incremental_ui_tests.zig	src/features/ai/pane/tests/incremental_ui_tests.zig	tests	ai	
+src/notification_read_view_tests.zig	src/features/terminal/tests/notification_read_view_tests.zig	tests	terminal	实际测 TerminalView
+src/settings_runtime_consumer_tests.zig	src/features/terminal/tests/settings_runtime_consumer_tests.zig	tests	terminal	
+src/settings_transfer_defaults_tests.zig	src/features/transfer/tests/settings_transfer_defaults_tests.zig	tests	transfer	
+src/sftp_adapter_tests.zig	src/host/tests/sftp_adapter_tests.zig	core	root-core	
+src/ssh_connection_details_tests.zig	src/features/connections/progress/tests/ssh_connection_details_tests.zig	tests	connections	import application_host
+src/ssh_disconnect_runner.zig	src/features/workspace/tests/acceptance/ssh_disconnect_runner.zig	tests	workspace	依赖 UI 宿主的验收 runner；构建根
+src/ssh_reconnect_loopback_runner.zig	src/features/workspace/tests/acceptance/ssh_reconnect_loopback_runner.zig	tests	workspace	同上
+src/ssh_shared_connection_runner.zig	src/features/workspace/tests/acceptance/ssh_shared_connection_runner.zig	tests	workspace	同上
+src/ssh_shell_execution_runner.zig	src/features/workspace/tests/acceptance/ssh_shell_execution_runner.zig	tests	workspace	同上
+src/ssh_reconnect_tests.zig	src/features/workspace/tests/ssh_reconnect_tests.zig	tests	workspace	
+src/ssh_request_counter_tests.zig	src/proto/ssh/tests/ssh_request_counter_tests.zig	core	root-core	只依赖 core 与已下沉的 host_key_confirmation
+src/ssh_terminal_service_tests.zig	src/features/terminal/tests/ssh_terminal_service_tests.zig	tests	terminal	
+src/terminal_execution_tests.zig	src/features/terminal/tests/terminal_execution_tests.zig	tests	terminal	构建根（test-terminal-execution）
+src/theme_layer_tests.zig	src/shared/ui/tests/theme_layer_tests.zig	tests	shared-ui	跨 feature 主题测试
+src/ui_constraint_tests.zig	src/shared/ui/tests/ui_constraint_tests.zig	tests	shared-ui	跨 feature 约束测试
+src/ui/donation_qr.zig	src/shared/base/donation_qr.zig	shared_base	shared-ui	不 import ui；使下沉到 vt 的 terminal_record_geometry 不反向依赖 feature
+src/ui/donation_qr_view.zig	src/features/terminal/view/donation_qr_view.zig	view	terminal	
+src/ui/formatted_output.zig	src/features/ai/cards/model/formatted_output.zig	model	ai	只被 AI 工具结果视图使用
+src/ui/plugin_challenge_presenter.zig	src/features/connections/auth/host/plugin_challenge_presenter.zig	host	connections	
+src/ui/plugin_content_host.zig	src/features/shell/host/plugin_content_host.zig	host	shell	插件窗口承载基础设施
+src/ui/plugin_window_host.zig	src/features/shell/host/plugin_window_host.zig	host	shell	同上
+src/ui/plugin_editor_host.zig	src/features/connections/wizard/host/plugin_editor_host.zig	host	connections	被向导使用
+src/ui/remote_session_notice.zig	src/features/workspace/view/remote_session_notice.zig	view	workspace	
+src/ui/retained_panel.zig	src/features/shell/view/retained_panel.zig	view	shell	
+src/ui/session_icon.zig	src/shared/ui/components/session_icon/session_icon.zig	shared_ui	shared-ui	shell/connections/workspace 共用
+src/ui/shortcut_dispatch.zig	src/features/shell/model/shortcut_dispatch.zig	model	shell	全局快捷键
+src/ui/shortcut_router.zig	src/features/shell/model/shortcut_router.zig	model	shell	同上

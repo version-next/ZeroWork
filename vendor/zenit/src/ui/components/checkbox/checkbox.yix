@@ -8,6 +8,8 @@ const S = @import("styles.yss");
 /// on_change only reports settled value. indeterminate read-only (controlled by parent, parent
 /// decides after click whether to clear).
 /// Disabled suppresses click / space / enter, exits Tab order.
+/// size: box edge (null = `size.checkbox` token); the check glyph scales with it (12:16).
+/// labelFontSize: label font size (null = `font_size.md`).
 pub fn Checkbox(
     checked: Model(bool) = false,
     indeterminate: bool = false,
@@ -16,8 +18,8 @@ pub fn Checkbox(
     focusRing: ui.FocusRingConfig = .{},
     onChange: ?Handler(bool) = null,
     checkIconAsset: ?ui.SvgAsset = null,
-    boxSize: f32 = 18,
-    labelFontSize: f32 = 14,
+    size: ?f32 = null,
+    labelFontSize: ?f32 = null,
 ) View {
     const on = computed(checked or indeterminate);
     const mixed = computed(indeterminate and !checked);
@@ -30,13 +32,13 @@ pub fn Checkbox(
             a11y={.{ .role = .checkbox, .checked = checked, .indeterminate = mixed, .disabled = disabled, .label = label }}
             onClick={if (!disabled) checked = !checked}
         >
-            <box style={.{ S.CheckboxParts.slot(.box, .{ .on = on, .disabled = disabled }), ui.view.styleBy(boxSize, S.checkboxSize) }}>
-                <icon style={.{ S.CheckboxParts.slot(.check, .{ .shown = checked, .disabled = disabled }), ui.view.styleBy(boxSize, S.checkboxCheckSize) }} src={checkIconAsset orelse ui.icons.check} />
-                <box style={.{ S.CheckboxParts.slot(.indet, .{ .shown = mixed }), ui.view.styleBy(boxSize, S.checkboxSize) }}>
-                    <icon style={.{ S.CheckboxParts.slot(.check, .{ .shown = true, .disabled = disabled }), ui.view.styleBy(boxSize, S.checkboxCheckSize) }} src={ui.icons.minus} />
+            <box style={.{ S.CheckboxParts.slot(.box, .{ .on = on, .disabled = disabled }), S.box_size.of(.{ .size = size }) }}>
+                <icon style={.{ S.CheckboxParts.slot(.check, .{ .shown = checked, .disabled = disabled }), S.check_size.of(.{ .size = size }) }} src={checkIconAsset orelse ui.assets.common.checkbox_check} />
+                <box style={.{ S.CheckboxParts.slot(.indet, .{ .shown = mixed }), S.box_size.of(.{ .size = size }) }}>
+                    <icon style={.{ S.CheckboxParts.slot(.check, .{ .shown = true, .disabled = disabled }), S.check_size.of(.{ .size = size }) }} src={ui.assets.common.checkbox_mixed} />
                 </box>
             </box>
-            {if (label.len != 0) <text style={.{ S.CheckboxParts.slot(.label, .{ .disabled = disabled }), ui.view.styleBy(labelFontSize, S.checkboxLabelSize) }}>{label}</text>}
+            {if (label.len != 0) <text style={.{ S.CheckboxParts.slot(.label, .{ .disabled = disabled }), ui.view.styleBy(labelFontSize, S.labelSize) }}>{label}</text>}
         </row>
     );
 }

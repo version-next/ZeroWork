@@ -400,6 +400,18 @@ pub fn Source(comptime T: type) type {
             return self == .value;
         }
 
+        /// Append epoch (`Signal.appendEpoch`) for `Source([]const E)`: a static value never
+        /// changes (0); an owned slice signal reports its epoch; a borrowed slice signal, a memo
+        /// or a derived value reports null (unknown: compare prefixes instead).
+        pub fn appendEpoch(self: Self) ?u64 {
+            comptime if (signal_mod.SliceElem(T) == void) @compileError("appendEpoch is only available on Source([]const E), got Source(" ++ @typeName(T) ++ ")");
+            return switch (self) {
+                .value => 0,
+                .signal => |s| s.appendEpoch(),
+                .memo, .derived => null,
+            };
+        }
+
         /// Unified read for component view function: `read(false)` snapshot at mount
         /// (error direct return), `read(true)` register dependency in effect. Reuse one
         /// view function both places.
@@ -554,6 +566,12 @@ pub fn Bound(comptime T: type) type {
         /// When data source actually changes, call `on_change` with settled value
         /// (parent-transformed value, not proposal).
         pub fn propose(self: Self, v: T, on_change: anytype) void {
+            // One batch for the write, the settled read and `on_change`: a parent whose write
+            // unmounts this component (a dialog mounted only while open, closed by its own
+            // proposal) disposes the read source and the callback's context only after both
+            // were used, not in the middle of the pipeline.
+            self.owner.beginBatch();
+            defer self.owner.endBatch();
             const landed = self.commit(v) orelse return;
             const C = @TypeOf(on_change);
             if (C == @TypeOf(null)) return;
@@ -574,18 +592,18 @@ pub fn Bound(comptime T: type) type {
         /// For components whose callback type differs from `T` (e.g., `?[]const u8` value +
         /// `[]const u8` callback), use this directly.
         pub fn commit(self: Self, v: T) ?T {
-            if (debug_checks) {
-                // Scan entire tracking stack: untrack's empty reader sentinel masks effect/memo
-                // frames below it.
-                for (self.owner.graph.tracking_stack.items) |id| {
-                    if (!id.isNull()) {
-                        std.debug.panic("Model.propose called inside an effect/memo; proposals must come from event handlers", .{});
-                    }
-                }
+            if (debug_checks and self.owner.inReactiveComputation()) {
+                // Event handlers that a computation sets off synchronously (blur from an effect
+                // revoking focus) defer their proposal with `SignalOwner.runOutsideComputation`.
+                std.debug.panic("Model.propose called inside an effect/memo; proposals must come from event handlers", .{});
             }
             // Compare keys, not save old slice: split's parent callback may write text source
             // twice, or drain another write synchronously outside batch; the double-buffer holding
             // the old slice will be overwritten/freed.
+            // Effects of the write (e.g. the parent unmounting this component's scope together
+            // with a derived read source) run after the settled value below was read.
+            self.owner.beginBatch();
+            defer self.owner.endBatch();
             const before = eqKey(T, self.read.peek());
             if (self.signal) |s| {
                 s.set(v);

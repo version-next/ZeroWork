@@ -39,6 +39,40 @@ const bridge = @import("coretext/coretext_bridge.zig");
 
 pub const FamilyClass = bridge.FamilyClass;
 
+/// Browser (Web DOM host): the page reports installed families
+/// ("name\tclass\n" lines; class = FamilyClass int), probed synchronously
+/// with document.fonts.check over a curated list (Local Font Access needs a
+/// permission prompt, so it is not used for the catalog).
+extern "zenit" fn font_catalog(ptr: [*]u8, cap: usize) usize;
+
+fn scanWeb(allocator: std.mem.Allocator, arena_in: std.heap.ArenaAllocator) !FontCatalog {
+    var arena = arena_in;
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const buf = try a.alloc(u8, 64 * 1024);
+    const n = font_catalog(buf.ptr, buf.len);
+    var list: std.ArrayListUnmanaged(Family) = .empty;
+    var it = std.mem.splitScalar(u8, buf[0..@min(n, buf.len)], '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+        const class_int: c_int = if (tab < line.len) std.fmt.parseInt(c_int, line[tab + 1 ..], 10) catch 0 else 0;
+        const class: FamilyClass = @enumFromInt(class_int);
+        try list.append(a, .{
+            .name = line[0..tab],
+            .is_symbolic = class == .symbolic,
+            .can_render_name = class != .symbolic,
+            .is_variable = false,
+            .face_count = 1,
+            .class = class,
+            .lang = "",
+            .has_latin = class != .symbolic,
+            .sample_cps = if (class == .symbolic) &[_]u32{ 0x2665, 0x2663, 0x2660 } else &.{},
+        });
+    }
+    return .{ .allocator = allocator, .families = list.items, .arena = arena };
+}
+
 /// What to draw on this row in preview.
 pub const PreviewPlan = union(enum) {
     /// Render family name in the font itself.
@@ -157,6 +191,7 @@ pub const FontCatalog = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
+        if (comptime builtin.cpu.arch.isWasm()) return scanWeb(allocator, arena);
         if (builtin.target.os.tag != .macos) {
             return .{
                 .allocator = allocator,
@@ -395,6 +430,27 @@ test "familyExists: 不存在的家族不能伪装成存在" {
     if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     try std.testing.expect(familyExists("Helvetica Neue"));
     try std.testing.expect(!familyExists("NoSuchFontXYZ__"));
+}
+
+test "coretext_font_weight_range / weight_value: 可变族给出范围，非可变族如实返回 0 / -1" {
+    // SKIP-REASON: depends on system font families; skipped (not passed) when absent.
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var lo: c_int = 0;
+    var hi: c_int = 0;
+    var def: c_int = 0;
+    if (!familyExists("Menlo")) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), bridge.coretext_font_weight_range("Menlo", &lo, &hi, &def));
+    const menlo = bridge.coretext_find_font("Menlo", 16, 400, 0) orelse return error.SkipZigTest;
+    defer bridge.coretext_release_font(menlo);
+    try std.testing.expect(bridge.coretext_font_weight_value(menlo) < 0);
+
+    if (!familyExists("STIX Two Text")) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 1), bridge.coretext_font_weight_range("STIX Two Text", &lo, &hi, &def));
+    try std.testing.expect(lo < hi and lo <= def and def <= hi);
+    try std.testing.expect(lo <= 450 and 450 <= hi);
+    const stix = bridge.coretext_find_font_exact_weight("STIX Two Text", 16, 450, 0) orelse return error.TestUnexpectedResult;
+    defer bridge.coretext_release_font(stix);
+    try std.testing.expectApproxEqAbs(@as(f64, 450), bridge.coretext_font_weight_value(stix), 0.5);
 }
 
 test "sampleForLang: 主子标签匹配" {

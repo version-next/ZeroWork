@@ -38,7 +38,7 @@ const styles = @import("styles.zig");
 
 // AccordionItemRecipe, recipe(variant) unifies AccordionItem styling.
 // variant dimension:
-//   - default: filled background + rounded corner, no border
+//   - default: primary surface + panel radius + 1px border
 //   - outline: transparent background + 1px border + rounded corner
 //   - ghost:   fully transparent, no border no corner
 
@@ -77,10 +77,6 @@ pub const AccordionItemState = struct {
     title_node: ?*Node = null,
     /// header button node (a11y expanded attribute on it).
     header_node: ?*Node = null,
-    /// item container hover signal (expanded hover -> border appears).
-    item_hovered: ?*Signal(bool) = null,
-    /// border color on hover.
-    hover_border_color: Color = Color.TRANSPARENT,
     /// animation allocator (must match node allocator, used in beforeRender callback).
     alloc: Allocator = std.heap.page_allocator,
 
@@ -134,11 +130,6 @@ fn accordionItemBeforeRender(node: *Node) void {
     const state: *AccordionItemState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
     const content = state.content_node orelse return;
     const alloc = state.alloc;
-
-    // 0. hover -> item container border appears (direct switch, no transition).
-    if (state.item_hovered) |hovered_sig| {
-        node.style.border.color = if (hovered_sig.get()) state.hover_border_color else Color.TRANSPARENT;
-    }
 
     // 1. detect expanded state change.
     if (state.expanded != state.last_expanded) {
@@ -306,6 +297,12 @@ pub const AccordionItemProps = struct {
     on_change: ?Handler(bool) = null,
     /// Chevron icon (optional, default chevron_right).
     chevron_asset: ?svg_assets.Asset = null,
+    /// Run the item's own disclosure motion (content height animation and chevron rotation on
+    /// expand / collapse). false: the item never writes the content height or the chevron
+    /// rotation after mount, so the app drives them (e.g. its own motion, reading
+    /// `stateOf(result).expanded`); expand state, keyboard, accessibility, header hover and the
+    /// focus ring keep working.
+    builtin_motion: bool = true,
 };
 
 /// Create AccordionItem: `W.AccordionItem(.{ .title = "Details", .expanded = open })`.
@@ -317,17 +314,19 @@ pub fn AccordionItem(props: anytype) AccordionItemBuilder {
 pub const AccordionItemResult = struct {
     item: *Node,
     body: *Node,
-    /// Public header parts for caller styling and content arrangement. Their
-    /// interaction and expand animation remain owned by AccordionItem.
-    header: *Node,
-    title: *Node,
-    chevron: *Node,
 
     /// `ui.view` integration (see src/ui/view_parts.zig).
     pub fn viewParts(self: AccordionItemResult) core.ViewParts {
         return .{ .root = self.item, .slot = self.body };
     }
 };
+
+/// The item's runtime state: its parts (`header_node`, `title_node`, `chevron_node`,
+/// `content_node`) for caller styling / arrangement, and `expanded` (last applied value). Fields
+/// are owned by the item (read them, style the nodes; don't reassign the fields).
+pub fn stateOf(r: AccordionItemResult) *AccordionItemState {
+    return @ptrCast(@alignCast(r.item.behavior.events.event_context.?));
+}
 
 /// AT ExpandCollapse: explicit target state, uses same write-back pipeline as click
 /// (mutual expand guaranteed by `acc.item(i)` data source, no manual sibling collapse
@@ -363,14 +362,12 @@ pub const AccordionItemBuilder = struct {
         const item_resolved = item_cs.resolve(.{});
 
         const item_bg = item_resolved.background orelse Color.TRANSPARENT;
-        const border_color = styles.accordionHoverBorderColor(item_bg, t);
 
         // allocate internal state.
         const state = try my_scope.allocator.create(AccordionItemState);
         state.* = .{
             .expanded = initially_expanded,
             .last_expanded = initially_expanded,
-            .hover_border_color = border_color,
             .alloc = allocator,
         };
         try my_scope.adoptResource(@ptrCast(state), struct {
@@ -388,12 +385,9 @@ pub const AccordionItemBuilder = struct {
         }.destroy);
 
         // outer container (vertical: header + content); style from Recipe variant; rounded
-        // corners + border extracted from recipe (border initially transparent, appears via
-        // transition on hover).
+        // corners + persistent border extracted from the recipe.
         const item_radius = item_resolved.corner_radius orelse 0;
-        var item_border: Border = .{};
-        item_border.color = Color.TRANSPARENT;
-        item_border.width = 1;
+        var item_border: Border = item_resolved.border orelse .{};
         if (item_resolved.border) |b| {
             item_border.radius = b.radius;
         } else if (item_radius > 0) {
@@ -405,6 +399,7 @@ pub const AccordionItemBuilder = struct {
             .background = item_bg,
             .corner_radius = if (item_radius > 0) item_radius else null,
             .border = item_border,
+            .overflow_hidden = true,
         };
         // Chevron indicator (rotate around icon's own center).
         const chevron_size: core.Sizing = .{ .px = styles.accordion_chevron_size };
@@ -421,7 +416,7 @@ pub const AccordionItemBuilder = struct {
         const item = try view.render(my_scope, cx, view.col(.{ .style = item_style }, .{
             // === Header (clickable) ===.
             view.capture(&parts.header, view.box(.{
-                .style = styles.accordionHeaderStyle(t),
+                .style = .{ styles.accordionHeaderStyle(t), view.hover(styles.accordionHeaderHover) },
                 .focusable = true,
                 // header is button semantic node.
                 .tag = .button,
@@ -431,7 +426,7 @@ pub const AccordionItemBuilder = struct {
                     .expansion = .{ .context = @ptrCast(rt), .set = setAccessibleExpanded },
                 },
             }, .{
-                view.capture(&parts.chevron, view.icon(.{ .style = chevron_style, .tint = t.tokens.color.fg_secondary, .hit_test = false }, p.chevron_asset orelse svg_assets.common.chevron_right)),
+                view.capture(&parts.chevron, view.icon(.{ .style = chevron_style, .tint = t.tokens.color.fg_tertiary, .hit_test = false }, p.chevron_asset orelse svg_assets.common.chevron_right)),
                 // title text: fills header remaining width (long titles clipped in header, same as
                 // box text node).
                 view.capture(&parts.title, view.attrs(.{ .style = core.BoxStyle{ .width = .{ .grow = .{} } } }, view.text(.{ .style = styles.accordionTitleText(initially_expanded, t), .hit_test = false }, p.title.peek()))),
@@ -454,8 +449,6 @@ pub const AccordionItemBuilder = struct {
         }));
         // sweep: item guard armed until return.
         errdefer cx.freeNode(item);
-        const item_hovered = try hooks.useHover(my_scope, item);
-        state.item_hovered = item_hovered;
 
         item.meta.ownership.meta.component_name = "AccordionItem";
         try core.bindScopeToNode(my_scope, item);
@@ -487,11 +480,11 @@ pub const AccordionItemBuilder = struct {
 
         // Set on_before_render animation (must come after useFocusRing, which chains saves).
         item.behavior.events.event_context = state;
-        item.meta.per_frame.hooks.before_render.main = accordionItemBeforeRender;
+        item.meta.per_frame.hooks.before_render.main = if (p.builtin_motion) accordionItemBeforeRender else null;
 
         // expanded is Model: local is also signal, click changes it, must have effect.
         try my_scope.createEffect(rt, ItemRuntime.viewEffect);
-        return .{ .item = item, .body = body, .header = header, .title = title_node, .chevron = parts.chevron };
+        return .{ .item = item, .body = body };
     }
 };
 
@@ -670,29 +663,6 @@ test "AccordionItem: expanded" {
     const header = result.item.children.items[0];
     const chevron = header.children.items[0];
     try std.testing.expectApproxEqAbs(std.math.pi / 2.0, chevron.style.rotate(), 0.0001);
-}
-
-test "AccordionItem: public header parts retain expand behavior after arrangement" {
-    const cx = try Cx.init(std.testing.allocator, std.testing.io);
-    defer cx.deinit();
-    cx.root = try box(cx, .{}, .{});
-    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
-    defer scope.dispose();
-    const expanded = try scope.createSignal(bool, true);
-    const result = try AccordionItem(.{ .title = "Details", .expanded = expanded }).mount(scope, cx);
-    try cx.root.?.appendChild(cx.allocator, result.item);
-
-    result.header.removeChild(result.chevron);
-    try result.header.appendChild(cx.allocator, result.chevron);
-    try std.testing.expect(result.chevron.parent == result.header);
-    try std.testing.expect(result.title.parent == result.header);
-    try std.testing.expectEqualStrings("Details", result.title.getText().?.content);
-    expanded.set(false);
-    try std.testing.expectEqual(false, result.header.behavior.interaction.a11y.?.expanded.?);
-    const handler = result.header.behavior.events.on_event.?;
-    _ = handler(.{ .key_down = .{ .key = .@"return", .modifiers = .{} } }, result.header.behavior.events.event_context);
-    try std.testing.expect(expanded.peek());
-    try std.testing.expectEqual(true, result.header.behavior.interaction.a11y.?.expanded.?);
 }
 
 fn itemState(result: AccordionItemResult) *AccordionItemState {
@@ -1032,4 +1002,86 @@ test "accordion_item: mount 在任意分配点失败时不泄漏（sweep）" {
             return r.item;
         }
     }.m);
+}
+
+fn renderAccordionFrames(cx: *Cx, n: usize) void {
+    for (0..n) |_| {
+        cx.frame_count += 1;
+        cx.frame_time_ms += 16;
+        _ = cx.render();
+    }
+}
+
+test "AccordionItem: stateOf exposes the header parts; builtin motion animates by default" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(480, 320);
+    const root = try box(ctx, .{ .width = .{ .px = 480 }, .height = .{ .px = 320 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+
+    const open = try scope.createSignal(bool, false);
+    const result = try AccordionItem(.{ .title = "Details", .expanded = open }).mount(scope, ctx);
+    try root.appendChild(alloc, result.item);
+    const st = stateOf(result);
+    try std.testing.expect(st == itemState(result));
+    try std.testing.expect(st.header_node.?.parent == result.item);
+    try std.testing.expect(st.title_node.?.parent == st.header_node.?);
+    try std.testing.expect(st.chevron_node.?.parent == st.header_node.?);
+    try std.testing.expectEqualStrings("Details", st.title_node.?.getText().?.content);
+    try std.testing.expect(result.item.meta.per_frame.hooks.before_render.main != null);
+
+    renderAccordionFrames(ctx, 2);
+    open.set(true);
+    renderAccordionFrames(ctx, 2);
+    // Default: the item drives the content height / chevron rotation itself.
+    try std.testing.expect(st.anim_phase != .idle or st.content_node.?.style.height != .px);
+    renderAccordionFrames(ctx, 40);
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, st.chevron_node.?.style.rotate(), 0.0001);
+}
+
+test "AccordionItem: builtin_motion=false leaves geometry to the app, focus ring and state still work" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(480, 320);
+    const root = try box(ctx, .{ .width = .{ .px = 480 }, .height = .{ .px = 320 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+
+    const open = try scope.createSignal(bool, false);
+    const result = try AccordionItem(.{ .title = "Details", .expanded = open, .builtin_motion = false }).mount(scope, ctx);
+    try root.appendChild(alloc, result.item);
+    const st = stateOf(result);
+    const header = st.header_node.?;
+    const content = st.content_node.?;
+    try std.testing.expect(result.item.meta.per_frame.hooks.before_render.main == null);
+
+    renderAccordionFrames(ctx, 2);
+    // Expand: state, a11y and title weight follow; the content height and chevron are untouched.
+    open.set(true);
+    renderAccordionFrames(ctx, 40);
+    try std.testing.expect(st.expanded);
+    try std.testing.expectEqual(true, header.behavior.interaction.a11y.?.expanded.?);
+    try std.testing.expectEqual(@as(u16, 600), st.title_node.?.getText().?.font_weight);
+    try std.testing.expectEqual(@as(f32, 0), content.style.height.px);
+    try std.testing.expect(content.frame_state.frame_local.runtime.commands == null or content.frame_state.frame_local.runtime.commands.?.count == 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), st.chevron_node.?.style.rotate(), 0.0001);
+    // An app-driven height stays as written.
+    content.style.height = .{ .px = 42 };
+    content.markLayoutDirty();
+    open.set(false);
+    renderAccordionFrames(ctx, 40);
+    try std.testing.expectEqual(@as(f32, 42), content.style.height.px);
+
+    // Keyboard toggling and the header focus ring keep working.
+    ctx.layout();
+    ctx.focus_manager.setFocus(header);
+    ctx.handleKeyDown(.@"return", .{});
+    try std.testing.expect(open.peek());
+    renderAccordionFrames(ctx, 20);
+    try std.testing.expect(header.style.outline() != null);
 }

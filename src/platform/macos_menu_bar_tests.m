@@ -24,7 +24,7 @@ int main(int argc, const char **argv) {
             int p=(y*72+x)*4; rgba[p]=x<36?255:0; rgba[p+1]=0; rgba[p+2]=x<36?0:255; rgba[p+3]=255;
         }
         zw_menu_bar_add_session(5, (const unsigned char *)"source colours", 14, NULL, 0, rgba, sizeof(rgba), 0xffffffff, 0, true, true, false, (const unsigned char *)"online", 6);
-        NSData *isoftBytes = [NSData dataWithContentsOfFile:argc == 4 ? @(argv[3]) : @"src/ui/assets/host-os/isoft.rgba"];
+        NSData *isoftBytes = [NSData dataWithContentsOfFile:argc == 4 ? @(argv[3]) : @"src/shared/ui/assets/host-os/isoft.rgba"];
         assert(isoftBytes.length == 72*72*4);
         zw_menu_bar_add_session(6, (const unsigned char *)"iSoft", 5, NULL, 0, isoftBytes.bytes, isoftBytes.length, 0xffffffff, 0xffffffff, true, false, false, NULL, 0);
         zw_menu_bar_finish();
@@ -157,7 +157,7 @@ int main(int argc, const char **argv) {
         // Use the production menu boundary for every selective contrast asset.
         // Warning states receive original alpha, never the readability helper.
         NSArray<NSString *> *contrastNames = @[@"debian", @"alpine", @"freebsd", @"bclinux", @"netbsd", @"redflag"];
-        NSString *assetDirectory = argc == 4 ? [@(argv[3]) stringByDeletingLastPathComponent] : @"src/ui/assets/host-os";
+        NSString *assetDirectory = argc == 4 ? [@(argv[3]) stringByDeletingLastPathComponent] : @"src/shared/ui/assets/host-os";
         for (int state=0;state<3;state++) {
             zw_menu_bar_update(contrastNames.count);
             for (NSUInteger i=0;i<contrastNames.count;i++) {

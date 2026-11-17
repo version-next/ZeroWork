@@ -328,9 +328,11 @@ test "password input: Cmd+C / Cmd+X 不写剪贴板、不删文本" {
     defer cx.deinit();
     cx.system_sdk = &sdk;
 
-    inline for (.{ input.InputType.password, input.InputType.text }) |ty| {
+    // A revealed password shows its characters but keeps the password clipboard policy.
+    inline for (.{ .{ input.InputType.password, false }, .{ input.InputType.password, true }, .{ input.InputType.text, false } }) |case| {
+        const ty = case[0];
         rec.sets = 0;
-        var s: input.TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .cx_ref = cx, .input_type = ty };
+        var s: input.TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .cx_ref = cx, .input_type = ty, .revealed = case[1] };
         defer s.deinit();
         _ = try s.setTextChecked("secret");
         s.selection_anchor = 0;
@@ -387,5 +389,48 @@ test "readonly Input selects copies and fences every editing event" {
     f.event(.{ .mouse_down = .{ .x = 5, .y = 5 } });
     f.event(.{ .mouse_up = .{ .x = 5, .y = 5 } });
     try t.expect(f.state.focused);
+    try t.expectEqualStrings("seed", f.state.getText());
+}
+
+test "readonly Textarea selects copies and fences every editing event" {
+    var f: Fixture(2) = undefined;
+    try f.init(t.allocator, t.allocator);
+    defer f.deinit();
+    f.state.readonly = true;
+    const undo = f.state.undo_count;
+    const redo = f.state.redo_count;
+    f.event(.{ .key_down = .{ .key = .c, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("seed", f.backend.copied[0..f.backend.copied_len]);
+    const mutations = [_]Event{
+        .{ .text_input = .{ .text = "changed" } },
+        .{ .ime_preedit = .{ .text = "中", .cursor_utf8_offset = 3 } },
+        .{ .ime_commit = .{ .text = "中" } },
+        .{ .ime_delete_surrounding = .{ .before_bytes = 1, .after_bytes = 0 } },
+        .{ .key_down = .{ .key = .delete } },
+        .{ .key_down = .{ .key = .forward_delete } },
+        .{ .key_down = .{ .key = .@"return" } },
+        .{ .key_down = .{ .key = .x, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .v, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .z, .modifiers = .{ .super = true, .shift = true } } },
+        .{ .key_down = .{ .key = .y, .modifiers = .{ .super = true } } },
+    };
+    for (mutations) |event| f.event(event);
+    try t.expectEqualStrings("seed", f.state.getText());
+    try t.expectEqual(undo, f.state.undo_count);
+    try t.expectEqual(redo, f.state.redo_count);
+    try t.expectEqual(@as(usize, 0), f.calls);
+    try t.expectEqual(@as(usize, 0), f.backend.reads);
+    try t.expectEqual(@as(usize, 1), f.backend.writes);
+    // Tab is focus traversal, not an indent: not consumed.
+    try t.expectEqual(core.EventResult.ignored, textarea.textareaEventHandler(.{ .key_down = .{ .key = .tab } }, &f.state));
+    // Caret movement, selection and copy pass.
+    f.event(.{ .key_down = .{ .key = .end } });
+    f.event(.{ .key_down = .{ .key = .left, .modifiers = .{ .shift = true } } });
+    try t.expectEqualStrings("d", f.state.getSelectedText().?);
+    f.event(.{ .key_down = .{ .key = .c, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("d", f.backend.copied[0..f.backend.copied_len]);
+    f.event(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("seed", f.state.getSelectedText().?);
     try t.expectEqualStrings("seed", f.state.getText());
 }

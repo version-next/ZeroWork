@@ -131,7 +131,7 @@ pub fn parse(invocation: host.Invocation) !Request {
     }
     if (operation == .open_session or operation == .rename_group or operation == .add_group_member or operation == .remove_group_member) {
         request.group = try groupOwner(invocation.context, try text(args, "group_ref"));
-        if (invocation.context.binding != .group or invocation.context.binding.group != @backingInt(request.group.?.id)) return error.TargetNotAuthorized;
+        if (invocation.context.contentOf() != .group or invocation.context.contentOf().group != @backingInt(request.group.?.id)) return error.TargetNotAuthorized;
     }
     if (operation == .open_session) {
         if (args.object.get("interactive_execution")) |value| {
@@ -173,7 +173,7 @@ pub fn parse(invocation: host.Invocation) !Request {
 
 test "lifecycle references bind the conversation and operation task" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
     const op = identity.HostOperationId.generate();
     const reference = try operationRef(a, context, op);
     defer a.free(reference);
@@ -185,7 +185,7 @@ test "lifecycle references bind the conversation and operation task" {
 
 test "lifecycle saved-source references fence asset revision and conversation" {
     const a = std.testing.allocator;
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     const source: identity.AssetOwner = .{ .id = @fromBackingInt(9), .revision = 4 };
     const reference = try connectionRef(a, context, source);
     defer a.free(reference);
@@ -199,7 +199,7 @@ test "lifecycle saved-source references fence asset revision and conversation" {
 }
 
 test "lifecycle catalog validates through the host table and marks effects explicitly" {
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 1, .grant_revision = 1 };
     var table = try @import("plugin_tools.zig").RequestTable.initWithHost(std.testing.allocator, .{ .owner = context.binding, .members = .{} }, &.{}, &.{}, context, &contributions);
     defer table.deinit();
     try std.testing.expectEqual(@as(usize, 10), table.entries.len);

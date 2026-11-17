@@ -1,4 +1,5 @@
 /** Retained native window, live Local PTY, Dock reopen and normal Quit. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, writeFile, rm, copyFile, realpath} from 'node:fs/promises';

@@ -2,6 +2,7 @@
  * node e2e/transfer_startup_failure_native.ts /absolute/evidence [fixture-binary]
  * Deterministic connector failure; no network or user transfer is touched.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,readFile,writeFile,rm} from 'node:fs/promises';

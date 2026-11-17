@@ -1,6 +1,7 @@
 const std = @import("std");
 const applog = @import("../platform/applog.zig");
 const identity = @import("identity.zig");
+const environment = @import("environment.zig");
 const operations = @import("operation.zig");
 const plugins = @import("plugin_registry.zig");
 const typed = @import("plugin_services.zig");
@@ -8,7 +9,7 @@ const envelopes = @import("../config/connection_envelope.zig");
 const contexts = @import("host_context.zig");
 const probes = @import("probe_contract.zig");
 const access = @import("session_service_access.zig");
-const Snapshot = @import("../ui/session_lifecycle.zig").Snapshot;
+const Snapshot = @import("session_lifecycle.zig").Snapshot;
 
 pub const SessionHandle = identity.SessionHandle;
 pub const OperationKey = operations.OperationKey;
@@ -260,6 +261,24 @@ const Entry = struct {
     available_bindings: std.ArrayList(typed.Binding) = .empty,
     capability_states: std.ArrayList(@import("capability_snapshot.zig").ServiceState) = .empty,
     capability_revision: u64 = 1,
+
+    // The lifecycle state and the capability revision (bindings, authorization, attachment) are
+    // part of the AI's environment (LIFECYCLE.md §5.2–5.3). Production code writes them only
+    // through these; each publishes an actual change, a same-value write does not.
+    fn setState(self: *Entry, next: Lifecycle) void {
+        if (self.state == next) return;
+        self.state = next;
+        environment.publish();
+    }
+    fn setCapabilityRevision(self: *Entry, revision: u64) void {
+        if (self.capability_revision == revision) return;
+        self.capability_revision = revision;
+        environment.publish();
+    }
+    /// Saturating, like the revocations it records: a saturated revision is not a change.
+    fn advanceCapabilityRevision(self: *Entry) void {
+        self.setCapabilityRevision(self.capability_revision +| 1);
+    }
 };
 
 pub const RetainedTransferStart = struct { binding: ServiceHandle, key: OperationKey, spec: SessionCreateSpec };
@@ -458,8 +477,8 @@ pub const SessionHost = struct {
                 .failed => .failed,
                 .cancelled => .cancelled,
             }, safe_message, null);
-            entry.state = .closed;
-        } else entry.state = if (receipt == .unknown) .cleanup_unknown else .closing;
+            entry.setState(.closed);
+        } else entry.setState(if (receipt == .unknown) .cleanup_unknown else .closing);
         return true;
     }
 
@@ -576,6 +595,21 @@ pub const SessionHost = struct {
     pub fn manifestFor(self: *SessionHost, handle: SessionHandle) ?*const plugins.PluginManifest {
         return self.registry.find(self.protocolId(handle) orelse return null);
     }
+    /// 会话呈现的卡片类型（PLUGIN_ARCH_PLAN 2.5、PL4a）。
+    pub fn cardTypeFor(self: *SessionHost, handle: SessionHandle) ?*const plugins.CardTypeDef {
+        return self.registry.cardTypeFor(self.manifestFor(handle) orelse return null);
+    }
+    /// 会话卡片的 AI 声明；AI 能力只看卡片类型（2.5.8 M9），不读插件清单。
+    pub fn cardAiFor(self: *SessionHost, handle: SessionHandle) ?*const plugins.card_types.CardAi {
+        const card = self.cardTypeFor(handle) orelse return null;
+        return if (card.ai) |*ai| ai else null;
+    }
+    /// 会话卡片在该会话协议下的 AI 工具引擎（卡片 AI 声明的 `session_tools`）。
+    pub fn aiEngineFor(self: *SessionHost, handle: SessionHandle) ?@import("../ai/legacy_adapter.zig").Factory {
+        const entry = self.manifestFor(handle) orelse return null;
+        const ai = (self.registry.cardTypeFor(entry) orelse return null).ai orelse return null;
+        return ai.engineFor(entry.id);
+    }
     pub fn connectionEnvelope(self: *SessionHost, handle: SessionHandle) ?envelopes.Envelope {
         const entry = self.find(handle) orelse return null;
         return if (entry.spec.value == .plugin) entry.spec.value.plugin else null;
@@ -633,9 +667,9 @@ pub const SessionHost = struct {
         try entry.typed_bindings.ensureTotalCapacity(self.allocator, bindings.len);
         _ = try self.journal.publish(key, .progress, "ready", null);
         entry.typed_bindings.appendSliceAssumeCapacity(bindings);
-        for (bindings) |binding| entry.capability_revision = @max(entry.capability_revision, binding.revision);
+        for (bindings) |binding| entry.setCapabilityRevision(@max(entry.capability_revision, binding.revision));
         entry.ready_accepted = true;
-        entry.state = .ready;
+        entry.setState(.ready);
         return true;
     }
     fn validatePluginBindings(self: *SessionHost, entry: *const Entry, bindings: []const typed.Binding) !void {
@@ -739,7 +773,7 @@ pub const SessionHost = struct {
     }
     fn capabilityChanged(self: *SessionHost, owner: SessionHandle) void {
         const entry = self.find(owner) orelse return;
-        entry.capability_revision +|= 1;
+        entry.advanceCapabilityRevision();
         for (entry.typed_bindings.items) |*binding| binding.revision +|= 1;
     }
     /// Providers may publish optional services after startup. The host assigns
@@ -760,7 +794,7 @@ pub const SessionHost = struct {
         var binding = proposed;
         binding.revision = revision;
         if (slot) |index| entry.typed_bindings.items[index] = binding else entry.typed_bindings.appendAssumeCapacity(binding);
-        entry.capability_revision = revision;
+        entry.setCapabilityRevision(revision);
         return binding;
     }
     pub fn revokeTypedService(self: *SessionHost, handle: SessionHandle, operation: OperationKey, service_key: typed.ServiceKey) !bool {
@@ -769,7 +803,7 @@ pub const SessionHost = struct {
         for (entry.typed_bindings.items, 0..) |binding, index| if (binding.definition.key.eql(service_key)) {
             const revision = try identity.advance(entry.capability_revision);
             _ = entry.typed_bindings.orderedRemove(index);
-            entry.capability_revision = revision;
+            entry.setCapabilityRevision(revision);
             return true;
         };
         return false;
@@ -780,7 +814,7 @@ pub const SessionHost = struct {
             if (binding.authorized == authorized) return;
             binding.revision = try identity.advance(binding.revision);
             binding.authorized = authorized;
-            entry.capability_revision = try identity.advance(entry.capability_revision);
+            entry.setCapabilityRevision(try identity.advance(entry.capability_revision));
             return;
         };
         return error.ServiceNotBound;
@@ -876,13 +910,13 @@ pub const SessionHost = struct {
         entry.handle = next;
         entry.attempt = attempt;
         entry.create_operation = key;
-        entry.state = .creating;
+        entry.setState(.creating);
         entry.ready_accepted = false;
         entry.creation_ended = false;
         entry.create_cleanup = .not_started;
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
+        entry.advanceCapabilityRevision();
         self.startAdapter(entry) catch |err| try self.failCreate(entry, @errorName(err));
         return .{ .handle = next, .operation = key };
     }
@@ -893,11 +927,11 @@ pub const SessionHost = struct {
         if (entry.state != .creating and entry.state != .ready) return false;
         if (entry.state == .ready and entry.purpose == .socks_background) return false;
         _ = try self.journal.publish(key, .cancelled, "", null);
-        entry.state = .failed;
+        entry.setState(.failed);
         entry.creation_ended = true;
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
+        entry.advanceCapabilityRevision();
         if (entry.prepared_start) {
             entry.prepared_start = false;
             try self.applyCreateCleanup(entry, .released);
@@ -1006,7 +1040,7 @@ pub const SessionHost = struct {
             }
         }
         _ = try self.journal.publish(key, if (purpose_kind == .socks_background) .completed else .progress, if (purpose_kind == .socks_background) "background ready" else "ready", null);
-        entry.state = .ready;
+        entry.setState(.ready);
         entry.ready_accepted = true;
         return true;
     }
@@ -1028,7 +1062,7 @@ pub const SessionHost = struct {
         if (entry.state != .ready or !std.meta.eql(entry.target, attachment.target) or @backingInt(attachment.tab_id) == 0) return false;
         _ = try self.journal.publish(entry.create_operation, .completed, "attached", null);
         entry.attachment = attachment;
-        entry.state = .attached;
+        entry.setState(.attached);
         return true;
     }
 
@@ -1050,7 +1084,7 @@ pub const SessionHost = struct {
         try rebind(factory_value.context, handle, context);
         entry.target = destination.target;
         entry.attachment = destination;
-        entry.capability_revision = revision;
+        entry.setCapabilityRevision(revision);
         for (entry.typed_bindings.items) |*binding| binding.revision += 1;
     }
 
@@ -1061,8 +1095,8 @@ pub const SessionHost = struct {
         _ = if (failure.cleanup == .released) try self.journal.failReleased(key, failure) else try self.journal.publish(key, .failed, "", failure);
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
-        entry.state = .failed;
+        entry.advanceCapabilityRevision();
+        entry.setState(.failed);
         entry.creation_ended = true;
         entry.create_cleanup = failure.cleanup;
         return true;
@@ -1082,8 +1116,8 @@ pub const SessionHost = struct {
         }, "transport lost", failure);
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
-        entry.state = .failed;
+        entry.advanceCapabilityRevision();
+        entry.setState(.failed);
         entry.creation_ended = true;
         entry.create_cleanup = failure.cleanup;
         return true;
@@ -1101,8 +1135,8 @@ pub const SessionHost = struct {
         }, "shell ended", null);
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
-        entry.state = .ended;
+        entry.advanceCapabilityRevision();
+        entry.setState(.ended);
         entry.creation_ended = true;
         entry.create_cleanup = cleanup;
         return true;
@@ -1643,7 +1677,7 @@ pub const SessionHost = struct {
         entry.hooks = hooks;
         applog.info(.workspace, "session close begin session={d} generation={d} operation={d}", .{ @backingInt(handle.session_id), handle.generation, key.operation_id });
         self.capabilityChanged(handle);
-        entry.state = .closing;
+        entry.setState(.closing);
         try self.advanceClose(entry);
         return key;
     }
@@ -1659,7 +1693,7 @@ pub const SessionHost = struct {
         if (entry.prepared_start) {
             _ = try self.cancel(entry.create_operation);
             entry.shutdown_receipt = .released;
-            entry.state = .ended;
+            entry.setState(.ended);
             return .released;
         }
         if (entry.shutdown_receipt == null) {
@@ -1667,7 +1701,7 @@ pub const SessionHost = struct {
             entry.bindings.clearRetainingCapacity();
             entry.typed_bindings.clearRetainingCapacity();
             entry.available_bindings.clearRetainingCapacity();
-            entry.capability_revision +|= 1;
+            entry.advanceCapabilityRevision();
         }
         const adapter = self.factory(entry);
         const receipt = if (entry.shutdown_via_cancel)
@@ -1681,7 +1715,7 @@ pub const SessionHost = struct {
             .unknown => .unknown,
         };
         entry.creation_ended = true;
-        entry.state = if (receipt == .unknown) .cleanup_unknown else .ended;
+        entry.setState(if (receipt == .unknown) .cleanup_unknown else .ended);
         return receipt;
     }
 
@@ -1692,7 +1726,7 @@ pub const SessionHost = struct {
             try self.recordCloseWait(entry, receipt);
             return true;
         }
-        entry.state = .closing;
+        entry.setState(.closing);
         if (step == .release_content) {
             try self.finishClose(entry);
         } else {
@@ -1736,7 +1770,7 @@ pub const SessionHost = struct {
         const unknown = receipt == .unknown;
         applog.info(.workspace, "session close wait session={d} generation={d} operation={d} step={s} receipt={s}", .{ @backingInt(entry.handle.session_id), entry.handle.generation, entry.close_operation.?.operation_id, @tagName(entry.close_step), @tagName(receipt) });
         _ = try self.journal.publish(entry.close_operation.?, if (unknown) .cleanup_unknown else .cleanup_progress, @tagName(entry.close_step), null);
-        entry.state = if (unknown) .cleanup_unknown else .closing;
+        entry.setState(if (unknown) .cleanup_unknown else .closing);
     }
 
     fn closeError(entry: *const Entry, err: anyerror) CloseReceipt {
@@ -1749,9 +1783,9 @@ pub const SessionHost = struct {
         _ = try self.journal.completeReleased(entry.close_operation.?, "closed");
         entry.bindings.clearRetainingCapacity();
         entry.typed_bindings.clearRetainingCapacity();
-        entry.capability_revision +|= 1;
+        entry.advanceCapabilityRevision();
         entry.attachment = null;
-        entry.state = .closed;
+        entry.setState(.closed);
         applog.info(.workspace, "session close released session={d} generation={d} operation={d}", .{ @backingInt(entry.handle.session_id), entry.handle.generation, entry.close_operation.?.operation_id });
     }
 
@@ -1768,7 +1802,7 @@ pub const SessionHost = struct {
         // Throwing from create means the adapter rejected before acquiring any
         // resource. Failures after acquisition use failed()+cleanup receipts.
         _ = try self.journal.failReleased(entry.create_operation, .{ .domain = .plugin, .code = code, .cleanup = .released, .safe_message = "会话创建失败" });
-        entry.state = .failed;
+        entry.setState(.failed);
         entry.creation_ended = true;
         entry.create_cleanup = .released;
     }
@@ -1786,7 +1820,7 @@ pub const SessionHost = struct {
         }, "", null);
         entry.create_cleanup = next_cleanup;
         if (receipt == .released and entry.close_operation != null and entry.close_step == .close_protocol and (entry.state == .closing or entry.state == .cleanup_unknown)) {
-            entry.state = .closing;
+            entry.setState(.closing);
             entry.close_step = .release_content;
             try self.advanceClose(entry);
         }
@@ -2632,4 +2666,39 @@ test "legacy engine query and typed service resolve share revocation and stale r
     for (available) |binding| try std.testing.expect(!std.mem.eql(u8, binding.definition.key.name, "directory"));
     _ = try host.requestClose(accepted.handle, .{});
     try std.testing.expectError(error.StaleBinding, current.vtable.resolve(current.context, current.binding));
+}
+
+test "lifecycle and capability changes publish the environment and same-value writes do not" {
+    var adapter: ControlledAdapter = .{};
+    var host = try SessionHost.init(std.testing.allocator, &.{adapter.adapter()});
+    defer host.deinit();
+    const accepted = try host.create(testSpec(), test_target);
+    var before = environment.revision();
+    try std.testing.expect(try host.ready(accepted.handle, accepted.operation, plugins.requiredServices(.ssh)));
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    // A ready replay changes nothing.
+    try std.testing.expect(!try host.ready(accepted.handle, accepted.operation, plugins.requiredServices(.ssh)));
+    try std.testing.expectEqual(before, environment.revision());
+    try std.testing.expect(try host.attached(accepted.handle, .{ .target = test_target, .tab_id = @fromBackingInt(1) }));
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    try std.testing.expect(!try host.attached(accepted.handle, .{ .target = test_target, .tab_id = @fromBackingInt(1) }));
+    try std.testing.expectEqual(before, environment.revision());
+
+    const capability = host.capabilityRevisionFor(accepted.handle).?;
+    host.capabilityChanged(accepted.handle);
+    try std.testing.expect(host.capabilityRevisionFor(accepted.handle).? > capability);
+    try std.testing.expect(environment.revision() > before);
+    before = environment.revision();
+    host.capabilityChanged(.{ .session_id = @fromBackingInt(999) });
+    try std.testing.expectEqual(before, environment.revision());
+
+    // The setters themselves: only an actual change publishes.
+    const entry = host.find(accepted.handle).?;
+    entry.setState(entry.state);
+    entry.setCapabilityRevision(entry.capability_revision);
+    try std.testing.expectEqual(before, environment.revision());
+    entry.setState(.ended);
+    try std.testing.expect(environment.revision() > before);
 }

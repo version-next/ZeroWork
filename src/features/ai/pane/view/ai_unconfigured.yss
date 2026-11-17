@@ -1,0 +1,4 @@
+//! “尚未配置 AI 服务”提示的位置：输入区正上方，左右与输入区对齐；提示本身是原生 `W.Alert` 默认外观。
+const ui = @import("ui");
+
+style holder { width: fill; height: fit; padding: 0 12 8 12; flex-shrink: 0; }

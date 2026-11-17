@@ -44,7 +44,14 @@ size_t zenit_uia_node_size(void);
 typedef int (*ZenitA11yActionCallback)(void *context, uint32_t id, uint8_t action, const char *text, size_t length, double number);
 int zenit_uia_set_action_handler(void *binding, void *context, ZenitA11yActionCallback callback);
 int zenit_uia_drain(void *binding);
+/* Publishes the current tree for a client's first query. Returns zero when it
+   cannot do so now; the window then repaints and publishes from that frame. */
+typedef int (*ZenitA11yDemandCallback)(void *context, void *window);
+int zenit_uia_set_demand_handler(void *binding, void *context, void *window, ZenitA11yDemandCallback callback);
+int zenit_uia_should_publish(void *binding);
 #define ZENIT_UIA_WAKE_MESSAGE 0x803a
+#define ZENIT_UIA_REFRESH_MESSAGE 0x803b
+int zenit_uia_refresh(void *binding, uintptr_t identity);
 #ifdef __cplusplus
 }
 #endif

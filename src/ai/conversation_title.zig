@@ -47,6 +47,8 @@ pub const Title = struct {
 
 pub const Service = struct {
     jobs: std.ArrayList(*Job) = .empty,
+    /// The UI that polls this service (its owner binds it); a finished job publishes to it.
+    wake: ?*const @import("publication.zig").Wake = null,
 
     pub fn cancel(self: *Service) void {
         for (self.jobs.items) |job| job.cancel.cancel();
@@ -65,6 +67,7 @@ pub const Service = struct {
         try self.jobs.ensureUnusedCapacity(allocator, 1);
         const job = try Job.create(config, conversation, question, effort);
         errdefer job.destroy();
+        job.wake = self.wake;
         job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
         self.jobs.appendAssumeCapacity(job);
     }
@@ -98,6 +101,7 @@ const Job = struct {
     arena: std.heap.ArenaAllocator,
     config: pc.ProviderConfig,
     conversation: ConversationId,
+    wake: ?*const @import("publication.zig").Wake = null,
     input: []const u8 = "",
     effort: ?p.Effort,
     thread: ?std.Thread = null,
@@ -161,7 +165,10 @@ const Job = struct {
     }
 
     fn run(self: *Job) void {
-        defer self.done.store(true, .release);
+        defer {
+            self.done.store(true, .release);
+            @import("publication.zig").publish(self.wake);
+        }
         var io: std.Io.Threaded = .init(std.heap.c_allocator, .{});
         defer io.deinit();
         var context: @import("provider_transport.zig").NativeContext = .{ .io = io.io() };
@@ -228,11 +235,11 @@ test "conversation title completion targets original identity and discards delet
     };
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
-    const first = try store.create(.{ .session = 1 });
+    const first = try store.create(.{ .tab = 1 });
     const original = first.conversation_id;
     const original_id = first.id;
     _ = first.beginTitle("原始问题");
-    const second = try store.create(.{ .session = 1 });
+    const second = try store.create(.{ .tab = 1 });
     _ = second.beginTitle("另一个问题");
     var service: Service = .{};
     defer service.deinit(std.testing.allocator);
@@ -245,7 +252,7 @@ test "conversation title completion targets original identity and discards delet
     while (!job.done.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(service.poll(&store));
     try std.testing.expectEqualStrings("原始会话的正式标题", store.findConversation(original).?.title.text().?);
-    try std.testing.expectEqualStrings("另一个问题", store.active(.{ .session = 1 }).?.title.text().?);
+    try std.testing.expectEqualStrings("另一个问题", store.active(.{ .tab = 1 }).?.title.text().?);
     const deleted = try Job.create(config, original, "原始问题", null);
     deleted.result = store.findConversation(original).?.title;
     deleted.success = true;
@@ -255,5 +262,5 @@ test "conversation title completion targets original identity and discards delet
     while (!deleted.done.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(!service.poll(&store));
     try std.testing.expectEqual(@as(usize, 0), service.jobs.items.len);
-    try std.testing.expectEqualStrings("另一个问题", store.active(.{ .session = 1 }).?.title.text().?);
+    try std.testing.expectEqualStrings("另一个问题", store.active(.{ .tab = 1 }).?.title.text().?);
 }

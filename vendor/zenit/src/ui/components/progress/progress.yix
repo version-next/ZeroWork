@@ -4,6 +4,7 @@ const ui = @import("../../ui.zig");
 const mod = @import("mod.zig");
 const S = @import("styles.yss");
 const ProgressStatus = mod.ProgressStatus;
+const ProgressSweep = mod.ProgressSweep;
 
 /// Determinate mode reports value (AT announces '70%'); indeterminate mode per ARIA spec doesn't
 /// report value, announces busy instead
@@ -14,10 +15,10 @@ fn a11yOf(indeterminate: bool, percent: f32) ui.A11yProps {
 
 /// Progress bar: W.Progress(.{ .value = upload_ratio, .show_text = true }).
 /// value (0-100, clamps to range) and status can be signals; indeterminate mode ignores value,
-/// gloss stripe sweeps with frame clock.
-pub fn Progress(value: f32 = 0, status: ProgressStatus = .normal, height: f32 = 4, showText: bool = false, indeterminate: bool = false, width: ?f32 = null) View {
+/// gloss stripe sweeps with frame clock (`sweep = .flat` drops the highlight / shade mix).
+pub fn Progress(value: f32 = 0, status: ProgressStatus = .normal, height: f32 = 6, showText: bool = false, indeterminate: bool = false, width: ?f32 = null, sweep: ProgressSweep = .gloss) View {
     const percent = computed(std.math.clamp(value, 0, 100));
-    const bar = computed(S.Bar{ .status = status, .height = height });
+    const bar = computed(S.Bar{ .status = status, .height = height, .sweep = sweep });
     const has_text = computed(showText and !indeterminate);
     const semantics = computed(a11yOf(indeterminate, percent));
     return (

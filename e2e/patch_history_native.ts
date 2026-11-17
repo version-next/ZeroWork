@@ -1,4 +1,5 @@
 /** Isolated archive regression: no connection, credentials or live shell. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, writeFile, readFile, rm, realpath} from 'node:fs/promises';
@@ -31,9 +32,15 @@ try{
  await request('POST','/mouse_up',{x:host.rect.x+80,y:host.rect.y+host.rect.h/2,button:'right'});
  await visible('context.menu.history');assert((await clickTestId('context.menu.history')).ok);
  await visible('history.record');assert((await clickTestId('history.record.view')).ok);
- await mouseMove(600,20);
  const card=await visible('terminal.history.card');assert(!text(card).includes('返回实时'));
  assert((await query('terminal.row')).some(n=>text(n).includes('AFTER RESIZE')));
+ // View selects inside the floating card. Move it to a tab to test replay Escape independently of the floating card's close action.
+ await visible('history.detail');
+ assert(!(await query('tabs.tab.1')).some(shown));
+ assert((await clickTestId('history.open_as_tab')).ok);
+ await visible('tabs.tab.1');await visible('terminal.history.card');
+ assert((await clickTestId('terminal.input')).ok);
+ await mouseMove(600,20);
  assert((await key('escape')).ok);await visible('terminal.history.card');
  assert((await query('terminal.row')).some(n=>text(n).includes('AFTER RESIZE')));
  report.checks.push('Archive uses original renderer; Esc preserves card and recorded content; no return-live hint.');

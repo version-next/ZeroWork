@@ -4,6 +4,7 @@
  * picker grant, @dl local-directory parameter, or synthetic transfer snapshot.
  * Root alone starts this runner after granting the serial native slot.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -20,10 +21,13 @@ for (let i = 2; i < process.argv.length; i += 2) {
 const prepare = options["--prepare-only"] === "1";
 const sharedMode = options["--shared-pacing-kbps"] !== undefined;
 const sharedPacing = sharedMode ? Number(options["--shared-pacing-kbps"]) : 0;
-assert(!sharedMode || (/^\d+$/.test(options["--shared-pacing-kbps"]) && Number.isSafeInteger(sharedPacing) && sharedPacing >= 0 && sharedPacing <= 4294967295), "Shared pacing is a saved unsigned KB/s setting, including 0");
+assert(!sharedMode || (/^\d+$/.test(options["--shared-pacing-kbps"]) && Number.isSafeInteger(sharedPacing) && sharedPacing >= 0 && sharedPacing <= 4294967295), "Shared pacing is a saved unsigned KiB/s setting, including 0");
 const skipClipboard = options["--skip-clipboard"] === "1";
 assert(options["--skip-clipboard"] === undefined || skipClipboard);
-const savedDownloadDirectory = options["--saved-download-dir"] === "1";
+// The default "~/Downloads" mode would make the app download into the REAL account home (the app resolves
+// the default directory through getpwuid, not $HOME), so it is refused: tests always save into a private directory.
+if (options["--saved-download-dir"] !== "1") throw new Error("Run with --saved-download-dir 1: the default ~/Downloads mode writes into the real home directory");
+const savedDownloadDirectory = true;
 assert(options["--prepare-only"] === undefined || prepare);
 assert(options["--saved-download-dir"] === undefined || ["0", "1"].includes(options["--saved-download-dir"]));
 assert(options["--out"], "Use a fresh --out directory; previous evidence is retained");
@@ -45,7 +49,7 @@ const report: any = {
 if (prepare) {
   report.download_defaults_plan = {
     configured_download_dir: savedDownloadDirectory ? "Fresh owned absolute directory named Saved Downloads With Spaces, written through config.toml [transfer] download_dir" : "Built-in transfer.download_dir=~/Downloads",
-    expected_initial_directory: savedDownloadDirectory ? "The runtime-created canonical directory, printed in handoff.json" : process.env.HOME ? join(process.env.HOME, "Downloads") : "No expanded hint when HOME is absent",
+    expected_initial_directory: savedDownloadDirectory ? "The runtime-created canonical directory, printed in handoff.json" : "(default ~/Downloads mode disabled)",
     selection_candidate: savedDownloadDirectory ? "The same owned Saved Downloads With Spaces directory; explicit AppKit Open is still required" : "Fresh owned download-target directory, printed in handoff.json",
     picker_receipt_injected: false, native_initial_directory_verified: false,
   };
@@ -58,7 +62,7 @@ const isolated = await mkdtemp(join(tmpdir(), "zerowork-ssh-aux-native-"));
 const rpc = join(isolated, "rpc"), data = join(isolated, "data"), local = join(isolated, savedDownloadDirectory ? "Saved Downloads With Spaces" : "download-target");
 await Promise.all([mkdir(rpc), mkdir(data), mkdir(local)]);
 const localDirectory = await realpath(local);
-const expectedDownloadDirectory = savedDownloadDirectory ? localDirectory : process.env.HOME ? join(process.env.HOME, "Downloads") : "";
+const expectedDownloadDirectory = savedDownloadDirectory ? localDirectory : "";
 Object.assign(report, { isolated, rpc, data, local_fixture: local, download_defaults: {
   configured_download_dir: savedDownloadDirectory ? localDirectory : "~/Downloads", expected_initial_directory: expectedDownloadDirectory,
   selection_candidate: localDirectory, same_directory_must_be_explicitly_opened: savedDownloadDirectory,
@@ -192,7 +196,9 @@ try {
   assert.equal(ready.host, "127.0.0.1"); assert.equal(ready.remote_path, "/fixture/release.txt");
   const fixture = `[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="SSH Auxiliary Download Loopback"\nhost="127.0.0.1"\nport=${ready.port}\nuser="${ready.user}"\nauth={password="${ready.password}"}\n`;
   await writeFile(join(data, "hosts.toml"), fixture);
-  const configuration = '[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_family="Menlo"\nfont_size=14\n' +
+  // The CUA step below checks the direct right-click paste path, which since design-r3 B1 is the
+  // opt-in "右键行为 = 直接粘贴" (the default right click opens the terminal menu).
+  const configuration = '[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_family="Menlo"\nfont_size=14\nterminal_right_click="paste"\n' +
     `\n[transfer]\ndedicated_connection=${!sharedMode}\nshared_pacing_kbps=${sharedMode ? sharedPacing : 2048}\n` +
     (savedDownloadDirectory ? `download_dir=${JSON.stringify(localDirectory)}\n` : "");
   await writeFile(join(data, "config.toml"), configuration);

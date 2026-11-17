@@ -4,6 +4,7 @@
 const std = @import("std");
 const wl = @import("wayland/window.zig");
 const common = @import("../unsupported/window.zig").UnsupportedWindow;
+const wake = @import("wake.zig");
 var next_window_id: u32 = 1;
 var live_windows: u32 = 0;
 pub const LinuxWindow = struct {
@@ -94,7 +95,7 @@ pub const LinuxWindow = struct {
         return self.pollEventsWithTimeout(0);
     }
     pub fn poll(self: *LinuxWindow, timeout_ms: u31) !bool {
-        const alive = try self.native.poll(timeout_ms);
+        const alive = try self.native.pollWake(timeout_ms, wake.fd());
         if (!alive) self.closed = true;
         self.refreshMetrics();
         if (self.display_link_running) _ = self.native.requestFrameClock() catch {
@@ -110,7 +111,7 @@ pub const LinuxWindow = struct {
     }
     pub fn pollEventsWithTimeout(self: *LinuxWindow, timeout_ms: u32) bool {
         if (self.closed) return false;
-        const alive = self.native.poll(@intCast(@min(timeout_ms, std.math.maxInt(u31)))) catch false;
+        const alive = self.native.pollWake(@intCast(@min(timeout_ms, std.math.maxInt(u31))), wake.fd()) catch false;
         if (!alive) self.closed = true;
         self.refreshMetrics();
         if (self.display_link_running) _ = self.native.requestFrameClock() catch {
@@ -194,7 +195,10 @@ pub const LinuxWindow = struct {
         self.native.cancelFrame();
     }
     pub fn pumpAppEvents() void {}
-    pub fn postEmptyEvent() void {}
+    /// Any thread: end the pump's wait (process-wide eventfd, see wake.zig).
+    pub fn postEmptyEvent() void {
+        wake.post();
+    }
     pub fn appShouldQuit() bool {
         return false;
     }
@@ -428,3 +432,7 @@ pub const LinuxWindow = struct {
         return unsupportedRecording();
     }
 };
+
+test {
+    _ = wake;
+}

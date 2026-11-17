@@ -101,7 +101,7 @@ pub fn validateValue(value: []const u8) !void {
     while (it.nextCodepoint()) |cp| if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.InvalidHostSecret;
 }
 fn fixture() Binding {
-    return .{ .context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .handle = .{ .session_id = @fromBackingInt(1), .generation = 1 }, .grant = .{ .execution_id = .{ .bytes = @splat(3) }, .task_id = .{ .bytes = @splat(2) }, .fence = 1, .input_epoch = 1, .ownership_revision = 1 }, .wait_sequence = 1, .input_sequence = 1 };
+    return .{ .context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 }, .handle = .{ .session_id = @fromBackingInt(1), .generation = 1 }, .grant = .{ .execution_id = .{ .bytes = @splat(3) }, .task_id = .{ .bytes = @splat(2) }, .fence = 1, .input_epoch = 1, .ownership_revision = 1 }, .wait_sequence = 1, .input_sequence = 1 };
 }
 const Spy = struct {
     calls: usize = 0,
@@ -144,7 +144,10 @@ test "host secret binds every authority and input identity" {
         switch (field) {
             0 => stale.context.conversation_id.bytes[0] += 1,
             1 => stale.context.task_id.bytes[0] += 1,
-            2 => stale.context.binding = .{ .group = 1 },
+            2 => {
+                stale.context.binding = .{ .tab = 1 };
+                stale.context.content = .{ .group = 1 };
+            },
             3 => stale.context.binding_revision += 1,
             4 => stale.context.grant_revision += 1,
             5 => stale.handle.session_id = @fromBackingInt(2),

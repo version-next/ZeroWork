@@ -285,6 +285,112 @@ test "css: _hover 跟随悬停（单独用与放进 v.when 里都生效）" {
     try testing.expect(Color.eql(theme.light.tokens.color.bg_hover, inner.getBackground()));
 }
 
+test "overlay：静态样式叠到已分层的组件根上也进层，换主题后不被组件自己的样式重算抹掉" {
+    const env = try Env.init();
+    const ControlShell = @import("components/control_shell/mod.zig").ControlShell;
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.attrs(.{ .style = BoxStyle{ .width = .{ .px = 77 }, .padding = core.Padding.all(3) } }, v.with(ControlShell(.{ .variant = .field }), .{}).slots(.{ .content = v.text(.{}, "x") })),
+    }));
+    defer env.deinit(root);
+    const shell = root.children.items[0];
+    try testing.expectEqual(core.Sizing{ .px = 77 }, shell.style.width);
+    env.cx.setTheme(&theme.dark);
+    try testing.expectEqual(core.Sizing{ .px = 77 }, shell.style.width);
+    try testing.expectEqual(core.Padding.all(3), shell.style.padding);
+    const bg = if (shell.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(.background)) |slot| if (slot.active) slot.to_color else shell.getBackground() else shell.getBackground() else shell.getBackground();
+    try testing.expect(Color.eql(theme.dark.tokens.color.input_bg, bg));
+}
+
+test "overlay state：叠加层的条件样式读调用方给的状态源，跟随信号切换" {
+    const env = try Env.init();
+    const ControlShell = @import("components/control_shell/mod.zig").ControlShell;
+    const invalid = try env.scope.createSignal(bool, false);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.attrs(.{ .style = css(.{ .padding = 2, ._invalid = .{ .padding = 6 } }), .state = .{ .invalid = invalid } }, v.with(ControlShell(.{ .variant = .field, .invalid = invalid }), .{}).slots(.{ .content = v.text(.{}, "x") })),
+    }));
+    defer env.deinit(root);
+    const shell = root.children.items[0];
+    try testing.expectEqual(core.Padding.all(2), shell.style.padding);
+    invalid.set(true);
+    try testing.expectEqual(core.Padding.all(6), shell.style.padding);
+    invalid.set(false);
+    try testing.expectEqual(core.Padding.all(2), shell.style.padding);
+}
+
+test "文字颜色继承：祖先 text_color 只填补未声明的颜色，文字自己声明的颜色总是优先" {
+    const env = try Env.init();
+    const painted = @import("core/render_engine/text_render.zig").resolveNodeLogicalTextProps;
+    const t = theme.light.tokens.color;
+    const root = try v.render(env.scope, env.cx, v.box(.{ .style = css(.{ .text_color = .fg_inverse }) }, .{
+        v.text(.{}, "inherits"),
+        v.text(.{ .style = css(.{ .color = .accent }) }, "own css"),
+        v.text(.{ .style = TextStyle{ .color = t.danger } }, "own value"),
+    }));
+    defer env.deinit(root);
+    try testing.expect(Color.eql(t.fg_inverse, painted(root.children.items[0]).?.color));
+    try testing.expect(Color.eql(t.accent, painted(root.children.items[1]).?.color));
+    try testing.expect(Color.eql(t.danger, painted(root.children.items[2]).?.color));
+}
+
+test "挂载时已在的状态（disabled / 钉住 hover）立即生效不走过渡；之后的变化照常过渡" {
+    const env = try Env.init();
+    const style = css(.{
+        .background = .bg_primary,
+        .transition = @import("recipe.zig").transition("background 150ms ease-out"),
+        ._hover = .{ .background = .bg_hover },
+        ._disabled = .{ .background = .disabled_bg },
+    });
+    const disabled = try env.scope.createSignal(bool, true);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.box(.{ .style = style, .state = .{ .disabled = disabled } }, .{}),
+        v.box(.{ .style = style, .state = .{ .hover = true, .disabled = false } }, .{}),
+    }));
+    defer env.deinit(root);
+    const t = theme.light.tokens.color;
+    const animating = struct {
+        fn f(n: *Node) bool {
+            const slots = n.frame_state.frame_local.runtime.transitions orelse return false;
+            const slot = slots.find(.background) orelse return false;
+            return slot.active;
+        }
+    }.f;
+    const kids = root.children.items;
+    try testing.expect(Color.eql(t.disabled_bg, kids[0].getBackground()));
+    try testing.expect(!animating(kids[0]));
+    try testing.expect(Color.eql(t.bg_hover, kids[1].getBackground()));
+    try testing.expect(!animating(kids[1]));
+    disabled.set(false);
+    try testing.expect(animating(kids[0]));
+}
+
+test "state 钉住：hover / active 不随指针；钉住 false 时悬停也不生效；disabled 压过钉住；信号可切换" {
+    const env = try Env.init();
+    const pressed_style = css(.{ .background = .bg_secondary, ._hover = .{ .background = .bg_hover }, ._active = .{ .background = .accent }, ._disabled = .{ .background = .disabled_bg } });
+    const pin_active = try env.scope.createSignal(bool, false);
+    const off = try env.scope.createSignal(bool, false);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.box(.{ .style = pressed_style, .state = .{ .hover = true, .disabled = false } }, .{}),
+        v.box(.{ .style = pressed_style, .state = .{ .hover = false, .disabled = false } }, .{}),
+        v.box(.{ .style = pressed_style, .state = .{ .hover = true, .active = pin_active, .disabled = off } }, .{}),
+    }));
+    defer env.deinit(root);
+    const t = theme.light.tokens.color;
+    const held = root.children.items[0];
+    const never = root.children.items[1];
+    const live = root.children.items[2];
+    // Pinned on: hover colours with no pointer at all.
+    try testing.expect(Color.eql(t.bg_hover, held.getBackground()));
+    // Pinned off: a real hover does not apply.
+    if (never.behavior.events.on_hover) |enter| enter.callback(enter.context);
+    try testing.expect(Color.eql(t.bg_secondary, never.getBackground()));
+    // Pin from a signal: switches; disabled short-circuits the pin.
+    try testing.expect(Color.eql(t.bg_hover, live.getBackground()));
+    pin_active.set(true);
+    try testing.expect(Color.eql(t.accent, live.getBackground()));
+    off.set(true);
+    try testing.expect(Color.eql(t.disabled_bg, live.getBackground()));
+}
+
 test "css: 文本样式从主题默认值起按字段叠加，v.when(css) 开合，换主题跟随" {
     const env = try Env.init();
     const done = try env.scope.createSignal(bool, false);
@@ -723,6 +829,156 @@ test ".visible：切 display 不卸载（子树与其 effect 保留）；v.dynam
     try testing.expectEqual(@as(usize, 2), contentLen(root));
 }
 
+// ---------- .visible reveal: content changed while hidden is laid out on the first layout ----------
+
+const RevealItem = struct { id: u32, name: []const u8 };
+const reveal_before = [_]RevealItem{ .{ .id = 1, .name = "alpha" }, .{ .id = 2, .name = "beta" } };
+const reveal_after = [_]RevealItem{ .{ .id = 3, .name = "gamma" }, .{ .id = 2, .name = "beta" }, .{ .id = 4, .name = "a considerably longer delta" }, .{ .id = 5, .name = "epsilon" } };
+
+const RevealState = struct {
+    shown: *reactive.Signal(bool),
+    n: *reactive.Signal(u32),
+    items: *reactive.Signal([]const RevealItem),
+    page: *reactive.Signal(u32),
+};
+
+const RevealView = struct {
+    fn row(it: RevealItem, scope: *Scope, cx: *Cx) !*Node {
+        return v.render(scope, cx, v.row(.{ .style = .{ .width = .{ .grow = .{} }, .gap = 8 } }, .{
+            v.text(.{}, it.name),
+            v.box(.{ .style = .{ .width = .{ .grow = .{} }, .height = .{ .px = 2 } } }, .{}),
+            v.text(.{}, "value"),
+        }));
+    }
+    fn detail(p: u32, scope: *Scope, cx: *Cx) !*Node {
+        var buf: [3][]const u8 = .{ "one", "two", "three" };
+        const lines: []const []const u8 = buf[0..@min(buf.len, p)];
+        const col = try v.render(scope, cx, v.col(.{ .style = .{ .width = .{ .grow = .{} }, .gap = 3 } }, .{}));
+        for (lines) |l| try col.appendChild(cx.allocator, try v.render(scope, cx, v.text(.{ .style = S.title }, l)));
+        return col;
+    }
+    /// Toggle button above the panel (pointer / keyboard path), then the `.visible` panel.
+    fn render(scope: *Scope, cx: *Cx, s: RevealState) !*Node {
+        return v.render(scope, cx, v.col(.{ .style = .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} } } }, .{
+            v.box(.{ .tag = .button, .focusable = true, .on_click = on.toggle(s.shown), .test_id = "toggle", .style = .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } } }, .{}),
+            v.col(.{ .visible = s.shown, .test_id = "panel", .style = .{ .width = .{ .grow = .{} }, .gap = 4 } }, .{
+                // Each changing part sits one level below a wrapper, as page sections do: the
+                // wrapper itself is untouched while its descendants change.
+                v.box(.{}, .{v.text(.{ .style = S.title }, v.fmt("count {d}", .{s.n}))}),
+                v.col(.{ .style = .{ .width = .{ .grow = .{} } } }, .{v.col(.{ .style = .{ .width = .{ .grow = .{} }, .gap = 2 } }, .{v.each(s.items, .id, row)})}),
+                v.col(.{ .style = .{ .width = .{ .grow = .{} } } }, .{v.dynamic(s.page, detail)}),
+            }),
+        }));
+    }
+};
+
+fn revealExpectSameLayout(actual: *Node, expected: *Node, depth: usize) !void {
+    const a = actual.globalRect();
+    const e = expected.globalRect();
+    if (actual.children.items.len != expected.children.items.len or
+        @abs(a.x - e.x) > 0.01 or @abs(a.y - e.y) > 0.01 or @abs(a.w - e.w) > 0.01 or @abs(a.h - e.h) > 0.01)
+    {
+        std.debug.print("layout mismatch at depth {d}: got ({d},{d} {d}x{d}) want ({d},{d} {d}x{d}), children {d} vs {d}\n", .{ depth, a.x, a.y, a.w, a.h, e.x, e.y, e.w, e.h, actual.children.items.len, expected.children.items.len });
+        return error.TestExpectedEqual;
+    }
+    for (actual.children.items, expected.children.items) |ac, ec| try revealExpectSameLayout(ac, ec, depth + 1);
+}
+
+fn revealState(scope: *Scope, shown: bool, n: u32, items: []const RevealItem, page: u32) !RevealState {
+    return .{
+        .shown = try scope.createSignal(bool, shown),
+        .n = try scope.createSignal(u32, n),
+        .items = try scope.createSignal([]const RevealItem, items),
+        .page = try scope.createSignal(u32, page),
+    };
+}
+
+/// Oracle: the final state rendered visible from scratch with the same theme, laid out once.
+fn expectRevealOracle(actual_root: *Node, tokens: *const ThemeTokens) !void {
+    const ref = try Env.init();
+    ref.cx.tokens = tokens;
+    ref.cx.setViewport(320, 400);
+    const s = try revealState(ref.scope, true, 42, &reveal_after, 3);
+    const root = try RevealView.render(ref.scope, ref.cx, s);
+    ref.cx.root = root;
+    defer {
+        ref.cx.root = null;
+        ref.deinit(root);
+    }
+    ref.cx.layout();
+    try revealExpectSameLayout(actual_root, root, 0);
+}
+
+const RevealTrigger = enum { programmatic, pointer, keyboard };
+
+fn revealToggle(cx: *Cx, s: RevealState, how: RevealTrigger) void {
+    switch (how) {
+        .programmatic => s.shown.set(!s.shown.peek()),
+        .pointer => {
+            cx.handleMouseMove(10, 10);
+            cx.handleMouseDown(10, 10, .{});
+            cx.handleMouseUp(10, 10);
+        },
+        .keyboard => _ = cx.handleKeyDown(.space, .{}),
+    }
+}
+
+test ".visible reveal: each / dynamic / bound text changes while hidden are laid out by the first layout" {
+    inline for (.{ RevealTrigger.programmatic, RevealTrigger.pointer, RevealTrigger.keyboard }) |how| {
+        const env = try Env.init();
+        env.cx.setViewport(320, 400);
+        const s = try revealState(env.scope, true, 1, &reveal_before, 1);
+        const root = try RevealView.render(env.scope, env.cx, s);
+        env.cx.root = root;
+        defer {
+            env.cx.root = null;
+            env.deinit(root);
+        }
+        env.cx.layout();
+        if (how == .keyboard) {
+            _ = env.cx.handleKeyDown(.tab, .{});
+            try testing.expectEqualStrings("toggle", env.cx.focus_manager.getFocused().?.meta.ownership.meta.test_id.?);
+        }
+        revealToggle(env.cx, s, how);
+        try testing.expect(!s.shown.peek());
+        env.cx.layout();
+        // Background refresh while hidden: list rows replaced / reordered / added, a dynamic
+        // subtree rebuilt and bound text changed.
+        s.items.set(&reveal_after);
+        s.n.set(42);
+        s.page.set(3);
+        env.cx.layout();
+        env.cx.layout();
+        revealToggle(env.cx, s, how);
+        try testing.expect(s.shown.peek());
+        env.cx.layout();
+        try expectRevealOracle(root, &theme.light);
+    }
+}
+
+test ".visible reveal: a theme switch while hidden (text metrics change) is laid out by the first layout" {
+    const env = try Env.init();
+    env.cx.setViewport(320, 400);
+    const s = try revealState(env.scope, true, 42, &reveal_after, 3);
+    const root = try RevealView.render(env.scope, env.cx, s);
+    env.cx.root = root;
+    defer {
+        env.cx.root = null;
+        env.deinit(root);
+    }
+    env.cx.layout();
+    s.shown.set(false);
+    env.cx.layout();
+    var big = theme.light;
+    big.tokens.font_size.xxl = theme.light.tokens.font_size.xxl + 9;
+    env.cx.setTheme(&big);
+    env.cx.layout();
+    env.cx.layout();
+    s.shown.set(true);
+    env.cx.layout();
+    try expectRevealOracle(root, &big);
+}
+
 // ---------- Component protocol ----------
 
 const Leaf = struct {
@@ -765,6 +1021,54 @@ test "attrs .parts：按 Result 字段名给组件内部部件设 test_id（组�
     try testing.expectEqualStrings("p2.inner", p2.children.items[0].meta.ownership.meta.test_id.?);
     try testing.expectEqualStrings("x", textOf(p2.children.items[0].children.items[0]));
     try testing.expectEqualStrings("p3", root.children.items[2].meta.ownership.meta.test_id.?);
+}
+
+test "attrs .parts：部件的 test_id 可以是字符串源（组件参数 / 信号，挂载时取值，同 testId）" {
+    const env = try Env.init();
+    const id = try env.scope.createSignal([]const u8, "row.field");
+    const from_param: reactive.Source([]const u8) = .{ .signal = id };
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.attrs(.{ .parts = .{ .inner = from_param } }, Panel{}),
+        v.with(Panel{}, .{}).parts(.{ .inner = id }),
+        v.attrs(.{ .parts = .{ .inner = .{ .test_id = from_param } } }, Panel{}),
+    }));
+    defer env.deinit(root);
+    for (root.children.items) |panel| try testing.expectEqualStrings("row.field", panel.children.items[0].meta.ownership.meta.test_id.?);
+    // Read at mount (structure, like testId): a later write does not move the id.
+    id.set("other");
+    try testing.expectEqualStrings("row.field", root.children.items[0].children.items[0].meta.ownership.meta.test_id.?);
+}
+
+test "attrs .parts：部件值直接给样式 / 配方（同 .style），配方维度是源时随源重算；test_id 可以是 memo" {
+    const env = try Env.init();
+    const Gap = cva(.{
+        .base = .{ .gap = 2 },
+        .variants = .{ .wide = .{ .false = .{}, .true = .{ .gap = 30 } } },
+        .defaults = .{ .wide = false },
+    });
+    const wide = try env.scope.createSignal(bool, false);
+    const Id = struct {
+        fn read(c: anytype) []const u8 {
+            return if (c.w.get()) "wide" else "narrow";
+        }
+    };
+    const id = try env.scope.createMemo([]const u8, .{ .w = wide }, Id.read);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.attrs(.{ .parts = .{ .inner = Gap.of(.{ .wide = wide }) } }, Panel{}),
+        v.attrs(.{ .parts = .{ .inner = .{ Gap.of(.{ .wide = true }), css(.{ .padding = 4 }) } } }, Panel{}),
+        v.attrs(.{ .parts = .{ .inner = .{ .test_id = id } } }, Panel{}),
+    }));
+    defer env.deinit(root);
+    const a = root.children.items[0].children.items[0];
+    const b = root.children.items[1].children.items[0];
+    try testing.expectEqual(@as(f32, 2), a.style.gap);
+    try testing.expectEqual(@as(f32, 30), b.style.gap);
+    try testing.expectEqual(@as(f32, 4), b.style.padding.top);
+    try testing.expectEqualStrings("narrow", root.children.items[2].children.items[0].meta.ownership.meta.test_id.?);
+    wide.set(true);
+    try testing.expectEqual(@as(f32, 30), a.style.gap);
+    // The test id was read at mount.
+    try testing.expectEqualStrings("narrow", root.children.items[2].children.items[0].meta.ownership.meta.test_id.?);
 }
 
 test "组件：返回 *Node 直接挂；返回 Result 走 viewParts；with 把子元素放进 slot" {
@@ -1079,6 +1383,59 @@ test "Grid.cells：视图形态单元格挂进池化格" {
     }));
     defer env.deinit(root);
     try testing.expect(subtreeHasText(root, "2/1"));
+}
+
+fn labeledGridCell(ctx: CellCtx, row: usize, col: usize) v.Text(@TypeOf(.{}), v.Fmt("{s}:{d}.{d}", struct { *reactive.Signal([]const u8), usize, usize })) {
+    return v.text(.{}, v.fmt("{s}:{d}.{d}", .{ ctx.label, row, col }));
+}
+
+fn labeledRow(ctx: CellCtx, row: usize) v.Text(@TypeOf(.{}), v.Fmt("{s}:{d}", struct { *reactive.Signal([]const u8), usize })) {
+    return v.text(.{}, v.fmt("{s}:{d}", .{ ctx.label, row }));
+}
+
+fn liveEffects(cx: *Cx) usize {
+    return cx.owner.graph.countByKind().get(.effect);
+}
+
+test "Grid.cells：释放 Grid 根（调用方 scope 仍存活）时单元格内容 scope / 绑定效果随 Grid 一并回收" {
+    const W = @import("components/mod.zig");
+    const env = try Env.init();
+    const label = try env.scope.createSignal([]const u8, "x");
+    const widths = [_]f32{ 60, 60 };
+    const base = liveEffects(env.cx);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        W.Grid(.{ .row_count = 3, .col_count = 2, .col_widths = &widths, .width = 200, .height = 200 }).cells(CellCtx{ .label = label }, labeledGridCell),
+    }));
+    defer env.deinit(root);
+    try testing.expect(subtreeHasText(root, "x:2.1"));
+    try testing.expect(liveEffects(env.cx) > base);
+
+    // Grid binds its own scope to its root, so freeing the root alone must retire everything
+    // the grid mounted -- including the cells' content effects.
+    const grid = root.children.items[0];
+    env.cx.detachChild(root, grid);
+    env.cx.freeNode(grid);
+    try testing.expectEqual(base, liveEffects(env.cx));
+    label.set("y"); // a surviving bindText effect would write the freed text node
+}
+
+test "VirtualList.rows：释放列表容器（调用方 scope 仍存活）时行内容 scope / 绑定效果随列表一并回收" {
+    const W = @import("components/mod.zig");
+    const env = try Env.init();
+    const label = try env.scope.createSignal([]const u8, "x");
+    const base = liveEffects(env.cx);
+    const root = try v.render(env.scope, env.cx, v.col(.{}, .{
+        W.VirtualList(.{ .item_count = 5, .item_height = 20, .height = 200 }).rows(CellCtx{ .label = label }, labeledRow),
+    }));
+    defer env.deinit(root);
+    try testing.expect(subtreeHasText(root, "x:4"));
+    try testing.expect(liveEffects(env.cx) > base);
+
+    const list = root.children.items[0];
+    env.cx.detachChild(root, list);
+    env.cx.freeNode(list);
+    try testing.expectEqual(base, liveEffects(env.cx));
+    label.set("y");
 }
 
 const grid_cols = [_]core.GridTrackSize{ .{ .px = 70 }, .{ .fr = 1 } };
@@ -1440,8 +1797,12 @@ test "运行期静态样式的主题重放：信号源仍走 effect" {
     const root = try v.render(env.scope, env.cx, v.box(.{ .style = ReplayRecipe.of(.{ .tone = tone }) }, .{}));
     defer env.deinit(root);
     try testing.expectEqual(before + 1, env.cx.owner.graph.countByKind().get(.effect));
-    try testing.expect(root.meta.per_frame.hooks.view_theme == null);
+    // The effect path also hangs a replay link: a branch replayed into a subtree with a fixed
+    // colour scheme re-resolves; a replay with the tokens the effect already used is a no-op.
+    try testing.expect(root.meta.per_frame.hooks.view_theme != null);
     tone.set(.loud);
+    try testing.expectEqual(theme.light.tokens.color.accent, root.getBackground());
+    env.cx.replaySubtreeTheme(root);
     try testing.expectEqual(theme.light.tokens.color.accent, root.getBackground());
 }
 
@@ -1789,10 +2150,6 @@ test "hover style preserves user callbacks and Button hover animation subscripti
     for (root.children.items) |node| {
         node.behavior.events.on_hover.?.invoke();
         try testing.expectApproxEqAbs(@as(f32, 0.5), node.getOpacity(), 0.001);
-        if (node.meta.per_frame.hooks.slots.animated_bg_state) |ptr| {
-            const animation: *@import("hooks.zig").AnimBgState = @ptrCast(@alignCast(ptr));
-            try testing.expect(animation.hover_signal.?.peek());
-        }
         node.behavior.events.on_leave.?.invoke();
         try testing.expectApproxEqAbs(@as(f32, 1), node.getOpacity(), 0.001);
     }
@@ -2418,6 +2775,142 @@ test "组件内联层：压过元素自己的悬停样式；setStyleInline 在�
     try testing.expect(Color.eql(Color.hex(0x123456), plain.getBackground()));
 }
 
+// Reference-checked OOM sweep over the style runtime's mount paths (components/oom_sweep.zig): an
+// element styled through the effect's first run (state source, a pinned hover, transitions), a
+// loop style (author + animation layers recalculated together) and a static caller overlay on a
+// layered component root. A mount that reports success must
+// look exactly like the uninjected one; `check` pins the states the reference was given.
+test "view 样式运行时：mount 成功即外观完整，任意分配点失败不假成功（sweep）" {
+    const sw = @import("components/oom_sweep.zig");
+    try sw.sweepMountVerified("view(style runtime)", struct {
+        const red = Color.rgba(200, 0, 0, 255);
+        const blue = Color.rgba(0, 0, 200, 255);
+        const disabled_style = css(.{
+            .background = Color.rgba(10, 10, 10, 255),
+            .corner_radius = 6,
+            .padding = 4,
+            .transition = @import("recipe.zig").transition("background 150ms ease-out, opacity 150ms ease-out"),
+            ._disabled = .{ .background = red, .shadow = types.Shadow{ .blur = 3, .color = blue } },
+        });
+        const hover_style = css(.{
+            .background = Color.rgba(10, 10, 10, 255),
+            .transition = @import("recipe.zig").transition("border-color 150ms ease-out"),
+            ._hover = .{ .border_width = 2 },
+            ._invalid = .{ .border_color = blue },
+        });
+        const plain = css(.{ .background = Color.rgba(10, 10, 10, 255), .transition = @import("recipe.zig").transition("opacity 150ms ease-out") });
+        fn loopStyle(phase: f32, _: *const ThemeTokens) BoxStyle {
+            return .{ .opacity = 0.5 + phase / 4, .corner_radius = 3 };
+        }
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const disabled = try scope.createSignal(bool, true);
+            const invalid = try scope.createSignal(bool, true);
+            return try v.render(scope, cx, v.col(.{}, .{
+                v.box(.{ .style = disabled_style, .state = .{ .disabled = disabled } }, .{}),
+                v.box(.{ .style = hover_style, .state = .{ .hover = true, .invalid = invalid } }, .{}),
+                v.box(.{ .style = .{ plain, v.loop(.{ .period_ms = 1000 }, loopStyle) } }, .{}),
+                // static caller overlay on a component root that already has style layers
+                v.attrs(.{ .style = BoxStyle{ .width = .{ .px = 77 }, .padding = core.Padding.all(3) } }, v.with(@import("components/control_shell/mod.zig").ControlShell(.{ .variant = .field }), .{}).slots(.{ .content = v.text(.{}, "x") })),
+            }));
+        }
+    }.m, struct {
+        fn check(root: *Node) anyerror!void {
+            // states present at mount resolved by the effect's first run, without a transition
+            const a = root.children.items[0];
+            try testing.expect(Color.eql(Color.rgba(200, 0, 0, 255), a.getBackground()));
+            try testing.expect(a.style.shadow() != null);
+            try testing.expectApproxEqAbs(@as(f32, 6), a.style.effectiveRadii()[0], 0.001);
+            try testing.expect(!a.frame_state.frame_local.runtime.transitions.?.any_active);
+            const b = root.children.items[1];
+            try testing.expectEqual(@as(f32, 2), b.style.border.width);
+            try testing.expect(Color.eql(Color.rgba(0, 0, 200, 255), b.style.border.color));
+            try testing.expect(b.frame_state.frame_local.runtime.transitions.?.find(.border_color) != null);
+            // loop: author and animation layers both landed
+            const c = root.children.items[2];
+            try testing.expect(c.hasBeforeRenderHooks());
+            try testing.expectApproxEqAbs(@as(f32, 3), c.style.effectiveRadii()[0], 0.001);
+            try testing.expect(Color.eql(Color.rgba(10, 10, 10, 255), c.getBackground()));
+            const d = root.children.items[3];
+            try testing.expectEqual(core.Sizing{ .px = 77 }, d.style.width);
+            try testing.expectEqual(core.Padding.all(3), d.style.padding);
+        }
+    }.check);
+}
+
+test "setStyleInlineFallible：任意分配点失败时报错且节点不变（有宿主 / 无宿主），成功时完整生效" {
+    const want = BoxStyle{ .corner_radii = .{ .each = .{ 8, 0, 0, 8 } }, .border_right_color = Color.TRANSPARENT, .margin = .{ .left = -1 } };
+    for ([_]bool{ true, false }) |hosted| {
+        var failure_index: usize = 0;
+        var failures: usize = 0;
+        while (true) : (failure_index += 1) {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            const cx = try Cx.init(failing.allocator(), std.testing.io);
+            defer cx.deinit();
+            cx.tokens = &theme.light;
+            const scope = try Scope.init(failing.allocator(), null, cx.owner);
+            defer scope.dispose();
+            const node = if (hosted)
+                try v.render(scope, cx, v.box(.{ .style = .{ BoxStyle{ .gap = 1, .padding = types.Padding.all(2) }, v.hover(BoxStyle{ .opacity = 0.5 }) } }, .{}))
+            else
+                try core.box(cx, .{ .gap = 1, .padding = types.Padding.all(2) }, .{});
+            defer cx.freeNode(node);
+            try testing.expectEqual(hosted, node.meta.per_frame.hooks.style_host != null);
+            const had_ext = node.style.ext != null;
+            failing.fail_index = failing.alloc_index + failure_index;
+            const result = node.setStyleInlineFallible(cx.allocator, want);
+            failing.fail_index = std.math.maxInt(usize);
+            if (result) |_| {
+                try testing.expectEqual(@as(f32, 0), node.style.effectiveRadii()[1]);
+                try testing.expectEqual(@as(f32, 8), node.style.effectiveRadii()[3]);
+                try testing.expect(Color.eql(Color.TRANSPARENT, node.style.border_side_colors().?.right.?));
+                try testing.expectEqual(@as(f32, -1), node.style.margin.left);
+                try testing.expectEqual(@as(f32, 1), node.style.gap);
+                // A later best-effort write still cascades over the fallible one.
+                node.setStyleInline(cx.allocator, .{ .gap = 4 });
+                try testing.expectEqual(@as(f32, 4), node.style.gap);
+                try testing.expectEqual(@as(f32, -1), node.style.margin.left);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                failures += 1;
+                // nothing applied, nothing left behind
+                try testing.expectEqual(@as(f32, 0), node.style.margin.left);
+                try testing.expectEqual(@as(f32, 0), node.style.effectiveRadii()[0]);
+                try testing.expect(node.style.border_side_colors() == null);
+                try testing.expectEqual(had_ext, node.style.ext != null);
+                // and the node keeps working: the write lands once memory is back
+                try node.setStyleInlineFallible(cx.allocator, want);
+                try testing.expectEqual(@as(f32, -1), node.style.margin.left);
+            }
+        }
+        // host: inline declaration, target and ext block; direct: the ext block
+        try testing.expect(failures >= if (hosted) @as(usize, 3) else 1);
+    }
+}
+
+test "stageStyleInline：abort 后节点原样（不留新建的 ext、不留暂存），commit 后完整生效" {
+    const env = try Env.init();
+    defer env.deinit(null);
+    for ([_]bool{ true, false }) |hosted| {
+        const node = if (hosted)
+            try v.render(env.scope, env.cx, v.box(.{ .style = .{ BoxStyle{ .gap = 1 }, v.hover(BoxStyle{ .opacity = 0.5 }) } }, .{}))
+        else
+            try core.box(env.cx, .{ .gap = 1 }, .{});
+        defer env.cx.freeNode(node);
+        try testing.expectEqual(hosted, node.meta.per_frame.hooks.style_host != null);
+        try testing.expect(node.style.ext == null);
+        const want = BoxStyle{ .corner_radii = .{ .all = 6 }, .margin = .{ .left = -1 } };
+        const staged = try node.stageStyleInline(env.cx.allocator, want);
+        try testing.expectEqual(@as(f32, 0), node.style.margin.left); // nothing visible yet
+        staged.abort();
+        try testing.expect(node.style.ext == null);
+        try testing.expectEqual(@as(f32, 0), node.style.margin.left);
+        (try node.stageStyleInline(env.cx.allocator, want)).commit();
+        try testing.expectEqual(@as(f32, 6), node.style.effectiveRadii()[0]);
+        try testing.expectEqual(@as(f32, -1), node.style.margin.left);
+    }
+}
+
 test "组件内联层：绕过宿主直接改写它管着的字段会被 Debug 检测到" {
     const env = try Env.init();
     const sel = try env.scope.createSignal(bool, false);
@@ -2427,6 +2920,306 @@ test "组件内联层：绕过宿主直接改写它管着的字段会被 Debug �
     root.style.gap = 42; // Directly overwrite gap managed by host
     sel.set(true);
     try testing.expect(v.styleConflictReportedForTest(root));
+}
+
+// ---------- In-place inline translation write (StyleHost.writeTranslationInPlace) ----------
+
+/// The per-frame motion write of the S4 benchmark: a fixed border / shadow, moving translates.
+fn motionWrite(tx: ?f32, ty: ?f32) BoxStyle {
+    return .{
+        .border_width = 0,
+        .border_color = Color.TRANSPARENT,
+        .shadow = .{ .blur = 16, .offset_y = 4, .color = Color.rgba(0, 0, 0, 64) },
+        .translate_x = tx,
+        .translate_y = ty,
+    };
+}
+
+fn motionCardStyle(i: usize) BoxStyle {
+    return .{
+        .position = .absolute,
+        .inset = .{ .left = .{ .px = @as(f32, @floatFromInt(i % 4)) * 110 + 8 }, .top = .{ .px = @as(f32, @floatFromInt(i / 4)) * 80 + 8 } },
+        .flex_shrink = 0,
+        .width = .{ .px = 96 },
+        .height = .{ .px = 64 },
+        .corner_radius = 12,
+        .border_width = 0,
+        .background = Color.WHITE,
+        .gradient = .{ .from = Color.hex(0x4f7cff), .to = Color.hex(0x8a5cff), .direction = .diagonal },
+        .shadow = .{ .blur = 16, .offset_y = 4, .color = Color.rgba(0, 0, 0, 64) },
+    };
+}
+
+fn themedPanel(t: *const ThemeTokens) BoxStyle {
+    return .{ .background = t.tokens.color.bg_secondary, .border_color = t.tokens.color.accent, .padding = core.Padding.all(4) };
+}
+
+/// One tree per path: the same nodes, signals and history, written once with the in-place
+/// translation write and once through the full path only.
+const MotionRig = struct {
+    const node_count = 8;
+    env: Env,
+    root: *Node,
+    nodes: [node_count]*Node,
+    tone: *reactive.Signal(bool),
+    lift: *reactive.Signal(bool),
+    in_place: bool,
+
+    fn init(in_place: bool) !MotionRig {
+        const W = @import("components/mod.zig");
+        const env = try Env.init();
+        errdefer env.deinit(null);
+        const tone = try env.scope.createSignal(bool, false);
+        const lift = try env.scope.createSignal(bool, false);
+        const slide = comptime @import("recipe.zig").transition("translate-x 200ms");
+        const fade = comptime @import("recipe.zig").transition("background 200ms");
+        const root = try v.render(env.scope, env.cx, v.box(.{ .style = .{ .width = .{ .px = 480 }, .height = .{ .px = 200 } } }, .{
+            // 0, 1: the benchmark card (caller layer over a Card, a body child)
+            v.attrs(.{ .style = motionCardStyle(0) }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+            v.attrs(.{ .style = motionCardStyle(1) }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+            // 2: a caller layer that takes translate_y over while `lift` is on
+            v.attrs(.{ .style = .{ motionCardStyle(2), v.when(lift, BoxStyle{ .translate_y = 5 }) } }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+            // 3: a class toggled over a themed element style (theme switches replay it)
+            v.attrs(.{ .style = .{ motionCardStyle(3), v.when(tone, BoxStyle{ .background = Color.hex(0x112233), .border_color = Color.hex(0x445566) }) } }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+            // 4: translate_x transitions
+            v.box(.{ .style = .{ motionCardStyle(4), css(.{ .transition = slide }) } }, .{v.text(.{}, "slide")}),
+            // 5: a background transition the class toggle starts (in flight for a while)
+            v.box(.{ .style = .{ motionCardStyle(5), css(.{ .transition = fade }), v.when(tone, BoxStyle{ .background = Color.hex(0x00FF00) }) } }, .{v.text(.{}, "fade")}),
+            // 6: themed style function, nested children
+            v.box(.{ .style = .{ themedPanel, motionCardStyle(6) } }, .{v.row(.{}, .{ v.text(.{}, "a"), v.box(.{ .style = .{ .width = .{ .px = 8 }, .height = .{ .px = 8 } } }, .{}) })}),
+            // 7: a state class that declares translate_x itself (above the inline layer)
+            v.attrs(.{ .style = .{ motionCardStyle(7), v.when(lift, BoxStyle{ .translate_x = -3 }) } }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+        }));
+        env.cx.root = root;
+        env.cx.setViewport(480, 200);
+        var nodes: [node_count]*Node = undefined;
+        for (&nodes, 0..) |*n, i| n.* = content(root, i);
+        return .{ .env = env, .root = root, .nodes = nodes, .tone = tone, .lift = lift, .in_place = in_place };
+    }
+
+    fn deinit(self: *MotionRig) void {
+        self.env.cx.root = null;
+        self.env.deinit(self.root);
+    }
+
+    /// Run `op` with this rig's path selected.
+    fn select(self: *const MotionRig) void {
+        v.inline_translation_in_place_for_test = self.in_place;
+    }
+
+    /// A frame at the shared frame clock: tick (transitions advance), layout, paint, lowering.
+    fn frame(self: *MotionRig) []const @import("core/paint_table.zig").DisplayItem {
+        self.select();
+        self.env.cx.frame_time_ms = render_engine.current_frame_time_ms;
+        layoutAndRender(self.env.cx);
+        return self.env.cx.lowerForEncoderPaintTable();
+    }
+};
+
+fn expectSameNodeState(a: *Node, b: *Node) !void {
+    if (v.differingBoxStorageForTest(&a.style, &b.style)) |field| {
+        std.debug.print("node {d}: box storage differs at {s}\n", .{ a.id, field });
+        return error.TestUnexpectedResult;
+    }
+    try sameOn(a, "background", Color.eql(a.getBackground(), b.getBackground()));
+    try sameOn(a, "opacity", a.getOpacity() == b.getOpacity());
+    try sameOn(a, "dirty bits", std.meta.eql(a.frame_state.state_bits.dirty, b.frame_state.state_bits.dirty));
+    try sameOn(a, "versions", std.meta.eql(a.meta.per_frame.caches.versions, b.meta.per_frame.caches.versions));
+    try sameOn(a, "own cache", (a.meta.per_frame.caches.commands.own == null) == (b.meta.per_frame.caches.commands.own == null));
+    const sa = a.frame_state.frame_local.runtime.transitions;
+    const sb = b.frame_state.frame_local.runtime.transitions;
+    try sameOn(a, "transition slots", (sa == null) == (sb == null));
+    if (sa) |x| {
+        const y = sb.?;
+        try sameOn(a, "transition count", x.count == y.count and x.any_active == y.any_active);
+        for (x.slots[0..x.count], y.slots[0..y.count]) |p, q| {
+            try sameOn(a, "transition slot", p.prop == q.prop and p.active == q.active and p.from_value == q.from_value and
+                p.to_value == q.to_value and Color.eql(p.from_color, q.from_color) and Color.eql(p.to_color, q.to_color) and
+                p.start_time_ms == q.start_time_ms);
+        }
+    }
+    const ha = v.styleHostStateForTest(a);
+    const hb = v.styleHostStateForTest(b);
+    try sameOn(a, "host", (ha == null) == (hb == null));
+    if (ha) |x| {
+        const y = hb.?;
+        const eql = @import("style_decl.zig").valueEql;
+        try sameOn(a, "host target", eql(x.computed, y.computed) and x.computed_mask == y.computed_mask);
+        try sameOn(a, "host inline layer", eql(x.inline_decl, y.inline_decl) and x.inline_mask == y.inline_mask);
+        try sameOn(a, "host stale / layers", x.stale == y.stale and x.layer_count == y.layer_count and std.mem.eql(bool, &x.applied_once, &y.applied_once));
+    }
+    try sameOn(a, "children", a.children.items.len == b.children.items.len);
+    for (a.children.items, b.children.items) |ca, cb| try expectSameNodeState(ca, cb);
+}
+
+fn sameOn(n: *const Node, what: []const u8, ok: bool) !void {
+    if (ok) return;
+    std.debug.print("node {d}: {s} differs\n", .{ n.id, what });
+    return error.TestUnexpectedResult;
+}
+
+fn expectSamePaint(a: []const @import("core/paint_table.zig").DisplayItem, b: []const @import("core/paint_table.zig").DisplayItem) !void {
+    try testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try testing.expectEqual(x.kind, y.kind);
+        try testing.expectEqual(x.paint_digest, y.paint_digest);
+        try testing.expect(std.meta.eql(x.geom, y.geom));
+        try testing.expect(std.meta.eql(x.color, y.color));
+        try testing.expect(std.meta.eql(x.radii, y.radii));
+        try testing.expect(std.meta.eql(x.local_bounds, y.local_bounds));
+        try testing.expectEqual(x.shadow_blur, y.shadow_blur);
+        try testing.expectEqual(x.shadow_offset_x, y.shadow_offset_x);
+        try testing.expectEqual(x.shadow_offset_y, y.shadow_offset_y);
+        try testing.expect(std.meta.eql(x.gradient_to_color, y.gradient_to_color));
+    }
+}
+
+test "组件内联层：只改 translate 的写入原地完成，与完整路径的节点状态、宿主状态、脏标记和绘制输出逐步一致" {
+    const saved_switch = v.inline_translation_in_place_for_test;
+    defer v.inline_translation_in_place_for_test = saved_switch;
+    const saved_time = render_engine.current_frame_time_ms;
+    defer render_engine.current_frame_time_ms = saved_time;
+    render_engine.current_frame_time_ms = 1000;
+
+    var full = try MotionRig.init(false);
+    defer full.deinit();
+    var fast = try MotionRig.init(true);
+    defer fast.deinit();
+    expectSameNodeState(full.root, fast.root) catch |err| {
+        std.debug.print("after mount\n", .{});
+        return err;
+    };
+    try expectSamePaint(full.frame(), fast.frame());
+
+    const hits_before = v.inline_translation_in_place_count_for_test;
+    var prng = std.Random.DefaultPrng.init(0x7a11_5a7e);
+    const r = prng.random();
+    var translate_writes: u64 = 0;
+    for (0..3000) |step| {
+        const i = r.uintLessThan(usize, MotionRig.node_count);
+        const tx: f32 = if (r.uintLessThan(u8, 8) == 0) 0 else @floatFromInt(@as(i32, r.intRangeAtMost(i32, -48, 48)));
+        const ty: f32 = @as(f32, @floatFromInt(r.intRangeAtMost(i32, -48, 48))) / 4;
+        const op = r.uintLessThan(u8, 100);
+        inline for (.{ &full, &fast }) |rig| {
+            rig.select();
+            const n = rig.nodes[i];
+            const a = rig.env.cx.allocator;
+            switch (op) {
+                // the motion write: both, only x, only y; repeats now and then
+                0...49 => n.setStyleInline(a, motionWrite(tx, ty)),
+                50...54 => n.setStyleInline(a, motionWrite(tx, null)),
+                55...59 => n.setStyleInline(a, motionWrite(null, ty)),
+                // a different fixed value with the move
+                60...62 => {
+                    var w = motionWrite(tx, ty);
+                    w.shadow.?.blur = 4;
+                    n.setStyleInline(a, w);
+                },
+                63...64 => n.setStyleInline(a, .{ .border = .{ .width = 1, .color = Color.hex(0x123456) }, .translate_x = tx }),
+                65...66 => n.setStyleInline(a, .{ .shadows = types.ShadowList.of(&.{.{ .blur = 2, .color = Color.hex(0x000000) }}), .translate_y = ty }),
+                // a field the inline layer doesn't hold yet
+                67...68 => n.setStyleInline(a, .{ .opacity = 0.75, .translate_x = tx }),
+                69...71 => n.unsetStyleInline(.{ .translate_x = 0 }),
+                72...73 => n.unsetStyleInline(.{ .shadow = .{}, .border_width = 0 }),
+                74...77 => rig.tone.set(!rig.tone.get()),
+                78...81 => rig.lift.set(!rig.lift.get()),
+                82...83 => rig.env.cx.setTheme(if (step % 2 == 0) &theme.dark else &theme.light),
+                84...86 => (try n.stageStyleInline(a, motionWrite(tx, ty))).commit(),
+                87...88 => (try n.stageStyleInline(a, motionWrite(ty, tx))).abort(),
+                // direct imperative setters routed into the inline layer
+                89...90 => n.setTranslateX(tx),
+                else => {},
+            }
+        }
+        if (op < 60) translate_writes += 1;
+        expectSameNodeState(full.root, fast.root) catch |err| {
+            std.debug.print("step {d}: op {d} on node {d}\n", .{ step, op, i });
+            return err;
+        };
+        if (step % 7 == 0) {
+            // long frames: transitions settle between class toggles
+            render_engine.current_frame_time_ms += 40;
+            try expectSamePaint(full.frame(), fast.frame());
+            try expectSameNodeState(full.root, fast.root);
+        }
+    }
+    const hits = v.inline_translation_in_place_count_for_test - hits_before;
+    // Most motion writes stay in place; the rest (transitions, a stale target after a class or
+    // layer change, a first declaration) took the full path.
+    try testing.expect(hits > translate_writes / 3);
+    try testing.expect(hits < translate_writes);
+    // Nothing was written around the hosts: the debug re-apply check stays quiet.
+    for (fast.nodes) |n| try testing.expect(!v.styleConflictReportedForTest(n));
+}
+
+test "组件内联层：稳态只改 translate 的写入不分配、不跑级联，500 张卡片每帧全部走原地写入" {
+    const W = @import("components/mod.zig");
+    const saved_switch = v.inline_translation_in_place_for_test;
+    defer v.inline_translation_in_place_for_test = saved_switch;
+    v.inline_translation_in_place_for_test = true;
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const cx = try Cx.init(counting.allocator(), std.testing.io);
+    cx.tokens = &theme.light;
+    const scope = try Scope.init(counting.allocator(), null, cx.owner);
+    const root = try v.render(scope, cx, v.box(.{ .style = .{ .width = .{ .px = 1280 }, .height = .{ .px = 720 } } }, .{}));
+    defer {
+        scope.dispose();
+        cx.freeNode(root);
+        cx.deinit();
+    }
+    var cards: [500]*Node = undefined;
+    for (&cards, 0..) |*c, i| c.* = try v.append(scope, cx, root, v.attrs(.{ .style = motionCardStyle(i) }, W.Card(.{ .width = 96, .height = 64, .padded = false })));
+    // First write declares the translates (full path), the second settles the target.
+    for (cards) |c| c.setStyleInline(cx.allocator, motionWrite(1, 1));
+    const allocations = counting.allocations;
+    const hits = v.inline_translation_in_place_count_for_test;
+    for (0..4) |frame| {
+        for (cards, 0..) |c, i| {
+            const phase = @as(f32, @floatFromInt(frame)) * 0.3 + @as(f32, @floatFromInt(i)) * 0.1;
+            c.setStyleInline(cx.allocator, motionWrite(@sin(phase) * 12, @cos(phase) * 12));
+        }
+    }
+    try testing.expectEqual(allocations, counting.allocations);
+    try testing.expectEqual(hits + 4 * cards.len, v.inline_translation_in_place_count_for_test);
+    const last_phase = @as(f32, @floatFromInt(@as(usize, 3))) * 0.3 + @as(f32, @floatFromInt(@as(usize, 499))) * 0.1;
+    try testing.expectEqual(@sin(last_phase) * 12, cards[499].style.translate_x);
+    // The full path allocates on every such write (inline + target encodings).
+    v.inline_translation_in_place_for_test = false;
+    cards[0].setStyleInline(cx.allocator, motionWrite(5, 5));
+    try testing.expect(counting.allocations > allocations);
+}
+
+test "组件内联层：原地 translate 写入不回写整份目标，Debug 仍报告绕过宿主改写的字段（含 checkConflicts 不查的 ext 字段）" {
+    if (!std.debug.runtime_safety) return error.SkipZigTest;
+    const W = @import("components/mod.zig");
+    const saved_switch = v.inline_translation_in_place_for_test;
+    defer v.inline_translation_in_place_for_test = saved_switch;
+    v.inline_translation_in_place_for_test = true;
+    const env = try Env.init();
+    const root = try v.render(env.scope, env.cx, v.box(.{}, .{
+        v.attrs(.{ .style = motionCardStyle(0) }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+        v.attrs(.{ .style = motionCardStyle(1) }, W.Card(.{ .width = 96, .height = 64, .padded = false })),
+    }));
+    defer env.deinit(root);
+    const plain = root.children.items[0];
+    const ext_written = root.children.items[1];
+    for ([_]*Node{ plain, ext_written }) |n| {
+        n.setStyleInline(env.cx.allocator, motionWrite(1, 1));
+        n.setStyleInline(env.cx.allocator, motionWrite(2, 2));
+        try testing.expect(!v.styleConflictReportedForTest(n));
+    }
+    const hits = v.inline_translation_in_place_count_for_test;
+    // A Style field (checkConflicts covers it) and an ext field (only the re-apply check does).
+    plain.style.width = .{ .px = 10 };
+    ext_written.style.ext.?.corner_radius = .{ .all = 3 };
+    plain.setStyleInline(env.cx.allocator, motionWrite(3, 3));
+    ext_written.setStyleInline(env.cx.allocator, motionWrite(3, 3));
+    try testing.expectEqual(hits + 2, v.inline_translation_in_place_count_for_test);
+    try testing.expect(v.styleConflictReportedForTest(plain));
+    try testing.expect(v.styleConflictReportedForTest(ext_written));
+    // The in-place write leaves such a write in place (the full path would have undone it).
+    try testing.expectEqual(@as(f32, 3), ext_written.style.ext.?.corner_radius.?.all);
+    try testing.expectEqual(@as(f32, 3), ext_written.style.translate_x);
 }
 
 fn expectSameBoxStorage(a: *Node, b: *Node) !void {
@@ -2542,7 +3335,7 @@ test "组件内联层：宿主创建时背景正在过渡，捕获的是过渡�
         pub fn mount(_: @This(), _: *Scope, cx: *Cx) !*Node {
             const n = try core.box(cx, .{ .background = Color.hex(0x000000), .width = .{ .px = 10 } }, .{});
             const tr = comptime @import("recipe.zig").transition("background 200ms");
-            n.applyTransition(cx.allocator, &tr);
+            try n.applyTransition(cx.allocator, &tr);
             n.setBackground(Color.hex(0xFFFFFF)); // Transition start: black to white, current rendered is still black
             return n;
         }
@@ -2565,7 +3358,7 @@ test "呈现值与过渡：叠加层的首次应用（挂载期间）立即生�
         pub fn mount(_: @This(), _: *Scope, cx: *Cx) !*Node {
             const n = try core.box(cx, .{ .background = Color.hex(0x000000), .width = .{ .px = 10 } }, .{});
             const tr = comptime @import("recipe.zig").transition("background 200ms");
-            n.applyTransition(cx.allocator, &tr);
+            try n.applyTransition(cx.allocator, &tr);
             return n;
         }
     };
@@ -2624,7 +3417,7 @@ test "呈现值与过渡：叠加层挂载时与当前显示相同（没有变�
         pub fn mount(_: @This(), _: *Scope, cx: *Cx) !*Node {
             const n = try core.box(cx, .{ .background = Color.hex(0xFF0000), .width = .{ .px = 10 } }, .{});
             const tr = comptime @import("recipe.zig").transition("background 200ms");
-            n.applyTransition(cx.allocator, &tr);
+            try n.applyTransition(cx.allocator, &tr);
             return n;
         }
     };
@@ -2636,4 +3429,485 @@ test "呈现值与过渡：叠加层挂载时与当前显示相同（没有变�
     color.set(Color.hex(0x0000FF));
     try testing.expect(slot.active); // Not first apply: transitioned interpolation
     try testing.expect(Color.eql(Color.hex(0x0000FF), slot.to_color));
+}
+
+fn paintedTextColor(cx: *Cx, content_str: []const u8) ?Color {
+    for (cx.display_list.items.items) |item| switch (item) {
+        .text_run => |run| if (std.mem.eql(u8, run.content, content_str)) return run.color,
+        else => {},
+    };
+    return null;
+}
+
+fn paintedIconTint(cx: *Cx) ?Color {
+    for (cx.display_list.items.items) |item| switch (item) {
+        .icon_rep => |ic| return ic.tint,
+        else => {},
+    };
+    return null;
+}
+
+const CurrentColorProbe = struct {
+    var seen: ?Color = null;
+    fn draw(ctx: core.DrawContext, _: void, _: v.Frame) anyerror!void {
+        seen = ctx.current_color;
+    }
+};
+
+fn layoutAndRender(cx: *Cx) void {
+    cx.layout();
+    _ = cx.render();
+}
+
+const StarIcon = struct {
+    fn current(c: ?Color, _: *const ThemeTokens) ?Color {
+        return c;
+    }
+};
+
+/// A box whose text_color follows `danger`, holding `leaf` (two levels down).
+fn inheritedColorPage(env: Env, danger: *reactive.Signal(bool), leaf: anytype) !*Node {
+    const page = try v.render(env.scope, env.cx, v.box(.{ .style = .{ .width = .{ .px = 200 }, .height = .{ .px = 60 } } }, .{
+        v.box(.{ .style = .{ css(.{ .text_color = .fg_primary }), v.when(danger, css(.{ .text_color = .danger })) } }, .{
+            v.row(.{}, .{leaf}),
+        }),
+    }));
+    env.cx.root = page;
+    env.cx.setViewport(200, 60);
+    layoutAndRender(env.cx);
+    return page;
+}
+
+fn closePage(env: Env, page: *Node) void {
+    env.cx.root = null;
+    env.deinit(page);
+}
+
+test "继承的文字颜色：祖先 text_color 变化时文字重画，不回放旧缓存" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const danger = try env.scope.createSignal(bool, false);
+    const page = try inheritedColorPage(env, danger, v.text(.{}, "inherits"));
+    defer closePage(env, page);
+    try testing.expect(Color.eql(t.fg_primary, paintedTextColor(env.cx, "inherits").?));
+    danger.set(true);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.danger, paintedTextColor(env.cx, "inherits").?));
+    danger.set(false);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.fg_primary, paintedTextColor(env.cx, "inherits").?));
+}
+
+test "继承的文字颜色：currentColor 图标跟随祖先 text_color 重画" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const danger = try env.scope.createSignal(bool, false);
+    const page = try inheritedColorPage(env, danger, v.icon(.{
+        .style = .{ .width = .{ .px = 12 }, .height = .{ .px = 12 } },
+        .tint = v.tintBy(@as(?Color, null), StarIcon.current),
+    }, @import("svg_assets.zig").common.star));
+    defer closePage(env, page);
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+    danger.set(true);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.danger, paintedIconTint(env.cx).?));
+}
+
+test "继承的文字颜色：自绘的 DrawContext.current_color 跟随祖先 text_color" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const danger = try env.scope.createSignal(bool, false);
+    CurrentColorProbe.seen = null;
+    const page = try inheritedColorPage(env, danger, v.canvas(.{ .style = .{ .width = .{ .px = 4 }, .height = .{ .px = 4 } } }, v.paint(.{}, CurrentColorProbe.draw)));
+    defer closePage(env, page);
+    try testing.expect(Color.eql(t.fg_primary, CurrentColorProbe.seen.?));
+    CurrentColorProbe.seen = null;
+    danger.set(true);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.danger, CurrentColorProbe.seen.?));
+}
+
+test "currentColor 图标：没有祖先声明文字颜色时用 fg-primary；tintBy 返回颜色时照常着色" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const tint = try env.scope.createSignal(?Color, null);
+    const page = try v.render(env.scope, env.cx, v.box(.{ .style = .{ .width = .{ .px = 50 }, .height = .{ .px = 50 } } }, .{
+        v.icon(.{ .style = .{ .width = .{ .px = 12 }, .height = .{ .px = 12 } }, .tint = v.tintBy(tint, StarIcon.current) }, @import("svg_assets.zig").common.star),
+    }));
+    env.cx.root = page;
+    defer {
+        env.cx.root = null;
+        env.deinit(page);
+    }
+    env.cx.setViewport(50, 50);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+    tint.set(t.accent);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.accent, paintedIconTint(env.cx).?));
+    try testing.expect(!page.children.items[0].getIcon().?.tint_current_color);
+    tint.set(null);
+    layoutAndRender(env.cx);
+    try testing.expect(page.children.items[0].getIcon().?.tint_current_color);
+}
+
+const LayeredTone = cva(.{
+    .base = .{ .background = .bg_primary, ._hover = .{ .background = .bg_hover }, ._active = .{ .background = .bg_active }, ._disabled = .{ .background = .disabled_bg } },
+    .variants = .{ .kind = .{ .plain = .{}, .loud = .{ .background = .accent } } },
+});
+
+test "cva .merge(layers)：运行期分状态层并进配方——调用方 base 在配方 :hover / :active / :disabled 之下，同状态层后者胜，层可来自信号" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const red = Color.rgba(200, 0, 0, 255);
+    const blue = Color.rgba(0, 0, 200, 255);
+    const layers = try env.scope.createSignal(core.ConditionalStyle, .{ .base = .{ .background = red, .padding = core.Padding.all(3) } });
+    const disabled = try env.scope.createSignal(bool, false);
+    const page = try v.render(env.scope, env.cx, v.col(.{}, .{
+        v.box(.{
+            .style = LayeredTone.of(.{ .kind = .plain }).merge(layers),
+            .state = .{ .disabled = disabled, .invalid = false, .selected = false, .expanded = false },
+        }, .{}),
+    }));
+    defer env.deinit(page);
+    const n = page.children.items[0];
+    const bg = struct {
+        fn of(x: *Node) Color {
+            if (x.frame_state.frame_local.runtime.transitions) |slots| if (slots.find(.background)) |slot| if (slot.active) return slot.to_color;
+            return x.getBackground();
+        }
+    }.of;
+    try testing.expect(Color.eql(red, bg(n)));
+    try testing.expectEqual(core.Padding.all(3), n.style.padding);
+    n.behavior.events.on_hover.?.invoke();
+    try testing.expect(Color.eql(t.bg_hover, bg(n))); // recipe :hover over the caller's base
+    env.cx.pressed_node = n;
+    env.cx.notifyPressWatchers();
+    try testing.expect(Color.eql(t.bg_active, bg(n)));
+    env.cx.pressed_node = null;
+    env.cx.notifyPressWatchers();
+    layers.set(.{ .base = .{ .background = red }, .hover = .{ .background = blue } });
+    try testing.expect(Color.eql(blue, bg(n))); // same state: the layer wins
+    try testing.expectEqual(core.Padding.ZERO, n.style.padding); // dropped field falls back
+    disabled.set(true);
+    try testing.expect(Color.eql(t.disabled_bg, bg(n))); // :disabled short-circuits, over the base
+}
+
+fn laidOutWidth(n: *Node) f32 {
+    return n.rectFromWorldOrFallback().w;
+}
+
+/// Weight-aware stand-in for the platform measure (the test build's fallback ignores weight).
+fn weightedMeasure(_: [*]const u8, len: usize, font_size: f32, font_weight: u16, _: bool) f32 {
+    return @as(f32, @floatFromInt(len)) * font_size * (0.4 + @as(f32, @floatFromInt(font_weight)) / 2000);
+}
+
+test "继承的字号 / 字重：布局测量与绘制用同一份解析结果；文字自己声明的优先；祖先变化后代重新测量" {
+    const env = try Env.init();
+    const painted = @import("core/render_engine/text_render.zig").resolveNodeLogicalTextProps;
+    const big = try env.scope.createSignal(bool, false);
+    const start = BoxStyle{ .direction = .column, .align_items = .start };
+    const page = try v.render(env.scope, env.cx, v.box(.{ .style = start }, .{
+        v.box(.{ .style = .{ start, css(.{ .font_size = 13, .font_weight = 500 }), v.when(big, css(.{ .font_size = 20, .font_weight = 700 })) } }, .{
+            v.text(.{}, "Inherited label"),
+            v.text(.{ .style = css(.{ .font_size = 11 }) }, "Own size"),
+            v.text(.{ .style = TextStyle{ .font_size = 12, .font_weight = 400 } }, "Whole style"),
+        }),
+        // References: the same strings with the expected properties declared.
+        v.text(.{ .style = TextStyle{ .font_size = 13, .font_weight = 500 } }, "Inherited label"),
+        v.text(.{ .style = TextStyle{ .font_size = 20, .font_weight = 700 } }, "Inherited label"),
+        v.text(.{ .style = TextStyle{ .font_size = 11, .font_weight = 500 } }, "Own size"),
+        v.text(.{ .style = TextStyle{ .font_size = 11, .font_weight = 700 } }, "Own size"),
+        v.text(.{ .style = TextStyle{ .font_size = 12, .font_weight = 400 } }, "Whole style"),
+    }));
+    env.cx.root = page;
+    defer {
+        env.cx.root = null;
+        env.deinit(page);
+    }
+    env.cx.text.measure_fn = weightedMeasure;
+    env.cx.setViewport(800, 400);
+    layoutAndRender(env.cx);
+    const host = page.children.items[0];
+    const inherited = host.children.items[0];
+    const own = host.children.items[1];
+    const whole = host.children.items[2];
+    const ref = page.children.items[1..];
+    try testing.expect(laidOutWidth(ref[0]) != laidOutWidth(ref[1]));
+    try testing.expect(laidOutWidth(ref[2]) != laidOutWidth(ref[3]));
+
+    // Rest: undeclared size / weight come from the box, declared ones stay the text's.
+    try testing.expectEqual(@as(f32, 13), painted(inherited).?.font_size);
+    try testing.expectEqual(@as(u16, 500), painted(inherited).?.font_weight);
+    try testing.expectEqual(@as(f32, 11), painted(own).?.font_size);
+    try testing.expectEqual(@as(u16, 500), painted(own).?.font_weight);
+    try testing.expectEqual(@as(f32, 12), painted(whole).?.font_size);
+    try testing.expectEqual(@as(u16, 400), painted(whole).?.font_weight);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[0]), laidOutWidth(inherited), 0.01);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[2]), laidOutWidth(own), 0.01);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[4]), laidOutWidth(whole), 0.01);
+
+    // The box's size / weight change: undeclared descendants re-measure at what they now paint.
+    big.set(true);
+    layoutAndRender(env.cx);
+    try testing.expectEqual(@as(f32, 20), painted(inherited).?.font_size);
+    try testing.expectEqual(@as(u16, 700), painted(inherited).?.font_weight);
+    try testing.expectEqual(@as(f32, 11), painted(own).?.font_size);
+    try testing.expectEqual(@as(u16, 700), painted(own).?.font_weight);
+    try testing.expectEqual(@as(f32, 12), painted(whole).?.font_size);
+    try testing.expectEqual(@as(u16, 400), painted(whole).?.font_weight);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[1]), laidOutWidth(inherited), 0.01);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[3]), laidOutWidth(own), 0.01);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[4]), laidOutWidth(whole), 0.01);
+
+    big.set(false);
+    layoutAndRender(env.cx);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[0]), laidOutWidth(inherited), 0.01);
+    try testing.expectApproxEqAbs(laidOutWidth(ref[2]), laidOutWidth(own), 0.01);
+}
+
+test "currentColor 图标 + cva .merge(layers) 的 hover 层 icon_color：悬停用层色，离开后恢复 currentColor 模式（继续跟随祖先文字色）" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const red = Color.rgba(200, 0, 0, 255);
+    const danger = try env.scope.createSignal(bool, false);
+    const layers = try env.scope.createSignal(core.ConditionalStyle, .{ .hover = .{ .icon_color = red } });
+    const page = try inheritedColorPage(env, danger, v.icon(.{
+        .style = LayeredTone.of(.{ .kind = .plain }).merge(layers),
+        // Layers may carry any condition: the a11y props give the semantic states.
+        .a11y = core.A11yProps{},
+        .tint = v.tintBy(@as(?Color, null), StarIcon.current),
+    }, @import("svg_assets.zig").common.star));
+    defer closePage(env, page);
+    const icon = page.children.items[0].children.items[0].children.items[0];
+    try testing.expect(icon.getIcon().?.tint_current_color);
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+    icon.behavior.events.on_hover.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(red, paintedIconTint(env.cx).?));
+    icon.behavior.events.on_leave.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(icon.getIcon().?.tint_current_color);
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+    danger.set(true);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.danger, paintedIconTint(env.cx).?));
+}
+
+test "currentColor 图标：悬停层生效期间 tintBy 源变化只改元素底色，不盖过层色；层撤销后落到最新的元素着色" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const red = Color.rgba(200, 0, 0, 255);
+    const danger = try env.scope.createSignal(bool, false);
+    const tint = try env.scope.createSignal(?Color, null);
+    const layers = try env.scope.createSignal(core.ConditionalStyle, .{ .hover = .{ .icon_color = red } });
+    const page = try inheritedColorPage(env, danger, v.icon(.{
+        .style = LayeredTone.of(.{ .kind = .plain }).merge(layers),
+        // Layers may carry any condition: the a11y props give the semantic states.
+        .a11y = core.A11yProps{},
+        .tint = v.tintBy(tint, StarIcon.current),
+    }, @import("svg_assets.zig").common.star));
+    defer closePage(env, page);
+    const icon = page.children.items[0].children.items[0].children.items[0];
+    icon.behavior.events.on_hover.?.invoke();
+    tint.set(t.accent);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(red, paintedIconTint(env.cx).?));
+    icon.behavior.events.on_leave.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.accent, paintedIconTint(env.cx).?));
+    try testing.expect(!icon.getIcon().?.tint_current_color);
+    icon.behavior.events.on_hover.?.invoke();
+    tint.set(null);
+    icon.behavior.events.on_leave.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(icon.getIcon().?.tint_current_color);
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+}
+
+test "currentColor 图标 + 外部叠加层（v.attrs）的 hover icon_color：离开后恢复 currentColor 模式" {
+    const env = try Env.init();
+    const t = theme.light.tokens.color;
+    const red = Color.rgba(200, 0, 0, 255);
+    const danger = try env.scope.createSignal(bool, false);
+    const page = try inheritedColorPage(env, danger, v.attrs(.{ .style = css(.{ ._hover = .{ .icon_color = comptime Color.rgba(200, 0, 0, 255) } }) }, v.icon(.{
+        .style = .{ .width = .{ .px = 12 }, .height = .{ .px = 12 } },
+        .tint = v.tintBy(@as(?Color, null), StarIcon.current),
+    }, @import("svg_assets.zig").common.star)));
+    defer closePage(env, page);
+    const icon = page.children.items[0].children.items[0].children.items[0];
+    try testing.expect(Color.eql(t.fg_primary, paintedIconTint(env.cx).?));
+    icon.behavior.events.on_hover.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(red, paintedIconTint(env.cx).?));
+    icon.behavior.events.on_leave.?.invoke();
+    layoutAndRender(env.cx);
+    try testing.expect(icon.getIcon().?.tint_current_color);
+    danger.set(true);
+    layoutAndRender(env.cx);
+    try testing.expect(Color.eql(t.danger, paintedIconTint(env.cx).?));
+}
+
+// Hand-written components that a Yix template uses as tags (ZeroWork G9 / G10): the template passes
+// constants as values, attributes that read parameters / row variables as `ui.Source(T)`, and
+// `onX={…}` statements as a pending handler (`ui.on.AnyHandler`). `v.component` with
+// `props: anytype` converts all three to the declared Props fields.
+const TemplateProps = struct {
+    action: reactive.Source(TemplateAction) = .{ .value = .revert },
+    title: reactive.Source([]const u8) = .{ .value = "" },
+    count: reactive.Source(i32) = .{ .value = 0 },
+    field_id: reactive.Source([]const u8) = .{ .value = "" },
+    context: ?*anyopaque = null,
+    on_pick: ?core.Handler([]const u8) = null,
+    on_go: ?core.Handler(void) = null,
+};
+const TemplateAction = enum { revert, save };
+const TemplateLog = struct {
+    picked: []const u8 = "",
+    went: usize = 0,
+};
+fn mountTemplateComponent(props: TemplateProps, _: *Scope, cx: *Cx) anyerror!*Node {
+    const node = try core.text(cx, props.title.peek(), .{});
+    node.meta.ownership.meta.test_id = props.field_id.peek();
+    node.behavior.events.on_click = if (props.on_go) |h| .{ .callback = h.callback, .context = h.context } else null;
+    if (props.on_pick) |h| h.call("picked");
+    return node;
+}
+fn TemplateComponent(props: anytype) v.ComponentOf(mountTemplateComponent) {
+    return v.component(mountTemplateComponent, props);
+}
+
+test "v.component: template-shaped props (constants, sources, pending handlers) reach Source / Handler fields" {
+    const env = try Env.init();
+    var log: TemplateLog = .{};
+    const count = try env.scope.createSignal(i32, 3);
+    const title: reactive.Source([]const u8) = .{ .value = "Overview" };
+    const pick = try on.bindAny(env.scope, .{ .log = &log }, struct {
+        fn f(c: anytype, value: []const u8) void {
+            c.log.picked = value;
+        }
+    }.f);
+    const go = try on.bindAny(env.scope, .{ .log = &log }, struct {
+        fn f(c: anytype) void {
+            c.log.went += 1;
+        }
+    }.f);
+    const element = TemplateComponent(.{ .action = .save, .title = title, .count = count, .field_id = "settings.field", .context = @as(*anyopaque, @ptrCast(&log)), .on_pick = pick, .on_go = go });
+    try testing.expectEqual(TemplateAction.save, element.props.action.peek());
+    try testing.expect(element.props.action.isStatic());
+    try testing.expectEqual(@as(i32, 3), element.props.count.peek());
+    count.set(4);
+    try testing.expectEqual(@as(i32, 4), element.props.count.peek());
+    const node = try element.mount(env.scope, env.cx);
+    defer env.deinit(node);
+    try testing.expectEqualStrings("Overview", node.getText().?.content);
+    try testing.expectEqualStrings("settings.field", node.meta.ownership.meta.test_id.?);
+    try testing.expectEqualStrings("picked", log.picked);
+    const click = node.behavior.events.on_click.?;
+    click.callback(click.context);
+    try testing.expectEqual(@as(usize, 1), log.went);
+}
+
+test "yixFormat：值的格式不变；参数字段取到的响应式源不再格式化成结构体转储（编译报错见 tests/css_errors/interp_reactive_field.zig）" {
+    comptime {
+        std.debug.assert(std.mem.eql(u8, v.yixFormat(i32, ""), "{d}"));
+        std.debug.assert(std.mem.eql(u8, v.yixFormat(reactive.Source(i32), ".2"), "{d:.2}"));
+        std.debug.assert(std.mem.eql(u8, v.yixFormat(*reactive.Signal([]const u8), ""), "{s}"));
+        std.debug.assert(std.mem.eql(u8, v.yixFormat(reactive.Source([]const u8), ""), "{s}"));
+        std.debug.assert(std.mem.eql(u8, v.yixFormat(?u8, ""), "{any}"));
+    }
+}
+
+test "yixCallMayDerive：大结构体（?BoxStyle、ConditionalStyle）在默认 eval branch quota 内判定，生成代码不需要 @setEvalBranchQuota" {
+    // Generated code: `if (comptime !ui.view.yixCallMayDerive(__yix_Raw)) raw else derived` for a
+    // zero-argument call used as an attribute value (hoverStyle={hover()}).
+    try testing.expect(comptime v.yixCallMayDerive(?BoxStyle));
+    try testing.expect(comptime v.yixCallMayDerive(core.ConditionalStyle));
+    try testing.expect(comptime v.yixCallMayDerive(TextStyle));
+    try testing.expect(comptime !v.yixCallMayDerive(type));
+    try testing.expect(comptime !v.yixCallMayDerive(reactive.Source(i32)));
+}
+
+fn settleFrames(cx: *Cx) void {
+    for (0..20) |_| {
+        render_engine.current_frame_time_ms += 16.0;
+        render_engine.current_frame_dt_ms = 16.0;
+        cx.frame_time_ms = render_engine.current_frame_time_ms;
+        cx.layout();
+        _ = cx.render();
+    }
+}
+
+test ".parts 给 Input 的输入框叠 token 样式：聚焦描边、换主题都由框架重放（不需要 InputResult 句柄重绘）" {
+    const W = @import("components/mod.zig");
+    const env = try Env.init();
+    env.cx.setViewport(400, 200);
+    // A search pill: token fill, no frame until focused, larger radius (Yix: `parts={.{ .input_container = .{ .style = S.searchPill } }}`).
+    const pill = css(.{ .background = .bg_active, .border_color = .transparent, .corner_radius = 14, ._focus = .{ .border_color = .accent } });
+    const St = struct { input: W.input.InputResult = undefined };
+    const st = try env.scope.createState(St, .{});
+    const root = try v.render(env.scope, env.cx, v.col(.{ .style = .{ .width = 400, .height = 200 } }, .{
+        v.attrs(.{ .parts = .{ .input_container = .{ .style = pill, .test_id = "search" } } }, v.capture(&st.input, W.Input(.{ .placeholder = "Search", .size = .sm }))),
+    }));
+    defer env.deinit(root);
+    env.cx.root = root;
+    defer env.cx.root = null;
+    const field = st.input.input_container;
+    settleFrames(env.cx);
+    try testing.expectEqual(theme.light.tokens.color.bg_active, field.getBackground());
+    try testing.expectEqual(Color.TRANSPARENT, field.style.border.color);
+    try testing.expectEqual(@as(f32, 14), field.style.effectiveRadius());
+
+    env.cx.setFocus(field);
+    settleFrames(env.cx);
+    try testing.expectEqual(theme.light.tokens.color.accent, field.style.border.color);
+
+    env.cx.setTheme(&theme.dark);
+    settleFrames(env.cx);
+    try testing.expectEqual(theme.dark.tokens.color.bg_active, field.getBackground());
+    try testing.expectEqual(theme.dark.tokens.color.accent, field.style.border.color);
+    try testing.expect(st.input.state.tokens == &theme.dark);
+
+    env.cx.setFocus(null);
+    settleFrames(env.cx);
+    try testing.expectEqual(Color.TRANSPARENT, field.style.border.color);
+    try testing.expectEqual(theme.dark.tokens.color.bg_active, field.getBackground());
+}
+
+test "W.ScrollArea 的 scrollY + onScrollYChange（Yix 写法）：视图模型持有偏移，重挂恢复，无句柄" {
+    const W = @import("components/mod.zig");
+    const env = try Env.init();
+    env.cx.setViewport(400, 300);
+    const offset = try env.scope.createSignal(f32, 240);
+    const Vm = struct {
+        offset: *reactive.Signal(f32),
+        fn read(c: anytype) f32 {
+            return c.o.get();
+        }
+        fn remember(self: *@This(), y: f32) void {
+            self.offset.set(y);
+        }
+    };
+    var vm = Vm{ .offset = offset };
+    // What the template lowers to: a derived read plus the handler (props.coerce makes the split).
+    const shown = try env.scope.createMemo(f32, .{ .o = offset }, Vm.read);
+    const tall = BoxStyle{ .height = .{ .px = 100 } };
+    const root = try v.render(env.scope, env.cx, v.col(.{ .style = .{ .width = 400, .height = 300 } }, .{
+        v.attrs(.{ .test_id = "pages" }, v.with(W.ScrollArea(.{ .height = 200, .scroll_y = shown, .on_scroll_y_change = env.cx.on(Vm, &vm, Vm.remember) }), .{
+            v.box(.{ .style = tall }, {}), v.box(.{ .style = tall }, {}), v.box(.{ .style = tall }, {}),
+            v.box(.{ .style = tall }, {}), v.box(.{ .style = tall }, {}), v.box(.{ .style = tall }, {}),
+        })),
+    }));
+    defer env.deinit(root);
+    env.cx.root = root;
+    defer env.cx.root = null;
+    settleFrames(env.cx);
+    const area = content(root, 0);
+    const scrolled = area.children.items[0];
+    try testing.expectEqual(@as(f32, -240), scrolled.style.translate_y);
+    // Out of range from the view-model: clamped to 400 (600 content - 200 viewport), reported back.
+    offset.set(9999);
+    settleFrames(env.cx);
+    try testing.expectEqual(@as(f32, -400), scrolled.style.translate_y);
+    try testing.expectEqual(@as(f32, 400), offset.peek());
 }

@@ -10,7 +10,7 @@ static _Atomic(int) fetchRequests;
     fetchRequests++;
     NSString *path=self.request.URL.path;NSInteger code=404;NSData *data=[NSData data];NSDictionary *headers=@{};
     if([fetchScenario isEqual:@"timeout"]){[self.client URLProtocol:self didFailWithError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil]];return;}
-    if([path isEqual:@"/repos/iskylite/ZeroWork"]){code=[fetchScenario isEqual:@"missing-repo"]?404:200;data=[@"{\"full_name\":\"iskylite/ZeroWork\",\"private\":false}" dataUsingEncoding:NSUTF8StringEncoding];}
+    if([path isEqual:@"/repos/version-next/ZeroWork"]){code=[fetchScenario isEqual:@"missing-repo"]?404:200;data=[@"{\"full_name\":\"version-next/ZeroWork\",\"private\":false}" dataUsingEncoding:NSUTF8StringEncoding];}
     else if([path hasSuffix:@"/releases/latest"]){
         if([fetchScenario isEqual:@"api-denied"])code=403;
         else if([fetchScenario isEqual:@"invalid-probe"]){code=200;data=[@"[]" dataUsingEncoding:NSUTF8StringEncoding];}

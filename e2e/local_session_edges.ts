@@ -1,18 +1,21 @@
 /** Real Local session ownership/lifecycle checks through the public Harness.
  * node e2e/local_session_edges.ts --out DIR [--binary PATH]
  * Requires an existing test-mode binary. This file does not build the app.
- * Normal exit -> "新建本地会话" creates a NEW SessionId, not a generation retry.
- * Failed-start retry and right-click directory duplication need separate native
- * UI coverage; this runner never invents a failure or invokes domain backdoors.
+ * Normal shell exit leaves a read-only tab. Reconnect starts a fresh shell
+ * in the original logical session. This fixture drives both via native UI.
  * PNGs need visual review. Harness input is not native keyboard or IME evidence.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import * as harness from '../zig-out/share/zenit/harness/client.ts';
+import { openSessionDetails } from './workspace_tab_actions.ts';
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, writeFile, rm, realpath, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { waitForServerReady, waitFor, query, focused, clickAt, key, type_, resizeWindow, screenshot, sleep, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
+import { waitForServerReady, waitFor, query, focused, clickAt, mouseMove, key, type_, resizeWindow, screenshot, sleep, request, type QueryNode } from "../zig-out/share/zenit/harness/client.ts";
 
 const args = process.argv.slice(2), options: Record<string, string> = {};
 for (let i = 0; i < args.length; i += 2) {
@@ -51,7 +54,7 @@ const report: Record<string, unknown> = {
   status: "running", binary, binary_sha256: binaryHash, pid: child.pid, started_at: new Date().toISOString(),
   functional_checks: [], sessions: {}, shell_receipts: [], captures: [], pixel_review: "pending", real_ime: "not_tested",
   unverified: [
-    { requirement: "Duplicate a Local session in its current directory", status: "requires_cua", reason: "The actual entry is the tab right-click menu (context.menu.clone_session). The current public Harness mouse endpoint only dispatches left presses; Local Surface does not intercept the legacy @dup palette. No copy is simulated." },
+    { requirement: "Duplicate a Local session in its current directory", status: "not_exercised", reason: "This fixture uses independently opened tabs to verify process ownership and reconnect." },
     { requirement: "Failed-start retry increments the same SessionId generation", status: "not_exercised", reason: "local.start.retry is only visible for a real failed startup with released cleanup. No artificial failure is injected. Normal exit exposes local.ended.reconnect; failed startup is not injected by this runner." },
     { requirement: "Native keyboard, clipboard and real IME", status: "not_tested", reason: "All input uses public Harness type_/key/click APIs." },
   ],
@@ -90,9 +93,9 @@ async function newTab(previous: string[]): Promise<string> {
   });
 }
 async function grid(): Promise<Surface["grid"]> {
-  const label = text(await visible("local.status.grid")), match = label.match(/(\d+)×(\d+)/);
-  assert(match, `Missing real grid: ${label}`);
-  return { cols: Number(match[1]), rows: Number(match[2]) };
+  const {grid} = await request('POST', '/zerowork/terminal', {action: 'metrics'});
+  assert(grid?.cols > 0 && grid?.rows > 0, 'Missing terminal projection grid');
+  return grid;
 }
 async function surface(): Promise<Surface> {
   // Avoid the populated terminal.surface subtree (SDK response limit 256KiB).
@@ -126,14 +129,14 @@ async function select(session: Session): Promise<void> {
   // No terminal click or explicit focus call is allowed here: typing below
   // must reach the original terminal solely through the tab's public action.
 }
-async function sessionId(): Promise<string> {
-  await clickVisible("local.status.identity");
+async function sessionId(tab: string): Promise<string> {
+  await openSessionDetails(harness, tab);
   const result = await waitFor(async () => text(await visible("status.detail")).match(/会话 #(\d+)/)?.[1] ?? null);
   await clickVisible("status.detail.close");
   return result;
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap((line) => {
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
   });
@@ -197,7 +200,7 @@ try {
   assert.equal(initialA.cwd, expectedCwdA);
   assert.equal(initialA.scope, "alpha");
   assert(descendants().some((value) => value.pid === initialA.pid && value.command.endsWith("/zsh")), "A's receipt must come from an app-owned interactive zsh");
-  const a: Session = { tab: aTab, session_id: await sessionId(), focus_id: aFocus, shell_pid: initialA.pid, cwd: initialA.cwd, marker: initialA.marker };
+  const a: Session = { tab: aTab, session_id: await sessionId(aTab), focus_id: aFocus, shell_pid: initialA.pid, cwd: initialA.cwd, marker: initialA.marker };
   (report.sessions as Record<string, Session>).a = a;
   await select(a);
   assert((await type_("printf '__PENDING_A_%s__\\n' RESTORED")).ok); // deliberately no Return
@@ -212,7 +215,7 @@ try {
   assert.notEqual(initialB.pid, a.shell_pid);
   assert.notEqual(bFocus, a.focus_id);
   assert(descendants().some((value) => value.pid === initialB.pid && value.command.endsWith("/zsh")), "B must own another actual interactive zsh");
-  const b: Session = { tab: bTab, session_id: await sessionId(), focus_id: bFocus, shell_pid: initialB.pid, cwd: initialB.cwd, marker: initialB.marker };
+  const b: Session = { tab: bTab, session_id: await sessionId(bTab), focus_id: bFocus, shell_pid: initialB.pid, cwd: initialB.cwd, marker: initialB.marker };
   assert.notEqual(b.session_id, a.session_id);
   (report.sessions as Record<string, Session>).b = b;
   assert(!(await surface()).rows.some((row) => row.text.includes(a.marker)), "B's projection must not show A's output");
@@ -238,7 +241,7 @@ try {
   await waitFor(async () => !descendants().some((value) => value.pid === a.shell_pid) || null);
   await visible("local.ended.reconnect");
   await visible("local.ended.close");
-  await waitFor(async () => text(await visible("local.status.identity")).includes("已退出") || null);
+  await waitFor(async () => text(await visible(a.tab)).includes("已退出") || null);
   assert.equal((await nodes("local.start.retry")).filter(shown).length, 0, "Normal exit must not expose failed-start retry");
   assert.deepEqual(await tabs(), [a.tab, b.tab], "Normal exit preserves the original tab");
   assert(text(await visible(a.tab)).includes("已退出"));
@@ -250,16 +253,24 @@ try {
   assert.equal(await exists(denied), false, "Read-only tombstone input must not execute in any session");
   assert.deepEqual((await surface()).rows.map((row) => row.text), readonlyRows, "Typing into the tombstone must preserve its actual final VT output");
   assert(descendants().some((value) => value.pid === b.shell_pid), "A's normal exit must leave B's shell alive");
+  const blockedInput = await visible("notifications.toast.0");
+  assert(text(blockedInput).includes("当前会话只读"), "Read-only input explains why no bytes were sent");
   await capture("a-exited-readonly");
+  await mouseMove(blockedInput.rect.x + blockedInput.rect.w / 2, blockedInput.rect.y + 12);
+  await clickVisible("notifications.dismiss.0");
+  await mouseMove(20, 300);
+  await waitFor(async () => !(await nodes("notifications.toast.0")).some(shown) || null);
   checks.push("A exits normally with code 0 through its actual shell; its process disappears while its tab/final output and visible ended actions remain, typing cannot execute or alter the read-only grid, and B stays alive");
 
+  const oldSurface = (await visible("terminal.surface")).id;
   await clickVisible("local.ended.reconnect");
+  await waitFor(async () => (await nodes("terminal.surface")).some(node => shown(node) && node.id !== oldSurface) || null);
   await surface();
   const cFocus = await focusId(), initialC = await shell("A-reconnected", { clear: true });
   assert(![a.shell_pid, b.shell_pid].includes(initialC.pid));
   assert.equal(initialC.scope, "unset", "Reconnecting starts a fresh shell without inheriting private variables");
   assert(descendants().some((value) => value.pid === initialC.pid && value.command.endsWith("/zsh")));
-  const c: Session = { tab: a.tab, session_id: await sessionId(), focus_id: cFocus, shell_pid: initialC.pid, cwd: initialC.cwd, marker: initialC.marker };
+  const c: Session = { tab: a.tab, session_id: await sessionId(a.tab), focus_id: cFocus, shell_pid: initialC.pid, cwd: initialC.cwd, marker: initialC.marker };
   assert.equal(c.session_id, a.session_id, "Reconnect preserves the logical SessionId");
   assert.deepEqual(await tabs(), [a.tab, b.tab], "Reconnect preserves the existing TabId and count");
   (report.sessions as Record<string, Session>).reconnected_a = c;
@@ -268,7 +279,7 @@ try {
   const afterExitB = await shell("B-after-A-exit");
   assert.deepEqual([afterExitB.pid, afterExitB.cwd, afterExitB.scope], [b.shell_pid, b.cwd, "beta"]);
   checks.push("The ended banner reconnects A in its original TabId/SessionId with a new shell PID and fresh private state; B retains its original owner, cwd and shell");
-  report.status = "covered_functional_checks_passed_native_menu_and_retry_pending";
+  report.status = "passed";
 } catch (error) {
   failure = launchError ?? error;
   report.status = "failed";

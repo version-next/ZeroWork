@@ -1,4 +1,5 @@
 /** Captured edge selection in real Local/SSH terminals, with a stationary pointer. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, realpath, writeFile} from 'node:fs/promises';

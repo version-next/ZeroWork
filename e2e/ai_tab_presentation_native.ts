@@ -1,12 +1,16 @@
 /** Per-session assistant presentation with real Local tabs and a loopback model.
  * ZW_AI_TEST_PREFIX=<test build> node e2e/ai_tab_presentation_native.ts <out>
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir, mkdtemp, open, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? '/tmp/zw-tab-ime-fix');
 const out = resolve(process.argv[2] ?? '/tmp/zw-ai-tab-presentation');
 await mkdir(out, {recursive: true});
@@ -19,8 +23,7 @@ let modelRequests = 0;
 const frame = (content: string) => 'data: ' + JSON.stringify({choices: [{index: 0, delta: {content}}]}) + '\n\n';
 const server = createServer(async (req, res) => {
     if (req.method !== 'POST') {res.end('{"data":[{"id":"tabs-fixture"}]}'); return;}
-    let raw = ''; for await (const bytes of req) raw += bytes;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (!body.tools?.length) {res.end(frame('本地会话测试') + 'data: [DONE]\n\n'); return;}
     modelRequests++;
@@ -64,7 +67,7 @@ const report: any = {status: 'running', isolation: iso, checks: []};
 const capture = async (name: string) => {await h.mouseMove(1, 1); assert((await h.screenshot(join(out, name + '.png'))).ok);};
 try {
     await h.waitForServerReady(60000); await h.resizeWindow(1200, 900);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
     await input('FIRST_TASK'); await click('ai.send'); await h.waitFor(() => held || null, 15000);
     await input('FIRST_SESSION_DRAFT');
     await click('toolbar.new_session'); await click('session.menu.local'); await visible('terminal.surface');
@@ -73,7 +76,7 @@ try {
     await visible('ai.stop');
     await click('tabs.tab.2'); await absent('ai.panel');
     report.checks.push('new tab starts collapsed; returning to first session restores its open panel, draft and running task');
-    await click('toolbar.ai'); await input('SECOND_SESSION_DRAFT');
+    await click(await aiToggleId()); await input('SECOND_SESSION_DRAFT');
     await click('tabs.tab.1'); await draft('FIRST_SESSION_DRAFT'); await click('ai.collapse'); await absent('ai.panel');
     await click('tabs.tab.2'); await visible('ai.panel'); await draft('SECOND_SESSION_DRAFT');
     await absent('ai.stop'); await capture('second-open-first-collapsed');
@@ -81,7 +84,7 @@ try {
     await h.key('2', {cmd: true}); await visible('ai.panel'); await draft('SECOND_SESSION_DRAFT');
     report.checks.push('collapse is session-local; mouse and keyboard switching restore independent visibility without moving task or draft');
     await h.resizeWindow(860, 480); await click('ai.collapse'); await absent('ai.panel');
-    await h.key('1', {cmd: true}); await absent('ai.panel'); await click('toolbar.ai');
+    await h.key('1', {cmd: true}); await absent('ai.panel'); await click(await aiToggleId());
     await visible('ai.panel'); await draft('FIRST_SESSION_DRAFT'); await visible('ai.stop');
     await capture('first-open-compact');
     assert.equal(modelRequests, 1, 'switching/reopening never sends or cancels the original task');

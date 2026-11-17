@@ -29,6 +29,7 @@ static unsigned checks=0,failed=0;
 #define CHECK(x) do{++checks;if(!(x)){++failed;printf("FAIL line %d: %s\n",__LINE__,#x);}}while(0)
 #include "a11y_snapshot_tests.h"
 #include "accessibility_provider_tests.h"
+#include "accessibility_demand_tests.h"
 static void verify(CLIPFORMAT format,unsigned kind,const void *p,size_t size,bool valid,const char *expected=nullptr,bool truncated=false){
     Data d(format,p,size);Bytes b;bool result=read_data(&d,format,kind,b);
     CHECK(result==valid);CHECK(b.truncated==truncated);CHECK(d.reads==1);
@@ -258,7 +259,9 @@ int main(int argc,char **argv){
         effect=7;target.DragEnter(&text,0,point,&effect);CHECK(effect==0&&!target.peek(&packet)&&sequence==before);
         effect=7;target.Drop(&text,0,point,&effect);CHECK(effect==0&&sequence==before);
     }
+    a11y_demand_contract(window);
     a11y_provider_contract(window);
+    a11y_static_text_name_contract(window);
     a11y_focus_contract(window);
     a11y_invoke_contract(window);
     a11y_toggle_contract(window);
@@ -289,5 +292,6 @@ int main(int argc,char **argv){
     a11y_geometry_contract(); CHECK(GetForegroundWindow()==foreground);
     a11y_caret_contract(); CHECK(GetForegroundWindow()==foreground);
     a11y_rows_contract(); CHECK(GetForegroundWindow()==foreground);
+    a11y_offset_mapping_contract(); CHECK(GetForegroundWindow()==foreground);
     OleUninitialize();printf("Windows native contracts: %u/%u checks passed\n",checks-failed,checks);return failed?1:0;
 }

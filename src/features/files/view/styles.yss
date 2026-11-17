@@ -1,0 +1,29 @@
+//! SFTP file workspace, Island B v3 (Pencil `c0vKlM` SFTP · 列表视图,
+//! `OQD5Y` 多选与右键菜单). Reusable parts: `QGtx5` Pane Header, `tVVKV`
+//! Files / Toolbar, `GW9no` Files / Header, `Che9A` Files / Row, path bar.
+//! Values are the design's numbers; colors are zenit semantic tokens plus
+//! ZeroWork's zw-* island tokens. Theme-ink text keeps app_theme roles.
+const ui = @import("ui");
+
+/// View island interior: padding 4, panes gap 4.
+style root { width: fill; height: fill; min-width: 0; min-height: 0; direction: row; gap: 4; padding: 4; background: transparent; }
+/// One side: file pane over an optional transfer card, gap 4. `flex: 1` only sets the grow factor; with the
+/// default `flex-basis: auto` each side would start from its own content width and the two sides would differ
+/// by the difference of their contents (583.4 / 598.6 at 1194). Basis 0 makes the row split evenly.
+style column_stack { width: fill; height: fill; flex: 1; flex-basis: 0; min-width: 0; min-height: 0; direction: column; gap: 4; }
+/// Pane (Pane · 本地文件 / 远程文件): radius 8, 1px bg-active hairline.
+style card { width: fill; height: fill; flex: 1; min-width: 0; min-height: 0; direction: column; gap: 0; padding: 0; background: zw-island-focus; corner-radius: 8; border-overlay: true; border: 1 bg-active; overflow: hidden; }
+/// Pane Header (QGtx5 in the pane): 30 high, padding [0, 4, 0, 12], gap 6.
+style pane_header { width: fill; height: 30; flex-shrink: 0; min-width: 0; direction: row; align-items: center; gap: 6; padding: 0 4 0 12; background: transparent; }
+/// Files / Toolbar (tVVKV): 44 high, padding [0, 10], gap 4.
+style toolbar { width: fill; height: 44; flex-shrink: 0; min-width: 0; direction: row; align-items: center; gap: 4; padding: 0 10; background: transparent; }
+/// Files / Header (GW9no): 26 high, bottom bg-active hairline.
+style header_clip { width: fill; height: 26; flex-shrink: 0; overflow: hidden; border-overlay: true; border-bottom-width: 1; border-color: bg-active; }
+/// Path bar: 28 high, top bg-active hairline, padding [0, 12], gap 4.
+style path_bar { width: fill; height: 28; flex-shrink: 0; min-width: 0; direction: row; align-items: center; gap: 4; padding: 0 12; border-overlay: true; border-top-width: 1; border-color: bg-active; background: transparent; }
+/// Breadcrumb frame inside the path bar (click to edit the path).
+style path_field { width: fill; height: 28; flex: 1; min-width: 0; direction: row; align-items: center; gap: 0; padding: 0; background: transparent; overflow: hidden; }
+/// Status group at the path bar end (summary · status).
+style path_status { height: 28; flex-shrink: 1; min-width: 0; direction: row; align-items: center; gap: 8; overflow: hidden; }
+/// Pane title badge: 18 high, radius 6, bg-active tint.
+style badge { height: 18; padding: 0 6; align-items: center; justify: center; background: bg-active; corner-radius: 6; flex-shrink: 1; min-width: 0; max-width: 150; overflow: hidden; }

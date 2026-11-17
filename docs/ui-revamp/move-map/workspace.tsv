@@ -1,0 +1,63 @@
+old_path	new_path	layer	mixed	note
+src/broadcast_view_tests.zig	src/features/workspace/tests/broadcast_view_tests.zig	tests	no	
+src/group_close_controller_tests.zig	src/features/workspace/tests/group_close_controller_tests.zig	tests	no	
+src/session_export_tests.zig	src/features/workspace/tests/session_export_tests.zig	tests	no	还 import ui/terminal_export.zig 与 vt
+src/session_menu_tests.zig	src/features/workspace/tests/session_menu_tests.zig	tests	no	
+src/ui/broadcast_controller.zig	src/features/workspace/model/broadcast_controller.zig	model	no	不 import ui
+src/ui/broadcast_event.zig	src/features/workspace/model/broadcast_event.zig	model	no	
+src/ui/broadcast_styles.zig	src/features/workspace/view/broadcast_styles.zig	view	no	跟随 broadcast_view
+src/ui/broadcast_view.zig	src/features/workspace/view/broadcast_view.zig	view	no	
+src/ui/context_menu_effects.zig	src/features/workspace/model/context_menu_effects.zig	model	no	
+src/ui/context_menu_state.zig	src/features/workspace/model/context_menu_state.zig	model	no	
+src/ui/context_menu_view.zig	src/features/workspace/model/context_menu_view.zig	model	no	名为 view 但不 import ui，仅生成 snapshot 数据
+src/ui/context_menus.zig	src/features/workspace/model/context_menus.zig	model	no	
+src/ui/empty_saved_connections.zig	src/features/workspace/view/empty_saved_connections.zig	view	no	空工作区已保存连接列表；import sidebar_styles.zig（shell）；被 workspace.zig 使用
+src/ui/group_close_controller.zig	src/ai/group_close_controller.zig	core	no	被 core import: src/ai/legacy_adapter.zig（Impact 类型）；不 import ui；建议下沉 src/ai/；group_close_view/group_workspace_model/main 需改引用
+src/ui/group_close_styles.zig	src/features/workspace/view/group_close_styles.zig	view	no	
+src/ui/group_close_view.zig	src/features/workspace/view/group_close_view.zig	view	no	
+src/ui/group_context.zig	src/features/workspace/model/group_context.zig	model	no	
+src/ui/group_dispatch.zig	src/features/workspace/model/group_dispatch.zig	model	no	
+src/ui/group_join_view.zig	src/features/workspace/view/group_join_view.zig	view	no	
+src/ui/group_layout.zig	src/features/workspace/model/group_layout.zig	model	no	
+src/ui/group_model.zig	src/features/workspace/model/group_model.zig	model	no	
+src/ui/group_workspace_model.zig	src/features/workspace/view/group_workspace_model.zig	view	no	名为 model 但 import ui 且持有 *ui.Node，按规则放 view
+src/ui/group_workspace_styles.zig	src/features/workspace/view/group_workspace_styles.zig	view	no	
+src/ui/multiwindow_test_routes.zig	src/features/workspace/host/multiwindow_test_routes.zig	host	no	import zenit_app/application_host/plugin_window_host；仅 test 路由，被 main.zig 引用；归属有风险
+src/ui/pane_manager.zig	src/features/workspace/model/pane_manager.zig	model	no	
+src/ui/pane_worker_registry.zig	src/features/workspace/model/pane_worker_registry.zig	model	no	import host/runtime_service（core）
+src/ui/session_export.zig	src/features/workspace/host/session_export.zig	host	no	不 import ui，但含 writeArchive 文件 I/O，放 host
+src/ui/session_export_jobs.zig	src/features/workspace/host/session_export_jobs.zig	host	no	import ui；开线程做导出
+src/ui/session_lifecycle.zig	src/host/session_lifecycle.zig	core	no	被 core import: src/ai/{assistant_store,attached_service,child_gateway,child_projection,conversation_commands,session_journal,session_runtime}.zig src/config/hosts.zig src/host/{command,file_binding_host,file_route_factory,plugin_registry,session_host,sftp_adapter,socks_background_runtime,socks_route_host}.zig src/vt/reconnect.zig；§5.2 下沉 host/
+src/ui/session_menu.zig	src/features/workspace/view/session_menu.zig	view	no	
+src/ui/session_menu_styles.zig	src/features/workspace/view/session_menu_styles.zig	view	no	
+src/ui/session_os_cache.zig	src/features/workspace/host/session_os_cache.zig	host	no	读写磁盘缓存 OS 标签；不 import ui；被 main.zig/workspace.zig 使用
+src/ui/session_reconnect_policy.zig	src/features/workspace/model/session_reconnect_policy.zig	model	no	
+src/ui/session_runtime.zig	src/features/workspace/host/session_runtime.zig	host	no	不 import ui，但 1092 行，起线程/做日志 I/O；src/ai/session_runtime.zig 是 ai 自己的同名文件，非此文件；无 core import
+src/ui/session_tombstone.zig	src/features/workspace/model/session_tombstone.zig	model	no	
+src/ui/session_tombstone_view.zig	src/features/workspace/model/session_tombstone_view.zig	model	no	不 import ui，仅 snapshot
+src/ui/workspace.zig	src/features/workspace/view/workspace.zig	view	yes	8780 行混合巨型文件（模型/视图/宿主）；整体放 view
+src/ui/workspace_chrome.zig	src/features/workspace/view/workspace_chrome.zig	view	no	
+src/ui/workspace_model.zig	src/features/workspace/model/workspace_model.zig	model	no	
+src/ui/workspace_tab_styles.zig	src/features/workspace/view/workspace_tab_styles.zig	view	no	被 main.zig 引用；与 shell 页签样式可能重叠
+# CONTESTED src/ui/focus_fill.zig shared/ui(zenit_ext) 焦点指示扩展，import ui，被 shell_styles.zig 与 chrome_policy_tests 使用，非 workspace 专属
+# CONTESTED src/ui/layout_motion.zig shared/ui 通用布局动画；被 core 的 src/config/settings_accordion.zig import（该文件将搬入 settings feature），被 transfer_panel_tests/workspace 使用
+# CONTESTED src/ui/session_icon.zig shared/ui 被 config/settings_parts/settings_plugins.zig、sidebar_view、quick_connect_view、wizard、workspace 共用的图标选择
+# CONTESTED src/ui/session_os_assets.zig shared/ui 自动生成的 OS 图标（gen-icons），被 host_os_assets.zig 使用，符合 *_assets.zig -> shared/ui
+# CONTESTED src/asset_group_host_tests.zig connections 测 ui/asset_group_host.zig（连接资产）并 import workspace.zig
+# CONTESTED src/session_host_auxiliary_tests.zig core(host) 只 import host/session_host、plugin_registry，测 core src/host
+# CONTESTED src/session_host_background_tests.zig core(host) 只 import host/session_host、operation，测 core src/host
+# CONTESTED src/session_host_retained_tests.zig core(host) 只 import host/session_host、plugin_registry，测 core src/host
+# E2E docs/DESIGN/V0.1.6_GROUPS_FORWARDING.md 引用了 src/ui/group_dispatch.zig, src/ui/group_model.zig
+# E2E docs/DESIGN/V0.2.6_AI_SESSION_EXECUTION.md 引用了 src/ui/group_model.zig, src/ui/session_runtime.zig, src/ui/workspace.zig
+# E2E docs/DESIGN/V0.1.3_SSH_CONNECTIONS.md 引用了 src/ui/pane_worker_registry.zig, src/ui/session_lifecycle.zig, src/ui/session_runtime.zig
+# E2E docs/DESIGN/DESIGN_STANDARDS.md 引用了 src/ui/session_runtime.zig
+# E2E docs/DESIGN/V0.1.2_LOCAL_TERMINAL.md 引用了 src/ui/session_runtime.zig
+# E2E docs/DESIGN/V0.1.5_TERMINAL_HISTORY.md 引用了 src/ui/session_runtime.zig
+# E2E docs/DESIGN/V0.3_MENU_BAR_ACTIVITY.md 引用了 src/ui/workspace.zig
+# E2E docs/ui-revamp/ARCHITECTURE_PLAN.md 引用了 src/ui/workspace.zig
+# TESTID groups
+# TESTID tabs
+# TESTID session
+# TESTID pane
+# TESTID group
+# TESTID workspace

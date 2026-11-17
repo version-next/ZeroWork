@@ -5,12 +5,15 @@ const gpu = @import("../gpu.zig");
 const b = @import("renderer_device.zig");
 const resources = @import("renderer_resources.zig");
 extern fn zenit_d12_surface_create(*anyopaque, *anyopaque, u32, u32, u32, u32, *?*anyopaque) c_int;
+extern fn zenit_d12_surface_create_sequential(*anyopaque, *anyopaque, u32, u32, u32, u32, *?*anyopaque) c_int;
 extern fn zenit_d12_surface_resize(*anyopaque, u32, u32, u32) c_int;
 extern fn zenit_d12_surface_size(*anyopaque, *u32, *u32) c_int;
 extern fn zenit_d12_surface_acquire(*anyopaque, *?*anyopaque) c_int;
 extern fn zenit_d12_surface_present(*anyopaque, *anyopaque, u32, *c_int) c_int;
+extern fn zenit_d12_surface_present_dirty(*anyopaque, *anyopaque, u32, u32, u32, u32, u32, *c_int) c_int;
 extern fn zenit_d12_surface_discard(*anyopaque, *anyopaque) c_int;
 extern fn zenit_d12_surface_destroy(*anyopaque, u32) c_int;
+extern fn zenit_d12_surface_composition(*anyopaque, *?*anyopaque, *?*anyopaque) c_int;
 fn status(value: c_int) !void {
     return switch (value) {
         0 => {},
@@ -24,6 +27,7 @@ fn status(value: c_int) !void {
 pub const SurfaceUsage = enum { color_target_only, color_target_and_read };
 pub const PresentMode = enum { fifo, immediate, mailbox };
 pub const AlphaMode = enum { fully_opaque, premultiplied, postmultiplied };
+pub const SwapStrategy = enum { discard, sequential, dirty };
 pub const SurfaceConfiguration = struct {
     format: gpu.TextureFormat,
     width: u32,
@@ -32,12 +36,17 @@ pub const SurfaceConfiguration = struct {
     present_mode: PresentMode = .fifo,
     alpha_mode: AlphaMode = .fully_opaque,
     maximum_frame_latency: u32 = 2,
+    swap_strategy: SwapStrategy = .discard,
 };
 pub const Surface = struct {
     hwnd: *anyopaque,
     raw: ?*anyopaque = null,
     context: ?*resources.Context = null,
     config: ?SurfaceConfiguration = null,
+    /// Present sync interval override (1..4 vblanks per frame) for pacing
+    /// measurements; null uses the configured present mode.
+    sync_interval: ?u32 = null,
+    supports_dirty_present: bool = false,
     pub fn init(hwnd: *anyopaque) Surface {
         return .{ .hwnd = hwnd };
     }
@@ -57,14 +66,16 @@ pub const Surface = struct {
         if (self.raw) |raw| {
             if (self.context.? != device.context) return error.InvalidSurfaceDevice;
             const old = self.config.?;
-            if (old.format != config.format or old.maximum_frame_latency != config.maximum_frame_latency) return error.UnsupportedSurfaceReconfiguration;
+            if (old.format != config.format or old.maximum_frame_latency != config.maximum_frame_latency or old.swap_strategy != config.swap_strategy) return error.UnsupportedSurfaceReconfiguration;
             try status(zenit_d12_surface_resize(raw, config.width, config.height, device.context.timeout_ms));
         } else {
             var raw: ?*anyopaque = null;
-            try status(zenit_d12_surface_create(device.context.queue.raw, self.hwnd, config.width, config.height, format, config.maximum_frame_latency + 1, &raw));
+            const create: *const @TypeOf(zenit_d12_surface_create) = if (config.swap_strategy == .discard) zenit_d12_surface_create else zenit_d12_surface_create_sequential;
+            try status(create(device.context.queue.raw, self.hwnd, config.width, config.height, format, config.maximum_frame_latency + 1, &raw));
             self.raw = raw.?;
             self.context = device.context;
             device.context.resources += 1;
+            self.supports_dirty_present = config.swap_strategy == .dirty and self.compositionTree()[0] == null;
         }
         self.config = config;
     }
@@ -80,7 +91,7 @@ pub const Surface = struct {
         context.resources += 1;
         const size: gpu.Extent3D = .{ .width = width, .height = height };
         const format = self.config.?.format;
-        return .{ .surface = raw, .interval = if (self.config.?.present_mode == .fifo) 1 else 0, .texture = .{
+        return .{ .surface = raw, .interval = self.sync_interval orelse if (self.config.?.present_mode == .fifo) 1 else 0, .texture = .{
             .context = context,
             .format = format,
             .size = size,
@@ -89,6 +100,14 @@ pub const Surface = struct {
             .memory = .device_local,
             .inner = .{ .raw = @ptrCast(texture.?), .size = size, .format = format, .mip_level_count = 1, .dimension = .@"2d", .memory = .device_local, .sample_count = 1 },
         } };
+    }
+    /// The swap chain's DirectComposition device and root visual when it is
+    /// presented through one (custom-frame windows), else nulls.
+    pub fn compositionTree(self: *const Surface) [2]?*anyopaque {
+        var device: ?*anyopaque = null;
+        var root: ?*anyopaque = null;
+        if (self.raw) |raw| _ = zenit_d12_surface_composition(raw, &device, &root);
+        return .{ device, root };
     }
     pub fn deinitChecked(self: *Surface) !void {
         if (self.raw) |raw| {
@@ -107,6 +126,7 @@ pub const SurfaceTexture = struct {
     interval: u32,
     presented: bool = false,
     occluded: bool = false,
+    dirty_rect: ?[4]u32 = null,
     pub fn preparePresentChecked(self: *SurfaceTexture, command: *const b.CommandBuffer) !void {
         if (self.presented) return error.SurfaceAlreadyPresented;
         if (command.shared.context != self.texture.context) return error.InvalidSurfaceDevice;
@@ -118,7 +138,11 @@ pub const SurfaceTexture = struct {
         try self.preparePresentChecked(command);
         if (command.shared.serial == null) return error.CommandNotSubmitted;
         var occluded: c_int = 0;
-        try status(zenit_d12_surface_present(self.surface, self.texture.inner.raw, self.interval, &occluded));
+        const result = if (self.dirty_rect) |rect|
+            zenit_d12_surface_present_dirty(self.surface, self.texture.inner.raw, self.interval, rect[0], rect[1], rect[2], rect[3], &occluded)
+        else
+            zenit_d12_surface_present(self.surface, self.texture.inner.raw, self.interval, &occluded);
+        try status(result);
         self.occluded = occluded != 0;
         self.presented = true;
     }
@@ -128,6 +152,62 @@ pub const SurfaceTexture = struct {
     pub fn deinit(self: *SurfaceTexture) void {
         if (!self.presented) status(zenit_d12_surface_discard(self.surface, self.texture.inner.raw)) catch @panic("invalid D3D12 frame discard");
         self.texture.destroy();
+        self.* = undefined;
+    }
+};
+
+extern fn zenit_d12_sprite_atlas_create(*anyopaque, u32, u32, u32, *?*anyopaque, *?*anyopaque) c_int;
+extern fn zenit_d12_sprite_atlas_present(*anyopaque) c_int;
+extern fn zenit_d12_sprite_atlas_content(*anyopaque) ?*anyopaque;
+extern fn zenit_d12_sprite_atlas_release(?*anyopaque) void;
+
+/// Compositor sprite flipbook atlas (src/zenit_app/sprite_host.zig): an opaque
+/// composition swap chain the system compositor shows. Fill `texture` once
+/// (render or writeRegion), submit, then `present`; the compositor keeps
+/// showing that image.
+pub const SpriteAtlas = struct {
+    raw: *anyopaque,
+    texture: resources.Texture,
+
+    pub fn create(device: *b.Device, width: u32, height: u32, format: gpu.TextureFormat) !SpriteAtlas {
+        const code: u32 = switch (format) {
+            .bgra8_unorm => 87,
+            .bgra8_unorm_srgb => 91,
+            .rgba8_unorm => 28,
+            .rgba8_unorm_srgb => 29,
+            else => return error.UnsupportedSurfaceFormat,
+        };
+        var raw: ?*anyopaque = null;
+        var texture: ?*anyopaque = null;
+        try status(zenit_d12_sprite_atlas_create(device.context.queue.raw, width, height, code, &raw, &texture));
+        const context = device.context;
+        context.resources += 1;
+        const size: gpu.Extent3D = .{ .width = width, .height = height };
+        return .{
+            .raw = raw.?,
+            .texture = .{
+                .context = context,
+                .format = format,
+                .size = size,
+                .mip_level_count = 1,
+                .dimension = .@"2d",
+                // Device-local; writeRegion stages uploads into it.
+                .memory = .host_upload,
+                .inner = .{ .raw = @ptrCast(texture.?), .size = size, .format = format, .mip_level_count = 1, .dimension = .@"2d", .memory = .device_local, .sample_count = 1 },
+            },
+        };
+    }
+    /// Show the rendered image (after its commands were submitted).
+    pub fn present(self: *SpriteAtlas) !void {
+        try status(zenit_d12_sprite_atlas_present(self.raw));
+    }
+    /// The DirectComposition content object (borrowed).
+    pub fn content(self: *const SpriteAtlas) ?*anyopaque {
+        return zenit_d12_sprite_atlas_content(self.raw);
+    }
+    pub fn destroy(self: *SpriteAtlas) void {
+        self.texture.destroy();
+        zenit_d12_sprite_atlas_release(self.raw);
         self.* = undefined;
     }
 };

@@ -3,8 +3,7 @@
 // still belong to the OS; this is not a defence against a compromised host.
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
-extern int macos_claim_native_event_window(void *);
-extern void macos_release_native_event_window(void *);
+#include "zenit_native_event_filter.h"
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
@@ -100,7 +99,6 @@ static NSColor *zw_secret_color(uint32_t c, BOOL foreground) {
 @property(nonatomic, copy) void (^cancelled)(void);
 @end
 @implementation ZWSecretPanel
-- (BOOL)zenitHandlesNativeEvents { return YES; }
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (void)cancelOperation:(id)sender { (void)sender; if (self.cancelled) self.cancelled(); }
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
@@ -115,14 +113,43 @@ static NSColor *zw_secret_color(uint32_t c, BOOL foreground) {
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic) NSInteger state; // 0 pending, 1 submitted, 2 cancelled
 @property(nonatomic) BOOL secureEvents;
+@property(nonatomic) BOOL ownsEvents;
 - (void)finish:(BOOL)submit;
 - (void)expire;
 @end
+// The visible collector owns this application's keyboard events through
+// zenit's pre-routing native event filter: AppKit responder delivery reaches
+// only this panel until submit, cancel or expiry. At most one collector owns
+// events at a time; a second live claimant is rejected.
+static __weak ZWSecretCollector *g_zw_secret_owner = nil;
+static int zw_secret_event_filter(void *ctx, void *raw) {
+    ZWSecretCollector *collector = (__bridge ZWSecretCollector *)ctx;
+    NSEvent *event = (__bridge NSEvent *)raw;
+    if (collector.state || !collector.panel.isVisible) return 0;
+    const BOOL keyboard = event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged;
+    if (!keyboard && event.window != collector.panel) return 0;
+    [collector.panel sendEvent:event];
+    return 1;
+}
+static BOOL zw_secret_claim_events(ZWSecretCollector *collector) {
+    ZWSecretCollector *previous = g_zw_secret_owner;
+    if (previous && previous != collector && !previous.state && previous.panel.isVisible) return NO;
+    if (!macos_add_native_event_filter(zw_secret_event_filter, (__bridge void *)collector)) return NO;
+    g_zw_secret_owner = collector;
+    collector.ownsEvents = YES;
+    return YES;
+}
+static void zw_secret_release_events(ZWSecretCollector *collector) {
+    if (!collector.ownsEvents) return;
+    macos_remove_native_event_filter(zw_secret_event_filter, (__bridge void *)collector);
+    collector.ownsEvents = NO;
+    if (g_zw_secret_owner == collector) g_zw_secret_owner = nil;
+}
 @implementation ZWSecretCollector
 - (void)finish:(BOOL)submit {
     if (self.state) return;
     self.state = submit && self.field->_length ? 1 : 2;
-    macos_release_native_event_window((__bridge void *)self.panel);
+    zw_secret_release_events(self);
     if (self.state == 2) [self.field erase];
     if (self.state == 2) { [self.timer invalidate]; self.timer = nil; }
     if (self.secureEvents) { DisableSecureEventInput(); self.secureEvents = NO; }
@@ -176,8 +203,8 @@ void *zw_host_secret_open(const char *metadata, const ZWSecretTheme *theme) {
     collector.field.finish = ^(BOOL submit) { [weak finish:submit]; };
     collector.panel.cancelled = ^{ [weak finish:NO]; };
     collector.timer = [NSTimer scheduledTimerWithTimeInterval:60 repeats:NO block:^(NSTimer *timer) { (void)timer; [weak expire]; }];
-    if (!macos_claim_native_event_window((__bridge void *)collector.panel)) return NULL;
-    if (EnableSecureEventInput() != noErr) { macos_release_native_event_window((__bridge void *)collector.panel); return NULL; }
+    if (!zw_secret_claim_events(collector)) return NULL;
+    if (EnableSecureEventInput() != noErr) { zw_secret_release_events(collector); return NULL; }
     collector.secureEvents = YES;
     [collector.panel center]; [collector.panel makeKeyAndOrderFront:nil]; [collector.panel makeFirstResponder:collector.field];
     return (__bridge_retained void *)collector;

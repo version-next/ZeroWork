@@ -1,0 +1,15 @@
+//! tab body 的空状态“卡片已浮动”（cards-float，Pencil MSg5W「Tab body · 卡片已浮动」）：单卡 tab 的卡片浮动
+//! 出去、或分屏里所有卡片都浮动出去时，tab 仍在标签栏上，tab body 显示这一块：原生 `W.Empty`（图标 · 标题 ·
+//! 说明 · 动作“放回标签页”，与浮动外框的“放入分屏”同一个动作：放回原位）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("card_floated_view.zig");
+const S = @import("card_floated.yss");
+
+pub fn CardFloated(vm: *m.Vm) View {
+    return (
+        <box testId="workspace.card_floated" style={S.root}>
+            <W.Empty icon={vm.icon} title="卡片已浮动" description={vm.detailText()} actionLabel="放回标签页" actionIconAsset={vm.put_back_icon} onAction={vm.putBack()} titleTestId="workspace.card_floated.title" descriptionTestId="workspace.card_floated.detail" actionTestId="workspace.card_floated.put_back" />
+        </box>
+    );
+}

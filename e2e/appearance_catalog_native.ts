@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Native catalogue, persistence and font-search acceptance. Uses isolated local data only.
  * node e2e/appearance_catalog_native.ts /absolute/evidence [binary]
@@ -7,6 +8,8 @@ import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,rm,open,readFile,writeFile,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import * as h from '../zig-out/share/zenit/harness/client.ts';
+import {settingsNav} from './settings_nav.ts';
+const nav=settingsNav();
 const out=resolve(process.argv[2]);await mkdir(out,{recursive:true});
 const binary=resolve(process.argv[3]??'zig-out/bin/zerowork');
 const isolated=await realpath(await mkdtemp('/private/tmp/zerowork-appearance-catalog-')),rpc=join(isolated,'rpc'),data=join(isolated,'data');
@@ -21,19 +24,23 @@ const shown=(n:any)=>n.visible!==false&&n.hidden!==true&&(n.effective_opacity??1
 const node=async(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null);
 async function click(id:string){await node(id);assert((await h.clickTestId(id)).ok,id);}
 async function capture(name:string){await h.mouseMove(5,5);await h.sleep(200);await h.screenshot(join(out,name+'.png'));report.captures.push(name+'.png');}
-async function saved(){await h.waitFor(async()=>(await node('settings.footer.state')).text==='已保存'||null);}
+// Saved = the floating Save Bar hides (was the persistent footer state "已保存"; H-save shows a Toast instead).
+async function saved(){await nav.saved();}
 async function chooseTheme(id:string){const strip=await node('settings.theme.strip');let tile=await node('settings.theme.'+id);for(let i=0;i<30&&(tile.rect.x<strip.rect.x||tile.rect.x+tile.rect.w>strip.rect.x+strip.rect.w);i++){await h.scrollAt(strip.rect.x+strip.rect.w/2,strip.rect.y+strip.rect.h/2,tile.rect.x<strip.rect.x?strip.rect.x-tile.rect.x+6:strip.rect.x+strip.rect.w-tile.rect.x-tile.rect.w-6,0);await h.sleep(80);tile=await node('settings.theme.'+id);}await click('settings.theme.'+id);await click('settings.save');await saved();assert.match(await readFile(join(data,'config.toml'),'utf8'),new RegExp('theme = "'+id+'"'));const palette=await node('settings.theme.ansi');assert.equal(palette.children[1].children.length,16,'actual 16-slot palette');report.themes.push(id);}
 async function searchFont(text:string){await click('settings.field.font_family');await h.key('a',{cmd:true});await h.key('backspace');await h.type_(text);}
 try{
- launch();await h.waitForServerReady();await h.resizeWindow(1280,720);await click('toolbar.settings');await click('settings.nav.appearance');
+ launch();await h.waitForServerReady();await h.resizeWindow(1280,720);await nav.toSub('appearance','theme');
  for(const id of Object.keys(design.themes)){await chooseTheme(id);if(['forest','graphite','paper','catppuccin-latte','tokyo-night','rose-pine'].includes(id))await capture(id);}
  report.checks.push('Every builtin theme selected through its real tile and persisted; 16 ANSI swatches mounted.');
- await click('settings.appearance.font.header');
+ await nav.toSub('appearance','font');
  await searchFont('Menlo');await node('settings.option.font_family.Menlo');assert(!(await h.query('settings.option.font_family.Monaco')).some(shown));await click('settings.option.font_family.Menlo');
  await searchFont('Fira');const missing=await node('settings.option.font_family.Fira Code');await writeFile(join(out,'font-option.json'),JSON.stringify(missing,null,2));await capture('font-search');await click('settings.option.font_family.Fira Code');
- await node('settings.font.preview');await capture('font-preview');await click('settings.save');await saved();assert.match(await readFile(join(data,'config.toml'),'utf8'),/font_family = "Fira Code"/);
+ // The terminal font preview (settings.font.preview) is the 预览 pane of 外观与主题 › 主题, not part of 字体与排版:
+ // save the family first, then check the preview there (leaving a subpage with a draft asks first).
+ await click('settings.save');await saved();assert.match(await readFile(join(data,'config.toml'),'utf8'),/font_family = "Fira Code"/);
+ await nav.toPane('settings.appearance.preview');await node('settings.font.preview');await capture('font-preview');await nav.toSub('appearance','font');
  report.checks.push('Font search filters candidates and selecting another family persists its requested identity, without replacing the requested identity.');
  await h.resizeWindow(860,480);await capture('compact-font');await h.resizeWindow(1280,720);
- child.kill('SIGTERM');await ended;launch();await h.waitForServerReady();await click('toolbar.settings');await click('settings.nav.appearance');await node('settings.theme.rose-pine');assert.match(await readFile(join(data,'config.toml'),'utf8'),/font_family = "Fira Code"/);await capture('restarted');report.checks.push('Saved theme and requested font survive a fresh process.');report.status='passed';
+ child.kill('SIGTERM');await ended;launch();await h.waitForServerReady();await nav.toSub('appearance','theme');await node('settings.theme.rose-pine');assert.match(await readFile(join(data,'config.toml'),'utf8'),/font_family = "Fira Code"/);await capture('restarted');report.checks.push('Saved theme and requested font survive a fresh process.');report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await capture('failure').catch(()=>{});console.error(e);}finally{if(child?.exitCode===null){child.kill('SIGTERM');await ended;}await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));await rm(isolated,{recursive:true,force:true});}
 if(report.status!=='passed')process.exitCode=1;else console.log('PASS',report.themes.length,'themes;',report.checks.length,'native acceptance checks');

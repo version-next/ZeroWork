@@ -1,0 +1,86 @@
+//! 同级面板的统一头部与关闭按钮（panel-heads；CONSISTENCY_AUDIT #4、用户拍板第 4 条；Pencil「面板头部与空状态规范」）。
+//!
+//! - 头部 `PanelHeader`：图标 14（fg-secondary）· 标题 12/600 · 副标题 11（计数“N 条”，有上下文时“N 条 · 会话名”）
+//!   · 弹性空白 · 动作区（调用方的辅助动作，原生组件）· 关闭。高 30、间距 6，与浮动卡片外框头部同一规格，
+//!   不带拖动把手。`inset` 只决定左右留白：`.card` 自己贴边（0 4 0 12，同浮动外框），`.flush` 放在已经有内边距的弹层里。
+//! - 关闭 `PanelClose`：全应用唯一的一颗——原生 `W.Button` ghost · sm · iconOnly（24 × 24）· x 图标 14，外包原生
+//!   `W.Tooltip`（默认“关闭 · Esc”）。不加 baseStyle / hoverStyle / iconTint。
+//! 计数文案与 Zig 侧挂载入口在 `panel_header.zig`。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("panel_header.yss");
+const m = @import("panel_header.zig");
+
+fn keepButton(out: ?*?*ui.Node, button: *ui.view.Ref(*ui.Node)) void {
+    const target = out orelse return;
+    target.* = button.get();
+}
+
+/// 全应用唯一的关闭按钮。`testId` 落在按钮上；`tooltipTestId` 落在提示气泡上；`buttonOut` 非空时挂载后写入
+/// 原生按钮节点（命令式宿主要拿它设焦点、改无障碍名）。
+pub fn PanelClose(
+    label: []const u8 = "关闭",
+    tooltip: []const u8 = m.close_tooltip,
+    buttonTestId: ?[]const u8 = null,
+    tooltipTestId: []const u8 = "",
+    focusName: []const u8 = "",
+    disabled: bool = false,
+    onClose: ?Handler(void) = null,
+    buttonOut: ?*?*ui.Node = null,
+) View {
+    const button = ref();
+    onMount(keepButton(buttonOut, button));
+    return (
+        <box style={S.action}>
+            <W.Tooltip text={tooltip} position={.bottom} parts={.{ .content = tooltipTestId }}>
+                <W.Button ref={button} testId={buttonTestId} focusId={focusName} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.x} iconSize={14} disabled={disabled} a11yLabel={label} onClick={onClose} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+fn keep(slots: ?*m.Slots, root: *ui.view.Ref(*ui.Node), actions: *ui.view.Ref(*ui.Node)) void {
+    const s = slots orelse return;
+    s.root = root.get();
+    s.actions = actions.get();
+}
+
+/// 面板头部。`children` 是动作区里关闭按钮之前的辅助动作（没有就留空）；`closable = false` 时不出关闭按钮
+/// （例如作为 tab 打开的卡片，关闭归页签）。
+pub fn PanelHeader(
+    icon: ui.SvgAsset,
+    title: []const u8,
+    subtitle: []const u8 = "",
+    inset: S.Inset = .card,
+    accent: bool = false,
+    headerTestId: ?[]const u8 = null,
+    titleTestId: ?[]const u8 = null,
+    subtitleTestId: ?[]const u8 = null,
+    closable: bool = true,
+    closeLabel: []const u8 = "关闭",
+    closeTooltip: []const u8 = m.close_tooltip,
+    closeTestId: ?[]const u8 = null,
+    closeTooltipTestId: []const u8 = "",
+    closeFocusId: []const u8 = "",
+    onClose: ?Handler(void) = null,
+    slots: ?*m.Slots = null,
+    children: View,
+) View {
+    const root = ref();
+    const actions = ref();
+    onMount(keep(slots, root, actions));
+    return (
+        <row ref={root} testId={headerTestId} style={S.Header.of(.{ .inset = inset })}>
+            <icon style={S.Icon.of(.{ .accent = accent })} src={icon} />
+            <box style={S.title_box}>
+                <text testId={titleTestId} style={S.title} box={S.text_box}>{title}</text>
+            </box>
+            <box style={S.subtitle_box} visible={m.shown(subtitle)}>
+                <text testId={subtitleTestId} style={S.subtitle} box={S.text_box}>{subtitle}</text>
+            </box>
+            <box style={S.spacer} />
+            <row ref={actions} style={S.actions}>{children}</row>
+            {if (closable) <PanelClose label={closeLabel} tooltip={closeTooltip} buttonTestId={closeTestId} tooltipTestId={closeTooltipTestId} focusName={closeFocusId} onClose={onClose} />}
+        </row>
+    );
+}

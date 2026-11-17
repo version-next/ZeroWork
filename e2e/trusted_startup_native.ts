@@ -2,13 +2,15 @@
  * node e2e/trusted_startup_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  * Own background App, RPC, data, startup files and shell only.
  */
+import { closeWorkspaceTab } from './workspace_tab_actions.ts';
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {access,copyFile,mkdir,mkdtemp,open,readFile,readdir,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname,join,resolve} from 'node:path';
-import {waitForServerReady,waitFor,query,clickAt,key,type_,screenshot,sleep,resizeWindow,screenPos} from '../zig-out/share/zenit/harness/client.ts';
+import {waitForServerReady,waitFor,query,clickAt,mouseMove,key,type_,screenshot,sleep,resizeWindow,screenPos} from '../zig-out/share/zenit/harness/client.ts';
 
 const args:Record<string,string>={};
 for(let i=2;i<process.argv.length;i+=2){assert(['--binary','--expected-sha','--out'].includes(process.argv[i])&&process.argv[i+1]);args[process.argv[i]]=process.argv[i+1]}
@@ -47,7 +49,9 @@ try{
  // The owned startup script records its actual integration socket. Public
  // Ctrl-C and the @ palette below prove cancellation and trusted editing.
  const receipt=join(isolated,'real-shell-receipt');
- const socket=String(await waitFor(async()=>(await file(receipt)).trim()||null,20000));assert(socket.startsWith('/tmp/zw-edit-')&&socket.endsWith('/control'));report.private_socket=socket;
+ const socket=String(await waitFor(async()=>(await file(receipt)).trim()||null,20000));// #63 (c98d3467): an isolated build keeps the bridge in its private TMPDIR (<TMPDIR>/zw-edit-<uid>-*), or the tagged
+ // short /tmp/zw-edit-<uid>-t<fnv32>-* when the socket path would not fit 104 bytes; never the shared /tmp/zw-edit-<uid>-*.
+ {const {realpathSync}=await import('node:fs');const root=realpathSync(process.env.TMPDIR??tmpdir()).replace(/\/$/,'');const uid=process.getuid!();assert(socket.endsWith('/control'),socket);assert(socket.startsWith(`${root}/zw-edit-${uid}-`)||new RegExp(`^/(private/)?tmp/zw-edit-${uid}-t[0-9a-f]{8}-`).test(socket),`private bridge socket ${socket}`);}report.private_socket=socket;
  await sleep(250);await click('terminal.surface');await press('c',{ctrl:true});await sleep(250);report.explicit_ctrl_c=true;
  let trusted=false;
  for(let attempt=1;attempt<=3;attempt++){
@@ -56,7 +60,7 @@ try{
  assert(trusted,'Delayed real shell must expose production trusted command palette');check('production trusted @ palette opens after delayed first handshake');await capture('01-delayed-trusted-palette');
  await type('grp DelayedStartup');await press('right');await hidden('terminal.commands');await press('return');
  await waitFor(async()=>{const p=await screenPos('groups.workspace');return p.w>0&&p.h>0||null},20000);check('production trusted @grp creates group around original Local shell');await capture('02-delayed-real-group');
- await click('groups.close');await visible('groups.close.confirm');await click('groups.close.accept');
+ await closeWorkspaceTab({query,waitFor,mouseMove,clickAt}, 'groups.tab', 'groups.close');await visible('groups.close.confirm');await click('groups.close.accept');
  await waitFor(async()=>{if((await query('local.close.confirmation')).some(shown)){await click('local.close.accept');return null}const strip=(await query('tabs.strip')).find(shown);return (!strip||!flat(strip).some(n=>/^tabs\.tab\.\d+$/.test(n.test_id??'')))||null},30000);
  await waitFor(async()=>{try{process.kill(shellPid!,0);return null}catch{return true}},15000);
  await waitFor(async()=>{try{await access(dirname(socket));return null}catch{return true}},15000);

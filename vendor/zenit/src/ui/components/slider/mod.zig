@@ -39,6 +39,20 @@ const trackStyle = styles.trackStyle;
 const fillStyle = styles.fillStyle;
 const thumbStyle = styles.thumbStyle;
 
+/// A tick mark on the track (SliderProps.marks): a dot at `value`, and when `label` is not empty a
+/// line of text under it. test_id / label_test_id go on the dot / the text node.
+pub const SliderMark = struct {
+    value: f32,
+    label: []const u8 = "",
+    test_id: ?[]const u8 = null,
+    label_test_id: ?[]const u8 = null,
+};
+
+/// Slider paint. default: light thumb face with an accent outline over the range_track track.
+/// stepped: a solid accent thumb (the fill's color, no face, no outline, no shadow) over a
+/// translucent fg-tertiary track, accent mark dots; disabled thumb / fill / dots in fg-tertiary.
+pub const SliderLook = enum { default, stepped };
+
 pub const SliderProps = struct {
     label_text: ?[]const u8 = null,
     min: f32 = 0,
@@ -63,6 +77,16 @@ pub const SliderProps = struct {
     on_change: ?Handler(f32) = null,
     /// test_id set on track node (for E2E testing)
     test_id: ?[]const u8 = null,
+    /// Tick marks drawn in the track area under the thumb (see SliderMark): a 4px dot each at the
+    /// value's position (out-of-range values pinned to the ends), its label (when not empty) as
+    /// 9px fg-tertiary text centered under it. Neither is hit-testable (a click lands on the
+    /// track area as before). A source: dots and labels follow it (count, position, text).
+    /// Empty (default) adds no node.
+    marks: Source([]const SliderMark) = .{ .value = &.{} },
+    /// false hides the thumb (display none); track, fill and marks stay.
+    thumb_visible: Source(bool) = .{ .value = true },
+    /// Paint (see SliderLook); follows theme switches like the default.
+    look: SliderLook = .default,
 };
 
 /// Slider runtime (scope-owned). View = f(value, disabled, hover), applied by effect;
@@ -70,6 +94,9 @@ pub const SliderProps = struct {
 pub const SliderRuntime = struct {
     value: reactive.Bound(f32),
     disabled: Source(bool),
+    marks: Source([]const SliderMark),
+    thumb_visible: Source(bool),
+    look: SliderLook,
     haptic_feedback: Source(bool),
     haptic_pattern: Source(HapticFeedbackPattern),
     on_change: ?Handler(f32),
@@ -80,12 +107,24 @@ pub const SliderRuntime = struct {
     accent: Color,
     accent_hover: Color,
     tokens: *const core.ThemeTokens,
-    theme_signal: *Signal(*const core.ThemeTokens),
+    /// Allocator of the mark lists (the slider scope's, which frees them with the runtime).
+    scope_allocator: Allocator,
+    /// The view reads it: a theme switch recolors the track, fill, thumb and value text.
+    theme: *Signal(*const core.ThemeTokens),
     hovered: *Signal(bool),
     dragging: bool = false,
     /// Currently displayed value (data source value clamped to [min, max])
     shown: f32 = 0,
     is_disabled: bool = false,
+    /// Thumb display last applied (thumb_visible).
+    thumb_shown: bool = true,
+    /// Mark dots (in track_area, before the thumb) and the labels of marks with text (after it),
+    /// in mark order; rebuilt when `marks` changes.
+    mark_dots: std.ArrayList(*Node) = .empty,
+    mark_labels: std.ArrayList(*Node) = .empty,
+    /// The marks mount built; the marks effect's first run skips the rebuild when it reads the
+    /// same list.
+    marks_at_mount: ?[]const SliderMark = null,
     track_node: *Node,
     fill_node: *Node,
     thumb_node: *Node,
@@ -119,11 +158,19 @@ pub const SliderRuntime = struct {
         const v = self.displayOf(self.value.readAs(tracked));
         const dis = self.disabled.read(tracked);
         const hov = if (tracked) self.hovered.get() else self.hovered.peek();
+        const tokens = if (tracked) self.theme.get() else self.theme.peek();
+        const thumb_visible = self.thumb_visible.read(tracked);
+        if (thumb_visible != self.thumb_shown) {
+            self.thumb_shown = thumb_visible;
+            self.thumb_node.setDisplay(if (thumb_visible) .flex else .none);
+        }
+        if (tokens != self.tokens) self.applyTheme(tokens);
         if (dis != self.is_disabled) {
             self.is_disabled = dis;
             self.applyDisabled();
         }
-        // When disabled, hover highlight not shown; color transitions via border-color
+        // When disabled, hover highlight not shown; a drag keeps it while the pointer leaves
+        // the track. Color transitions via border-color.
         self.thumb_node.setBorderColor(if (dis) self.tokens.tokens.color.range_disabled else if (self.dragging) self.tokens.tokens.color.range_drag else if (hov) self.accent_hover else self.accent);
         if (v != self.shown) {
             self.shown = v;
@@ -131,14 +178,88 @@ pub const SliderRuntime = struct {
         }
     }
 
-    fn viewEffect(self: *SliderRuntime) void {
-        _ = self.theme_signal.get();
-        self.tokens = self.cx.tokens;
-        self.accent = self.tokens.tokens.color.range_fill;
-        self.accent_hover = self.tokens.tokens.color.range_hover;
-        self.track_node.setBackground(self.tokens.tokens.color.range_track);
+    /// Theme switch: everything painted from mount-time tokens is re-resolved, as a fresh
+    /// mount under the new theme would paint it.
+    fn applyTheme(self: *SliderRuntime, t: *const core.ThemeTokens) void {
+        self.tokens = t;
+        self.accent = t.tokens.color.range_fill;
+        self.accent_hover = t.tokens.color.range_hover;
+        self.track_node.setBackground(styles.trackBackground(self.look, t));
+        if (self.value_text_node) |text| text.setTextColor(t.tokens.color.fg_secondary);
+        for (self.mark_labels.items) |label| label.setTextColor(styles.markLabelColor(t));
         self.applyDisabled();
-        if (self.value_text_node) |text| text.setTextColor(self.tokens.tokens.color.fg_secondary);
+    }
+
+    fn markPercent(self: *const SliderRuntime, value: f32) f32 {
+        if (self.max <= self.min or std.math.isNan(value)) return 0;
+        return std.math.clamp((value - self.min) / (self.max - self.min), 0, 1) * 100;
+    }
+
+    /// Drop the current mark nodes and build `marks` in their place: dots before the thumb (it
+    /// covers them), labels after it.
+    fn syncMarks(self: *SliderRuntime, marks: []const SliderMark) !void {
+        const cx = self.cx;
+        const area = self.track_area_node;
+        for (self.mark_dots.items) |dot| {
+            area.removeChild(dot);
+            cx.freeNode(dot);
+        }
+        self.mark_dots.clearRetainingCapacity();
+        for (self.mark_labels.items) |label| {
+            area.removeChild(label);
+            cx.freeNode(label);
+        }
+        self.mark_labels.clearRetainingCapacity();
+        const alloc = cx.allocator;
+        const list_alloc = self.listAllocator();
+        const dot_color = styles.fillBackground(self.look, self.is_disabled, self.accent, self.tokens);
+        for (marks) |mark| {
+            const percent = self.markPercent(mark.value);
+            try self.mark_dots.ensureUnusedCapacity(list_alloc, 1);
+            const dot = try box(cx, styles.markDotStyle(percent, dot_color), .{});
+            dot.setHitTestVisible(false);
+            dot.meta.ownership.meta.test_id = mark.test_id;
+            area.insertChildBefore(alloc, dot, self.thumb_node) catch |err| {
+                cx.freeNode(dot);
+                return err;
+            };
+            self.mark_dots.appendAssumeCapacity(dot);
+            if (mark.label.len == 0) continue;
+            try self.mark_labels.ensureUnusedCapacity(list_alloc, 1);
+            const label = try core.text(cx, "", styles.markLabelText(self.tokens));
+            label.setTextContent(alloc, mark.label) catch |err| {
+                cx.freeNode(label);
+                return err;
+            };
+            label.setStyleInlineFallible(alloc, styles.markLabelBox(percent)) catch |err| {
+                cx.freeNode(label);
+                return err;
+            };
+            label.setHitTestVisible(false);
+            label.meta.ownership.meta.test_id = mark.label_test_id;
+            area.appendChild(alloc, label) catch |err| {
+                cx.freeNode(label);
+                return err;
+            };
+            self.mark_labels.appendAssumeCapacity(label);
+        }
+        area.markLayoutDirty();
+    }
+
+    fn listAllocator(self: *const SliderRuntime) Allocator {
+        return self.scope_allocator;
+    }
+
+    fn marksEffect(self: *SliderRuntime) void {
+        const marks = self.marks.read(true);
+        if (self.marks_at_mount) |built| {
+            self.marks_at_mount = null;
+            if (built.ptr == marks.ptr and built.len == marks.len) return;
+        }
+        self.syncMarks(marks) catch |err| std.log.err("[Slider] marks update failed: {}", .{err});
+    }
+
+    fn viewEffect(self: *SliderRuntime) void {
         self.view(true) catch |err| std.log.err("[Slider] update failed: {}", .{err});
     }
 
@@ -149,8 +270,10 @@ pub const SliderRuntime = struct {
         self.container_node.style.cursor = if (dis) .not_allowed else .default;
         self.thumb_node.style.cursor = if (dis) .not_allowed else .pointer;
         if (self.container_node.behavior.interaction.a11y) |*a| a.disabled = dis;
-        self.fill_node.setBackground(if (dis) t.tokens.color.range_disabled else self.accent);
-        self.thumb_node.setBackground(styles.thumbBackground(dis, t));
+        self.fill_node.setBackground(styles.fillBackground(self.look, dis, self.accent, t));
+        self.thumb_node.setBackground(styles.thumbBackground(self.look, dis, self.accent, t));
+        const dot_color = styles.fillBackground(self.look, dis, self.accent, t);
+        for (self.mark_dots.items) |dot| dot.setBackground(dot_color);
         if (dis and self.dragging) {
             self.dragging = false;
             if (sliderOwnsCapture(self)) self.cx.releasePointerCapture();
@@ -262,6 +385,8 @@ pub const SliderBuilder = struct {
             break :blk np;
         };
         reactive.checkBorrow(my_scope, p.disabled);
+        reactive.checkBorrow(my_scope, p.marks);
+        reactive.checkBorrow(my_scope, p.thumb_visible);
         reactive.checkBorrow(my_scope, p.haptic_feedback);
         reactive.checkBorrow(my_scope, p.haptic_pattern);
         const value = try reactive.resolveModel(f32, my_scope, p.value);
@@ -320,19 +445,18 @@ pub const SliderBuilder = struct {
         const track = parts.track;
         const fill = parts.fill;
         const thumb = parts.thumb;
-        thumb.applyTransition(allocator, &comptime recipe_mod.transition("border-color 120ms ease-out"));
+        try thumb.applyTransition(allocator, &comptime recipe_mod.transition("border-color 120ms ease-out"));
 
         const hovered = try hooks.useHover(my_scope, track_area);
+        const theme_signal = try cx.themeSignal();
 
-        const theme_signal = try cx.themeSignal(blk: {
-            var root_scope = scope;
-            while (root_scope.parent) |parent| root_scope = parent;
-            break :blk root_scope;
-        });
         const rt = try my_scope.allocator.create(SliderRuntime);
         rt.* = .{
             .value = value,
             .disabled = p.disabled,
+            .marks = p.marks,
+            .thumb_visible = p.thumb_visible,
+            .look = p.look,
             .haptic_feedback = p.haptic_feedback,
             .haptic_pattern = p.haptic_pattern,
             .on_change = p.on_change,
@@ -343,7 +467,8 @@ pub const SliderBuilder = struct {
             .accent = accent,
             .accent_hover = t.tokens.color.range_hover,
             .tokens = t,
-            .theme_signal = theme_signal,
+            .scope_allocator = my_scope.allocator,
+            .theme = theme_signal,
             .hovered = hovered,
             // Not equal to any display value: first view must apply
             .shown = std.math.nan(f32),
@@ -356,7 +481,10 @@ pub const SliderBuilder = struct {
         };
         try my_scope.adoptResource(@ptrCast(rt), struct {
             fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                alloc.destroy(@as(*SliderRuntime, @ptrCast(@alignCast(ptr))));
+                const runtime: *SliderRuntime = @ptrCast(@alignCast(ptr));
+                runtime.mark_dots.deinit(alloc);
+                runtime.mark_labels.deinit(alloc);
+                alloc.destroy(runtime);
             }
         }.cleanup);
         if (container.behavior.interaction.a11y) |*a11y| {
@@ -387,6 +515,11 @@ pub const SliderBuilder = struct {
         try rt.view(false);
         // value is Model: local also signal, interaction changes it, must have effect
         try my_scope.createEffect(rt, SliderRuntime.viewEffect);
+        // Marks: built now (a failure fails the mount), then rebuilt when the source changes.
+        const initial_marks = p.marks.read(false);
+        if (initial_marks.len != 0) try rt.syncMarks(initial_marks);
+        rt.marks_at_mount = initial_marks;
+        try my_scope.createEffect(rt, SliderRuntime.marksEffect);
 
         return .{ .wrapper = container, .value = value.asSignal() };
     }
@@ -501,6 +634,45 @@ test "Slider: basic structure" {
 
     try root.appendChild(std.testing.allocator, result.wrapper);
     try std.testing.expectEqual(@as(f32, 50), result.value.?.peek());
+}
+
+test "Slider: re-applying an unchanged thumb offset requests no frame" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 100);
+    try ctx.setTestFrameStep(16);
+    ctx.caret_flip_host = true;
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try Slider(.{ .min = 0, .max = 100, .value = 30, .width = 220 }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    var frames: usize = 0;
+    while (ctx.wantsFrame() and frames < 60) : (frames += 1) {
+        ctx.advanceFrameClock();
+        ctx.layout();
+        _ = ctx.render();
+    }
+    try std.testing.expect(!ctx.wantsFrame());
+    // The before-render hook runs in every rendered frame and re-applies the thumb offset. With
+    // the offset unchanged it must leave the tree clean: a dirty hit scene each frame advances
+    // the scene epoch, and a live stationary pointer then re-resolves hover and requests the
+    // next frame forever (glasslab rendered 120 fps idle).
+    const Find = struct {
+        fn hooked(n: *Node) ?*Node {
+            if (n.meta.per_frame.hooks.before_render.main == sliderBeforeRender) return n;
+            for (n.children.items) |c| if (hooked(c)) |f| return f;
+            return null;
+        }
+    };
+    const track_area = Find.hooked(result.wrapper).?;
+    const rt: *SliderRuntime = @ptrCast(@alignCast(track_area.behavior.events.event_context.?));
+    const before = rt.thumb_node.style.translate_x;
+    try std.testing.expect(before != 0);
+    sliderBeforeRender(track_area);
+    try std.testing.expectEqual(before, rt.thumb_node.style.translate_x);
+    try std.testing.expect(!ctx.wantsFrame());
 }
 
 test "Slider: min > max 时 mount 不 assert，区间被规范化" {
@@ -652,7 +824,7 @@ test "Slider: render emits fill highlight" {
     var saw_fill = false;
     for (commands) |cmd| if (cmd.isFillRect()) {
         const r = cmd;
-        if (Color.eql(r.color.toColor(), ctx.tokens.tokens.color.range_fill) and r.geom.w > 100 and r.geom.h >= 4) {
+        if (Color.eql(r.color.toColor(), ctx.tokens.tokens.color.accent) and r.geom.w > 100 and r.geom.h >= 4) {
             saw_fill = true;
         }
     };
@@ -734,25 +906,71 @@ test "Slider: dynamic disabled blocks input and updates focus / a11y / colors" {
     defer ctx.freeNode(result.wrapper);
     const rt = runtimeOf(result);
     try std.testing.expect(result.wrapper.behavior.interaction.focusable);
-    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), ctx.tokens.tokens.color.range_fill));
+    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), ctx.tokens.tokens.color.accent));
 
     off.set(true);
     try std.testing.expect(!result.wrapper.behavior.interaction.focusable);
     try std.testing.expect(result.wrapper.behavior.interaction.a11y.?.disabled);
-    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), ctx.tokens.tokens.color.range_disabled));
+    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), ctx.tokens.tokens.color.fg_disabled));
     try std.testing.expectEqual(EventResult.ignored, sliderKeyHandler(.right, .{}, @ptrCast(rt)));
     try std.testing.expect(!setA11ySliderValue(rt, 80));
     try std.testing.expectEqual(@as(f32, 30), result.value.?.peek());
 
     // When disabled, hover highlight not shown
     rt.hovered.set(true);
-    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.range_disabled));
+    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.fg_disabled));
 
     off.set(false);
-    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.range_hover));
+    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.accent_hover));
     try std.testing.expect(result.wrapper.behavior.interaction.focusable);
     _ = sliderKeyHandler(.right, .{}, @ptrCast(rt));
     try std.testing.expectEqual(@as(f32, 31), result.value.?.peek());
+}
+
+test "Slider: theme switch recolors track, fill, thumb and value text" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setTheme(&core.theme.light);
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const off = try scope.createSignal(bool, false);
+    const result = try Slider(.{ .value = 30, .disabled = off, .show_value = true }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    const rt = runtimeOf(result);
+
+    ctx.setTheme(&core.theme.dark);
+    const dark = &core.theme.dark;
+    try std.testing.expect(rt.tokens == dark);
+    try std.testing.expect(Color.eql(rt.track_node.getBackground(), dark.tokens.color.bg_tertiary));
+    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), dark.tokens.color.accent));
+    try std.testing.expect(Color.eql(rt.thumb_node.getBackground(), styles.thumbBackground(.default, false, dark.tokens.color.range_fill, dark)));
+    try std.testing.expect(Color.eql(thumbBorderTarget(rt), dark.tokens.color.accent));
+    try std.testing.expect(Color.eql(rt.value_text_node.?.getText().?.color, dark.tokens.color.fg_secondary));
+
+    off.set(true);
+    try std.testing.expect(Color.eql(rt.fill_node.getBackground(), dark.tokens.color.fg_disabled));
+}
+
+test "Slider: a drag keeps the thumb highlighted after the pointer leaves the track" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try Slider(.{ .value = 30 }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    ctx.layout();
+    const rt = runtimeOf(result);
+    const r = rt.track_area_node.globalRect();
+    _ = sliderEventHandler(.{ .mouse_down = .{ .x = r.x + r.w / 2, .y = r.y + r.h / 2 } }, @ptrCast(rt));
+    try std.testing.expect(rt.dragging);
+    rt.hovered.set(false);
+    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.accent_hover));
+    _ = sliderEventHandler(.{ .mouse_up = .{ .x = r.x, .y = r.y } }, @ptrCast(rt));
+    try std.testing.expect(!rt.dragging);
+    try std.testing.expect(Color.eql(thumbBorderTarget(rt), ctx.tokens.tokens.color.accent));
 }
 
 fn thumbBorderTarget(rt: *SliderRuntime) Color {
@@ -1016,4 +1234,208 @@ test "Slider: losing or failing to acquire capture ends pointer updates" {
         try std.testing.expectEqual(@as(usize, if (redirect_during_acquire) 0 else 1), changes);
         try std.testing.expect(cx.node_registry.resolve(cx.dispatcher.pointer_capture_handle, null) == replacement);
     }
+}
+
+test "Slider: range_* role tokens default to the semantic colors, drive every state and refresh on theme switch" {
+    inline for (.{ &core.theme.light, &core.theme.dark, &core.theme.high_contrast }) |t| {
+        const c = t.tokens.color;
+        try std.testing.expectEqual(c.bg_tertiary, c.range_track);
+        try std.testing.expectEqual(c.accent, c.range_fill);
+        try std.testing.expectEqual(c.accent_hover, c.range_hover);
+        try std.testing.expectEqual(c.accent_hover, c.range_drag);
+        try std.testing.expectEqual(c.bg_primary, c.range_thumb);
+        try std.testing.expectEqual(c.fg_disabled, c.range_disabled);
+        try std.testing.expectEqual(c.fg_disabled, c.range_disabled_thumb);
+    }
+    // ZeroWork-style runtime theme: a copy of light with only the roles changed, applied with
+    // setTheme after mount.
+    var custom = core.theme.light;
+    const c = &custom.tokens.color;
+    c.range_track = Color.hex(0x111111);
+    c.range_fill = Color.hex(0x222222);
+    c.range_hover = Color.hex(0x333333);
+    c.range_drag = Color.hex(0x444444);
+    c.range_thumb = Color.hex(0x555555);
+    c.range_disabled = Color.hex(0x666666);
+    c.range_disabled_thumb = Color.hex(0x777777);
+
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setTheme(&core.theme.light);
+    const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const off = try scope.createSignal(bool, false);
+    const result = try Slider(.{ .value = 30, .disabled = off }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    ctx.layout();
+    const rt = runtimeOf(result);
+
+    ctx.setTheme(&custom);
+    try std.testing.expect(rt.tokens == &custom);
+    try std.testing.expectEqual(Color.hex(0x111111), rt.track_node.getBackground());
+    try std.testing.expectEqual(Color.hex(0x222222), rt.fill_node.getBackground());
+    try std.testing.expectEqual(Color.hex(0x555555), rt.thumb_node.getBackground());
+    try std.testing.expectEqual(Color.hex(0x222222), thumbBorderTarget(rt));
+    rt.hovered.set(true);
+    try std.testing.expectEqual(Color.hex(0x333333), thumbBorderTarget(rt));
+    const r = rt.track_area_node.globalRect();
+    _ = sliderEventHandler(.{ .mouse_down = .{ .x = r.x + r.w / 2, .y = r.y + r.h / 2 } }, @ptrCast(rt));
+    try std.testing.expect(rt.dragging);
+    try std.testing.expectEqual(Color.hex(0x444444), thumbBorderTarget(rt));
+    _ = sliderEventHandler(.{ .mouse_up = .{ .x = r.x, .y = r.y } }, @ptrCast(rt));
+    rt.hovered.set(false);
+    off.set(true);
+    try std.testing.expectEqual(Color.hex(0x666666), rt.fill_node.getBackground());
+    try std.testing.expectEqual(Color.hex(0x666666), thumbBorderTarget(rt));
+    try std.testing.expectEqual(Color.hex(0x777777), rt.thumb_node.getBackground());
+
+    // Back to the default theme: the semantic defaults return.
+    ctx.setTheme(&core.theme.light);
+    try std.testing.expectEqual(core.theme.light.tokens.color.bg_tertiary, rt.track_node.getBackground());
+    try std.testing.expectEqual(core.theme.light.tokens.color.fg_disabled, rt.fill_node.getBackground());
+}
+
+test "Slider: default props keep the tree (no mark nodes, thumb shown, default paint)" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try Slider(.{ .value = 30 }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    const rt = runtimeOf(result);
+    try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
+    const area = result.wrapper.children.items[0];
+    try std.testing.expectEqual(@as(usize, 2), area.children.items.len);
+    try std.testing.expect(area.children.items[0] == rt.track_node);
+    try std.testing.expect(area.children.items[1] == rt.thumb_node);
+    try std.testing.expectEqual(@as(usize, 1), rt.track_node.children.items.len);
+    try std.testing.expect(rt.thumb_node.style.display != .none);
+    try std.testing.expectEqual(@as(usize, 0), rt.mark_dots.items.len);
+    const c = ctx.tokens.tokens.color;
+    try std.testing.expectEqual(c.range_track, rt.track_node.getBackground());
+    try std.testing.expectEqual(c.range_thumb, rt.thumb_node.getBackground());
+    try std.testing.expectEqual(c.range_fill, rt.fill_node.getBackground());
+}
+
+test "Slider: marks draw dots and labels on the track and follow their source" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const two = [_]SliderMark{
+        .{ .value = 0, .label = "Low", .test_id = "mark.0", .label_test_id = "mark.0.label" },
+        .{ .value = 4, .label = "Max", .test_id = "mark.1", .label_test_id = "mark.1.label" },
+    };
+    const three = [_]SliderMark{ .{ .value = 0, .label = "a" }, .{ .value = 2, .label = "b" }, .{ .value = 4, .label = "c" } };
+    const one = [_]SliderMark{.{ .value = 2 }};
+    const marks = try scope.createSignal([]const SliderMark, &two);
+    const result = try Slider(.{ .min = 0, .max = 4, .step = 0, .width = 308, .thumb_size = 12, .track_height = 3, .value = 1, .marks = marks }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    ctx.layout();
+    const rt = runtimeOf(result);
+    const area = rt.track_area_node;
+
+    // Dots sit before the thumb (it covers them), labels after it; none is hit-testable.
+    try std.testing.expectEqual(@as(usize, 2), rt.mark_dots.items.len);
+    try std.testing.expectEqual(@as(usize, 2), rt.mark_labels.items.len);
+    try std.testing.expectEqual(@as(usize, 2 + 2 + 2), area.children.items.len);
+    try std.testing.expect(area.children.items[0] == rt.track_node);
+    try std.testing.expect(area.children.items[1] == rt.mark_dots.items[0]);
+    try std.testing.expect(area.children.items[2] == rt.mark_dots.items[1]);
+    try std.testing.expect(area.children.items[3] == rt.thumb_node);
+    const track = rt.track_node.globalRect();
+    const d0 = rt.mark_dots.items[0].globalRect();
+    const d1 = rt.mark_dots.items[1].globalRect();
+    try std.testing.expectApproxEqAbs(track.x - 2, d0.x, 0.1);
+    try std.testing.expectApproxEqAbs(track.x + track.w - 2, d1.x, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), d0.w, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), d0.h, 0.1);
+    try std.testing.expectApproxEqAbs(area.globalRect().y + 4, d0.y, 0.1);
+    try std.testing.expectEqualStrings("mark.1", rt.mark_dots.items[1].meta.ownership.meta.test_id.?);
+    try std.testing.expect(!rt.mark_dots.items[0].frame_state.state_bits.flags.hit_test_visible);
+    for (rt.mark_labels.items, [_][]const u8{ "Low", "Max" }, [_]f32{ d0.x, d1.x }) |label, words, dot_x| {
+        try std.testing.expectEqualStrings(words, label.getText().?.content);
+        try std.testing.expect(!label.getText().?.selectable);
+        try std.testing.expect(!label.frame_state.state_bits.flags.hit_test_visible);
+        try std.testing.expectEqual(ctx.tokens.tokens.color.fg_tertiary, label.getText().?.color);
+        const r = label.globalRect();
+        try std.testing.expectApproxEqAbs(dot_x + 2, r.x + r.w / 2, 0.1);
+        try std.testing.expectApproxEqAbs(@as(f32, 32), r.w, 0.1);
+        try std.testing.expectApproxEqAbs(area.globalRect().y + 12, r.y, 0.1);
+    }
+    try std.testing.expectEqualStrings("mark.0.label", rt.mark_labels.items[0].meta.ownership.meta.test_id.?);
+
+    marks.set(&three);
+    ctx.layout();
+    try std.testing.expectEqual(@as(usize, 3), rt.mark_dots.items.len);
+    try std.testing.expectEqual(@as(usize, 3), rt.mark_labels.items.len);
+    try std.testing.expectEqual(@as(usize, 2 + 3 + 3), area.children.items.len);
+    try std.testing.expectEqualStrings("b", rt.mark_labels.items[1].getText().?.content);
+    try std.testing.expectApproxEqAbs(track.x + track.w / 2 - 2, rt.mark_dots.items[1].globalRect().x, 0.1);
+
+    // A mark without a label draws only its dot.
+    marks.set(&one);
+    ctx.layout();
+    try std.testing.expectEqual(@as(usize, 1), rt.mark_dots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rt.mark_labels.items.len);
+    try std.testing.expectEqual(@as(usize, 2 + 1), area.children.items.len);
+    try std.testing.expect(area.children.items[2] == rt.thumb_node);
+}
+
+test "Slider: thumb_visible hides the thumb only" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const shown = try scope.createSignal(bool, false);
+    const marks = [_]SliderMark{.{ .value = 50 }};
+    const result = try Slider(.{ .value = 30, .thumb_visible = shown, .marks = @as([]const SliderMark, &marks) }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    const rt = runtimeOf(result);
+    try std.testing.expectEqual(core.Display.none, rt.thumb_node.style.display);
+    try std.testing.expect(rt.track_node.style.display != .none);
+    try std.testing.expect(rt.mark_dots.items[0].style.display != .none);
+    shown.set(true);
+    try std.testing.expect(rt.thumb_node.style.display != .none);
+    shown.set(false);
+    try std.testing.expectEqual(core.Display.none, rt.thumb_node.style.display);
+}
+
+test "Slider: stepped look paints a solid accent thumb and dots, fg-tertiary when disabled, and follows the theme" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setTheme(&core.theme.light);
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const off = try scope.createSignal(bool, false);
+    const marks = [_]SliderMark{ .{ .value = 0 }, .{ .value = 100 } };
+    const result = try Slider(.{ .value = 30, .disabled = off, .thumb_size = 12, .look = .stepped, .marks = @as([]const SliderMark, &marks) }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    const rt = runtimeOf(result);
+    const light = core.theme.light.tokens.color;
+    try std.testing.expectEqual(light.accent, rt.thumb_node.getBackground());
+    try std.testing.expectEqual(rt.fill_node.getBackground(), rt.thumb_node.getBackground());
+    try std.testing.expectEqual(light.accent, rt.mark_dots.items[0].getBackground());
+    try std.testing.expect(!Color.eql(rt.track_node.getBackground(), light.range_track));
+    try std.testing.expectEqual(light.fg_tertiary.withAlpha(110), rt.track_node.getBackground());
+    try std.testing.expectEqual(@as(f32, 0), rt.thumb_node.style.border.width);
+    try std.testing.expectEqual(@as(f32, 6), rt.thumb_node.style.border.radius);
+
+    off.set(true);
+    try std.testing.expectEqual(light.fg_tertiary, rt.thumb_node.getBackground());
+    try std.testing.expectEqual(light.fg_tertiary, rt.fill_node.getBackground());
+    try std.testing.expectEqual(light.fg_tertiary, rt.mark_dots.items[1].getBackground());
+
+    ctx.setTheme(&core.theme.dark);
+    const dark = core.theme.dark.tokens.color;
+    try std.testing.expectEqual(dark.fg_tertiary, rt.thumb_node.getBackground());
+    try std.testing.expectEqual(dark.fg_tertiary.withAlpha(110), rt.track_node.getBackground());
+    off.set(false);
+    try std.testing.expectEqual(dark.accent, rt.thumb_node.getBackground());
+    try std.testing.expectEqual(dark.accent, rt.mark_dots.items[0].getBackground());
 }

@@ -1,0 +1,70 @@
+//! SSH 与网络（第 2 类）面板正文（P3 3e）：连接、断线重连、SOCKS5 默认值、双因素认证。
+//! 文案 / id / 依赖在 `model/pane_fields.zig` 的 `ssh`（重连次数 / 间隔 / 缓存按 `Controller.fieldApplicable` 置灰）。
+const std = @import("std");
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const F = m.fields.ssh;
+
+const connection = &F.connection;
+const reconnect = &F.reconnect;
+const socks = &F.socks;
+const authentication = &F.authentication;
+
+const builtin = m.catalog.terminal_types.builtin;
+/// 内置终端类型 + “自定义 TERM 声明…”（选中后在选择框下方原地编辑，`R.CustomSelectRow`，S-13）。
+const terms = blk: {
+    var result: [builtin.len + 1]W.SelectOption = undefined;
+    for (builtin, 0..) |entry, i| result[i] = .{ .value = entry.name, .label = entry.name, .test_id = std.fmt.comptimePrint("settings.term.option.{s}", .{entry.name}) };
+    result[builtin.len] = .{ .value = R.custom_choice, .label = "自定义 TERM 声明…", .test_id = "settings.term.option.custom" };
+    break :blk result;
+};
+/// 草稿里是自定义 TERM 时追加一项显示它（两份交替：Yix 按内容判等）。
+var custom_terms: [2][terms.len + 1]W.SelectOption = undefined;
+var custom_flip: u1 = 0;
+fn termOptions(vm: *m.ViewModel) []const W.SelectOption {
+    const current = vm.selectValue(F.term) orelse return &terms;
+    for (builtin) |entry| if (std.mem.eql(u8, entry.name, current)) return &terms;
+    custom_flip +%= 1;
+    const list = &custom_terms[custom_flip];
+    @memcpy(list[0..terms.len], &terms);
+    list[terms.len] = .{ .value = current, .label = current };
+    return list;
+}
+const binds = [_]W.SelectOption{
+    .{ .value = "127.0.0.1", .label = "127.0.0.1" },
+    .{ .value = "0.0.0.0", .label = "0.0.0.0" },
+};
+fn bindOptions() []const W.SelectOption {
+    return &binds;
+}
+
+pub fn SshPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.ssh" style={S.category_panes}>
+            <R.Pane vm={vm} pane={connection}>
+                <R.InputRow vm={vm} pane={connection} row={F.keepalive_sec} />
+                <R.InputRow vm={vm} pane={connection} row={F.connect_timeout_sec} />
+                <R.CustomSelectRow vm={vm} pane={connection} row={F.term} options={termOptions(vm)} noteId="settings.term.custom.note" note="自定义仅声明 TERM 名称，不保证对应终端兼容。" placeholder="输入 TERM 名称后按 Enter" />
+                <R.ToggleRow vm={vm} pane={connection} row={F.compression} />
+                <R.ToggleRow vm={vm} pane={connection} row={F.auto_shell_integration} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={reconnect}>
+                <R.ToggleRow vm={vm} pane={reconnect} row={F.auto_reconnect} />
+                <R.InputRow vm={vm} pane={reconnect} row={F.reconnect_max} />
+                <R.InputRow vm={vm} pane={reconnect} row={F.reconnect_backoff} />
+                <R.ToggleRow vm={vm} pane={reconnect} row={F.buffer_input} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={socks}>
+                <R.InputRow vm={vm} pane={socks} row={F.socks_port} />
+                <R.SelectRow vm={vm} pane={socks} row={F.socks_bind} options={bindOptions()} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={authentication}>
+                <R.ToggleRow vm={vm} pane={authentication} row={F.otp_modal} />
+                <R.ToggleRow vm={vm} pane={authentication} row={F.totp_autofill} />
+            </R.Pane>
+        </box>
+    );
+}

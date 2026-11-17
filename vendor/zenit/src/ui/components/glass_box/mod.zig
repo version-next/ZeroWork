@@ -103,8 +103,13 @@ pub const GlassBoxProps = struct {
     /// Title/subtitle (empty string = none; can pass signal: hidden when empty).
     title: Source([]const u8) = .{ .value = "" },
     subtitle: Source([]const u8) = .{ .value = "" },
+    /// Fixed width / height (pt); null = fit the content. See `fill` for following the parent.
     width: ?f32 = null,
     height: ?f32 = null,
+    /// Stretch with the parent on an axis (CSS `width` / `height: 100%` with `min-*: 0`): the root
+    /// fills the parent and the content / body wrappers grow with it, so a body child with
+    /// `flex: 1` (a ScrollArea) gets the remaining space. Wins over `width` / `height` on that axis.
+    fill: GlassBoxFill = .none,
     padding: ?Padding = null,
     body_gap: f32 = 12,
     /// `NSGlassEffectView.cornerRadius`; null = the idiom profile's default (macOS 8).
@@ -170,12 +175,27 @@ pub const GlassBoxProps = struct {
 
 pub const ScrollEdge = enum(u8) { top = 1, bottom = 2, left = 3, right = 4 };
 
+/// `GlassBoxProps.fill`: which axes follow the parent instead of a fixed / fitted size.
+pub const GlassBoxFill = enum {
+    none,
+    width,
+    height,
+    both,
+
+    pub fn horizontal(self: GlassBoxFill) bool {
+        return self == .width or self == .both;
+    }
+    pub fn vertical(self: GlassBoxFill) bool {
+        return self == .height or self == .both;
+    }
+};
+
 pub const GlassArrowEdge = enum(u8) { bottom = 1, top = 2, left = 3, right = 4 };
 
 /// The iOS `_UILiquidLensView` as used by each control: the same filter stack with different
 /// inputs (tab: displacement 9, inner refraction -17.5 over 7 pt, aberration 3.68; slider thumb:
 /// displacement 0, -18.5 over 6.66 pt, aberration 1.95; switch knob: displacement 9, -19.2 over
-/// 6.9 pt, aberration 2.02), so a separately measured field each (glass.metal lens_sample_depth).
+/// 6.9 pt, aberration 2.02), so a separately measured field each (glass.metal lens_sample_point).
 pub const LensVariant = enum(u8) {
     tab = 0,
     slider_thumb = 1,
@@ -294,8 +314,9 @@ fn tabLensEnvOverride() void {
 /// the dark band only appears where the lifted lens overhangs the platter by 3 pt or more) and
 /// fades out into the body (GlassParams.tab_lens).
 pub const tab_lens = struct {
-    /// (The displacement field is the measured native table in glass.metal,
-    /// tab_lens_sample_depth; GlassParams.tab_lens[0] > 0 only marks the material.)
+    /// (The displacement field is the measured native table glass.metal's tab_lens_field
+    /// reads (src/render/tab_lens_field_table.zig); GlassParams.tab_lens[0] > 0 only marks the
+    /// material.)
     /// Coating offset in sRGB levels (negative darkens)
     pub var offset: f32 = -5.0;
     /// Rim: a 1 px wide line of this sRGB value centred `rim_inset` px inside the contour
@@ -343,6 +364,9 @@ pub const ScrollEdgeBinding = struct {
     style: ScrollEdgeStyle = .automatic,
     /// Gradient band width (logical pixels)
     fade_width: f32 = 32,
+    /// `.soft` only: length (logical pixels) from the edge held at full blur before the fade
+    /// starts (CSS `blur 0%, blur <hold>, none <hold + fade_width>`). 0 = fade from the edge.
+    hold: f32 = 0,
     /// Scroll distance needed for full intensity (logical pixels)
     ramp_distance: f32 = 28,
     max_strength: f32 = 0.9,
@@ -402,7 +426,15 @@ pub const GlassBoxBuilder = struct {
         // string)
         const want_title = !p.title.isStatic() or p.title.peek().len > 0;
         const want_subtitle = !p.subtitle.isStatic() or p.subtitle.peek().len > 0;
-        const grow_if_sized: core.Sizing = if (p.height != null) .{ .grow = .{} } else .{ .fit = .{} };
+        // An explicitly sized glass panel is a viewport; long content must not
+        // impose its intrinsic minimum on the content/body wrappers.
+        // A filled height is a viewport too: the wrappers take the root's height.
+        const sized = p.height != null or p.fill.vertical();
+        const grow_if_sized: core.Sizing = if (sized) .{ .grow = .{ .min = 0 } } else .{ .fit = .{} };
+        // The same floor as ext `min-height: 0` too: callers that retype the body's height
+        // (`body.style.height = .{ .grow = .{} }`, a row of controls) keep the zero minimum, which
+        // a Sizing `.min` would lose (docs/design/flex-slot-automatic-minimum.md).
+        const min_if_sized: ?f32 = if (sized) 0 else null;
         var title_style = glassTitleStyle(tokens);
         if (p.glass_style == .clear) title_style.color = Color.WHITE;
         var subtitle_style = glassSubtitleStyle(tokens);
@@ -413,8 +445,8 @@ pub const GlassBoxBuilder = struct {
         var parts: Parts = .{};
         const root = try view.render(my_scope, cx, view.col(.{
             .style = core.BoxStyle{
-                .width = if (p.width) |value| .{ .px = value } else .{ .fit = .{} },
-                .height = if (p.height) |value| .{ .px = value } else .{ .fit = .{} },
+                .width = if (p.fill.horizontal()) .{ .grow = .{ .min = 0 } } else if (p.width) |value| .{ .px = value } else .{ .fit = .{} },
+                .height = if (p.fill.vertical()) .{ .grow = .{ .min = 0 } } else if (p.height) |value| .{ .px = value } else .{ .fit = .{} },
                 .position = .relative,
                 // interactive / press feedback: hover / press go through root's event handler (see
                 // on_event below)
@@ -428,13 +460,17 @@ pub const GlassBoxBuilder = struct {
             //    composites into
             //    rectangular chunks (framework bug); 2) an absolute surface misaligns backdrop
             //    sampling.
-            view.capture(&parts.surface, view.col(.{ .style = core.BoxStyle{
-                .width = .{ .grow = .{} },
-                .height = .{ .grow = .{} },
-                .border = .{ .width = 1, .color = Color.rgba(255, 255, 255, 112), .radius = corner_radius },
-                .background = Color.rgba(255, 255, 255, 16),
-                .corner_radius = corner_radius,
-            } }, .{
+            view.capture(&parts.surface, view.col(.{
+                .style = core.BoxStyle{
+                    .width = .{ .grow = .{} },
+                    // The painted surface follows the wrapper, even when padded
+                    // content needs more room. Its content clip handles overflow.
+                    .height = .{ .grow = .{ .min = 0 } },
+                    .border = .{ .overlay = true, .width = 1, .color = Color.rgba(255, 255, 255, 112), .radius = corner_radius },
+                    .background = Color.rgba(255, 255, 255, 16),
+                    .corner_radius = corner_radius,
+                },
+            }, .{
                 view.capture(&parts.content, view.col(.{
                     .style = core.BoxStyle{
                         .width = .{ .grow = .{} },
@@ -461,6 +497,7 @@ pub const GlassBoxBuilder = struct {
                     view.capture(&parts.body, view.col(.{ .style = core.BoxStyle{
                         .width = .{ .grow = .{} },
                         .height = grow_if_sized,
+                        .min_height = min_if_sized,
                         .gap = p.body_gap,
                     } }, {})),
                 })),
@@ -537,6 +574,11 @@ pub const GlassBoxBuilder = struct {
         }
         adaptive.root = root;
         root.meta.per_frame.hooks.slots.anim_state = @ptrCast(adaptive);
+        // The hook writes the surface / group surface / content through dirty-marking entries
+        // (markGlassSurfaceDirty, setContentClipExt, setOpacity, setShadow), so the glass content
+        // subtree stays cacheable across frames (audited in Debug). Declared before registering:
+        // registration marks an undeclared hook's ancestors untrusted for good.
+        root.frame_state.state_bits.flags.before_render_hook_descendants_cache_safe = true;
         root.addBeforeRender(glassBoxBeforeRender);
 
         if (wants_pointer) {
@@ -549,7 +591,7 @@ pub const GlassBoxBuilder = struct {
         // first luminance reading lands (see AdaptiveGlassBoxState.family_probe).
         // Apply the fallback once first so tests do not read empty params after mount.
         const initial = resolvedGlassBoxStyle(glass_profile, tokens, p.readability, p.emphasis, if (p.enabled) p.glass_style else .identity, tint_color, 220, p.height orelse 140, corner_radius, null, if (adapts) (if (adaptive.family_dark) MaterialFamily.dark else .light) else .appearance);
-        applyAdaptiveGlass(root, adaptive, initial);
+        try applyAdaptiveGlass(root, adaptive, initial);
 
         return .{ .box = root, .body = body };
     }
@@ -574,7 +616,7 @@ pub const GlassBoxMount = struct {
 /// parameter fields at both ends transition field by field. root must be absolutely positioned
 /// (caller layout contract).
 pub fn glassMorphTo(state: *AdaptiveGlassBoxState, spec: MorphSpec) void {
-    if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) std.debug.print("[morph] glassMorphTo called root={}\n", .{state.root != null});
+    if (@import("zenit_environment").flag("ZENIT_DEBUG_GLASS")) std.debug.print("[morph] glassMorphTo called root={}\n", .{state.root != null});
     const root = state.root orelse return;
     const lr = root.rectFromWorldOrFallback();
     const r: struct { x: f32, y: f32, w: f32, h: f32 } = if (spec.from) |f| .{ .x = f[0], .y = f[1], .w = f[2], .h = f[3] } else .{ .x = lr.x, .y = lr.y, .w = lr.w, .h = lr.h };
@@ -720,6 +762,11 @@ pub const AdaptiveGlassBoxState = struct {
     transition: GlassTransition = .materialize,
     materialize: ?MaterializeState = null,
     materialize_level: f32 = 1.0,
+    /// The content fades with materialize_level: set for container members that a transaction
+    /// inserts or removes (the view enters / leaves the hierarchy). Plain glassEffect(isEnabled:)
+    /// keeps its content when the glass switches off, so this is off by default. Once set it stays:
+    /// a member that transactions insert / remove is not also an isEnabled-style toggle.
+    content_follows_presence: bool = false,
     /// Glass parameters this frame, before materialize modulation (container-shared source)
     group_shared_glass: ?types.GlassParams = null,
     root: ?*Node = null,
@@ -933,7 +980,7 @@ pub fn enterGroupMode(state: *AdaptiveGlassBoxState, link: *GlassGroupLink, inde
     const ext = state.surface.style.ensureExtFallible(state.allocator) catch return;
     ext.glass = null;
     state.surface.setBackgroundRaw(Color.rgba(0, 0, 0, 0));
-    state.surface.style.border = .{ .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = state.radius };
+    state.surface.style.border = .{ .overlay = true, .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = state.radius };
     markGlassSurfaceDirty(state);
 }
 
@@ -1427,6 +1474,13 @@ pub fn glassSetEnabledImmediate(state: *AdaptiveGlassBoxState, enabled: bool) vo
     state.cx.needs_redraw = true;
 }
 
+/// Initial presence of a container member that a later transaction inserts or removes: an absent
+/// member shows neither glass nor content (the view is not in the hierarchy yet).
+pub fn glassSetPresentImmediate(state: *AdaptiveGlassBoxState, present: bool) void {
+    state.content_follows_presence = true;
+    glassSetEnabledImmediate(state, present);
+}
+
 /// Drive the materialization level directly (0 = absent, 1 = full glass), for glass whose presence
 /// follows a gesture rather than a timed transition (the iOS tab selection lens).
 pub fn glassSetMaterializeLevel(state: *AdaptiveGlassBoxState, level: f32) void {
@@ -1712,6 +1766,34 @@ pub fn scrollEdgeStops(fade_width: f32, extent: f32, base_blur_level: f32) [2]co
     };
 }
 
+/// `scrollEdgeStops` with a plateau: full blur from the edge across `hold`, then the soft fade
+/// across `fade_width` back to `base_blur_level` (a header that floats over the band keeps the
+/// content under it fully frosted; only the strip below it fades). `hold` <= 0 gives exactly the
+/// two `scrollEdgeStops` stops. Positions clamp to [0, 1].
+pub const ScrollEdgeProfile = struct {
+    stops: [3]core.BlurGradient.Stop,
+    len: u8,
+
+    pub fn slice(self: *const ScrollEdgeProfile) []const core.BlurGradient.Stop {
+        return self.stops[0..self.len];
+    }
+};
+
+pub fn scrollEdgeProfile(hold: f32, fade_width: f32, extent: f32, base_blur_level: f32) ScrollEdgeProfile {
+    if (hold <= 0) {
+        const two = scrollEdgeStops(fade_width, extent, base_blur_level);
+        return .{ .stops = .{ two[0], two[1], two[1] }, .len = 2 };
+    }
+    const span = @max(extent, 1);
+    const hold_end = clampf(hold / span, 0, 1);
+    const fade_end = clampf((hold + @max(fade_width, 0)) / span, hold_end, 1);
+    return .{ .stops = .{
+        .{ .pos = 0, .strength = 1 },
+        .{ .pos = hold_end, .strength = 1 },
+        .{ .pos = fade_end, .strength = clampf(base_blur_level, 0, 1) },
+    }, .len = 3 };
+}
+
 /// shape -> current size corner radius (capsule/circle half short edge)
 pub fn shapeRadius(shape: ?GlassBoxShape, fallback: f32, w: f32, h: f32) f32 {
     const sh = shape orelse return fallback;
@@ -1870,7 +1952,7 @@ fn glassBoxBeforeRender(node: *Node) void {
             state.live_luminance = target_lum;
         }
     }
-    if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
+    if (@import("zenit_environment").flag("ZENIT_DEBUG_GLASS")) {
         std.debug.print("[glassbr] node={d} surf={d} measured={d:.4} live={d:.4} interp={} cache_dis={} boost={d:.2}\n", .{
             node.id,
             state.surface.id,
@@ -1885,7 +1967,7 @@ fn glassBoxBeforeRender(node: *Node) void {
     // morph: geometry interpolation + glass parameter field transition (during progress takes over
     // apply, skip normal adapt)
     if (state.morph) |*m| {
-        if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
+        if (@import("zenit_environment").flag("ZENIT_DEBUG_GLASS")) {
             const rr = node.rectFromWorldOrFallback();
             std.debug.print("[morph] tick t={d:.2} rect=({d:.0},{d:.0},{d:.0}x{d:.0})\n", .{ m.t, rr.x, rr.y, rr.w, rr.h });
         }
@@ -1923,14 +2005,15 @@ fn glassBoxBeforeRender(node: *Node) void {
         var to_style = familyStyle(state, m.to_readability, m.to_emphasis, if (state.enabled) m.to_variant else .identity, effectiveTint(state), w, h);
         applyInactiveTint(state, &from_style);
         applyInactiveTint(state, &to_style);
-        applyShapeExtras(state, &from_style);
-        applyShapeExtras(state, &to_style);
+        applyShapeExtras(state, &from_style, w, h);
+        applyShapeExtras(state, &to_style, w, h);
         var style = lerpGlassBoxStyle(from_style, to_style, t);
         // Mid-morph native frames show fractional edge coverage: the shape is
         // rasterized continuously while animating, and snaps only at rest.
         style.glass.native_continuous_geometry = m.t < 1.0;
         state.group_shared_glass = style.glass;
-        applyAdaptiveGlass(node, state, style);
+        // OOM: this frame is skipped and the morph does not advance; the next frame retries
+        applyAdaptiveGlass(node, state, style) catch return;
         if (m.t >= 1.0) {
             // transition complete: taken-over profile settled, resume normal adapt
             state.readability = m.to_readability;
@@ -2009,7 +2092,7 @@ fn glassBoxBeforeRender(node: *Node) void {
     };
     var resolved = familyStyle(state, state.readability, state.emphasis, effective_variant, effectiveTint(state), width, height);
     applyInactiveTint(state, &resolved);
-    applyShapeExtras(state, &resolved);
+    applyShapeExtras(state, &resolved, width, height);
 
     // scroll-edge effect: scroll position -> target strength, smoothed interpolation into glass
     // parameters
@@ -2035,10 +2118,12 @@ fn glassBoxBeforeRender(node: *Node) void {
             .top, .bottom => height,
             .left, .right => width,
         };
-        const edge_stops: [2]core.BlurGradient.Stop = if (binding.style == .hard)
-            .{ .{ .pos = 0, .strength = 1 }, .{ .pos = 1, .strength = 1 } }
+        const edge_profile: ScrollEdgeProfile = if (binding.style == .hard)
+            .{ .stops = .{ .{ .pos = 0, .strength = 1 }, .{ .pos = 1, .strength = 1 }, .{ .pos = 1, .strength = 1 } }, .len = 2 }
         else
-            scrollEdgeStops(binding.fade_width, extent, resolved.glass.blur_level);
+            // A `.blur_only` layer has no glass frosting of its own to fall back to: its edge fades
+            // all the way to sharp (UIScrollEdgeEffect over plain content, no bar platter).
+            scrollEdgeProfile(binding.hold, binding.fade_width, extent, if (state.material == .blur_only) 0 else resolved.glass.blur_level);
         resolved.glass.blur_gradient = (core.BlurGradient{
             .direction = switch (binding.edge) {
                 .top => .to_bottom,
@@ -2047,7 +2132,7 @@ fn glassBoxBeforeRender(node: *Node) void {
                 .right => .to_left,
             },
             .strength = state.edge_strength,
-        }).withStops(&edge_stops);
+        }).withStops(edge_profile.slice());
     }
 
     // press feedback: only system .glass button style (frame switch); custom interactive glass
@@ -2067,7 +2152,8 @@ fn glassBoxBeforeRender(node: *Node) void {
     // glass stays in backdrop render pass. Opacity composites in linear light in Metal; 0.9 gives
     // recorded native foreground contrast, not much paler sRGB 0.7 blend.
     const content_opacity: f32 = if (state.interactive) 1.0 - 0.1 * std.math.clamp((state.glass_boost - 0.45) / 0.55, 0, 1) else 1.0;
-    state.content.setOpacity(content_opacity);
+    const presence: f32 = if (state.content_follows_presence) std.math.clamp(level, 0.0, 1.0) else 1.0;
+    state.content.setOpacity(content_opacity * presence);
 
     if (@abs(width - state.last_width) <= 0.5 and
         @abs(height - state.last_height) <= 0.5 and
@@ -2078,12 +2164,13 @@ fn glassBoxBeforeRender(node: *Node) void {
         return;
     }
 
-    applyAdaptiveGlass(node, state, resolved);
+    // OOM: nothing changed and last_style still differs, so the next frame applies it again
+    applyAdaptiveGlass(node, state, resolved) catch return;
 }
 
 /// popover arrow and shadow toggle: geometry exterior is node, doesn't follow material
 /// interpolation
-fn applyShapeExtras(state: *const AdaptiveGlassBoxState, r: *ResolvedGlassBoxStyle) void {
+fn applyShapeExtras(state: *const AdaptiveGlassBoxState, r: *ResolvedGlassBoxStyle, width: f32, height: f32) void {
     r.glass.arrow = state.arrow;
     if (!state.drop_shadow) r.shadow.color.a = 0;
     if (state.material == .knob_lens) {
@@ -2105,7 +2192,9 @@ fn applyShapeExtras(state: *const AdaptiveGlassBoxState, r: *ResolvedGlassBoxSty
         g.native_tint_mode = 0;
         // sRGB layer out = 0.84*in + 28.5 (gray 128->136, 115->125, 104->116) = 178 gray 16%
         g.glass_tint = Color.rgba(178, 178, 178, @intFromFloat(@round(knob_lens.veil_alpha * 255)));
-        const h = @max(state.radius, 1);
+        // The lens scales with the corner radius the knob actually draws (fitted to its size, as
+        // the glass shape normalises it), not the requested one: `.rounded = 9999` is a capsule.
+        const h = @max(@min(state.radius, @min(width, height) / 2), 1);
         // The native knob lens is a minifying (shrinking) lens: edge pixels sample content further
         // outward (so the inner track appears smaller).
         g.refraction_level = -1;
@@ -2204,7 +2293,12 @@ fn applyShapeExtras(state: *const AdaptiveGlassBoxState, r: *ResolvedGlassBoxSty
     if (state.material == .blur_only) {
         const g = &r.glass;
         g.backdrop_blur = @max(state.blur_radius, 1);
-        g.blur_level = 1;
+        // The shader's BlurGradient.strength fades between this uniform base and the gradient
+        // profile (local = mix(blur_level, profile, strength)). A plain blur layer is uniformly
+        // blurred; a scroll-edge band has no frosting of its own, so its base is sharp: at rest
+        // (strength 0) it must not blur the content under it at all (UIScrollEdgeEffect shows
+        // nothing until content scrolls under the edge).
+        g.blur_level = if (state.scroll_edge != null) 0 else 1;
         g.native_fine_sigma = 0;
         g.native_coarse_sigma = 0;
         g.native_fine_weight = 0;
@@ -2281,29 +2375,50 @@ fn baseVeil(state: *AdaptiveGlassBoxState, resolved: ResolvedGlassBoxStyle, w: f
     return .{ @as(f32, @floatFromInt(veil.r)) / 255.0, @as(f32, @floatFromInt(veil.a)) / 255.0 };
 }
 
+/// Mirrors render backdrop_blur.singleRadiusShape: the popover silhouette (arrow) and the tab
+/// lens carry one corner radius, so a non-uniform (concentric) request draws its largest corner.
+fn singleRadiusShape(state: *const AdaptiveGlassBoxState) bool {
+    return state.arrow[0] > 0.5 or state.material == .tab_lens;
+}
+
+/// The glass shape's corners as written on the surface, the content clip and the root (shadow and
+/// hit shape): every one of them reads this, and the renderer fits it to each rect it evaluates.
+fn glassCorners(state: *const AdaptiveGlassBoxState) CornerRadius {
+    if (state.corner_radii) |r4| {
+        if (!singleRadiusShape(state)) return .{ .each = r4 };
+        return CornerRadius.uniform(@max(@max(r4[0], r4[1]), @max(r4[2], r4[3])));
+    }
+    return CornerRadius.uniform(state.radius);
+}
+
 /// The content clip follows the glass shape (capsule / circle / concentric radii change with
 /// the laid-out size).
-fn setContentClip(state: *AdaptiveGlassBoxState, corners: CornerRadius) void {
-    const content = state.content;
-    const ext = content.style.ensureExtFallible(state.allocator) catch return;
+fn setContentClipExt(content: *Node, ext: *types.StyleExt, corners: CornerRadius) void {
     if (std.meta.eql(ext.corner_radius, corners)) return;
     ext.corner_radius = corners;
     content.markRenderDirty();
 }
 
-fn applyAdaptiveGlass(node: *Node, state: *AdaptiveGlassBoxState, resolved: ResolvedGlassBoxStyle) void {
+/// Apply a resolved glass style to the box (surface, content clip, root shadow; a group member
+/// writes its container's shape table instead). All or nothing: every ext block it writes is
+/// reserved before anything changes, so `error.OutOfMemory` leaves the box exactly as it was.
+/// Mount propagates the error; the per-frame callers skip the frame, and since `last_style` was
+/// not updated the next frame applies it again.
+fn applyAdaptiveGlass(node: *Node, state: *AdaptiveGlassBoxState, resolved: ResolvedGlassBoxStyle) error{OutOfMemory}!void {
     const surface = state.surface;
+    const ext = try surface.style.ensureExtFallible(state.allocator);
+    const content_ext = try state.content.style.ensureExtFallible(state.allocator);
+    const root_ext = try node.style.ensureExtFallible(state.allocator);
     if (state.group) |g| {
+        const gext: ?*types.StyleExt = if (state.group_index == 0 and state.group_index < g.table.shapes.len) try g.surface.style.ensureExtFallible(state.allocator) else null;
         // member: geometry and material into container shape table; own surface doesn't draw
         // glass/background/stroke, shadow still on root (shadow only outer shape, painted after
         // container glass not darken interior).
         surface.setBackgroundRaw(Color.rgba(0, 0, 0, 0));
-        surface.style.border = .{ .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = state.radius };
-        const ext = surface.style.ensureExtFallible(state.allocator) catch return;
+        surface.style.border = .{ .overlay = true, .width = 0, .color = Color.rgba(0, 0, 0, 0), .radius = state.radius };
         ext.corner_radius = CornerRadius.uniform(state.radius);
         ext.glass = null;
-        setContentClip(state, CornerRadius.uniform(state.radius));
-        const root_ext = node.style.ensureExtFallible(state.allocator) catch return;
+        setContentClipExt(state.content, content_ext, CornerRadius.uniform(state.radius));
         root_ext.corner_radius = CornerRadius.uniform(state.radius);
         // shadow by container glass pass union SDF (continuous under bridge); member own shadow
         // off.
@@ -2342,12 +2457,11 @@ fn applyAdaptiveGlass(node: *Node, state: *AdaptiveGlassBoxState, resolved: Reso
             };
             if (g.table.count < idx + 1) g.table.count = @intCast(idx + 1);
             g.table.version +%= 1;
-            if (idx == 0) {
+            if (gext) |shared| {
                 // shared items (blur bank, chroma aperture) from member 0 material
-                const gext = g.surface.style.ensureExtFallible(state.allocator) catch return;
                 var gp = state.group_shared_glass orelse resolved.glass;
                 gp.group = g.table;
-                gext.glass = gp;
+                shared.glass = gp;
             }
         }
         state.last_style = resolved;
@@ -2355,25 +2469,26 @@ fn applyAdaptiveGlass(node: *Node, state: *AdaptiveGlassBoxState, resolved: Reso
         state.last_height = r.h;
         state.last_rel_x = r.x - c.x;
         state.last_rel_y = r.y - c.y;
+        // root shadow / corner radius changed with the style: the root's own content too
+        // (descendants_cache_safe contract).
+        node.markRenderDirty();
         markGlassSurfaceDirty(state);
         return;
     }
     surface.setBackgroundRaw(resolved.background);
     surface.style.border = .{
+        .overlay = true,
         .width = 1,
         .color = resolved.border_color,
         .radius = state.radius,
     };
 
-    // no abort per-frame (sweep measured mount period OOM direct signal 6), fail skip this frame
-    const ext = surface.style.ensureExtFallible(state.allocator) catch return;
-    const corners: CornerRadius = if (state.corner_radii) |r4| .{ .each = r4 } else CornerRadius.uniform(state.radius);
+    const corners = glassCorners(state);
     ext.corner_radius = corners;
     ext.glass = resolved.glass;
-    setContentClip(state, corners);
+    setContentClipExt(state.content, content_ext, corners);
     // shadow on root wrapper: glass node with shadow triggers rect subdivide (see mountBody
     // comment)
-    const root_ext = node.style.ensureExtFallible(state.allocator) catch return;
     root_ext.corner_radius = corners;
     root_ext.setShadow(resolved.shadow);
     // intentional no micro-scale: any non-1 scale makes root go opacity-layer offscreen composite,
@@ -2387,6 +2502,7 @@ fn applyAdaptiveGlass(node: *Node, state: *AdaptiveGlassBoxState, resolved: Reso
     const r = node.rectFromWorldOrFallback();
     state.last_width = r.w;
     state.last_height = r.h;
+    node.markRenderDirty();
     markGlassSurfaceDirty(state);
 }
 
@@ -3433,6 +3549,28 @@ test "GlassBox: scroll-edge 渐变 stops 不低于玻璃基底糊度" {
     try std.testing.expectEqual(@as(f32, 1), scrollEdgeStops(80, 44, 0.8)[1].pos);
 }
 
+test "GlassBox: scroll-edge hold keeps full blur from the edge, then fades; hold 0 is the two-stop fade" {
+    // hold 0: byte-identical to scrollEdgeStops (existing bands unchanged)
+    const plain = scrollEdgeProfile(0, 28, 44, 0.5);
+    const two = scrollEdgeStops(28, 44, 0.5);
+    try std.testing.expectEqual(@as(u8, 2), plain.len);
+    try std.testing.expectEqualSlices(core.BlurGradient.Stop, &two, plain.slice());
+    // hold 22.8 of 76, fade 53.2: CSS `blur 0%, blur 30%, none 100%`
+    const held = scrollEdgeProfile(22.8, 53.2, 76, 0);
+    try std.testing.expectEqual(@as(u8, 3), held.len);
+    try std.testing.expectEqual(@as(f32, 0), held.stops[0].pos);
+    try std.testing.expectEqual(@as(f32, 1), held.stops[0].strength);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), held.stops[1].pos, 1e-5);
+    try std.testing.expectEqual(@as(f32, 1), held.stops[1].strength);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), held.stops[2].pos, 1e-5);
+    try std.testing.expectEqual(@as(f32, 0), held.stops[2].strength);
+    // never below the glass base; positions clamp and stay ascending
+    const over = scrollEdgeProfile(60, 80, 44, 0.7);
+    try std.testing.expectEqual(@as(f32, 1), over.stops[1].pos);
+    try std.testing.expectEqual(@as(f32, 1), over.stops[2].pos);
+    try std.testing.expectEqual(@as(f32, 0.7), over.stops[2].strength);
+}
+
 test "glass_box: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("glass_box", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
@@ -3820,4 +3958,118 @@ test "GlassBox: re-entering the adaptive family starts from the appearance (no l
     const clear_light = familyStyle(m.state, .preferred, .regular, .clear, null, 104, 52);
     try std.testing.expect(clear_dark.glass.native_tint_dark > 0.99);
     try std.testing.expect(clear_light.glass.native_tint_dark < 0.01);
+}
+
+test "GlassBox: single-radius glass shapes (arrow, tab lens) clip and hit with the corner the glass draws" {
+    // Concentric glass whose corners differ: only the plain shape keeps them per corner. A popover
+    // arrow or a tab lens silhouette carries one radius in the glass shader (and in the encoder,
+    // backdrop_blur.shapeRadii), so the surface, the content clip and the root hit / shadow shape
+    // take the same largest corner instead of disagreeing with the drawn glass.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 900 }, .height = .{ .px = 400 }, .direction = .row }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const Case = struct { arrow: ?GlassArrow, material: GlassMaterial, want: CornerRadius };
+    const cases = [_]Case{
+        .{ .arrow = null, .material = .standard, .want = .{ .each = .{ 12, 0, 0, 0 } } },
+        .{ .arrow = .{}, .material = .standard, .want = CornerRadius.uniform(12) },
+        .{ .arrow = null, .material = .tab_lens, .want = CornerRadius.uniform(12) },
+    };
+    var mounts: [cases.len]GlassBoxMount = undefined;
+    for (cases, 0..) |c, i| {
+        // Container shape radius 30, glass inset (6, 18): TL = 30 - 18 = 12, the far corners 0.
+        const container = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 120 }, .padding = .{ .left = 6, .top = 18 } }, .{});
+        try root.appendChild(std.testing.allocator, container);
+        try concentric_mod.containerShape(container, ctx.allocator, 30);
+        mounts[i] = try GlassBox(.{ .width = 120, .height = 60, .shape = .{ .concentric = 0 }, .arrow = c.arrow, .material = c.material }).mountWithState(scope, ctx);
+        try container.appendChild(std.testing.allocator, mounts[i].box);
+    }
+    ctx.layout();
+    for (cases, mounts) |c, m| {
+        runBeforeRenderHooks(m.box);
+        try std.testing.expectEqual([4]f32{ 12, 0, 0, 0 }, m.state.corner_radii.?);
+        try std.testing.expectEqual(c.want, m.state.surface.style.ext.?.corner_radius.?);
+        try std.testing.expectEqual(c.want, m.state.content.style.ext.?.corner_radius.?);
+        try std.testing.expectEqual(c.want, m.box.style.ext.?.corner_radius.?);
+    }
+}
+
+test "GlassBox bounded sidebar keeps scroll viewport below content height" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 1000 }, .direction = .column }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const glass = try GlassBox(.{ .width = 200, .height = 1, .padding = Padding.ZERO, .body_gap = 0 }).mountWithState(scope, ctx);
+    glass.box.style.height = .{ .grow = .{ .min = 0 } };
+    try root.appendChild(ctx.allocator, glass.box);
+    const scroll = try @import("../scroll_area/mod.zig").ScrollArea(.{ .direction = .vertical }).mount(scope, ctx);
+    try glass.body.appendChild(ctx.allocator, scroll.container);
+    const content = try box(ctx, .{ .width = .{ .px = 180 }, .height = .{ .px = 4000 } }, .{});
+    try scroll.content.appendChild(ctx.allocator, content);
+    ctx.layout();
+    try std.testing.expect(glass.box.rectFromWorldOrFallback().h <= 1000);
+    try std.testing.expect(scroll.container.rectFromWorldOrFallback().h <= 1000);
+    try std.testing.expect(scroll.content.rectFromWorldOrFallback().h >= 4000);
+}
+
+test "GlassBox: a sized body keeps its zero minimum when a caller retypes its height" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 }, .direction = .column, .align_items = .start }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const glass = try GlassBox(.{ .width = 200, .height = 56, .padding = Padding.ZERO, .body_gap = 0 }).mountWithState(scope, ctx);
+    try root.appendChild(ctx.allocator, glass.box);
+    // The bar pattern: a row of controls in the body, height retyped to a plain grow.
+    glass.body.style.direction = .row;
+    glass.body.style.height = .{ .grow = .{} };
+    _ = try core.adoptChild(ctx, ctx.allocator, glass.body, try box(ctx, .{ .width = .{ .px = 40 }, .height = .{ .px = 300 }, .flex_shrink = 0 }, .{}));
+    ctx.layout();
+    try std.testing.expectApproxEqAbs(@as(f32, 56), glass.box.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expect(glass.body.rectFromWorldOrFallback().h <= 56.5);
+}
+
+test "GlassBox: fill stretches root, content and body with the parent (flex child gets the rest)" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .fixed(900), .height = .fixed(400), .direction = .row }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const Probe = struct {
+        fn mount(c: *Cx, s: *Scope, fill: GlassBoxFill) !struct { glass: *Node, rest: *Node } {
+            const g = try GlassBox(.{ .width = 120, .fill = fill, .padding = Padding.all(10), .body_gap = 0 }).mountWithState(s, c);
+            _ = try core.adoptChild(c, c.allocator, g.body, try box(c, .{ .width = .{ .grow = .{} }, .height = .fixed(40) }, .{}));
+            const rest = try core.adoptChild(c, c.allocator, g.body, try box(c, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{ .min = 0 } } }, .{}));
+            return .{ .glass = g.box, .rest = rest };
+        }
+    };
+    // Height fill in a row: the root stretches on the cross axis, the body's flex child gets the
+    // height left after padding and the fixed sibling; width stays the fixed 120.
+    const tall = try Probe.mount(ctx, scope, .height);
+    try root.appendChild(std.testing.allocator, tall.glass);
+    // Default (no fill): the row still stretches the root, but the wrappers fit their content and
+    // the flex child gets nothing (ZeroWork G29).
+    const fit = try Probe.mount(ctx, scope, .none);
+    try root.appendChild(std.testing.allocator, fit.glass);
+    // Both axes inside a 300 x 400 column: the root takes the column's width too (wins over
+    // `width`).
+    const column = try box(ctx, .{ .width = .fixed(300), .height = .fixed(400), .direction = .column }, .{});
+    try root.appendChild(std.testing.allocator, column);
+    const both = try Probe.mount(ctx, scope, .both);
+    try column.appendChild(std.testing.allocator, both.glass);
+    ctx.layout();
+    try std.testing.expectApproxEqAbs(@as(f32, 400), tall.glass.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), tall.glass.rectFromWorldOrFallback().w, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 400 - 20 - 40), tall.rest.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), fit.rest.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), both.glass.rectFromWorldOrFallback().w, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), both.glass.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 400 - 20 - 40), both.rest.rectFromWorldOrFallback().h, 0.5);
 }

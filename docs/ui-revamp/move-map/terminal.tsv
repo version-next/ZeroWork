@@ -1,0 +1,79 @@
+old_path	new_path	layer	mixed	note
+src/builtin_records_tests.zig	src/features/terminal/tests/builtin_records_tests.zig	tests	no	import ui/terminal_document + history_cast + history_reading(history 包); e2e/builtin_records_test.sh 硬编码路径
+src/command_error_hint_tests.zig	src/features/terminal/tests/command_error_hint_tests.zig	tests	no	测 command_error_hint_view/terminal_view
+src/floating_input_tests.zig	src/shared/ui/zenit_ext/floating_input_tests.zig	tests	no	测 floating_input (shared_ui); 另 import plugins/bmc_ikvm/styles 与 file_workspace_styles 做覆盖; 随 floating_input 走
+src/terminal_focus_local_tests.zig	src/features/terminal/tests/terminal_focus_local_tests.zig	tests	no	import ui/terminal_view 与 ai_return_focus
+src/terminal_overlay_theme_tests.zig	src/features/terminal/tests/terminal_overlay_theme_tests.zig	tests	no	导入 terminal_view
+src/terminal_search_tests.zig	src/features/terminal/tests/terminal_search_tests.zig	tests	no	导入 terminal_search
+src/terminal_search_theme_tests.zig	src/features/terminal/tests/terminal_search_theme_tests.zig	tests	no	导入 terminal_search, app_theme, shell_styles
+src/terminal_surface_tests.zig	src/features/terminal/tests/terminal_surface_tests.zig	tests	no	包装文件, 导入 terminal_focus_local_tests 与 ui/terminal_surface_tests
+src/trusted_completion_ui_tests.zig	src/features/terminal/tests/trusted_completion_ui_tests.zig	tests	no	导入 terminal_view
+src/ui/builtin_commands.zig	src/vt/builtin_commands.zig	core	no	被 core import 间接: command_palette(->vt/ssh_shell_execution) 依赖它; 依赖 command_catalog(->ai); 建议随 command_palette 下沉到 vt (不 import ui)
+src/ui/builtin_completion.zig	src/host/builtin_completion.zig	core	no	被 core import: src/host/runtime_service.zig, src/plugins/ssh/runtime_binding.zig; 依赖 ai/execbridge 与 platform/account; 不 import ui; 超出 §5.2 已知名单
+src/ui/builtin_dispatch.zig	src/features/terminal/model/builtin_dispatch.zig	model	no	不 import ui
+src/ui/builtin_records_styles.zig	src/features/terminal/view/builtin_records_styles.zig	view	no	import ui; 样式跟随 terminal_document/视图
+src/ui/command_annotation_styles.zig	src/features/terminal/view/command_annotation_styles.zig	view	no	import ui
+src/ui/command_annotations.zig	src/features/terminal/model/command_annotations.zig	model	no	不 import ui
+src/ui/command_bar.zig	src/features/terminal/model/command_bar.zig	model	no	不 import ui; 依赖 host/runtime_service
+src/ui/command_catalog.zig	src/ai/command_catalog.zig	core	no	被 core import: src/ai/session_prompt.zig (§5.2 已知)
+src/ui/command_error_hint_styles.zig	src/features/terminal/view/command_error_hint_styles.zig	view	no	import ui
+src/ui/command_error_hint_view.zig	src/features/terminal/view/command_error_hint_view.zig	view	no	import ui; src/notification_preview_runner.zig 也引用它
+src/ui/command_help_view.zig	src/features/terminal/view/command_help_view.zig	view	no	import ui
+src/ui/command_history_styles.zig	src/features/terminal/view/command_history_styles.zig	view	no	import ui
+src/ui/command_history_view.zig	src/features/terminal/view/command_history_view.zig	view	no	import ui
+src/ui/command_palette.zig	src/vt/command_palette.zig	core	no	被 core import: src/vt/ssh_shell_execution.zig (LineTracker); 依赖 builtin_commands; 不 import ui; 超出 §5.2 已知名单
+src/ui/completion.zig	src/features/terminal/model/completion.zig	model	no	不 import ui
+src/ui/completion_controller.zig	src/features/terminal/model/completion_controller.zig	model	no	不 import ui 故归 model (无 ui 依赖的 controller)
+src/ui/completion_input.zig	src/features/terminal/model/completion_input.zig	model	no	不 import ui
+src/ui/completion_state.zig	src/features/terminal/model/completion_state.zig	model	no	不 import ui
+src/ui/floating_input.zig	src/shared/ui/zenit_ext/floating_input.zig	shared_ui	no	import ui; 被 workspace/history/notification/transfer/background_layers/layer_materials/main 及 config/settings_picker 共用的输入隔离策略, 非终端专属; 建议 shared/ui (也可由主 agent 裁决)
+src/ui/glyph_atlas.zig	src/features/terminal/model/glyph_atlas.zig	model	no	不 import ui; 仅被 root.zig 引用
+src/ui/history_cast.zig	src/vt/history_cast.zig	core	no	被 core import: src/local/recording.zig, src/vt/ssh_worker.zig (§5.2 已知); 传递依赖 history_replay(history 包), terminal_document, terminal_document_source 需一并考虑
+src/ui/local_close_styles.zig	src/features/terminal/view/local_close_styles.zig	view	no	import ui
+src/ui/local_close_view.zig	src/features/terminal/view/local_close_view.zig	view	no	import ui; status_detail_tests/theme_layer_tests 引用
+src/ui/local_command_state.zig	src/features/terminal/model/local_command_state.zig	model	no	不 import ui; 被 terminal_view/root.zig 引用
+src/ui/local_session_styles.zig	src/features/terminal/view/local_session_styles.zig	view	no	import ui
+src/ui/local_status_styles.zig	src/features/terminal/view/local_status_styles.zig	view	no	import ui
+src/ui/local_status_view.zig	src/features/terminal/view/local_status_view.zig	view	no	import ui
+src/ui/paste_policy.zig	src/host/paste_policy.zig	core	no	被 core import: src/host/terminal_service.zig (§5.2 已知)
+src/ui/reconnect_bridge.zig	src/features/terminal/host/reconnect_bridge.zig	host	no	不 import ui, 但按 §5.2 *_bridge 归 host; 依赖 vt/reconnect 与 session_tombstone(workspace 包)
+src/ui/terminal_cell_graphics.zig	src/features/terminal/view/terminal_cell_graphics.zig	view	no	import ui
+src/ui/terminal_document.zig	src/vt/terminal_document.zig	core	no	不 import ui; 被 history_cast(->vt) 传递依赖, 因此建议随之下沉; 依赖 terminal_record_geometry 与 donation_qr(非本包); 若主 agent 不愿下沉则退回 features/terminal/model/
+src/ui/terminal_document_source.zig	src/host/terminal_document_source.zig	core	no	被 core import: src/plugins/ssh/terminal_service.zig; 也被 history_cast(->vt) 依赖; 不 import ui; 超出 §5.2 已知名单
+src/ui/terminal_export.zig	src/features/terminal/host/terminal_export.zig	host	no	不 import ui; 做文件写入 I/O 故归 host; session_export(workspace) 与 terminal_view 引用
+src/ui/terminal_file_bridge.zig	src/features/terminal/host/terminal_file_bridge.zig	host	no	bridge + 线程原子量; 依赖 application_host 与 ai/plugin_tools
+src/ui/terminal_file_job.zig	src/features/terminal/host/terminal_file_job.zig	host	no	文件任务 + mutex; 依赖 application_host 与 ai; ai_local_tools_tests 引用
+src/ui/terminal_overlay_styles.zig	src/features/terminal/view/terminal_overlay_styles.zig	view	no	import ui
+src/ui/terminal_record_geometry.zig	src/vt/terminal_record_geometry.zig	core	no	被 core import: src/vt/search_snapshot.zig, src/vt/snapshot.zig (§5.2 已知); 引用 donation_qr.zig(非本包) 的 Slice 类型, 需一并下沉或解耦
+src/ui/terminal_scrollbar.zig	src/features/terminal/view/terminal_scrollbar.zig	view	no	import ui
+src/ui/terminal_search.zig	src/features/terminal/view/terminal_search.zig	view	no	import ui
+src/ui/terminal_search_styles.zig	src/features/terminal/view/terminal_search_styles.zig	view	no	import ui
+src/ui/terminal_selection.zig	src/features/terminal/model/terminal_selection.zig	model	no	不 import ui
+src/ui/terminal_status_snapshot.zig	src/features/terminal/model/terminal_status_snapshot.zig	model	no	不 import ui; ssh_status_host(connections 包) 也引用
+src/ui/terminal_styles.zig	src/features/terminal/view/terminal_styles.zig	view	no	import ui
+src/ui/terminal_surface.zig	src/features/terminal/view/terminal_surface.zig	view	yes	1525 行; 视图+输入+合成文档状态混合
+src/ui/terminal_surface_input.zig	src/features/terminal/view/terminal_surface_input.zig	view	no	import ui; 输入事件处理
+src/ui/terminal_surface_tests.zig	src/features/terminal/tests/terminal_surface_view_tests.zig	tests	no	2914 行; 与根目录 src/terminal_surface_tests.zig 同名冲突故改名 (被 root 包装文件及 background_surface_tests/settings_runtime_consumer_tests 以 ui/terminal_surface_tests.zig 路径 import)
+src/ui/terminal_view.zig	src/features/terminal/view/terminal_view.zig	view	yes	8469 行混合巨型文件(§5.2); 被 core import: src/host/runtime_service.zig (TerminalViewNode 类型/mountTerminal), 属 check-arch 基线违规, 留待 P5
+src/ui/timestamp_gutter.zig	src/vt/timestamp_gutter.zig	core	no	被 core import: src/vt/text_projection.zig (§5.2 已知)
+# CONTESTED src/ui/formatted_output.zig ai 仅被 src/ui/ai_tool_results_view.zig 与 src/ai_tool_results_view_tests.zig 使用, 实际是 AI 工具结果展示投影
+# CONTESTED src/ui/shortcut_router.zig shell 全局快捷键分类(切页签/侧栏/快速连接/复制), 非终端专属; 仅 root.zig 引用
+# CONTESTED src/ui/shortcut_dispatch.zig shell 依赖 workspace 的 pane_manager.Manager 做页签切换, 全局快捷键分发
+# CONTESTED src/keybinding_tests.zig settings 导入 config/keybinding_picker 与 config/keybindings (§5.2 归 settings)
+# CONTESTED src/keybinding_recorder_tests.zig settings 导入 config/keybinding_picker 与 config/keybindings (§5.2 归 settings)
+# CONTESTED src/terminal_execution_tests.zig root-core 主要测 ai/host/local; 仅一处 import ui/history_archive(history); build.zig 硬编码
+# CONTESTED src/host_terminal_queries_tests.zig ai 导入 ai/host_queries, ui/ai_host_terminal_queries, application_host, terminal_document_source
+# CONTESTED src/ssh_terminal_service_tests.zig connections 以 SSH 终端服务为主, 导入 ui/session_runtime 与 terminal_document
+# CONTESTED src/ssh_terminal_status_tests.zig connections 导入 ssh_status_host, connection_details_view, session_runtime, terminal_view
+# CONTESTED src/terminal_controller_tests.zig root-core 仅 import core(vt/host/proto), 不 import ui; build.zig 硬编码
+# CONTESTED src/command_metadata_tests.zig root-core 仅 import core(vt/host), 不 import ui
+# CONTESTED src/terminal_search_service_tests.zig root-core 仅 import core(vt), 不 import ui
+# CONTESTED src/local_adapter_tests.zig root-core 仅 import core(local/host/vt/config), 不 import ui; build.zig 硬编码
+# CONTESTED src/local_fs_service_tests.zig root-core 仅 import core, 不 import ui
+# CONTESTED src/local_process_tests.zig root-core 仅 import core, 不 import ui; build.zig 硬编码
+# CONTESTED src/local_trusted_edit_tests.zig root-core 仅 import core, 不 import ui; build.zig 硬编码
+# E2E e2e/builtin_records_test.sh 引用了 src/builtin_records_tests.zig
+# E2E tools/arch/baseline.txt 引用了 src/ui/{builtin_completion,command_catalog,command_palette,completion,history_cast,paste_policy,terminal_document_source,terminal_record_geometry,terminal_view,timestamp_gutter}.zig (P1 搬迁后需同步裁剪/更新基线)
+# E2E docs/DESIGN/V0.1.5_TERMINAL_HISTORY.md 等设计文档引用了若干 src/ui/ 旧路径 (仅文档, 可不处理)
+# TESTID terminal.
+# TESTID local.

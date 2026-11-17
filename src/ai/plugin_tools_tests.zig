@@ -5,7 +5,7 @@ const identity = @import("../host/identity.zig");
 const services = @import("../host/plugin_services.zig");
 const operations = @import("../host/operation_store.zig");
 const schema = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"session_ids\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":16,\"uniqueItems\":true,\"items\":{\"type\":\"integer\",\"minimum\":1}},\"value\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":20}},\"required\":[\"session_ids\",\"value\"]}";
-const captured: scope.Scope = .{ .owner = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
+const captured: scope.Scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{ .ids = .{ 101, 102 } ++ @as([14]u64, @splat(0)), .len = 2 } };
 const Fake = struct {
     count: usize = 0,
     fail: bool = false,
@@ -51,7 +51,7 @@ test "session capabilities narrow each host execution source independently in a 
     var fake: Fake = .{};
     const read_binding: tools.ToolBinding = .{ .plugin_id = "example", .definition_id = "read_terminal", .handler = Fake.handler };
     const members = [_]tools.Member{ member(&fake, 101, &.{read_binding}), member(&fake, 102, &.{read_binding}) };
-    const context: tools.host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = captured.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = captured.owner, .content = captured.content, .binding_revision = 1, .grant_revision = 1 };
     var contributions = @import("host_terminal_queries.zig").contributions ++ @import("host_execution.zig").contributions;
     for (&contributions) |*contribution| {
         if (std.mem.eql(u8, contribution.definition.id, "host.run_in_terminal")) contribution.session_targets = &.{members[0].owner};
@@ -122,7 +122,7 @@ test "host terminal read replaces the legacy catalog and advertises authorized h
     const read_binding: tools.ToolBinding = .{ .plugin_id = "example", .definition_id = "read_terminal", .handler = Fake.handler };
     var members = [_]tools.Member{ member(&fake, 101, &.{read_binding}), member(&fake, 102, &.{read_binding}) };
     members[1].authorized = false;
-    const context: @import("host_tools.zig").Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = captured.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: @import("host_tools.zig").Context = .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = captured.owner, .content = captured.content, .binding_revision = 1, .grant_revision = 1 };
     var table = try tools.RequestTable.initWithHost(a, captured, &.{@import("legacy_adapter.zig").builtin_definitions[1]}, &members, context, &@import("host_terminal_queries.zig").contributions);
     defer table.deinit();
     try std.testing.expect(table.lookup("read_terminal") == null);
@@ -167,7 +167,7 @@ test "dynamic tool directory keeps 300 frozen members while each call stays boun
         id.* = value;
         target.* = member(&fake, value, &.{binding});
     }
-    const wide: scope.Scope = .{ .owner = .{ .group = 7 }, .members = .{}, .inventory = &ids };
+    const wide: scope.Scope = .{ .owner = .{ .tab = 7 }, .content = .{ .group = 7 }, .members = .{}, .inventory = &ids };
     var table = try tools.RequestTable.init(a, wide, &.{definition()}, &members);
     defer table.deinit();
     var cloned = try tools.cloneTable(&table, a);
@@ -190,7 +190,7 @@ test "dynamic tool directory keeps 300 frozen members while each call stays boun
 
 test "tool name guidance in descriptions and recovery matches registered functions" {
     const a = std.testing.allocator;
-    const context: tools.host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = captured.owner, .binding_revision = 1, .grant_revision = 1 };
+    const context: tools.host.Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = captured.owner, .content = captured.content, .binding_revision = 1, .grant_revision = 1 };
     const contributions = @import("host_execution.zig").contributions ++ @import("host_queries.zig").contributions ++ @import("host_terminal_queries.zig").contributions;
     var table = try tools.RequestTable.initWithHost(a, captured, &.{}, &.{}, context, &contributions);
     defer table.deinit();
@@ -244,7 +244,7 @@ test "API2 plugin contributions cannot impersonate the host namespace" {
 
 test "host table captures conversation authority without a fake member and cannot enter plugin runtime" {
     const a = std.testing.allocator;
-    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
+    const context: tools.host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
     const host_definition: tools.ToolDefinition = .{ .id = "host.get_current_context", .schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" };
     const empty_scope: scope.Scope = .{ .owner = context.binding, .members = .{} };
     var table = try tools.RequestTable.initWithHost(a, empty_scope, &.{}, &.{}, context, &.{.{ .definition = host_definition, .authority = .conversation_context }});

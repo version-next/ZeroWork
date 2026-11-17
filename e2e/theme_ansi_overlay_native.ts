@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Native overlays over real local PTY truecolor output, without a wallpaper.
  * node e2e/theme_ansi_overlay_native.ts BINARY EVIDENCE_DIR [theme,theme]
@@ -8,12 +9,21 @@ import {mkdir,mkdtemp,readFile,writeFile,open,realpath,rm} from 'node:fs/promise
 import {join,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {aiToggleId} from './ai_entry.ts';
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]);await mkdir(out,{recursive:true});
 const palettes=nativeThemeData.themes;
 const themes=process.argv[4]?.split(',')??Object.keys(palettes);
 const report:any={status:'running',binary,binary_sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),cases:[],limits:['Actual local zsh PTY output; no external host or model request.','1440×900 pt, no background image, transparency 100, blur 0.','Black and white use explicit 24-bit SGR backgrounds, independent of each theme ANSI slots.']};
 const shown=(n:any)=>n?.rect&&n.visible!==false&&n.hidden!==true&&(n.effective_opacity??1)>0&&n.rect.w>0&&n.rect.h>0;
-const vis=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);
+// 终端画了 28 行逐格着色的输出之后，terminal.surface 的子树（每个着色格一个节点）超过 harness 256 KB 的结果缓冲，
+// query 返回 {error:"query result too large…"} 而不是数组。终端只需要它自己的矩形：用不带子树的 screen_pos。
+const node=async(id:string):Promise<any>=>{
+ const found:any=await h.query(id);
+ if(Array.isArray(found))return found.find(shown)??null;
+ assert(/too large/.test(String(found?.error)),`${id}: ${JSON.stringify(found)}`);
+ const p:any=await h.screenPos(id);return p&&p.w>0&&p.h>0?{test_id:id,rect:{x:p.x,y:p.y,w:p.w,h:p.h},subtree:'omitted: larger than the harness result buffer'}:null;
+};
+const vis=(id:string)=>h.waitFor(()=>node(id),15000);
 const click=async(id:string)=>{const n=await vis(id);assert((await h.clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok,id)};
 try{for(const theme of themes){
  assert(palettes[theme],theme);
@@ -26,11 +36,11 @@ try{for(const theme of themes){
  try{await h.waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await h.resizeWindow(1440,900);await click('workspace.empty.local');await vis('terminal.surface');await h.sleep(700);
   for(const [name,value]of [['black',0],['white',255]]as const){
    const item:any={theme,background:name,transparency:100,captures:[]};report.cases.push(item);
-   const capture=async(state:string,ids:string[])=>{if(ids.includes('ai.permission.menu')){const n=await vis('ai.permission.menu');await h.mouseMove(n.rect.x+n.rect.w-4,n.rect.y+4);}else await h.mouseMove(3,3);await h.sleep(300);for(const id of ids)await vis(id);const stem=(state==='terminal'?'proof-':'')+theme+'-'+name+'-'+state;assert((await h.screenshot(join(out,stem+'.png'))).ok);await writeFile(join(out,stem+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(ids.map(async id=>[id,await h.query(id)]))),null,2));item.captures.push(stem)};
+   const capture=async(state:string,ids:string[])=>{if(ids.includes('ai.permission.menu')){const n=await vis('ai.permission.menu');await h.mouseMove(n.rect.x+n.rect.w-4,n.rect.y+4);}else await h.mouseMove(3,3);await h.sleep(300);for(const id of ids)await vis(id);const stem=(state==='terminal'?'proof-':'')+theme+'-'+name+'-'+state;assert((await h.screenshot(join(out,stem+'.png'))).ok);await writeFile(join(out,stem+'.json'),JSON.stringify(Object.fromEntries(await Promise.all(ids.map(async id=>{const found:any=await h.query(id);return [id,Array.isArray(found)?found:[await node(id)]];}))),null,2));item.captures.push(stem)};
    await click('terminal.surface');await h.type_(`printf '\\033[38;2;${255-value};${255-value};${255-value};48;2;${value};${value};${value}m'; repeat 28 { printf '%136s\\n' 'ANSI background'; }; printf '\\033[0m'; printf ready > '${join(iso,name)}'`);await h.key('return');await h.waitFor(async()=>{try{return(await readFile(join(iso,name),'utf8'))==='ready'||null}catch{return null}},15000);await capture('terminal',['terminal.surface']);
    await h.key('k',{cmd:true});await vis('quick.connect');await capture('quick',['quick.connect']);await h.key('escape');await h.sleep(150);
-   await click('toolbar.ai');await vis('ai.panel');await capture('ai',['ai.panel']);
-   await click('ai.composer.permission');await vis('ai.permission.menu');await capture('permission',['ai.permission.menu']);await h.key('escape');await click('ai.collapse');await h.sleep(180);
+   await click(await aiToggleId());await vis('ai.panel');await capture('ai',['ai.panel']);
+   /* 浮动面板的工具行在窄宽度下把权限 / 运行方式收成图标按钮（ai.composer.permission.compact）：点当前显示的那一个。 */await click(await h.waitFor(async()=>{for(const id of ['ai.composer.permission','ai.composer.permission.compact'])if(await node(id))return id;return null;},15000));await vis('ai.permission.menu');await capture('permission',['ai.permission.menu']);await h.key('escape');await click('ai.collapse');await h.sleep(180);
    item.status='captured';console.log(theme,name,'captured');await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));
   }
  }finally{if(app.exitCode===null&&app.signalCode===null)app.kill('SIGTERM');await ended;await log.close();await rm(iso,{recursive:true,force:true})}

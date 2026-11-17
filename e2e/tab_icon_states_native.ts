@@ -1,6 +1,7 @@
 /** OS colour states, background icon motion, and real native menu projection.
  * node e2e/tab_icon_states_native.ts BUILD_PREFIX PYTHON [OUTPUT_DIRECTORY] [PRIMARY_OS]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, realpath, rm, writeFile} from 'node:fs/promises';
@@ -11,7 +12,7 @@ const prefix = resolve(process.argv[2]), python = process.argv[3];
 const out = resolve(process.argv[4] ?? '/tmp/zerowork-tab-icons-evidence');
 const primary = process.argv[5] ?? 'kylin';
 const expectedBackdrop = primary === 'isoft' ? 0xffffffff : 0;
-const assetRegistry = await readFile('src/ui/host_os_assets.zig', 'utf8');
+const assetRegistry = await readFile('src/shared/ui/assets/host_os_assets.zig', 'utf8');
 const iconIds = Object.fromEntries([...assetRegistry.matchAll(/pub const (\w+) = source\("[^"]+", (\d+)\);/g)].map(match => [match[1], Number(match[2])]));
 await mkdir(out, {recursive: true});
 const base = await realpath(await mkdtemp('/tmp/zw-tab-icons-'));

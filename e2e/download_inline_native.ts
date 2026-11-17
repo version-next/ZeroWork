@@ -1,6 +1,7 @@
 /** Isolated current main-app download popover. No sessions or network IO.
  * Leaves its explicitly requested new visible instance open on success.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";

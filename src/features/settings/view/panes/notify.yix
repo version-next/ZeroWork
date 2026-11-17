@@ -1,0 +1,66 @@
+//! 通知（第 6 类）面板正文（P3 3e）：事件提醒（含系统通知权限）、注意标记与勿扰。
+//! 文案 / id / 搜索词在 `model/pane_fields.zig` 的 `notify`；授权状态来自宿主（`HostStatus.authorization_*`）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const F = m.fields.notify;
+
+const events = &F.events;
+const attention = &F.attention;
+const info_tip = "settings.notifications.permission.info.tooltip";
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn setPopup(vm: *m.ViewModel, open: bool) void {
+    vm.dispatch(m.Intent.popupChanged(info_tip, open));
+}
+fn last(vm: *m.ViewModel) bool {
+    return vm.rowLast(events, F.permission);
+}
+fn shown(vm: *m.ViewModel) bool {
+    return vm.rowShown(events, F.permission);
+}
+
+/// 系统通知权限：状态 + “i”说明（原生 Tooltip），可操作时给“允许通知 / 打开系统设置”，等待授权结果时显示“等待授权…”；
+/// 授权请求的回执（失败、请求后的授权说明）显示在行下方。
+fn PermissionRow(vm: *m.ViewModel) View {
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm) })} visible={shown(vm)}>
+            <box testId="settings.notifications.permission" style={S.setting_line}>
+                <box style={S.setting_heading}>
+                    <text style={S.setting_label}>系统通知权限</text>
+                    <box style={S.permission_status} onFocus={setPopup(vm, true)} onBlur={setPopup(vm, false)}>
+                        <text style={S.permission_note}>{vm.permissionStatus()}</text>
+                        <W.Tooltip text={vm.permissionHelp()} position={.top} width={292} open={vm.popupOpen(info_tip)} onOpenChange={|o| setPopup(vm, o)} parts={.{ .content = info_tip }}>
+                            <W.Button testId="settings.notifications.permission.info" variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.info} iconSize={14} a11yLabel={vm.permissionHelp()} onClick={setPopup(vm, true)} />
+                        </W.Tooltip>
+                    </box>
+                </box>
+                <text style={S.permission_note} visible={vm.permissionWaiting()}>等待授权…</text>
+                <W.Button testId="settings.notifications.permission.open" visible={vm.permissionButtonShown()} label={vm.permissionButton()} variant={.secondary} size={.sm} iconAsset={ui.icons.external_link} iconSize={14} disabled={vm.isSaving()} onClick={send(vm, m.Intent.runCommand(.notification_permission))} />
+            </box>
+            <text testId="settings.notifications.permission.feedback" style={S.setting_hint} box={S.setting_hint_box} visible={vm.permissionFeedbackShown()}>{vm.permissionFeedback()}</text>
+        </box>
+    );
+}
+
+pub fn NotifyPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.notifications" style={S.category_panes}>
+            <R.Pane vm={vm} pane={events}>
+                <R.ToggleRow vm={vm} pane={events} row={F.transfer_done} />
+                <R.ToggleRow vm={vm} pane={events} row={F.reconnect} />
+                <R.ToggleRow vm={vm} pane={events} row={F.ai_ready} />
+                <R.ToggleRow vm={vm} pane={events} row={F.bell} />
+                <PermissionRow vm={vm} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={attention}>
+                <R.ToggleRow vm={vm} pane={attention} row={F.tab_dot} />
+                <R.InputRow vm={vm} pane={attention} row={F.quiet_hours} />
+            </R.Pane>
+        </box>
+    );
+}

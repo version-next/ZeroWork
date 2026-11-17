@@ -1,0 +1,46 @@
+[registry]
+schema_version = 2
+revision = 1
+next_connection_id = 3
+connection_ids_exhausted = false
+next_group_id = 1
+group_ids_exhausted = false
+
+[[hosts]]
+connection_id = 1
+revision = 1
+protocol = "ssh"
+pinned = false
+options = { strict_host_key = true }
+name = "node"
+auth_mode = "agent"
+host = "10.0.0.8"
+port = 22
+user = "ops"
+startup_commands = ["uptime"]
+ts_default = true
+keepalive = true
+socks_enabled = false
+socks_port = 1080
+socks_bind = "127.0.0.1"
+socks_auto_start = false
+socks_max_connections = 64
+
+[[hosts]]
+connection_id = 2
+revision = 1
+protocol = "ssh"
+pinned = false
+options = { strict_host_key = true }
+name = "跳板"
+auth_mode = "agent"
+host = "jump.example"
+port = 2222
+user = "root"
+ts_default = true
+keepalive = true
+socks_enabled = false
+socks_port = 1080
+socks_bind = "127.0.0.1"
+socks_auto_start = false
+socks_max_connections = 64

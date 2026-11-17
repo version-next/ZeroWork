@@ -1,0 +1,114 @@
+const std = @import("std");
+const ui = @import("ui");
+const styles = @import("../view/shell_styles.zig");
+const theme = @import("../../../shared/ui/theme/app_theme.zig");
+const Chrome = @FieldType(@FieldType(@import("zenit_app").App, "chrome"), "initial");
+
+test "fullscreen titlebar leaves native controls outside the expanded workspace" {
+    const Case = struct { chrome: Chrome, left: f32 };
+    for ([_]Case{
+        .{ .chrome = .{ .native_controls_count = 3 }, .left = 0 },
+        .{ .chrome = .{ .maximized = true, .native_controls_count = 3 }, .left = 0 },
+        .{ .chrome = .{ .fullscreen_transitioning = true, .native_controls_count = 3 }, .left = 0 },
+        .{ .chrome = .{ .fullscreen = true, .fullscreen_transitioning = true }, .left = 0 },
+        .{ .chrome = .{ .fullscreen = true }, .left = 0 },
+        .{ .chrome = .{ .fullscreen_transitioning = true }, .left = 0 },
+        .{ .chrome = .{ .native_controls_count = 3 }, .left = 0 },
+        // Expanded workspace keeps traffic lights over the separate sidebar,
+        // including unknown geometry and fullscreen transitions.
+        .{ .chrome = .{ .controls_geometry_known = false }, .left = 0 },
+        .{ .chrome = .{ .controls_geometry_known = false, .fullscreen = true }, .left = 0 },
+    }) |case| {
+        const padding = styles.titlePaddingForChrome(case.chrome);
+        try std.testing.expectEqual(case.left, padding.left);
+        try std.testing.expectEqual(@as(f32, 0), padding.right);
+    }
+}
+
+const Hook = struct {
+    cx: *ui.Cx,
+    bar: *ui.Node,
+    chrome: Chrome = .{ .native_controls_count = 3 },
+    fn run(raw: *anyopaque, _: u8, _: bool) ui.AfterLayoutResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (styles.syncWorkspaceChrome(self.cx.allocator, self.bar, self.chrome, true)) .needs_layout else .done;
+    }
+    fn frame(self: *@This()) void {
+        self.cx.frame_count += 1;
+        self.cx.frame_time_ms += 16;
+        _ = self.cx.render();
+    }
+};
+
+test "collapsed workspace retains children focus and window isolation across fullscreen theme publication and resize" {
+    // Island B v3 view bar (Pencil aPxql/KBJoz, shell_styles.syncWorkspaceChrome): padding
+    // [0, 6, 0, 12]; a collapsed sidebar moves the traffic lights into the view bar start,
+    // D8dPB Window chrome: padding-left 14 + traffic lights 52 + gap 6 = 72 before the 24 pt
+    // sidebar toggle (replaces the 12 pt inset). Fullscreen hides them (inset 12, not 0).
+    const view_bar_inset: f32 = 12;
+    const traffic_inset: f32 = 14 + 52 + 6;
+    const saved = theme.currentName();
+    defer theme.select(saved);
+    const allocator = std.testing.allocator;
+    const cx = try ui.Cx.init(allocator, std.testing.io);
+    defer cx.deinit();
+    const other_cx = try ui.Cx.init(allocator, std.testing.io);
+    defer other_cx.deinit();
+    cx.setViewport(1440, 900);
+    other_cx.setViewport(1000, 700);
+    const publication = try cx.bindState(styles.ThemePublication, .{});
+    publication.publish(cx, theme.widgetTheme(saved));
+    const root = try ui.boxStyled(cx, styles.root, .{});
+    cx.root = root;
+    const bar = try ui.boxStyled(cx, styles.title, .{});
+    try root.appendChild(allocator, bar);
+    const controls = try ui.box(cx, .{ .width = .fill(), .height = .{ .px = 30 }, .direction = .row }, .{});
+    try bar.appendChild(allocator, controls);
+    const tab = try ui.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    tab.setFocusable(true);
+    try controls.appendChild(allocator, tab);
+    const other_bar = try ui.boxStyled(other_cx, styles.title, .{});
+    other_cx.root = other_bar;
+    var hook: Hook = .{ .cx = cx, .bar = bar };
+    var other: Hook = .{ .cx = other_cx, .bar = other_bar };
+    try cx.addAfterLayoutHook(&hook, Hook.run);
+    defer cx.removeAfterLayoutHook(&hook);
+    try other_cx.addAfterLayoutHook(&other, Hook.run);
+    defer other_cx.removeAfterLayoutHook(&other);
+    hook.frame();
+    other.frame();
+    cx.setFocus(tab);
+    try std.testing.expectApproxEqAbs(styles.outer + traffic_inset, tab.globalRect().x, 0.01);
+    const bar_id = bar.id;
+    const tab_id = tab.id;
+    hook.chrome = .{ .fullscreen = true };
+    cx.requestRedraw();
+    hook.frame();
+    try std.testing.expectApproxEqAbs(styles.outer + view_bar_inset, tab.globalRect().x, 0.01);
+    // Theme publication replays boxStyled defaults. The same safe hook must
+    // restore native-state padding before the frame is presented.
+    theme.select(.light);
+    publication.publish(cx, theme.widgetTheme(.light));
+    cx.setViewport(1728, 1117);
+    hook.frame();
+    try std.testing.expectEqual(view_bar_inset, bar.style.padding.left);
+    try std.testing.expectApproxEqAbs(styles.outer + view_bar_inset, tab.globalRect().x, 0.01);
+    try std.testing.expectEqual(bar_id, bar.id);
+    try std.testing.expectEqual(tab_id, controls.children.items[0].id);
+    try std.testing.expectEqual(tab, cx.focused_node.?);
+    try std.testing.expectEqual(traffic_inset, other_bar.style.padding.left);
+    try std.testing.expect(!styles.syncWorkspaceChrome(allocator, bar, hook.chrome, true));
+    hook.chrome = .{ .native_controls_count = 3 };
+    cx.setViewport(1440, 900);
+    hook.frame();
+    try std.testing.expectApproxEqAbs(styles.outer + traffic_inset, tab.globalRect().x, 0.01);
+    try std.testing.expectEqual(tab, cx.focused_node.?);
+    try std.testing.expectEqual(tab_id, controls.children.items[0].id);
+    // The second window deliberately has no tabs; its own fullscreen state
+    // still changes the title inset independently.
+    other.chrome = .{ .fullscreen = true };
+    other_cx.requestRedraw();
+    other.frame();
+    try std.testing.expectEqual(view_bar_inset, other_bar.style.padding.left);
+    try std.testing.expectEqual(traffic_inset, bar.style.padding.left);
+}

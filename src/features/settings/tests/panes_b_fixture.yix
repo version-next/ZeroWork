@@ -1,0 +1,15 @@
+//! 测试夹具：快捷键与关于与更新两个分类的面板正文挂在一列里（settings_panes_b_tests.zig 使用；P3 3e 第二批）。
+//! 不经内容页外壳：夹具的 Controller 不开 drill-down，面板全部显示。
+const ui = @import("ui");
+const m = @import("../model/view_model.zig");
+const Keys = @import("../view/panes/keys.yix");
+const Updates = @import("../view/panes/updates.yix");
+
+pub fn PanesBFixture(vm: *m.ViewModel) View {
+    return (
+        <col>
+            <Keys.KeysPanes vm={vm} />
+            <Updates.UpdatesPanes vm={vm} />
+        </col>
+    );
+}

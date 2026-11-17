@@ -1,4 +1,8 @@
 //! Publish a complete owned UIA snapshot on the UI thread after projection.
+//! Publication follows recent client queries and per-window event subscriptions.
+//! Idle proxies renew demand through the owner thread before reading a snapshot.
+//! Frames do not project the a11y tree on Windows (Cx.a11y_on_demand): the
+//! snapshot publisher and the action path project it when they need it.
 const std = @import("std");
 const ui = @import("ui");
 const platform = @import("platform");
@@ -81,6 +85,9 @@ extern fn zenit_uia_node_size() usize;
 const ActionCallback = *const fn (?*anyopaque, u32, u8, ?[*]const u8, usize, f64) callconv(.c) c_int;
 extern fn zenit_windows_set_accessibility_action(window: *anyopaque, context: ?*anyopaque, callback: ?ActionCallback) c_int;
 extern fn zenit_windows_drain_accessibility(window: *anyopaque) c_int;
+const DemandCallback = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+extern fn zenit_windows_set_accessibility_demand(window: *anyopaque, context: ?*anyopaque, target: ?*anyopaque, callback: ?DemandCallback) c_int;
+extern fn zenit_windows_accessibility_should_publish(window: *anyopaque) c_int;
 extern fn zenit_a11y_set_text_selection(window_id: u32, handle: u64, start: u32, end: u32) c_int;
 extern fn zenit_a11y_set_text_value(window_id: u32, handle: u64, bytes: ?[*]const u8, length: c_int) c_int;
 extern fn zenit_a11y_set_numeric_value(window_id: u32, handle: u64, value: f32) c_int;
@@ -250,9 +257,100 @@ fn perform(context: ?*anyopaque, raw: u32, action: u8, bytes: ?[*]const u8, leng
 pub fn install(cx: *ui.Cx, window: *platform.Window) !void {
     if (zenit_windows_set_accessibility_action(window.native, cx, &perform) == 0)
         return error.AccessibilityHandlerInstallFailed;
+    if (zenit_windows_set_accessibility_demand(window.native, cx, window, &publishForFirstClient) == 0)
+        return error.AccessibilityHandlerInstallFailed;
 }
 pub fn detach(window: *platform.Window) void {
+    _ = zenit_windows_set_accessibility_demand(window.native, null, null, null);
     _ = zenit_windows_set_accessibility_action(window.native, null, null);
+    dropBoundaries(window.native, null);
+}
+
+/// WM_GETOBJECT can arrive while a frame pumps messages, when Cx is mid-update.
+/// Windows of one UI thread share this count, so any open frame defers.
+threadlocal var open_frames: u32 = 0;
+/// Diagnostic evidence for nested WM_GETOBJECT/COM requests. Count at the
+/// actual callback branch, before any owner-only Cx state can be accessed.
+threadlocal var deferred_requests: u64 = 0;
+pub const FrameScope = struct {
+    pub fn leave(_: FrameScope) void {
+        open_frames -= 1;
+    }
+};
+pub fn enterFrame() FrameScope {
+    open_frames += 1;
+    return .{};
+}
+fn publishForFirstClient(context: ?*anyopaque, target: ?*anyopaque) callconv(.c) c_int {
+    if (open_frames != 0) {
+        deferred_requests +%= 1;
+        if (@import("zenit_environment").flag("ZENIT_UIA_TRACE"))
+            std.log.info("[uia-demand-deferred] count={d} open_frames={d}", .{ deferred_requests, open_frames });
+        return 0;
+    }
+    const cx: *ui.Cx = @ptrCast(@alignCast(context orelse return 0));
+    const window: *platform.Window = @ptrCast(@alignCast(target orelse return 0));
+    // A frame that deferred projection leaves the tree stale; publishSnapshot
+    // projects the current node tree (as macOS on-demand and `perform` do).
+    // Declining here instead would make UiaReturnRawElementProvider read the
+    // root's own properties without a snapshot.
+    publishSnapshot(cx, window) catch |err| {
+        std.log.err("Windows accessibility projection: {s}", .{@errorName(err)});
+        return 0;
+    };
+    return 1;
+}
+
+/// Character, word and paragraph units of one editable value. A caret blink or
+/// scroll republishes the same text, so units follow the text, not the frame.
+const Boundaries = struct {
+    const Key = struct { window: *anyopaque, element: u64 };
+    const Entry = struct {
+        allocator: std.mem.Allocator,
+        text_hash: u64,
+        length: usize,
+        generation: u64,
+        units: [3][]u32,
+
+        fn deinit(self: Entry) void {
+            for (self.units) |unit| self.allocator.free(unit);
+        }
+    };
+};
+threadlocal var boundary_entries: std.AutoHashMapUnmanaged(Boundaries.Key, Boundaries.Entry) = .{};
+threadlocal var boundary_generation: u64 = 0;
+
+fn textBoundaries(allocator: std.mem.Allocator, key: Boundaries.Key, text_hash: u64, bytes: []const u8) !*const [3][]u32 {
+    const slot = try boundary_entries.getOrPut(allocator, key);
+    if (slot.found_existing) {
+        const entry = slot.value_ptr;
+        entry.generation = boundary_generation;
+        if (entry.text_hash == text_hash and entry.length == bytes.len) return &entry.units;
+        entry.deinit();
+    }
+    errdefer _ = boundary_entries.remove(key);
+    const characters = try ui.a11y.characterBoundaries(allocator, bytes);
+    errdefer allocator.free(characters);
+    const words = try ui.a11y.wordBoundariesFrom(allocator, bytes, characters);
+    errdefer allocator.free(words);
+    const paragraphs = try ui.a11y.paragraphBoundariesFrom(allocator, bytes, characters);
+    slot.value_ptr.* = .{
+        .allocator = allocator,
+        .text_hash = text_hash,
+        .length = bytes.len,
+        .generation = boundary_generation,
+        .units = .{ characters, words, paragraphs },
+    };
+    return &slot.value_ptr.units;
+}
+/// Drops the window's entries, keeping those of `kept_generation` if given.
+fn dropBoundaries(window: *anyopaque, kept_generation: ?u64) void {
+    var entries = boundary_entries.iterator();
+    while (entries.next()) |item| {
+        if (item.key_ptr.window != window or item.value_ptr.generation == kept_generation) continue;
+        item.value_ptr.deinit();
+        boundary_entries.removeByPtr(item.key_ptr);
+    }
 }
 pub fn drain(window: *platform.Window) void {
     _ = zenit_windows_drain_accessibility(window.native);
@@ -271,7 +369,16 @@ pub fn clear(window: *platform.Window) void {
     _ = zenit_windows_publish_accessibility(window.native, null, 0);
 }
 pub fn publish(cx: *ui.Cx, window: *platform.Window) !void {
+    // Harness contract calls read the snapshot without a UIA root query.
+    const eager = @import("test_harness").enabled and !@import("zenit_environment").flag("ZENIT_A11Y_ON_DEMAND");
+    if (!eager and zenit_windows_accessibility_should_publish(window.native) == 0) return;
+    return publishSnapshot(cx, window);
+}
+fn publishSnapshot(cx: *ui.Cx, window: *platform.Window) !void {
     if (zenit_uia_node_size() != @sizeOf(Node)) return error.AccessibilityAbiMismatch;
+    // Frames skip projection while no UIA client reads (Cx.a11y_on_demand);
+    // every publication projects the current node tree first.
+    cx.projectA11yIfStale();
     // getSize rounds to integral logical units. The physical client size and
     // current DPI preserve the fractional logical boundary used by native UIA.
     const drawable = window.getDrawableSize();
@@ -307,6 +414,7 @@ pub fn publish(cx: *ui.Cx, window: *platform.Window) !void {
         boundary_storage.deinit(cx.allocator);
     }
     var editable_bytes: usize = 0;
+    boundary_generation += 1;
     var geometry_storage: std.ArrayList([]GeometrySegment) = .empty;
     defer {
         for (geometry_storage.items) |owned| cx.allocator.free(owned);
@@ -346,14 +454,8 @@ pub fn publish(cx: *ui.Cx, window: *platform.Window) !void {
             const bytes: []const u8 = if (value.bytes) |ptr| ptr[0..value.length] else "";
             if (bytes.len > 8 * 1024 * 1024 - editable_bytes) return error.AccessibilityTreeTooLarge;
             editable_bytes += bytes.len;
-            inline for (.{ ui.a11y.characterBoundaries, ui.a11y.wordBoundaries, ui.a11y.paragraphBoundaries }, 0..) |make, index| {
-                const owned = try make(cx.allocator, bytes);
-                boundary_storage.append(cx.allocator, owned) catch |err| {
-                    cx.allocator.free(owned);
-                    return err;
-                };
-                unit_offsets[index] = .{ .bytes = owned.ptr, .count = owned.len };
-            }
+            const units = try textBoundaries(cx.allocator, .{ .window = window.native, .element = node.element.raw() }, node.text_hash, bytes);
+            for (units, 0..) |unit, index| unit_offsets[index] = .{ .bytes = unit.ptr, .count = unit.len };
             // Pending wrapping has no reliable visual lines yet. Keep current
             // text/selection and let TextRange use its next larger known unit.
             const lines = cx.a11yTextLineBoundaries(nodeRaw(node), bytes) catch |err| switch (err) {
@@ -498,4 +600,5 @@ pub fn publish(cx: *ui.Cx, window: *platform.Window) !void {
     if (result.items.len != ordered.items.len) return error.AccessibilityDisconnectedProjection;
     if (zenit_windows_publish_accessibility(window.native, result.items.ptr, result.items.len) == 0)
         return error.AccessibilityPublishFailed;
+    dropBoundaries(window.native, boundary_generation);
 }

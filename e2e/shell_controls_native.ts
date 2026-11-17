@@ -2,6 +2,8 @@
  * only root may run it in the serialized native slot. Public Harness input is
  * synthetic. Screenshots require separate human/model visual review.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10,6 +12,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForServerReady, waitFor, query, inputState, clickAt, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import * as harness from "../zig-out/share/zenit/harness/client.ts";
+import { closeWorkspaceTab, openSessionDetails } from "./workspace_tab_actions.ts";
+import { chooseTheme } from "./theme_settings_entry.ts";
+import { settingsNav } from "./settings_nav.ts";
+const nav = settingsNav();
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const options: Record<string, string> = {};
@@ -87,29 +94,38 @@ async function capture(name: string): Promise<void> {
   const file = join(output, `${name}.png`);
   assert((await screenshot(file)).ok);
   const scopes: Record<string, unknown> = {};
-  for (const id of ["tabs.strip", "tabs.rename", "tabs.rename.input", "local.statusbar", "status.detail", "status.theme", "local.close.confirmation", "settings.search", "settings.content", "settings.field.font_size", "settings.footer.state"]) scopes[id] = await query(id);
+  for (const id of ["tabs.strip", "tabs.rename", "tabs.rename.input", "local.statusbar", "status.detail", "settings.appearance.themes", "local.close.confirmation", "settings.search", "settings.content", "settings.field.font_size", "settings.footer.state"]) scopes[id] = await query(id);
   await writeFile(join(output, `${name}.queries.json`), JSON.stringify(scopes, null, 2));
   report.screenshots.push({ name, path: file, queries: `${name}.queries.json` });
   await writeFile(join(output, "report.json"), JSON.stringify(report, null, 2));
   console.log(`[shell-controls] ${name}`);
 }
 function descendants(): { pid: number; parent: number; command: string }[] {
-  const all = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" }).trim().split("\n").flatMap(line => { const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return m ? [{ pid: Number(m[1]), parent: Number(m[2]), command: m[3] }] : []; });
+  const all = psCompat(["-axo", "pid=,ppid=,comm="]).trim().split("\n").flatMap(line => { const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return m ? [{ pid: Number(m[1]), parent: Number(m[2]), command: m[3] }] : []; });
   const owned = new Set([child.pid!]);
   for (let i = 0; i < all.length; i++) { let changed = false; for (const p of all) if (owned.has(p.parent) && !owned.has(p.pid)) { owned.add(p.pid); changed = true; } if (!changed) break; }
   return all.filter(p => p.pid !== child.pid && owned.has(p.pid));
 }
-async function expectDetail(kind: string, barId = "local.statusbar"): Promise<void> {
-  const detail = await stable("status.detail"), bar = await visible(barId);
-  assert(text(detail).includes(kind), `Expected detail ${kind}`);
-  assert.equal(detail.rect.w, 360);
-  const viewportWidth = report.viewport[0];
-  assert(detail.rect.x >= 8 && detail.rect.x + detail.rect.w <= viewportWidth - 8 + 0.5);
-  assert(Math.abs(bar.rect.y - detail.rect.y - detail.rect.h - 6) <= 1, "Detail must anchor 6pt above its real bar");
+async function captureLocalDetails(tab: string, name: string): Promise<void> {
+  const detail = await openSessionDetails(harness, tab);
+  const value = text(detail);
+  assert(value.includes("本地终端"));
+  assert(value.includes("UTF-8") && /\d+\s*×\s*\d+/.test(value), "Details show encoding and the current terminal grid");
+  assert(!value.includes("往返延迟"), "Local must not advertise SSH RTT");
+  const [width, height] = report.viewport;
+  assert(detail.rect.x >= 0 && detail.rect.x + detail.rect.w <= width + 0.5);
+  assert(detail.rect.y >= 0 && detail.rect.y + detail.rect.h <= height + 0.5);
+  await capture(name);
+  await click("status.detail.close");
+  await hidden("status.detail");
 }
-async function resize(width: number, height: number): Promise<void> { assert((await resizeWindow(width, height)).ok); report.viewport = [width, height]; await stable("local.statusbar"); }
+async function resize(width: number, height: number): Promise<void> {
+  assert((await resizeWindow(width, height)).ok);
+  report.viewport = [width, height];
+  await stable("tabs.strip");
+}
 async function closeRisk(tab: string, name: string, foregroundPid: number): Promise<void> {
-  await click(tab.replace("tabs.tab.", "tabs.close."));
+  await closeWorkspaceTab(harness, tab);
   await visible("local.close.confirmation");
   await capture(name);
   await click("local.close.cancel");
@@ -130,37 +146,34 @@ try {
   const currentTabs = await waitFor(async () => { const list = await tabs(); return list.length === 2 ? list : null; }, 15000);
   const renamedTab = currentTabs.find(n => n.test_id !== originalTab)!.test_id;
   report.tabs = { original: originalTab, renamed: renamedTab };
-  assert((await key("r", { cmd: true, shift: true })).ok);
+  assert((await key("f2")).ok);
   const rename = await stable("tabs.rename");
-  assert.equal(rename.rect.w, 380); assert.equal(rename.rect.h, 191);
+  assert.equal(rename.rect.w, 320); assert.equal(rename.rect.h, 118);
   const field = await visible("tabs.rename.input"), save = await visible("tabs.rename.save");
-  for (const control of [field, save]) assert(control.rect.x >= rename.rect.x && control.rect.y >= rename.rect.y && control.rect.x + control.rect.w <= rename.rect.x + rename.rect.w + 0.5 && control.rect.y + control.rect.h <= rename.rect.y + rename.rect.h + 0.5, "Rename field/save must stay within the exact 380x191 dialog");
+  for (const control of [field, save]) assert(control.rect.x >= rename.rect.x && control.rect.y >= rename.rect.y && control.rect.x + control.rect.w <= rename.rect.x + rename.rect.w + 0.5 && control.rect.y + control.rect.h <= rename.rect.y + rename.rect.h + 0.5, "Rename field/save must stay within the exact 320x118 dialog");
   await capture("01-rename-exact-dialog");
   const title = `Shell-${process.pid}`;
   await edit("tabs.rename.input", title); await click("tabs.rename.save"); await hidden("tabs.rename");
   await waitFor(async () => text(await visible(renamedTab)).includes(title) || null, 10000);
   assert.equal(text(await visible(originalTab)), originalTitle, "Rename must not change the other Local tab");
-  assert((await key("r", { cmd: true, shift: true })).ok); await edit("tabs.rename.input", "discarded-title"); await click("tabs.rename.cancel"); await hidden("tabs.rename");
+  assert((await key("f2")).ok); await edit("tabs.rename.input", "discarded-title"); await click("tabs.rename.cancel"); await hidden("tabs.rename");
   assert(text(await visible(renamedTab)).includes(title));
-  report.checks.push("Exact 380x191 rename field/save are visible, pointer save changes only the captured tab, cancel preserves its title");
+  report.checks.push("Exact 320x118 rename field/save are visible, pointer save changes only the captured tab, cancel preserves its title");
   await capture("02-renamed-original-owner-preserved");
 
-  await click("local.status.identity"); await expectDetail("本地终端"); await capture("03-local-identity"); await click("status.detail.close");
-  await click("local.status.encoding"); await expectDetail("终端编码"); assert(text(await visible("status.detail")).includes("UTF-8")); await capture("04-local-encoding"); await click("status.detail.close");
-  await click("local.status.grid"); await expectDetail("终端网格"); await capture("05-local-grid"); await click("status.detail.close");
-  await click("local.status.more"); await expectDetail("更多状态"); assert(!text(await visible("status.detail")).includes("往返延迟"), "Local More must not advertise SSH RTT"); await capture("06-local-more"); await click("status.detail.close");
-  await resize(860, 480); await capture("07-local-compact");
-  await click("local.status.more"); await expectDetail("更多状态"); await capture("08-local-compact-more"); await click("status.detail.close");
+  await captureLocalDetails(renamedTab, "03-local-session-details");
+  await resize(860, 480);
+  await captureLocalDetails(renamedTab, "08-local-compact-session-details");
   await resize(1440, 900);
-  report.checks.push("Standard and compact Local identity/encoding/grid/More are real bounded entry points; no fictitious network RTT");
+  report.checks.push("The active tab’s session details show Local identity, encoding and grid at standard and compact sizes");
 
-  await click("toolbar.settings"); await edit("settings.search", "font_size");
+  await nav.open(); await edit("settings.search", "font_size");
   const font = await stable("settings.field.font_size");
   assert.equal((await inputState("settings.field.font_size")).buffer, "14");
   const content = await visible("settings.content");
   assert(font.rect.y >= content.rect.y && font.rect.y + font.rect.h <= content.rect.y + content.rect.h + 0.5, "Search must display the actual font-size input inside its content area");
   await capture("09-settings-font-size-search-actual-input");
-  await edit("settings.search", ""); await click("settings.close"); await hidden("settings.search");
+  await edit("settings.search", ""); await nav.close(); await hidden("settings.search"); // no close button: Cmd+W (settings_nav.ts)
   report.checks.push("Searching schema key font_size renders the actual current Input rather than an empty section or legacy summary");
 
   await click("terminal.surface"); assert((await type_("printf '__SHELL_CONTROLS_%s__\\n' READY")).ok); assert((await key("return")).ok);
@@ -170,18 +183,17 @@ try {
   report.foreground_pid = sleeper.pid;
   await closeRisk(renamedTab, "10-local-close-dark-original-process", sleeper.pid);
   for (const theme of ["light", "sauber", "dark"]) {
-    await click("local.status.theme"); await visible("status.theme"); await click(`status.theme.item.${theme}`);
-    await waitFor(async () => new RegExp(`theme\\s*=\\s*"${theme}"`).test(await readFile(configPath, "utf8")) || null, 10000);
-    await click("status.theme.close"); await hidden("status.theme");
+    // title-click: 设置 › 外观与主题 via 菜单栏“显示 › 外观…” (no title bar theme popover).
+    await chooseTheme(harness, theme, configPath);
     await capture(`11-${theme}-standard`);
     await resize(860, 480); await capture(`12-${theme}-compact`); await resize(1440, 900);
     await closeRisk(renamedTab, `13-${theme}-close-original-process`, sleeper.pid);
   }
   report.checks.push("Dark/Light/Sauber persist through real global palette and yield separate standard/compact screenshots; each close Cancel preserves the same real ZSH foreground PID");
-  await click(renamedTab.replace("tabs.tab.", "tabs.close.")); await visible("local.close.confirmation"); await click("local.close.accept");
+  await closeWorkspaceTab(harness, renamedTab); await visible("local.close.confirmation"); await click("local.close.accept");
   await hidden(renamedTab); await waitFor(async () => !descendants().some(p => p.pid === sleeper.pid) || null, 10000);
   assert((await tabs()).some(n => n.test_id === originalTab), "Closing renamed tab preserves the original Local tab");
-  await click(originalTab.replace("tabs.tab.", "tabs.close."));
+  await closeWorkspaceTab(harness, originalTab);
   if ((await query("local.close.confirmation")).some(shown)) await click("local.close.accept");
   await hidden(originalTab); await visible("workspace.empty.local");
   await waitFor(async () => !descendants().some(p => p.command.endsWith("/zsh") || p.command.endsWith("/sleep")) || null, 10000);

@@ -10,6 +10,11 @@ pub const ClearColor = renderer_mod.ClearColor;
 pub const FrameStats = renderer_mod.FrameStats;
 
 pub const ResourcePath = @import("resource_path.zig").ResourcePath;
+/// Large blocks mapped directly, so freeing them returns the memory (macOS
+/// libmalloc keeps freed large blocks resident); see large_block_allocator.zig.
+pub const LargeBlockAllocator = @import("large_block_allocator.zig").LargeBlockAllocator;
+/// The same policy for C libraries' allocator hooks (tree-sitter, SQLite).
+pub const large_block_c_heap = @import("large_block_allocator.zig").c_heap;
 
 /// All-in-one application runtime; see runtime.zig
 pub const runtime = @import("runtime.zig");
@@ -19,6 +24,13 @@ pub const runtime = @import("runtime.zig");
 /// `runtime.App.run()` calls `drainTestCommands()` each frame itself; custom main-loop
 /// hosts must call it once per loop, or the file-RPC server receives requests but never
 /// executes or answers them, and clients hang until timeout.
+pub const dev_control = @import("dev_control/mod.zig");
+
+/// Custom-loop hosts drain after native event dispatch, before the frame.
+pub fn drainDevCommands() void {
+    dev_control.drain();
+}
+
 pub const test_harness = @import("test_harness");
 
 /// Drain E2E command queue once per frame. Custom main-loop hosts call after processEvents().
@@ -39,6 +51,12 @@ pub fn setTestRouteHandler(f: test_harness.AppRouteFn) void {
 /// Process-level font family registry (id <-> family name + face cache). Host creates one,
 /// `App.setFontRegistry` installs it, canvas/UI render by family.
 /// Exported from zenit_app not ui to avoid layer inversion (ui doesn't depend on render).
+/// Application-wide platform font smoothing. Off: every window rasterizes text without platform
+/// smoothing (a design-matched, lighter stem; TextProps.font_smoothing = false everywhere). Call
+/// before the first frame; glyphs already in the atlas keep their key.
+pub fn setPlatformFontSmoothing(on: bool) void {
+    @import("render").setPlatformFontSmoothing(on);
+}
 pub const FontRegistry = @import("render").FontRegistry;
 pub const FamilyId = @import("render").FamilyId;
 
@@ -69,6 +87,10 @@ test {
     _ = @import("remount_tests.zig");
     _ = @import("header_reveal_tests.zig");
     _ = @import("resource_path.zig");
+    _ = @import("cpu_patch.zig");
+    _ = @import("large_block_allocator.zig");
+    _ = @import("sprite_tiles.zig");
+    _ = @import("unwind_tables_contract.zig");
     // Native window code calls these exports even when no App is initialized.
     if (builtin.os.tag == .macos) {
         _ = @import("ui").a11y.macos_bridge;

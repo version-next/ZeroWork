@@ -1,6 +1,7 @@
 // Dedicated OLE STA keeps the App's render / SDK / test RPC pump responsive.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "../automation_environment.h"
 #include <ole2.h>
 #include <shlobj.h>
 #include <math.h>
@@ -88,7 +89,7 @@ extern "C" void *zenit_drag_source_start(void *window,unsigned kind,const char *
     const unsigned char *png,size_t png_length,float width,float height,float hotspot_x,float hotspot_y,uint64_t *token,int *error) {
     if(token)*token=0;if(error)*error=-1;
     HWND hwnd=(HWND)window;DWORD pid=0,thread=hwnd?GetWindowThreadProcessId(hwnd,&pid):0;
-    char background[8]={};GetEnvironmentVariableA("ZENIT_E2E_BACKGROUND",background,sizeof(background));
+    char background[8]={};zenitAutomationEnvironmentA("ZENIT_E2E_BACKGROUND",background,sizeof(background));
     POINT cursor={};RECT client={};
     if(!token||!hwnd||!IsWindow(hwnd)||pid!=GetCurrentProcessId()||thread!=GetCurrentThreadId()||background[0]=='1'||
        GetForegroundWindow()!=hwnd||!(GetAsyncKeyState(VK_LBUTTON)&0x8000)||!operations||(operations&~7u)||

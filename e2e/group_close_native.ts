@@ -2,6 +2,7 @@
  * subprocesses only. No injected session/result/product-state fixtures.
  * node e2e/group_close_native.ts --binary PATH --expected-sha SHA --out EMPTY_DIR
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 import {spawn,execFileSync} from 'node:child_process';
@@ -10,6 +11,8 @@ import {copyFile,mkdir,mkdtemp,open,readFile,readdir,realpath,writeFile,rm} from
 import {tmpdir} from 'node:os';
 import {dirname,join,resolve} from 'node:path';
 import {waitForServerReady,waitFor,query as rawQuery,clickAt,key,type_,screenshot,sleep,resizeWindow,screenPos,focused,mouseMove,scrollAt} from '../zig-out/share/zenit/harness/client.ts';
+import * as harness from '../zig-out/share/zenit/harness/client.ts';
+import {chooseTheme} from './theme_settings_entry.ts';
 async function query(id:string):Promise<any[]> { const value=await rawQuery(id);return Array.isArray(value)?value:value?[value]:[]; }
 const args:Record<string,string>={};for(let i=2;i<process.argv.length;i+=2){assert(['--binary','--expected-sha','--out','--local-count','--ssh','--confirm-only','--config'].includes(process.argv[i])&&process.argv[i+1]);args[process.argv[i]]=process.argv[i+1]}
 assert(args['--binary']&&args['--out']&&/^[a-f0-9]{64}$/.test(args['--expected-sha']??''));
@@ -31,7 +34,12 @@ const flat=(n:any):any[]=>shown(n)?[n,...(n.children??[]).flatMap(flat)]:[];
 const visible=async(id:string)=>waitFor(async()=>(await query(id)).find(shown)??null,20000);
 const hidden=async(id:string)=>waitFor(async()=>!(await query(id)).some(shown)||null,20000);
 const clickNode=async(n:any)=>{assert(shown(n));assert((await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok)};
-const click=async(id:string)=>{if(id.startsWith('tabs.close.')){const tab=await visible(`tabs.tab.${id.split('.').at(-1)}`);await mouseMove(tab.rect.x+tab.rect.w/2,tab.rect.y+tab.rect.h/2);await sleep(100)}report.last_action={kind:'click',id};await save();await clickNode(await visible(id))};
+// title-click: the theme is not a title bar tool (no palette button, no ⋯ row, no quick picker). The global
+// theme is chosen in 设置 › 外观与主题, opened from the native menu bar item “显示 › 外观…”.
+async function chooseGlobalTheme(theme:string):Promise<void>{await chooseTheme(harness,theme,join(data,'config.toml'));}
+const click=async(id:string)=>{if(id.startsWith('tabs.close.')){const tab=await visible(`tabs.tab.${id.split('.').at(-1)}`);await mouseMove(tab.rect.x+tab.rect.w/2,tab.rect.y+tab.rect.h/2);await sleep(100)}
+ // r3-tabs-2: a tab's close button (the group tab's is groups.close) shows on hover; hover the group tab first.
+ if(id==='groups.close'){const tab=await waitFor(async()=>(await tabNodes()).find(n=>flat(n).some(c=>c.test_id==='groups.tab.count'))??null,20000);await mouseMove(tab.rect.x+tab.rect.w/2,tab.rect.y+tab.rect.h/2);await sleep(150)}report.last_action={kind:'click',id};await save();await clickNode(await visible(id))};
 const press=async(name:string,mods?:any)=>{assert((await key(name,mods)).ok)};
 const type=async(text:string)=>{assert((await type_(text)).ok)};
 const tabNodes=async()=>{const result=await query('tabs.strip');const strip=Array.isArray(result)?result.find(shown):null;return strip?flat(strip).filter(n=>/^tabs\.tab\.\d+$/.test(n.test_id??'')):[]};
@@ -39,6 +47,9 @@ const sessionIds=async()=>{const ids:string[]=[];for(let candidate=1;candidate<=
 const groupVisible=async()=>waitFor(async()=>{const r=await screenPos('groups.workspace');return r.w>0&&r.h>0?r:null},15000);
 const capture=async(name:string)=>{await sleep(120);assert((await screenshot(join(output,`${name}.png`))).ok);const observations:any={};for(const id of ['tabs.strip','groups.workspace','groups.close.confirm','groups.close.partial','local.close.confirmation','status.connection.identity','status.connection.chain','status.connection.forward','status.transfer','transfer.session']) observations[id]=await query(id);await writeFile(join(output,`${name}.queries.json`),JSON.stringify(observations,null,2));report.screenshots.push(name);await save()};
 const check=(name:string,detail:any={})=>report.checks.push({name,status:'passed',detail});
+// cabb8e5a（危险操作统一走 shared/ui/confirm）起，组关闭确认 / 部分结果是原生 ConfirmDialog：宽 480、高度随内容、上限 max_height 480
+// （group_close_view.zig mount），不再是旧的固定 480×294 / 480×248 面板。断言现行契约：宽 480、高 ≤480、整体在窗口内、标题在上、按钮行在面板内。
+const dialogFits=(panel:any,winW:number,winH:number,label:string)=>{const r=panel.rect;assert(Math.abs(r.w-480)<1&&r.h>0&&r.h<=480.5,`${label}: 480 wide, content height capped at 480: ${JSON.stringify(r)}`);assert(r.x>=-0.5&&r.y>=-0.5&&r.x+r.w<=winW+0.5&&r.y+r.h<=winH+0.5,`${label}: dialog stays inside the ${winW}x${winH} window: ${JSON.stringify(r)}`);const nodes=flat(panel);for(const id of ['groups.close.heading','groups.close.members','groups.close.cancel','groups.close.accept']){const n=nodes.find(x=>x.test_id===id);assert(n,`${label}: ${id} visible`);assert(n.rect.x>=r.x-0.5&&n.rect.y>=r.y-0.5&&n.rect.x+n.rect.w<=r.x+r.w+0.5&&n.rect.y+n.rect.h<=r.y+r.h+0.5,`${label}: ${id} inside the dialog`)}};
 async function checkPaneHeaders(stage:string){
  if(args['--confirm-only']==='1')return;
  const panes=(await query('groups.workspace')).filter(shown).flatMap(flat).filter(n=>/^groups\.pane\.\d+$/.test(n.test_id??''));assert.equal(panes.length,totalCount);
@@ -111,13 +122,13 @@ try{
   await focusSession(sshId!);await visible('status.connection.chain');await visible('status.connection.forward');await capture('00-group-original-ssh-status-restored');check('mixed group bottom bar follows real focused session while transfer scope remains all frozen group members');
  }
  // Mandatory group cancellation must not terminate anything.
- await click('groups.close');const confirm=await visible('groups.close.confirm');assert(Math.abs(confirm.rect.w-480)<1&&confirm.rect.h<=294);assert.equal((await focused()).test_id,'groups.close.cancel');await capture('01-confirm-mixed');await press('escape');await hidden('groups.close.confirm');await click('groups.close');await visible('groups.close.confirm');await click('groups.close.cancel');await hidden('groups.close.confirm');assert.deepEqual(await sessionIds(),original);for(const owner of localOwners)process.kill(owner.pid,0);check('cancel preserves group members and every original Local process');
+ await click('groups.close');const confirm=await visible('groups.close.confirm');dialogFits(confirm,1440,900,'confirm');assert.equal((await focused()).test_id,'groups.close.cancel');await capture('01-confirm-mixed');await press('escape');await hidden('groups.close.confirm');await click('groups.close');await visible('groups.close.confirm');await click('groups.close.cancel');await hidden('groups.close.confirm');assert.deepEqual(await sessionIds(),original);for(const owner of localOwners)process.kill(owner.pid,0);check('cancel preserves group members and every original Local process');
  await press('w',{cmd:true});await visible('groups.close.confirm');await press('modifiers_released');await click('groups.close.cancel');await hidden('groups.close.confirm');assert.deepEqual(await sessionIds(),original);check('Command-W routes actual group owner through mandatory frozen confirmation');
  // The same real frozen membership is rendered under each persisted theme
  // at standard and minimum window sizes. No design/demo state is injected.
  for(const theme of ['light','sauber','dark']){
-  await click(localOwners[0].tab);await click('local.status.theme');await visible('status.theme');await click(`status.theme.item.${theme}`);await waitFor(async()=>new RegExp(`theme\\s*=\\s*"${theme}"`).test(await readFile(join(data,'config.toml'),'utf8'))||null,10000);await click('status.theme.close');await click('groups.tab');
-  for(const [size,w,h] of [['standard',1440,900],['minimum',860,480]] as const){await resizeWindow(w,h);await checkPaneHeaders(`${theme}-${size}`);await capture(`headers-${theme}-${size}`);await click('groups.close');const panel=await visible('groups.close.confirm');assert(Math.abs(panel.rect.w-480)<1&&panel.rect.h<=294);await capture(`confirm-${theme}-${size}`);await click('groups.close.cancel');await hidden('groups.close.confirm')}
+  await click(localOwners[0].tab);await chooseGlobalTheme(theme);await click('groups.tab');
+  for(const [size,w,h] of [['standard',1440,900],['minimum',860,480]] as const){await resizeWindow(w,h);await checkPaneHeaders(`${theme}-${size}`);await capture(`headers-${theme}-${size}`);await click('groups.close');const panel=await visible('groups.close.confirm');dialogFits(panel,w,h,`confirm-${theme}-${size}`);await capture(`confirm-${theme}-${size}`);await click('groups.close.cancel');await hidden('groups.close.confirm')}
  }
  if(args['--confirm-only']==='1'){report.status='passed';report.mode='confirmation_visual_only';}
  else {
@@ -134,7 +145,7 @@ try{
  await click('groups.close');await visible('groups.close.confirm');await click('groups.close.accept');
  await waitFor(async()=>{const tabs=await tabNodes();return tabs.some(n=>n.test_id===(sshEnabled?sshTab:localOwners[0].tab))?null:true},20000);
  await click('groups.close.cancel');await visible('groups.close.partial');await sleep(4800);await capture('03-real-partial-stop');
- const partial=await visible('groups.close.partial');const text=flat(partial).map(n=>n.text??'').join('\n');assert(/已关闭 [1-9]/.test(text),text);assert(/未关闭 [1-9]/.test(text),text);assert(/已取消|未关闭|等待/.test(text),text);assert(Math.abs(partial.rect.w-480)<1&&Math.abs(partial.rect.h-280)<1);
+ const partial=await visible('groups.close.partial');const text=flat(partial).map(n=>n.text??'').join('\n');assert(/已关闭 [1-9]/.test(text),text);assert(/未关闭 [1-9]/.test(text),text);assert(/已取消|未关闭|等待/.test(text),text);dialogFits(partial,1440,900,'partial');
  await click('groups.close.cancel');await hidden('groups.close.partial');await click('groups.close');await visible('groups.close.partial');check('dismissing and reopening partial results preserves original receipt ledger');
  const remaining=await sessionIds();assert(remaining.length>0&&remaining.length<totalCount);const closed=original.filter(id=>!remaining.includes(id));assert(closed.length>0);for(const owner of localOwners.filter(x=>remaining.includes(x.id)))process.kill(owner.pid,0);check('partial preserves real closed receipts and healthy unstarted remainder',{closed,remaining,text});noEstablishedSsh('partial');
  // Reopen the retained partial ledger under all three persisted themes,
@@ -142,9 +153,9 @@ try{
  for(const theme of ['light','sauber','dark']){
   await click('groups.close.cancel');await hidden('groups.close.partial');
   const healthy=localOwners.find(x=>remaining.includes(x.id));
-  await click((healthy?.tab??sshTab)!);await click(healthy?'local.status.theme':'status.connection.theme');await visible('status.theme');await click(`status.theme.item.${theme}`);await waitFor(async()=>new RegExp(`theme\\s*=\\s*"${theme}"`).test(await readFile(join(data,'config.toml'),'utf8'))||null,10000);await click('status.theme.close');await click('groups.tab');
+  await click((healthy?.tab??sshTab)!);await chooseGlobalTheme(theme);await click('groups.tab');
   for(const [size,w,h] of [['standard',1440,900],['minimum',860,480]] as const){
-   await resizeWindow(w,h);await click('groups.close');const panel=await visible('groups.close.partial');assert(Math.abs(panel.rect.w-480)<1&&Math.abs(panel.rect.h-280)<1);await capture(`partial-${theme}-${size}`);await click('groups.close.cancel');await hidden('groups.close.partial');
+   await resizeWindow(w,h);await click('groups.close');const panel=await visible('groups.close.partial');dialogFits(panel,w,h,`partial-${theme}-${size}`);await capture(`partial-${theme}-${size}`);await click('groups.close.cancel');await hidden('groups.close.partial');
   }
   await click('groups.close');await visible('groups.close.partial');
  }
@@ -154,8 +165,9 @@ try{
  await click('groups.close.accept');await visible('groups.close.confirm');const retryText=flat(await visible('groups.close.confirm')).map(n=>n.text??'').join('\n');for(const id of closed)assert(!new RegExp(`#${id} · 确认关闭`).test(retryText));await capture('04-retry-original-remainder');
  const scroll=flat(await visible('groups.close.confirm')).find(n=>n.test_id==='groups.close.members');assert(scroll);const fixedAccept=(await visible('groups.close.accept')).rect,fixedCancel=(await visible('groups.close.cancel')).rect;
  assert((await scrollAt(scroll.rect.x+scroll.rect.w/2,scroll.rect.y+scroll.rect.h/2,0,-2000)).ok);
- const notes=await waitFor(async()=>{const current=flat(await visible('groups.close.confirm'));const effect=current.find(n=>n.text==='停止命令、AI 与 SOCKS；传输暂停并保留。'),cancel=current.find(n=>n.text==='取消不会断开；已关闭的成员不能自动恢复。');return effect&&cancel&&[effect,cancel].every(n=>n.rect.y>=scroll.rect.y-.5&&n.rect.y+n.rect.h<=scroll.rect.y+scroll.rect.h+.5)?{effect:effect.rect,cancel:cancel.rect}:null},10000);
- const acceptButton=await visible('groups.close.accept'),cancelButton=await visible('groups.close.cancel');assert.deepEqual(acceptButton.rect,fixedAccept);assert.deepEqual(cancelButton.rect,fixedCancel);assert(acceptButton.focusable&&cancelButton.focusable);check('public group-close ScrollArea reveals complete effect and cancel notes while fixed actions remain enabled',{scroll:scroll.rect,notes,accept:acceptButton.rect,cancel:cancelButton.rect});await capture('04b-retry-notes-scrolled-fixed-actions');await click('groups.close.accept');
+ // cabb8e5a 起两条说明不在成员账本的 ScrollArea 里，而是 ConfirmDialog 正文里账本下方的固定文字：滚动账本后它们仍完整可见，位于账本之下、按钮行之上。
+ const notes=await waitFor(async()=>{const dialog=await visible('groups.close.confirm');const current=flat(dialog);const effect=current.find(n=>n.text==='将关闭全部成员，包括它们的独立页签。停止命令、AI 与 SOCKS；传输暂停并保留。'),cancel=current.find(n=>n.text==='已关闭的成员不能自动恢复。')/* 04750679: the cancel note is now just this sentence */;const ledger=current.find(n=>n.test_id==='groups.close.members');return effect&&cancel&&ledger&&[effect,cancel].every(n=>n.rect.h>0&&n.rect.y>=ledger.rect.y+ledger.rect.h-.5&&n.rect.y+n.rect.h<=fixedAccept.y+.5&&n.rect.x>=dialog.rect.x-.5&&n.rect.x+n.rect.w<=dialog.rect.x+dialog.rect.w+.5)?{effect:effect.rect,cancel:cancel.rect}:null},10000);
+ const acceptButton=await visible('groups.close.accept'),cancelButton=await visible('groups.close.cancel');assert.deepEqual(acceptButton.rect,fixedAccept);assert.deepEqual(cancelButton.rect,fixedCancel);assert(acceptButton.focusable&&cancelButton.focusable);check('group-close effect and cancel notes stay fully visible below the member ledger while it scrolls; fixed actions remain enabled',{scroll:scroll.rect,notes,accept:acceptButton.rect,cancel:cancelButton.rect});await capture('04b-retry-notes-scrolled-fixed-actions');await click('groups.close.accept');
  await waitFor(async()=>{if((await query('local.close.confirmation')).some(shown)){await click('local.close.accept');return null}return (await tabNodes()).length===0||null},30000);await hidden('groups.workspace');for(const owner of localOwners){assert.throws(()=>process.kill(owner.pid,0))}check('retry closes only remaining original handles and releases all original Local processes');noEstablishedSsh('complete');await capture('05-all-original-handles-released');
  report.status='passed';
  }

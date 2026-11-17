@@ -1,0 +1,75 @@
+//! The composer's decision panel (Pencil Kaf7E A7 approval / A11 question): while a request is
+//! pending it takes the composer's place — a native outlined `W.Card` holding the heading, the
+//! command well with a copy `W.Button` (+ `W.Tooltip`), the impact note, the run-mode choice
+//! (native segmented `W.Tabs` sm), the question's native `W.RadioGroup` (+ a `W.Input` for a custom
+//! answer) and the action row (ghost “稍后处理”, secondary “拒绝”, primary “允许执行” / “提交答案”).
+//! “稍后处理” folds it into a native secondary sm `W.Button` capsule above the composer
+//! (`PendingCapsule`). State, tickets and decisions live in the view-model
+//! (`ai_composer_interaction_view.zig`); this file is the view only.
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("ai_composer_interaction.yss");
+const M = @import("ai_composer_interaction_view.zig");
+
+fn keep(m: *M.View, viewport: *ui.view.Ref(W.scroll_area.ScrollAreaResult), accept: *ui.view.Ref(*ui.Node), reject: *ui.view.Ref(*ui.Node), submit: *ui.view.Ref(*ui.Node), answer: *ui.view.Ref(W.input.InputResult)) void {
+    m.keep(viewport.get(), accept.get(), reject.get(), submit.get(), answer);
+}
+
+pub fn Interaction(m: *M.View) View {
+    const viewport = ref(W.scroll_area.ScrollAreaResult);
+    const accept = ref();
+    const reject = ref();
+    const submit = ref();
+    const answer = ref(W.input.InputResult);
+    onMount(keep(m, viewport, accept, reject, submit, answer));
+    return (
+        <W.Card testId={m.space.id("ai.interaction.card")} variant={.outlined} padded={false} visible={M.expanded(m)}>
+            <col style={S.body} focusRequest={M.focus(m)}>
+                <W.ScrollArea ref={viewport} direction={.vertical} overscrollY={.contain} scrollbars={.always} scrollbarGutter={.stable} testId={m.space.id("ai.interaction.panel")} style={S.viewport.of(.{ .max = M.maxBody(m) })} parts={.{ .content = .{ .style = S.content } }}>
+                    <row style={S.heading}>
+                        <icon src={M.glyph("shield-alert")} style={S.warn_glyph} visible={!M.isQuestion(m)} />
+                        <icon src={M.glyph("message-circle-question")} style={S.ask_glyph} visible={M.isQuestion(m)} />
+                        <col style={S.title_block}>
+                            <text testId={m.space.id("ai.interaction.title")} style={S.title} box={S.fill_text}>{M.title(m)}</text>
+                            <text testId={m.space.id("ai.interaction.target")} style={S.secondary} box={S.fill_text} visible={M.targetShown(m)}>{M.target(m)}</text>
+                        </col>
+                    </row>
+                    <row style={S.command_row} visible={M.commandShown(m)}>
+                        <text testId={m.space.id("ai.interaction.command")} style={S.command} box={S.command_well}>{M.detail(m)}</text>
+                        <W.Tooltip text="复制命令或详情" position={.top}>
+                            <W.Button testId={m.space.id("ai.interaction.copy")} variant={.ghost} size={.sm} iconOnly={true} iconAsset={M.glyph("copy")} a11yLabel="复制命令或详情" onClick={M.copyDetail(m)} />
+                        </W.Tooltip>
+                    </row>
+                    <row testId={m.space.id("ai.interaction.impact.note")} style={S.impact_row} visible={M.impactShown(m)}>
+                        <icon src={M.glyph("info")} style={S.info_glyph} />
+                        <text testId={m.space.id("ai.interaction.impact")} style={S.secondary} box={S.row_text}>{M.impact(m)}</text>
+                    </row>
+                    <W.Tabs testId={m.space.id("ai.interaction.route")} items={M.routeItems(m)} variant={.segmented} size={.sm} active={M.routeActive(m)} onChange={|id| M.chooseRoute(m, id)} visible={M.routeShown(m)} />
+                    <text style={S.reason} box={S.fill_text} visible={M.reasonShown(m)}>{M.routeReason(m)}</text>
+                    <col style={S.options} visible={M.optionsShown(m)}>
+                        <W.RadioGroup options={M.radioOptions(m)} value={M.selectedValue(m)} disabled={M.locked(m)} onChange={|v| M.selectionChanged(m, v)} />
+                    </col>
+                    <row testId={m.space.id("ai.interaction.custom")} style={S.custom_row} visible={M.customShown(m)}>
+                        <W.Input ref={answer} value={M.customText(m)} placeholder="输入你的答案…" size={.sm} disabled={M.locked(m)} focusId="ai.interaction.answer" parts={.{ .input_container = m.space.id("ai.interaction.answer") }} onChange={|t| M.customChanged(m, t)} />
+                    </row>
+                    <text testId={m.space.id("ai.interaction.error")} style={S.failure} box={S.fill_text} visible={M.errorShown(m)}>{M.errorText(m)}</text>
+                </W.ScrollArea>
+                <row testId={m.space.id("ai.interaction.actions")} style={S.actions}>
+                    <spacer />
+                    <W.Button testId={m.space.id("ai.interaction.postpone")} label="稍后处理" variant={.ghost} size={.sm} disabled={M.locked(m)} onClick={M.postpone(m)} />
+                    <W.Button ref={reject} testId={m.space.id("ai.interaction.reject")} label="拒绝" iconAsset={M.glyph("x")} variant={.secondary} size={.sm} disabled={M.locked(m)} visible={!M.isQuestion(m)} onClick={M.deny(m)} />
+                    <W.Button ref={accept} testId={m.space.id("ai.interaction.approve")} label="允许执行" iconAsset={M.glyph("check")} variant={.primary} size={.sm} disabled={M.locked(m)} visible={!M.isQuestion(m)} onClick={M.approve(m)} />
+                    <W.Button ref={submit} testId={m.space.id("ai.interaction.submit")} label="提交答案" iconAsset={M.glyph("check")} variant={.primary} size={.sm} disabled={M.locked(m)} visible={M.isQuestion(m)} onClick={M.submit(m)} />
+                </row>
+            </col>
+        </W.Card>
+    );
+}
+
+/// “有 1 项操作待确认” / “有 1 个问题待回答”: shown after 稍后处理; a click reopens the panel. The host
+/// places it (just above the composer, at its right edge).
+pub fn PendingCapsule(m: *M.View) View {
+    return (
+        <W.Button testId={m.space.id("ai.interaction.pending")} label={M.pendingText(m)} variant={.secondary} size={.sm} iconAsset={ui.icons.clock} a11yLabel="继续处理待办请求" visible={M.pendingShown(m)} onClick={M.reopen(m)} />
+    );
+}

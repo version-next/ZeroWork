@@ -35,6 +35,11 @@ with tempfile.TemporaryDirectory(prefix='zw-grok-native-') as d:
     tree = Path(d)
     os.chmod(tree, 0o700)
     shutil.copytree(root / 'src', tree / 'src')
+    # The gateway test root is selected through src/acceptance.zig (zig build test-ai-gateway), so the private tree
+    # also needs the build scripts; everything else is linked read-only from the checkout.
+    for name in ('build.zig', 'build.zig.zon'): shutil.copy2(root / name, tree / name)
+    for entry in root.iterdir():
+        if entry.name not in ('src', 'build.zig', 'build.zig.zon', '.git', '.zig-cache', 'zig-out'): (tree / entry.name).symlink_to(entry)
     test = tree / 'src/ai/plugin_gateway_live_tests.zig'
     source = test.read_text()
     start = source.index('        var config = @import("provider_config.zig").defaults(.openai_compat);')
@@ -50,10 +55,9 @@ with tempfile.TemporaryDirectory(prefix='zw-grok-native-') as d:
     test.write_text(source)
     (out / 'grok-native-test-source.zig').write_text(source)
     env = dict(os.environ, ZEROWORK_AI_GATEWAY_LIVE='1', ZEROWORK_AI_GATEWAY_KEY=provider['api_key'], ZEROWORK_AI_GATEWAY_MODEL=model, ZEROWORK_AI_GATEWAY_CHAT_ENDPOINT=provider['endpoint'], ZEROWORK_AI_GATEWAY_MODELS_ENDPOINT=provider['endpoint'].removesuffix('/chat/completions')+'/models', ZEROWORK_AI_GATEWAY_EVIDENCE=str(out / 'result.json'), ZEROWORK_GROK_MODEL=model, ZEROWORK_GROK_CONFIG=str(private))
-    sdk = '/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk'
-    command = ['zig', 'test', str(tree / 'src/ai_gateway_runner.zig'), '--test-filter', 'API2 LIVE', '-lc', '-framework', 'CoreFoundation', '-framework', 'ImageIO', '-framework', 'CoreGraphics', '-F', sdk + '/System/Library/Frameworks', '-I', sdk + '/usr/include', '-L', sdk + '/usr/lib']
+    command = ['zig', 'build', 'test-ai-gateway']
     with (out / 'native-client.log').open('w') as log:
-        run = subprocess.run(command, cwd=root, env=env, stdout=log, stderr=log)
+        run = subprocess.run(command, cwd=tree, env=env, stdout=log, stderr=log)
     (out / 'invocation.json').write_text(json.dumps({'model': model, 'production_config_loaded': True, 'endpoint': provider['endpoint'], 'image_token_reservation': provider['models'][0]['image_token_reservation'], 'reservation_meaning': 'conservative per-image admission estimate, not actual usage', 'route_count': 1, 'gpt_fallback': False, 'exit_code': run.returncode}, indent=2))
     print(json.dumps({'model': model, 'exit_code': run.returncode, 'evidence': str(out)}))
     raise SystemExit(run.returncode)

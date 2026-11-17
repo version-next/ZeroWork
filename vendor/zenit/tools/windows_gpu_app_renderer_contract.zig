@@ -1,8 +1,8 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const ui = @import("ui");
+const env = @import("zenit_environment");
 const AppRenderer = @import("app_renderer").AppRenderer;
-extern "kernel32" fn SetEnvironmentVariableA([*:0]const u8, ?[*:0]const u8) callconv(.winapi) c_int;
 extern fn zenit_d12_test_hidden_window_create() ?*anyopaque;
 extern fn zenit_d12_test_hidden_window_destroy(*anyopaque) void;
 extern fn zenit_d12_test_gate_create(*anyopaque, *anyopaque) *anyopaque;
@@ -31,11 +31,14 @@ pub fn run(io: std.Io) !void {
     try checkAliasCopies(&dq.device);
     try checkIdleLuminance(io, a, hwnd, &dq.device, &dq.queue);
     try checkRangeProvider(io, a, hwnd, &dq.device, &dq.queue);
+    try checkVerticalPrewarm(io, a, hwnd, &dq.device, &dq.queue);
     try checkFrameDamage(io, a, hwnd, &dq.device, &dq.queue);
     try checkOpaqueTextComposite(io, a, hwnd, &dq.device, &dq.queue);
     {
-        if (SetEnvironmentVariableA("ZENIT_D3D12_SDF_GENERAL_ONLY", "1") == 0) return error.SetEnvironmentFailed;
-        defer _ = SetEnvironmentVariableA("ZENIT_D3D12_SDF_GENERAL_ONLY", null);
+        // Through setFlag: the renderer reads the switch via the cached `flag`,
+        // already read by the checks above.
+        try env.setFlag("ZENIT_D3D12_SDF_GENERAL_ONLY", "1");
+        defer env.setFlag("ZENIT_D3D12_SDF_GENERAL_ONLY", null) catch {};
         try checkFrameDamage(io, a, hwnd, &dq.device, &dq.queue);
         std.debug.print("PASS: optional SDF pipelines unavailable; general pipeline preserves full/partial UI pixel equality\n", .{});
     }
@@ -460,15 +463,15 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
     const system_lcd = renderer.text_renderer.cleartype_enabled;
     if (system_lcd and (renderer.text_renderer.lcd_glyph_count == 0 or renderer.text_renderer.gray_glyph_count != 0)) return error.OpaqueTextNotLCD;
     if (!system_lcd and renderer.text_renderer.lcd_glyph_count != 0) return error.DisabledClearTypeUsedLCD;
-    if (SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", "1") == 0) return error.EnvironmentUpdateFailed;
-    defer _ = SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", null);
+    try env.setFlag("ZENIT_TEXT_BASELINE_GRAYSCALE", "1");
+    defer env.setFlag("ZENIT_TEXT_BASELINE_GRAYSCALE", null) catch {};
     cx.root.?.markRenderDirty();
     cx.needs_redraw = true;
     try renderer.frame(cx, 256, 128, 1.75);
     renderer.frame_sync.drain(3);
     if (renderer.text_renderer.lcd_glyph_count != 0 or renderer.text_renderer.gray_glyph_count == 0) return error.DirectGrayTextWrongMode;
     try renderer.retained_tex.?.readBgra8(448, 224, &baseline, 1792);
-    _ = SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", null);
+    try env.setFlag("ZENIT_TEXT_BASELINE_GRAYSCALE", null);
     group.style.ensureExtPanic(a).composited_group = true;
     group.markRenderDirty();
     try renderer.frame(cx, 256, 128, 1.75);
@@ -499,4 +502,82 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
     std.debug.print("TEXT_COMPOSITE_GRAY_IDENTITY max_diff={d} changed_channels={d} direct_ink={d} composite_ink={d}\n", .{ max_diff, changed, ink[0], ink[1] });
     if (max_diff > 1) return error.OpaqueTextCompositeChangedPixels;
     std.debug.print("PASS: transparent composite text is grayscale, opaque direct text follows system LCD={}; same-mode gray composition max_diff={d}\n", .{ system_lcd, max_diff });
+}
+
+fn checkVerticalPrewarm(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, device: *gpu.Backend.Device, queue: *gpu.Backend.Queue) !void {
+    const text = @import("text");
+    const render = @import("render");
+    const Provider = struct {
+        renderer: *AppRenderer,
+        prewarm_calls: usize = 0,
+        fn ranges(raw: *anyopaque, _: render.TextRenderer.FontRangeRequest, _: *text.Font, _: std.mem.Allocator) !?*text.FontRanges {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.renderer.text_renderer.glyph_only) self.prewarm_calls += 1;
+            return null;
+        }
+    };
+    var fonts = try text.FontSystem.init(a, io);
+    defer fonts.deinit();
+    const font = try fonts.findFont(.{ .family = "Microsoft YaHei UI", .size = 16 });
+    var selector = render.FontSelector{ .small = font, .medium = font, .large = font };
+    var cases: usize = 0;
+    for ([_]f32{ 1, 1.5, 2 }) |scale| {
+        selector.setScaleFactor(scale);
+        const width: u32 = @intFromFloat(256 * scale);
+        const height: u32 = @intFromFloat(128 * scale);
+        const stride = width * 4;
+        var surface = gpu.Backend.Surface.init(hwnd);
+        defer surface.deinit();
+        try surface.configure(a, device, .{ .format = gpu.color_format, .width = width, .height = height, .usage = .color_target_and_read, .present_mode = .immediate });
+        const renderer = try a.create(AppRenderer);
+        defer a.destroy(renderer);
+        try renderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
+        defer renderer.deinit();
+        renderer.retain_present_copy = true;
+        renderer.retained_enabled = false;
+        renderer.setFonts(&selector);
+        var provider = Provider{ .renderer = renderer };
+        renderer.text_renderer.font_ranges_provider = Provider.ranges;
+        renderer.text_renderer.font_ranges_context = &provider;
+        const cx = try ui.Cx.init(a, io);
+        defer cx.deinit();
+        cx.setWindowMetrics(256, 128, scale);
+        const label = try ui.text(cx, "Vertical 中A 012345", .{ .font_size = 16, .color = ui.Color.BLACK });
+        cx.root = try ui.box(cx, .{ .width = .{ .px = 256 }, .height = .{ .px = 128 }, .background = ui.Color.WHITE, .padding = ui.Padding.all(8) }, .{label});
+        const cached = try a.alloc(u8, @as(usize, stride) * height);
+        defer a.free(cached);
+        const reference = try a.alloc(u8, cached.len);
+        defer a.free(reference);
+        for ([_]f32{ 0, 0.25, 0.5, 0.75 }) |x| {
+            label.setStyleInline(a, .{ .translate_x = x, .translate_y = 0 });
+            renderer.text_renderer.prewarm_signature_valid = false;
+            cx.needs_redraw = true;
+            try renderer.frame(cx, 256, 128, scale);
+            renderer.frame_sync.drain(3);
+            for ([_]f32{ 0.25, 7.75, 31.5 }) |y| {
+                const before = provider.prewarm_calls;
+                label.setStyleInline(a, .{ .translate_y = y });
+                cx.needs_redraw = true;
+                try renderer.frame(cx, 256, 128, scale);
+                renderer.frame_sync.drain(3);
+                if (provider.prewarm_calls != before) return error.VerticalPrewarmReuseNotReached;
+                try renderer.retained_tex.?.readBgra8(width, height, cached, stride);
+                renderer.text_renderer.prewarm_signature_valid = false;
+                cx.needs_redraw = true;
+                try renderer.frame(cx, 256, 128, scale);
+                renderer.frame_sync.drain(3);
+                if (provider.prewarm_calls <= before) return error.ForcedPrewarmReferenceNotReached;
+                try renderer.retained_tex.?.readBgra8(width, height, reference, stride);
+                if (!std.mem.eql(u8, cached, reference)) return error.VerticalPrewarmPixelMismatch;
+                var ink: usize = 0;
+                for (0..@as(usize, width) * height) |pixel| {
+                    if (cached[pixel * 4] < 200) ink += 1;
+                }
+                if (ink < 20) return error.VerticalPrewarmMissingInk;
+                cases += 1;
+            }
+        }
+    }
+    if (cases != 36) return error.MissingVerticalPrewarmCases;
+    std.debug.print("PASS: vertical prewarm reuse reached, 36 Latin/CJK full-surface byte-identical comparisons against forced prewarm at three DPI scales and four x phases\n", .{});
 }

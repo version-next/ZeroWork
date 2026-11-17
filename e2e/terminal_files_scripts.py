@@ -64,7 +64,7 @@ def main():
         image = root / "image.png"
         pixels = bytes(range(256)) * 32
         image.write_bytes(pixels)
-        assert read(image, 10000000)[0] == pixels
+        assert read(image, 10485760)[0] == pixels
         protected = root / "readonly"
         protected.write_bytes(b"keep")
         protected.chmod(0o400)

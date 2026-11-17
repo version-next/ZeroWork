@@ -20,9 +20,12 @@ pub const Adapter = struct {
         pending: *const fn (*anyopaque) ?Approval,
         decide: *const fn (*anyopaque, u64, [32]u8, bool) anyerror!void,
         pump: *const fn (*anyopaque, *anyopaque) void,
+        /// Whether the adapter has native work in flight that only its pump observes (an execution,
+        /// a read, a cleanup): the host keeps pumping it while this is true (LIFECYCLE.md §5.1 “时间”).
+        busy: *const fn (*anyopaque) bool,
         stop: *const fn (*anyopaque, identity.SessionHandle) @import("../host/session_host.zig").CloseReceipt,
         risk: *const fn (*anyopaque, identity.SessionHandle) bool,
-        impact: *const fn (*anyopaque, identity.SessionHandle) @import("../ui/group_close_controller.zig").Impact,
+        impact: *const fn (*anyopaque, identity.SessionHandle) @import("../host/group_close_controller.zig").Impact,
         shutdown: *const fn (*anyopaque, ?*anyopaque) void,
         clear: *const fn (*anyopaque) anyerror!void,
         destroy: *const fn (*anyopaque, std.mem.Allocator) void,
@@ -72,13 +75,16 @@ pub const Adapter = struct {
             fn pump(raw: *anyopaque, host: *anyopaque) void {
                 cast(raw).pump(app(host));
             }
+            fn busy(raw: *anyopaque) bool {
+                return cast(raw).busy();
+            }
             fn stop(raw: *anyopaque, owner: identity.SessionHandle) @import("../host/session_host.zig").CloseReceipt {
                 return cast(raw).stopOwner(owner);
             }
             fn risk(raw: *anyopaque, owner: identity.SessionHandle) bool {
                 return cast(raw).writeRisk(owner);
             }
-            fn impact(raw: *anyopaque, owner: identity.SessionHandle) @import("../ui/group_close_controller.zig").Impact {
+            fn impact(raw: *anyopaque, owner: identity.SessionHandle) @import("../host/group_close_controller.zig").Impact {
                 return cast(raw).closeImpact(owner);
             }
             fn shutdown(raw: *anyopaque, host: ?*anyopaque) void {
@@ -99,7 +105,7 @@ pub const Adapter = struct {
                 const capture = cast(raw).capture orelse return "会话";
                 return if (@hasField(@TypeOf(capture), "target")) capture.target else "本机 · zsh";
             }
-            const vtable: VTable = .{ .observe_verification = observeVerification, .prepare = prepare, .preflight = preflight, .interface = interface, .files = files, .delegate = delegate, .tool_ids = ids, .pending = pending, .decide = decide, .pump = pump, .stop = stop, .risk = risk, .impact = impact, .shutdown = shutdown, .clear = clear, .destroy = destroy, .label = label, .assemble_context = Impl.assembleContext };
+            const vtable: VTable = .{ .observe_verification = observeVerification, .prepare = prepare, .preflight = preflight, .interface = interface, .files = files, .delegate = delegate, .tool_ids = ids, .pending = pending, .decide = decide, .pump = pump, .busy = busy, .stop = stop, .risk = risk, .impact = impact, .shutdown = shutdown, .clear = clear, .destroy = destroy, .label = label, .assemble_context = Impl.assembleContext };
         };
         const implementation = try allocator.create(Impl);
         implementation.* = Impl.init(allocator);

@@ -2,6 +2,7 @@
 //! after beginDispatch succeeds. Recovered dispatched operations can be queried
 //! but can never be dispatched by reserve/beginDispatch again.
 const std = @import("std");
+const persist = @import("../../shared/base/persist.zig");
 const svc = @import("services.zig");
 pub const schema_version: u32 = 1;
 pub const max_journal_bytes = 4 * 1024 * 1024;
@@ -74,18 +75,9 @@ pub const FileBackend = struct {
     fn replace(raw: *anyopaque, bytes: []const u8) !void {
         const self: *FileBackend = @ptrCast(@alignCast(raw));
         if (bytes.len > max_journal_bytes) return error.JournalTooLarge;
-        var atomic = try self.dir.createFileAtomic(self.io, self.filename, .{ .replace = true, .permissions = @fromBackingInt(@intCast(0o600)) });
-        defer atomic.deinit(self.io);
-        var buffer: [4096]u8 = undefined;
-        var writer = atomic.file.writer(self.io, &buffer);
-        try writer.interface.writeAll(bytes);
-        try writer.interface.flush();
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
-        while (true) switch (std.posix.errno(std.c.fsync(self.dir.handle))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => return error.JournalDirectorySyncFailed,
+        persist.writeAtomic(self.io, self.dir, self.filename, bytes, .{ .sync_dir = true }) catch |err| return switch (err) {
+            error.DirectorySyncFailed => error.JournalDirectorySyncFailed,
+            else => err,
         };
     }
 };

@@ -2,6 +2,7 @@
 //! closed-session archive. The transport owner never writes files while feeding
 //! output: a bounded mailbox owns recording IO, and failures leave VT alive.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const c = @import("generated_ghostty_vt");
 const identity = @import("../host/identity.zig");
 const Config = @import("../config/config.zig");
@@ -546,11 +547,7 @@ pub const Recording = struct {
         defer self.allocator.free(bytes);
         if (c.ghostty_snapshot_encode_buf(self.terminal, bytes.ptr, bytes.len, &length) != c.GHOSTTY_SUCCESS) return error.RecordingSnapshotFailed;
         if (self.checkpoint.raw_file) |file| try file.sync(self.io);
-        var atomic = try self.dir.createFileAtomic(self.io, self.checkpoint_path, .{ .permissions = @as(std.Io.File.Permissions, @fromBackingInt(0o600)), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        try atomic.file.writePositionalAll(self.io, bytes[0..length], 0);
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try persist.writeAtomic(self.io, self.dir, self.checkpoint_path, bytes[0..length], .{ .make_path = true });
         self.checkpoint.scheduler.checkpointed(timestamp_ms);
         self.lock();
         self.checkpoint_count += 1;
@@ -1407,7 +1404,7 @@ test "command history native recording retains every repeated execution after cl
     }
     const cast = try tmp.dir.readFileAlloc(std.testing.io, recording.cast_path, a, .limited(1024 * 1024));
     defer a.free(cast);
-    var replay = try @import("../ui/history_cast.zig").loadWithManifest(a, cast, null, .{}, restored.value);
+    var replay = try @import("../features/history/model/history_cast.zig").loadWithManifest(a, cast, null, .{}, restored.value);
     defer replay.deinit();
     try std.testing.expectEqual(@as(usize, 520), replay.commands.items.len);
     try std.testing.expect(replay.commands.items[0].ai_execution_id.?.eql(ai_id));

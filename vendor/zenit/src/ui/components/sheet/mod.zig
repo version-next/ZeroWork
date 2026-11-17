@@ -19,6 +19,7 @@ const Signal = core.Signal;
 const reactive = @import("../../reactive.zig");
 const Scope = reactive.Scope;
 const Model = reactive.Model;
+const Source = reactive.Source;
 const Handler = core.Handler;
 const overlay_stack = @import("../../overlay_stack.zig");
 const render_engine = @import("../../core/render_engine/mod.zig");
@@ -39,6 +40,7 @@ pub const SheetProps = struct {
     side: SheetSide = .right,
     width: f32 = 320,
     height: f32 = 320,
+    /// Mask color: null = the theme overlay token (follows `Cx.setTheme`); a color stays fixed.
     overlay_color: ?Color = null,
     background: ?Color = null,
     close_on_overlay: bool = true,
@@ -47,8 +49,20 @@ pub const SheetProps = struct {
     /// only suggestions).
     open: Model(bool) = .{ .local = false },
     animation_ms: f32 = 250,
+    /// Play the enter transition when `open` is already true as the sheet mounts. Default false:
+    /// one mounted open (a page restored with its panel up) is the open result, not an opening, so
+    /// it appears at once. Set true when the caller mounts it in response to the opening itself.
+    animate_initial_open: bool = false,
     /// Called after user-initiated toggle (Esc / click mask) settles.
     on_open_change: ?Handler(bool) = null,
+    /// focusId of the control focused each time the sheet opens (read then, looked up inside it;
+    /// see `FocusManager.pushScopeWith`); a change while it still waits is followed. Mounted but
+    /// not shown / enabled yet = the sheet panel holds focus until it is; not mounted yet = the first
+    /// control meanwhile. null = a declared `autoFocus` inside, else the first focusable control.
+    initial_focus: Source(?[]const u8) = .{ .value = null },
+    /// focusId of the control focus returns to when the sheet closes (read then, looked up in the
+    /// whole window once the sheet is gone). null or not ready = the focus before it opened.
+    return_focus: Source(?[]const u8) = .{ .value = null },
 };
 
 /// Sheet mount returns handle.
@@ -100,7 +114,6 @@ pub const SheetBuilder = struct {
         defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
         const allocator = cx.allocator;
-        const t = cx.tokens;
         const p = self.props;
 
         const open = try reactive.resolveModel(bool, my_scope, p.open);
@@ -116,7 +129,7 @@ pub const SheetBuilder = struct {
         const panel_transition = transitionForSide(p.side);
         const ol = try overlay_stack.overlay(my_scope, cx, .{
             .kind = .modal,
-            .barrier = .{ .color = styles.sheetBarrierColor(p.overlay_color, t) },
+            .barrier = .colorOr(p.overlay_color),
             .dismiss = .{
                 .outside_click = if (p.close_on_overlay) .close else .none,
                 .escape = p.close_on_escape,
@@ -159,31 +172,17 @@ pub const SheetBuilder = struct {
             },
         }
 
-        // panel
-        const panel_w: core.Sizing = switch (p.side) {
-            .left, .right => .{ .px = p.width },
-            .top, .bottom => .{ .grow = .{} },
-        };
-        const panel_h: core.Sizing = switch (p.side) {
-            .left, .right => .{ .grow = .{} },
-            .top, .bottom => .{ .px = p.height },
-        };
-
         // sweep: panel mounted to barrier (barrier owned by overlay layer); on failure
         // view.mount reclaims mounted nodes.
         var panel: *Node = undefined;
         var content: *Node = undefined;
         try view.mount(my_scope, cx, barrier, view.capture(&panel, view.col(.{
-            .style = .{
-                .width = panel_w,
-                .height = panel_h,
-                .background = styles.sheetPanelBackground(p.background, t),
-                .shadows = core.ShadowList.of(&.{ styles.sheetKeyShadow(t), styles.sheet_ambient_shadow }),
-            },
+            // styleBy: background / border / shadow re-resolve on theme switch.
+            .style = view.styleBy(styles.Panel{ .side = p.side, .width = p.width, .height = p.height, .background = p.background }, styles.sheetPanel),
             // a11y attached to visible panel (overlay-configured a11y lands on ol.content
             // unused by this component).
             .a11y = .{ .role = .dialog, .modal = true },
-        }, view.capture(&content, view.box(.{ .style = styles.sheetContentStyle(t) }, {})))));
+        }, view.capture(&content, view.box(.{ .style = view.styleBy(styles.Themed{}, styles.sheetContent) }, {})))));
 
         // Position transition entirely via OverlayStack's slide_* transition. Don't
         // hand-write translate init here, otherwise stacks with enter/exit animation,
@@ -192,17 +191,20 @@ pub const SheetBuilder = struct {
         // Bind real content_node from OverlayStack layer to panel, keeping hierarchy
         // and animation target aligned.
         cx.overlay_stack.bindContentNode(allocator, ol.handle, panel);
+        if (rt.open.read.peek() and !p.animate_initial_open) cx.overlay_stack.skipInitialEnter(ol.handle);
 
         // open Effect
         {
             const vis = rt.open.read;
             reactive.checkBorrow(my_scope, vis);
+            reactive.checkBorrow(my_scope, p.initial_focus);
+            reactive.checkBorrow(my_scope, p.return_focus);
             const fm = &cx.focus_manager;
             const scope_pushed = try my_scope.createSignal(bool, false);
             // Direct unmount while open (Show switched / parent scope dispose) skips visible
             // effect pop branch -> focus scope stack leaks entry pointing to released barrier.
             const scope_guard = try my_scope.allocator.create(FocusScopeGuard);
-            scope_guard.* = .{ .fm = fm, .pushed = scope_pushed, .barrier = barrier, .barrier_id = barrier.id };
+            scope_guard.* = .{ .fm = fm, .pushed = scope_pushed, .barrier_id = barrier.id };
             try my_scope.adoptResource(@ptrCast(scope_guard), FocusScopeGuard.destroy);
             try my_scope.onCleanup(FocusScopeGuard, scope_guard, FocusScopeGuard.cleanup);
 
@@ -224,6 +226,9 @@ pub const SheetBuilder = struct {
                 .scope_pushed = scope_pushed,
                 .cx = cx,
                 .layer_handle = ol.handle,
+                .initial_focus = p.initial_focus,
+                .return_focus = p.return_focus,
+                .holder = panel,
             }, struct {
                 fn update(c: anytype) void {
                     if (c.visible.get()) {
@@ -239,7 +244,8 @@ pub const SheetBuilder = struct {
                         c.barrier.style.overflow_hidden = false;
                         c.barrier.markSizingDirty();
                         if (!c.scope_pushed.peek()) {
-                            c.fm.pushScope(c.barrier);
+                            // While the named target is not ready, the panel holds focus (not a control).
+                            c.fm.pushScopeWith(c.barrier, .{ .initial_focus = c.initial_focus.peek(), .placeholder = c.holder });
                             c.scope_pushed.set(true);
                         }
                     } else {
@@ -249,7 +255,7 @@ pub const SheetBuilder = struct {
                             }
                         }
                         if (c.scope_pushed.peek()) {
-                            c.fm.popScope();
+                            c.fm.removeScopeWith(c.barrier.id, .{ .restore = true, .return_focus = c.return_focus.peek() });
                             c.scope_pushed.set(false);
                         }
                     }
@@ -258,33 +264,29 @@ pub const SheetBuilder = struct {
                     c.cx.needs_redraw = true;
                 }
             }.update);
+            // A name computed from data that arrives after the open: the pending entry follows it.
+            if (!p.initial_focus.isStatic()) try my_scope.createEffect(.{ .fm = fm, .barrier = barrier, .pushed = scope_pushed, .initial = p.initial_focus }, struct {
+                fn follow(c: anytype) void {
+                    const name = c.initial.get();
+                    if (c.pushed.peek()) c.fm.updateScopeEntry(c.barrier, name);
+                }
+            }.follow);
         }
 
         return .{ .overlay = barrier, .panel = panel, .content = content, .portaled = ol.portaled, .open = rt.open.asSignal() };
     }
 };
 
-/// On unmount, pop focus scope this component still holds. Only pop if stack top
-/// really is self (popScope only pops top; nested wrong-pop removes upper
-/// floater's scope). Compare only id/pointer, don't dereference barrier (may be
-/// mid-free in cleanup).
+/// Unload this overlay's focus scope by id even when a child is above it.
 const FocusScopeGuard = struct {
     fm: *@FieldType(core.Cx, "focus_manager"),
     pushed: *Signal(bool),
-    barrier: *Node,
     barrier_id: u32,
 
     fn cleanup(g: *FocusScopeGuard) void {
         if (!g.pushed.peek()) return;
         g.pushed.set(false);
-        const fm = g.fm;
-        if (fm.scope_count == 0) return;
-        const top = fm.scope_count - 1;
-        const is_ours = if (fm.scope_stack_handles[top]) |h|
-            h.id == g.barrier_id
-        else
-            fm.scope_stack[top] == g.barrier;
-        if (is_ours) fm.popScope();
+        g.fm.removeScope(g.barrier_id, true);
     }
 
     fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -346,7 +348,7 @@ test "Sheet: visible signal control" {
     vis.set(false);
     try std.testing.expectEqual(core.Sizing{ .grow = .{} }, result.overlay.style.width);
     var exiting_found = false;
-    for (ctx.overlay_stack.layers) |slot| {
+    for (ctx.overlay_stack.layers.items) |slot| {
         if (slot) |layer| {
             try std.testing.expectEqual(overlay_stack.LayerState.exiting, layer.state);
             exiting_found = true;
@@ -364,6 +366,28 @@ test "Sheet: visible signal control" {
     }
 
     try std.testing.expectEqual(core.Sizing{ .px = 0 }, result.overlay.style.width);
+}
+
+fn sheetFirstFrameOffset(animate_initial_open: bool) !f32 {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(800, 600);
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const result = try Sheet(.{ .side = .right, .open = true, .animate_initial_open = animate_initial_open }).mount(scope, ctx);
+    if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
+    render_engine.current_frame_time_ms += 16.0;
+    render_engine.current_frame_dt_ms = 16.0;
+    ctx.layout();
+    _ = ctx.render();
+    return result.panel.style.translate_x;
+}
+
+test "Sheet: mounted open shows at once; animate_initial_open slides it in" {
+    try std.testing.expectEqual(@as(f32, 0), try sheetFirstFrameOffset(false));
+    try std.testing.expect(try sheetFirstFrameOffset(true) > 1);
 }
 
 test "Sheet: 打开状态下卸载会弹出自己的 focus scope" {
@@ -416,6 +440,43 @@ test "Sheet: 打开时 focus trap 生效并自动聚焦到对话框内" {
     for (order) |n| try std.testing.expect(n != outside);
 }
 
+test "Sheet: initial_focus names the control focused on open; return_focus names where focus goes back" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    ctx.root = root;
+    ctx.setViewport(800, 600);
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const vis = try scope.createSignal(bool, false);
+    const outside = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    outside.behavior.interaction.focusable = true;
+    try root.appendChild(std.testing.allocator, outside);
+    const other = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    other.behavior.interaction.focusable = true;
+    try root.appendChild(std.testing.allocator, other);
+    _ = try ctx.focus_targets.register(ctx, .target, other, "page.other", false);
+
+    const result = try Sheet(.{ .side = .right, .open = vis, .initial_focus = @as(?[]const u8, "sheet.second"), .return_focus = @as(?[]const u8, "page.other") }).mount(scope, ctx);
+    if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
+    const first = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    first.behavior.interaction.focusable = true;
+    try result.content.appendChild(std.testing.allocator, first);
+    const second = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    second.behavior.interaction.focusable = true;
+    try result.content.appendChild(std.testing.allocator, second);
+    _ = try ctx.focus_targets.register(ctx, .target, second, "sheet.second", false);
+
+    ctx.layout();
+    _ = ctx.render();
+    const fm = &ctx.focus_manager;
+    fm.setFocus(outside);
+    vis.set(true);
+    try std.testing.expect(fm.getFocused() == second);
+    vis.set(false);
+    try std.testing.expect(fm.getFocused() == other);
+}
+
 test "Sheet: exiting keeps overlay visible until commit" {
     var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
@@ -439,7 +500,7 @@ test "Sheet: exiting keeps overlay visible until commit" {
     try std.testing.expectEqual(core.Sizing{ .grow = .{} }, result.overlay.style.height);
 
     var exiting_found = false;
-    for (ctx.overlay_stack.layers) |slot| {
+    for (ctx.overlay_stack.layers.items) |slot| {
         if (slot) |layer| {
             if (layer.state == .exiting) {
                 exiting_found = true;
@@ -473,6 +534,32 @@ test "Sheet: four sides" {
     try std.testing.expect(root.children.items[0] == ctx.popover_portal_root.?);
 }
 
+test "Sheet: content taller than the panel stays inside it on every side (a scrolling column over a footer)" {
+    inline for (.{ SheetSide.left, SheetSide.right, SheetSide.top, SheetSide.bottom }) |s| {
+        var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        ctx.setViewport(800, 600);
+        const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+        ctx.root = root;
+        const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+        defer scope.dispose();
+        const result = try Sheet(.{ .side = s, .width = 300, .height = 240, .open = true }).mount(scope, ctx);
+        if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
+        // A column that clips / scrolls its own content (min 0), then a fixed footer.
+        const column = try core.adoptChild(ctx, std.testing.allocator, result.content, try box(ctx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .min_height = 0, .direction = .column, .overflow_hidden = true }, .{}));
+        _ = try core.adoptChild(ctx, std.testing.allocator, column, try box(ctx, .{ .width = .{ .px = 50 }, .height = .{ .px = 1000 }, .flex_shrink = 0 }, .{}));
+        const foot = try core.adoptChild(ctx, std.testing.allocator, result.content, try box(ctx, .{ .width = .{ .grow = .{} }, .height = .{ .px = 40 }, .flex_shrink = 0 }, .{}));
+        ctx.layout();
+        const panel = result.panel.rectFromWorldOrFallback();
+        const content = result.content.rectFromWorldOrFallback();
+        try std.testing.expect(panel.h > 0 and panel.h <= 600);
+        try std.testing.expect(content.y + content.h <= panel.h + 0.5);
+        const f = foot.rectFromWorldOrFallback();
+        try std.testing.expect(content.y + f.y + f.h <= panel.h + 0.5);
+        try std.testing.expect(column.rectFromWorldOrFallback().h < 1000);
+    }
+}
+
 // Test collection from styles.zig; this line required (see docs/STYLING.md).
 test {
     _ = @import("styles.zig");
@@ -486,4 +573,31 @@ test "sheet: mount 在任意分配点失败时不泄漏（sweep）" {
             return r.overlay;
         }
     }.m);
+}
+
+test "Sheet: a closed Sheet's content is not in the Tab order" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(800, 600);
+    const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const outside = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    outside.behavior.interaction.focusable = true;
+    try root.appendChild(std.testing.allocator, outside);
+    const open = try scope.createSignal(bool, false);
+    const r = try Sheet(.{ .open = open }).mount(scope, ctx);
+    if (!r.portaled) try root.appendChild(std.testing.allocator, r.overlay);
+    const inside = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
+    inside.behavior.interaction.focusable = true;
+    try r.content.appendChild(std.testing.allocator, inside);
+    ctx.layout();
+    for (0..3) |_| {
+        ctx.handleKeyDown(.tab, .{});
+        try std.testing.expect(ctx.focus_manager.getFocused() == outside);
+    }
+    open.set(true);
+    ctx.layout();
+    try std.testing.expect(ctx.focus_manager.getFocused() == inside);
 }

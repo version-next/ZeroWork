@@ -1,0 +1,4535 @@
+//! Main-thread bridge from the application controllers to SSH and Local
+//! runtimes. Workers keep their own snapshots; they never retain this host.
+const std = @import("std");
+const workspace_mod = @import("../../workspace/view/workspace.zig");
+const hosts = @import("../../../config/hosts.zig");
+const config = @import("../../../config/config.zig");
+const identity = @import("../../../host/identity.zig");
+const environment = @import("../../../host/environment.zig");
+const session = @import("../../../host/session_host.zig");
+const windows = @import("../../../host/window_host.zig");
+const plugins = @import("../../../host/plugin_registry.zig");
+const commands = @import("../../../host/command.zig");
+const local_mod = @import("../../../host/process_service.zig");
+const terminal = @import("../../../host/terminal_service.zig");
+const ui = @import("ui");
+const background = @import("../../../host/socks_background_runtime.zig");
+const group_close = @import("../../../host/group_close_controller.zig");
+const connection_envelope = @import("../../../config/connection_envelope.zig");
+const disconnect = @import("../../ai/tools/host/ai_disconnect_backend.zig");
+pub const BootstrapProduct = @import("../../../ai/ssh_bootstrap_product.zig");
+pub const DisconnectSnapshot = disconnect.Snapshot;
+pub const DisconnectPreflight = struct { create_operation: OperationKey, binding: session.ServiceHandle, impact_revision: u64 };
+pub const lifecycle = @import("../../../host/lifecycle_supervisor.zig");
+pub const OwnedLifecycleHooks = struct {
+    context: *anyopaque,
+    idle_evidence: ?*const fn (*anyopaque, identity.SessionHandle, identity.TaskId) anyerror!lifecycle.IdleEvidence = null,
+};
+pub const OwnedInputReason = enum { ordinary_input, keep_choice, execution_takeover };
+pub const OwnedInputEvent = struct {
+    context: @import("../../../ai/host_tools.zig").Context,
+    handle: identity.SessionHandle,
+    execution_id: ?identity.ExecutionId,
+    reason: OwnedInputReason,
+    phase: enum { requested, released },
+};
+const PendingOwnedSource = struct {
+    operation_ref: identity.HostOperationId,
+    connection: ?WindowConnection = null,
+    cwd: ?[]u8 = null,
+    dispatched: bool = false,
+    bootstrap_required: bool = false,
+    bootstrap: ?*BootstrapProduct.Prepared = null,
+    bootstrap_probed: ?BootstrapProduct.Probed = null,
+    probe: ?struct {
+        source: identity.SessionHandle,
+        handle: @import("../../../ai/execbridge.zig").ExecHandle,
+        key: OperationKey,
+        binding: session.ServiceHandle,
+        facts: ?BootstrapProduct.Facts = null,
+        failure: ?anyerror = null,
+    } = null,
+    fn deinit(self: *PendingOwnedSource, allocator: std.mem.Allocator) void {
+        if (self.connection) |*connection| connection.deinit();
+        if (self.cwd) |cwd| allocator.free(cwd);
+        self.connection = null;
+        self.cwd = null;
+        if (self.bootstrap) |prepared| prepared.release();
+        self.bootstrap = null;
+    }
+};
+pub const DeferredCloseSnapshot = struct {
+    operation_ref: identity.HostOperationId,
+    state: enum { accepted, closing, closed, cleanup_pending, cancelled_unsent } = .accepted,
+    local_released: bool = true,
+    remote_effect_unknown: bool = false,
+    error_code: ?[]const u8 = null,
+    recording_id: ?[32]u8 = null,
+    recording_generation: u64 = 0,
+    recording_unavailable_reason: ?[]const u8 = "RecordingUnavailable",
+};
+const DeferredClose = struct {
+    context: @import("../../../ai/host_tools.zig").Context,
+    handle: identity.SessionHandle,
+    snapshot: DeferredCloseSnapshot,
+    result_acknowledged: bool = false,
+    impact: group_close.Impact,
+    ownership_revision: ?u64 = null,
+    retained_metadata: lifecycle.SessionMetadata,
+};
+
+pub const CloseStep = session.CloseStep;
+pub const CloseReceipt = session.CloseReceipt;
+pub const OperationKey = session.OperationKey;
+pub const LegacySessionId = workspace_mod.SessionId;
+
+/// Called on the main thread. Returning awaiting requests another safeTick;
+/// unknown requires an explicit closeReceipt instead of blindly retrying work.
+/// Hooks must be idempotent and must not reenter SessionHost.
+pub const CloseExtension = struct {
+    context: *anyopaque,
+    run: *const fn (*anyopaque, LegacySessionId, CloseStep) CloseReceipt,
+};
+
+const remote_source = @import("../../../plugins/ssh/connection_source.zig");
+const SourceSnapshot = remote_source.SourceSnapshot;
+pub const FileSource = remote_source.Source;
+pub const WindowConnection = struct {
+    envelope: @import("../../../host/session_lifecycle.zig").Snapshot(connection_envelope.Envelope),
+    remote: ?SourceSnapshot = null,
+    pub fn init(allocator: std.mem.Allocator, host: hosts.HostConfig, global_config: config.Config, registry_values: []const hosts.HostConfig, host_id: workspace_mod.HostId, source_index: usize) !WindowConnection {
+        var remote = try remote_source.freezeWindowSource(allocator, host, global_config, registry_values, host_id, source_index);
+        errdefer if (remote) |*source| source.deinit();
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+        const envelope = try connection_envelope.fromLegacy(arena.allocator(), host);
+        try envelope.validate();
+        return .{ .envelope = try @import("../../../host/session_lifecycle.zig").Snapshot(connection_envelope.Envelope).init(allocator, envelope), .remote = remote };
+    }
+    pub fn deinit(self: *WindowConnection) void {
+        self.envelope.deinit();
+        if (self.remote) |*source| source.deinit();
+    }
+};
+const freezeSource = remote_source.freezeSource;
+const sourceSpec = remote_source.sourceSpec;
+const auth = remote_source.auth;
+pub fn localHomeDirectory(allocator: std.mem.Allocator) ![]u8 {
+    return @import("../../../platform/user_dirs.zig").home(allocator);
+}
+/// Installed only with a real file lifecycle adapter and its resource owner.
+pub const FilePlugin = struct {
+    adapter: session.Adapter,
+    context: *anyopaque,
+    tick: *const fn (*anyopaque, *session.SessionHost) anyerror!bool,
+    shutdown: *const fn (*anyopaque) CloseReceipt,
+    progress: ?*const fn (*anyopaque, identity.SessionHandle, OperationKey) ?@import("../../../host/sftp_adapter.zig").ConnectionProgress = null,
+};
+const FileCreateSource = struct { handle: identity.SessionHandle, key: OperationKey, source: SourceSnapshot, failure_reported: bool = false, progress_dismissed: bool = false };
+const CloseTarget = @import("../../workspace/model/workspace_model.zig").CloseTarget;
+const WindowClose = struct {
+    ticket: windows.Close,
+    key: OperationKey,
+    /// Borrowed from Workspace's one frozen close queue until this request ends.
+    targets: []const CloseTarget,
+    state: enum { draining, ready, cancelled, closed } = .draining,
+    cancel_requested: bool = false,
+};
+const Waiting = struct { key: OperationKey, step: CloseStep, unknown: bool = false };
+/// 非会话卡片 tab（会话记录卡片）的关闭：没有传输会话，但仍走同一个操作日志，并等 workspace 真正
+/// 移除视图后才确认。
+const CardClose = struct {
+    tab_id: identity.TabId,
+    owner: identity.CardId,
+    key: OperationKey,
+    state: enum { pending, closed, unknown } = .pending,
+};
+const ReconnectPolicy = struct { automatic: bool, max: u8, backoff: [5]u8 };
+const CloseDisplay = struct {
+    arena: std.heap.ArenaAllocator,
+    service: terminal.Service,
+    display: @import("../../../vt/recording_manifest.zig").Display,
+    fn deinit(self: *CloseDisplay) void {
+        self.arena.deinit();
+    }
+};
+// Only the scrollback policy follows the saved asset; endpoint, authentication
+// and the rest of an active connection keep their immutable source snapshot.
+fn currentScrollbackLimit(registry: *const hosts.Registry, source: hosts.HostConfig, global: u32) u32 {
+    const current = if (registry.indexOf(source.connection_id)) |index| registry.hosts[index] else source;
+    return if (current.scrollback_explicit or current.scrollback != 25000) current.scrollback else global;
+}
+
+const Mapping = struct {
+    process: ?*local_mod.Service = null,
+    handle: identity.SessionHandle,
+    create_operation: OperationKey,
+    legacy_id: LegacySessionId,
+    legacy_generation: u64,
+    tab_id: identity.TabId,
+    owner: identity.ContentOwner,
+    source: ?SourceSnapshot,
+    applied_scrollback_limit: ?u32 = null,
+    connected_received: bool = false,
+    ready_published: bool = false,
+    attached_published: bool = false,
+    plugin_connection_state: ?@FieldType(@import("../../../host/plugin_ui_contract.zig").ConnectionStatus, "state") = null,
+    failed_received: bool = false,
+    failed_published: bool = false,
+    cleanup_received: bool = false,
+    cleanup_unknown_received: bool = false,
+    failure: [384]u8 = undefined,
+    failure_len: usize = 0,
+    waiting: ?Waiting = null,
+    close_log_ns: i128 = 0,
+    acknowledged_step: ?CloseStep = null,
+    content_pending: bool = false,
+    local_retired: bool = false,
+    local_started: bool = false,
+    reconnect_policy: ?ReconnectPolicy = null,
+    reconnect_ticket: ?@import("../../../vt/reconnect.zig").Ticket = null,
+    reconnect_count: u8 = 0,
+    /// Separate from network retries; reset only after startup actually opens.
+    shell_initialization_retry_used: bool = false,
+    explicit_disconnect: bool = false,
+    runtime_loss_received: bool = false,
+    close_display: ?CloseDisplay = null,
+
+    pub fn recordFailure(self: *Mapping, text: []const u8) void {
+        var len = @min(text.len, self.failure.len);
+        while (len > 0 and !std.unicode.utf8ValidateSlice(text[0..len])) len -= 1;
+        @memcpy(self.failure[0..len], text[0..len]);
+        self.failure_len = len;
+        self.failed_received = true;
+    }
+};
+
+/// Process-owned services. A window host is only an attachment to this domain;
+/// native close releases its workspace while sibling session identities remain
+/// registered in this one registry. Adapter callbacks retain this stable owner.
+pub const Domain = struct {
+    allocator: std.mem.Allocator,
+    windows: windows.Host,
+    sessions: session.SessionHost,
+    local_adapter: *local_mod.Service,
+    dispatcher: commands.Dispatcher,
+    operation_history: @import("../../../host/operation_store.zig").Store,
+    plugin_security: @import("../../../host/plugin_security_host.zig").Services,
+    frame_budget: ?*@import("../../../host/frame_budget.zig").Budget = null,
+    /// 本次启动时随应用插件的启用状态与“已链接插件表”（Q5）：被禁用的插件不在注册表里，侧栏 / 向导 / 设置靠它
+    /// 把“已禁用”与“未知插件”区分开。启动后不再变化。
+    plugin_launch: @import("../../../host/plugin_enablement.zig").Launch = .{},
+    editor_credentials: ?@import("../../../host/editor_credentials.zig").Host = null,
+    probe_hosts: std.ArrayList(*@import("../../../host/probe_host.zig").Host) = .empty,
+    attachments: std.ArrayList(*ApplicationHost) = .empty,
+    idle_memory: @import("../../../platform/idle_memory.zig").Policy = .{},
+    idle_trimmed_bytes: usize = 0,
+    idle_input_epoch: u64 = 0,
+    idle_reclaim_runs: u64 = 0,
+    has_file_plugin: bool,
+    backgrounds: ?*background.Host = null,
+    tasks: ?*@import("../../../host/application_task_domain.zig").Domain = null,
+    ai: ?*@import("../../../ai/attached_service.zig").Host = null,
+    group_identity: u32 = 1,
+
+    pub fn aiService(self: *Domain) !*@import("../../../ai/attached_service.zig").Host {
+        if (self.ai) |host| return host;
+        const host = try self.allocator.create(@import("../../../ai/attached_service.zig").Host);
+        host.* = @import("../../../ai/attached_service.zig").Host.init(self.allocator);
+        host.presentations.authority = &host.service;
+        self.ai = host;
+        return host;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, has_file_plugin: bool) !*Domain {
+        return initWithContributions(allocator, has_file_plugin, &.{}, &.{});
+    }
+    pub fn initWithContributions(allocator: std.mem.Allocator, has_file_plugin: bool, manifests: []const plugins.PluginManifest, renderers: []const plugins.RendererDefinition) !*Domain {
+        const self = try allocator.create(Domain);
+        errdefer allocator.destroy(self);
+        const local = try @import("../../../plugins/linked_plugins.zig").createProcess(allocator);
+        errdefer local.deinit() catch {};
+        const adapters = @import("../../../plugins/linked_plugins.zig").applicationAdapters(Domain, ApplicationHost, self, local);
+        self.* = .{
+            .allocator = allocator,
+            .operation_history = @import("../../../host/operation_store.zig").Store.init(allocator),
+            .plugin_security = @import("../../../host/plugin_security_host.zig").Services.init(allocator),
+            .windows = .{ .allocator = allocator },
+            .sessions = try session.SessionHost.initWithPlugins(allocator, adapters[0..if (has_file_plugin) @as(usize, 3) else 2], manifests, renderers),
+            .local_adapter = local,
+            .dispatcher = .{ .allocator = allocator },
+            .has_file_plugin = has_file_plugin,
+        };
+        return self;
+    }
+
+    /// Called after native windows have released their Cx and adapters.
+    pub fn deinit(self: *Domain) void {
+        if (self.attachments.items.len != 0) {
+            std.log.warn("Shared application domain still has window attachments; retaining resources", .{});
+            return;
+        }
+        if (self.ai) |host| {
+            host.deinit() catch {
+                std.log.warn("Shared AI shutdown is not released; retaining its owner", .{});
+                return;
+            };
+            self.allocator.destroy(host);
+            self.ai = null;
+        }
+        if (self.local_adapter.shutdownStep() != .released) {
+            std.log.warn("Shared local shutdown is not released; retaining its owner", .{});
+            return;
+        }
+        if (self.tasks) |tasks| {
+            if (tasks.shutdownStep() != .released) {
+                std.log.warn("Shared task shutdown is not released; retaining its owner", .{});
+                return;
+            }
+            tasks.deinit() catch return;
+            self.tasks = null;
+        }
+        if (self.backgrounds) |host| {
+            if (host.shutdownStep() != .released) {
+                std.log.warn("Shared background shutdown is not released; retaining its owner", .{});
+                return;
+            }
+            host.deinit() catch return;
+            self.backgrounds = null;
+        }
+        while (self.probe_hosts.items.len != 0) {
+            const host = self.probe_hosts.items[0];
+            host.deinit() catch return;
+            _ = self.probe_hosts.orderedRemove(0);
+            self.allocator.destroy(host);
+        }
+        self.probe_hosts.deinit(self.allocator);
+        self.probe_hosts = .empty;
+        self.local_adapter.deinit() catch return;
+        self.operation_history.deinit();
+        self.sessions.deinit();
+        if (self.editor_credentials) |*credentials| credentials.deinit();
+        self.plugin_security.deinit();
+        self.windows.deinit();
+        self.dispatcher.deinit();
+        self.attachments.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn retireClosedOperations(self: *Domain) void {
+        for (self.sessions.sessions.items) |entry| {
+            const state = self.sessions.queryState(entry.handle) orelse continue;
+            switch (state.lifecycle) {
+                .closing, .closed, .failed, .ended, .cleanup_unknown => self.operation_history.ownerClosed(state.handle) catch |err| std.log.warn("operation history owner retirement: {s}", .{@errorName(err)}),
+                else => {},
+            }
+        }
+    }
+    /// One journal belongs to the process, so consuming from window A must
+    /// deliver window B's event to B instead of silently discarding it.
+    fn drainJournal(self: *Domain) void {
+        while (self.sessions.journal.take()) |owned_event| {
+            var event = owned_event;
+            defer event.deinit();
+            if (event.value.key.owner != .session) continue;
+            const source = self.ownerForHandle(event.value.key.owner.session) orelse continue;
+            const mapping = source.findHandle(event.value.key.owner.session) orelse {
+                if (event.value.kind == .failed) if (event.value.failure) |failure|
+                    source.publishFileCreateFailure(event.value.key, failure);
+                continue;
+            };
+            if (!mapping.create_operation.eql(event.value.key)) continue;
+            if (event.value.failure) |failure| if (event.value.kind == .failed) mapping.recordFailure(failure.safe_message);
+        }
+    }
+
+    pub fn sharedForward(raw: *anyopaque, binding: session.ServiceHandle, exit_index: ?usize) !*@import("../../../proto/ssh/forward_service.zig").Service {
+        const self: *Domain = @ptrCast(@alignCast(raw));
+        if (!self.sessions.bindingIsLive(binding) or binding.origin_session == null) return error.StaleForwardBinding;
+        if (self.backgrounds) |host| if (host.owns(binding.origin_session.?)) return host.forwardService(binding, exit_index);
+        const host = self.ownerForHandle(binding.origin_session.?) orelse return error.StaleSession;
+        return host.sshForwardService(binding, exit_index);
+    }
+
+    pub fn stopBackgroundOwner(self: *Domain, owner: identity.SessionHandle) !OperationKey {
+        const host = self.backgrounds orelse return error.StaleSession;
+        if (!host.owns(owner)) return error.StaleSession;
+        _ = host.requestStop(owner);
+        return self.sessions.requestClose(owner, .{
+            .pause_transfers = .{ .context = self, .run = backgroundPause },
+            .stop_ai = .{ .context = self, .run = backgroundStopAi },
+            .release_forwards = .{ .context = self, .run = backgroundReleaseForwards },
+            .release_content = .{ .context = self, .run = backgroundReleaseContent },
+        });
+    }
+    fn backgroundStep(raw: *anyopaque, owner: identity.SessionHandle, key: OperationKey, step: CloseStep) CloseReceipt {
+        const self: *Domain = @ptrCast(@alignCast(raw));
+        return (self.backgrounds orelse return .unknown).closeStep(owner, key, step);
+    }
+    fn backgroundPause(raw: *anyopaque, owner: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return backgroundStep(raw, owner, key, .pause_transfers);
+    }
+    fn backgroundStopAi(raw: *anyopaque, owner: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return backgroundStep(raw, owner, key, .stop_ai);
+    }
+    fn backgroundReleaseForwards(raw: *anyopaque, owner: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return backgroundStep(raw, owner, key, .release_forwards);
+    }
+    fn backgroundReleaseContent(raw: *anyopaque, owner: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return backgroundStep(raw, owner, key, .release_content);
+    }
+
+    fn detach(self: *Domain, host: *ApplicationHost) void {
+        for (self.attachments.items, 0..) |attachment, index| if (attachment == host) {
+            _ = self.attachments.orderedRemove(index);
+            break;
+        };
+        // Exceptional teardown can arrive without the native close callback.
+        // Retire that window identity without touching a sibling workspace.
+        if (self.windows.find(host.window_id)) |window| if (!window.closing) {
+            const ticket = self.windows.beginClose(host.window_id) catch return;
+            self.windows.completeClose(ticket) catch {};
+        };
+    }
+
+    pub fn ownerForWindow(self: *Domain, id: identity.WindowId) ?*ApplicationHost {
+        for (self.attachments.items) |host| if (host.window_id == id) return host;
+        return null;
+    }
+    pub fn ownerForTarget(self: *Domain, target_value: session.AttachmentTarget) ?*ApplicationHost {
+        for (self.attachments.items) |host| if (host.window_id == target_value.window_id and host.workspace_id == target_value.workspace_id) return host;
+        return null;
+    }
+    pub fn ownerForHandle(self: *Domain, handle: identity.SessionHandle) ?*ApplicationHost {
+        const state = self.sessions.queryState(handle) orelse return null;
+        return self.ownerForTarget(state.target);
+    }
+    fn ownerForKey(self: *Domain, key: OperationKey) ?*ApplicationHost {
+        return if (key.owner == .session) self.ownerForHandle(key.owner.session) else null;
+    }
+    /// A provider retains its own lifecycle callbacks. This bridge only resolves
+    /// the destination window; it never selects an engine from a protocol ID.
+    pub fn windowFactory(comptime implementation: session.Adapter.VTable) session.Adapter.VTable {
+        return struct {
+            fn create(raw: *anyopaque, request: session.CreateRequest) !void {
+                const self: *Domain = @ptrCast(@alignCast(raw));
+                const host = self.ownerForTarget(request.target) orelse return error.WorkspaceClosed;
+                if (host.workspace.shutting_down or host.windowClosePending()) return error.WorkspaceClosed;
+                return implementation.create(host, request);
+            }
+            fn cancel(raw: *anyopaque, key: OperationKey) CloseReceipt {
+                const self: *Domain = @ptrCast(@alignCast(raw));
+                if (key.owner == .session) if (self.backgrounds) |background_host| if (background_host.owns(key.owner.session)) return background_host.cancel(key);
+                const host = self.ownerForKey(key) orelse return .unknown;
+                return implementation.cancel(host, key);
+            }
+            fn close(raw: *anyopaque, handle: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+                const self: *Domain = @ptrCast(@alignCast(raw));
+                if (self.backgrounds) |background_host| if (background_host.owns(handle)) return background_host.closeStep(handle, key, .close_protocol);
+                const host = self.ownerForHandle(handle) orelse return .unknown;
+                return implementation.close(host, handle, key);
+            }
+            fn stale(raw: *anyopaque, handle: identity.SessionHandle, key: OperationKey) void {
+                const self: *Domain = @ptrCast(@alignCast(raw));
+                if (self.backgrounds) |background_host| if (background_host.owns(handle)) return background_host.releaseStale(handle, key);
+                const host = self.ownerForHandle(handle) orelse return;
+                implementation.release_stale(host, handle, key);
+            }
+            const vtable: session.Adapter.VTable = .{ .create = create, .cancel = cancel, .close = close, .release_stale = stale };
+        }.vtable;
+    }
+};
+
+/// Keep this allocation stable: adapter and workspace callbacks borrow self.
+/// init does not install callbacks or register cleanup with a UI scope. The
+/// application installs it after its close-risk bridge and calls deinit after
+/// it has stopped workspace polling/worker events during shutdown.
+pub const ApplicationHost = struct {
+    allocator: std.mem.Allocator,
+    workspace: *workspace_mod.Workspace,
+    domain: *Domain,
+    owns_domain: bool = false,
+    windows: *windows.Host,
+    window_id: identity.WindowId,
+    workspace_id: identity.WorkspaceId,
+    sessions: *session.SessionHost,
+    local_adapter: *local_mod.Service,
+    dispatcher: *commands.Dispatcher,
+    close_extension: ?CloseExtension = null,
+    mappings: std.ArrayList(Mapping) = .empty,
+    card_closes: std.ArrayList(CardClose) = .empty,
+    pending_source: ?*const SourceSnapshot = null,
+    pending_shared_connection: ?@import("../../../host/runtime_service.zig").SharedLease = null,
+    pending_bootstrap: ?*BootstrapProduct.Prepared = null,
+    previous_sessions: workspace_mod.SessionBridge = .{},
+    previous_close: workspace_mod.CloseBridge = .{},
+    previous_window_close: workspace_mod.WindowCloseBridge = .{},
+    window_close: ?WindowClose = null,
+    installed: bool = false,
+    last_rejection: ?commands.Rejection = null,
+    file_plugin: ?FilePlugin = null,
+    file_sources: std.ArrayList(FileCreateSource) = .empty,
+    /// A failed create has no tab to own the usual workspace feedback channel.
+    /// Delivered once on the original window, with the exact frozen owner.
+    file_failure: ?struct {
+        context: *anyopaque,
+        publish: *const fn (*anyopaque, identity.SessionHandle, []const u8) void,
+    } = null,
+    plugin_attempts: std.ArrayList(session.Accepted) = .empty,
+    pending_editor_handoff: ?@import("../../../host/editor_credentials.zig").Handoff = null,
+    window_auxiliary: ?struct {
+        context: *anyopaque,
+        cancel: *const fn (*anyopaque) void,
+        released: *const fn (*anyopaque) bool,
+    } = null,
+    background_previous_auth: ?workspace_mod.ExternalAuthentication = null,
+    lifecycle_supervisor: lifecycle.Supervisor,
+    owned_sources: std.ArrayList(PendingOwnedSource) = .empty,
+    owned_lifecycle_hooks: ?OwnedLifecycleHooks = null,
+    deferred_closes: std.ArrayList(DeferredClose) = .empty,
+    disconnects: disconnect.Ledger = .{},
+    // At most one ownership transition per Supervisor entry (limit 512).
+    // Fixed storage keeps accepted user input safe even under allocator OOM.
+    owned_input_events: [512]OwnedInputEvent = undefined,
+    owned_input_event_count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, workspace: *workspace_mod.Workspace) !*ApplicationHost {
+        return initWithFilePlugin(allocator, workspace, null);
+    }
+
+    pub fn initWithFilePlugin(allocator: std.mem.Allocator, workspace: *workspace_mod.Workspace, file_plugin: ?FilePlugin) !*ApplicationHost {
+        const domain = try Domain.init(allocator, file_plugin != null);
+        errdefer domain.deinit();
+        const self = try initInDomain(domain, workspace, file_plugin);
+        self.owns_domain = true;
+        return self;
+    }
+
+    /// Attach a workspace to the application's existing service registry.
+    /// The domain outlives all window Cx instances and owns process identities.
+    pub fn initInDomain(domain: *Domain, workspace: *workspace_mod.Workspace, file_plugin: ?FilePlugin) !*ApplicationHost {
+        if (file_plugin) |plugin| if (plugin.adapter.registration.plugin_id != .sftp) return error.InvalidFilePlugin;
+        if (file_plugin != null and !domain.has_file_plugin) return error.FilePluginUnavailable;
+        const self = try domain.allocator.create(ApplicationHost);
+        errdefer domain.allocator.destroy(self);
+        try domain.attachments.ensureUnusedCapacity(domain.allocator, 1);
+        const request = (try domain.windows.requestCreate(.workspace)).pending;
+        errdefer domain.windows.failed(request) catch {};
+        const window = try domain.windows.ready(request);
+        self.* = .{
+            .allocator = domain.allocator,
+            .domain = domain,
+            .workspace = workspace,
+            .windows = &domain.windows,
+            .window_id = window.id,
+            .workspace_id = window.workspace.?,
+            .sessions = &domain.sessions,
+            .local_adapter = domain.local_adapter,
+            .file_plugin = file_plugin,
+            .dispatcher = &domain.dispatcher,
+            .lifecycle_supervisor = lifecycle.Supervisor.init(domain.allocator),
+        };
+        domain.attachments.appendAssumeCapacity(self);
+        workspace.plugins = self.sessions.registry;
+        workspace.plugin_launch = &domain.plugin_launch;
+        workspace.credential_provider = .{ .context = &self.sessions.registry, .resolve = resolveCredentialReferences };
+        workspace.configureIdentity(self.window_id, self.workspace_id);
+        return self;
+    }
+
+    pub fn install(self: *ApplicationHost) void {
+        if (self.installed) return;
+        self.workspace.credential_provider = .{ .context = &self.sessions.registry, .resolve = resolveCredentialReferences };
+        self.previous_sessions = self.workspace.session_bridge;
+        self.previous_close = self.workspace.close_bridge;
+        self.previous_window_close = self.workspace.window_close_bridge;
+        self.workspace.session_bridge = .{ .context = self, .create = bridgeCreate, .recreate = bridgeRecreate, .reuse = bridgeReuse, .connected = bridgeConnected, .failed = bridgeFailed, .cleanup = bridgeCleanup, .cleanup_status = bridgeCleanupStatus, .create_local = bridgeCreateLocal, .duplicate_local = bridgeDuplicateLocal, .retry_local = bridgeRetryLocal, .retry_ssh = bridgeRetrySsh, .local_cwd = bridgeLocalCwd, .local_program = bridgeLocalProgram, .local_metadata_revision = bridgeLocalMetadataRevision };
+        // Resource teardown belongs to the five typed close steps. The old
+        // aggregate cleanup callback is replaced by close_extension.
+        self.workspace.close_bridge = .{ .context = self, .risk = bridgeRisk, .impact = bridgeImpact, .close_state = bridgeCloseState, .request_close = bridgeClose, .confirm = if (self.previous_close.confirm != null) bridgeConfirm else null };
+        self.workspace.window_close_bridge = .{ .context = self, .cancelled = bridgeWindowCancelled };
+        if (self.domain.backgrounds != null) self.installBackgroundAuth();
+        self.installed = true;
+    }
+
+    pub fn uninstall(self: *ApplicationHost) void {
+        if (self.workspace.credential_provider) |provider| {
+            if (provider.context == @as(*const anyopaque, &self.sessions.registry)) self.workspace.credential_provider = null;
+        }
+        if (!self.installed) return;
+        if (self.workspace.session_bridge.context == @as(?*anyopaque, self)) self.workspace.session_bridge = self.previous_sessions;
+        if (self.workspace.close_bridge.context == @as(?*anyopaque, self)) self.workspace.close_bridge = self.previous_close;
+        if (self.workspace.window_close_bridge.context == @as(?*anyopaque, self)) self.workspace.window_close_bridge = self.previous_window_close;
+        if (self.workspace.external_auth) |installed| if (installed.context == @as(*anyopaque, self)) {
+            self.workspace.external_auth = self.background_previous_auth;
+        };
+        self.installed = false;
+    }
+
+    pub fn deinit(self: *ApplicationHost) void {
+        // Native close normally reaches this with every view already released.
+        // An exceptional teardown must retain unknown/live owners, never free
+        // a TextSlot beneath a view or claim a worker's cleanup completed.
+        if (self.file_plugin) |plugin| if (plugin.shutdown(plugin.context) != .released) {
+            std.log.warn("File shutdown is not released; retaining its owner", .{});
+            return;
+        };
+        for (self.mappings.items) |mapping| if (mapping.process != null)
+            self.workspace.unbindLocalTerminal(mapping.legacy_id, mapping.handle);
+        if (self.workspace.external_auth) |installed| {
+            if (installed.context == @as(*anyopaque, self)) self.workspace.external_auth = self.background_previous_auth;
+        }
+        if (self.window_close) |close| _ = self.workspace.endWindowCloseBatch(close.ticket.request);
+        self.uninstall();
+        const domain = self.domain;
+        const owns_domain = self.owns_domain;
+        domain.detach(self);
+        for (self.mappings.items) |*mapping| {
+            if (mapping.source) |*source| source.deinit();
+            if (mapping.close_display) |*display| display.deinit();
+        }
+        self.mappings.deinit(self.allocator);
+        self.card_closes.deinit(self.allocator);
+        for (self.file_sources.items) |*source| source.source.deinit();
+        self.file_sources.deinit(self.allocator);
+        self.plugin_attempts.deinit(self.allocator);
+        for (self.owned_sources.items) |*source| source.deinit(self.allocator);
+        self.owned_sources.deinit(self.allocator);
+        self.lifecycle_supervisor.deinit();
+        self.deferred_closes.deinit(self.allocator);
+        self.disconnects.deinit(self.allocator);
+        self.allocator.destroy(self);
+        if (owns_domain) domain.deinit();
+    }
+
+    pub fn setCloseExtension(self: *ApplicationHost, context: *anyopaque, run: *const fn (*anyopaque, LegacySessionId, CloseStep) CloseReceipt) void {
+        self.close_extension = .{ .context = context, .run = run };
+    }
+
+    pub fn registry(self: *const ApplicationHost) plugins.Registry {
+        return self.sessions.registry;
+    }
+    /// 本次启动的随应用插件启用状态（Q5）。
+    pub fn pluginLaunch(self: *const ApplicationHost) *const @import("../../../host/plugin_enablement.zig").Launch {
+        return &self.domain.plugin_launch;
+    }
+
+    pub fn fileProgressKey(self: *ApplicationHost) ?OperationKey {
+        for (self.file_sources.items) |source| {
+            if (source.progress_dismissed) continue;
+            const state = self.sessions.queryState(source.handle) orelse continue;
+            if (state.create_operation.eql(source.key) and (state.lifecycle == .creating or state.lifecycle == .ready or state.lifecycle == .failed)) return source.key;
+        }
+        return null;
+    }
+
+    pub fn dismissFileProgress(self: *ApplicationHost, key: OperationKey) void {
+        for (self.file_sources.items) |*source| if (source.key.eql(key)) {
+            source.progress_dismissed = true;
+        };
+    }
+
+    pub fn fileConnectionProgress(self: *ApplicationHost, key: OperationKey) ?@import("../../../host/sftp_adapter.zig").ConnectionProgress {
+        if (key.owner != .session) return null;
+        for (self.file_sources.items) |source| if (source.key.eql(key) and source.progress_dismissed) return null;
+        const plugin = self.file_plugin orelse return null;
+        return if (plugin.progress) |get| get(plugin.context, key.owner.session, key) else null;
+    }
+
+    /// Frozen UI identity for a queued file create, independent of current
+    /// registry edits or tab focus. Borrowed until application shutdown.
+    pub fn fileSource(self: *const ApplicationHost, owner: identity.SessionHandle, key: OperationKey) !FileSource {
+        for (self.file_sources.items) |source| if (source.handle.eql(owner) and source.key.eql(key)) return source.source.value;
+        return error.StaleFileCreate;
+    }
+
+    /// Presentation callback invoked after the real adapter publishes ready.
+    /// Content/scope ownership transfers only on success, as in Workspace.
+    pub fn attachFileSession(self: *ApplicationHost, owner: identity.SessionHandle, key: OperationKey, content: *ui.Node, scope: *ui.Scope) !session.Attachment {
+        const state = self.sessions.queryState(owner) orelse return error.StaleSession;
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        if (!state.create_operation.eql(key) or state.lifecycle != .ready) return error.FileSessionNotReady;
+        if (!std.meta.eql(state.target, self.target())) return error.WrongAttachmentTarget;
+        if (self.findHandle(owner) != null) return error.FileSessionAlreadyAttached;
+        const source = try self.fileSource(owner, key);
+        try self.mappings.ensureUnusedCapacity(self.allocator, 1);
+        const id = try self.workspace.createFileSessionDirect(owner, source.host, source.host_id, source.source_index, content, scope);
+        const tab = self.workspace.sessionTab(id).?;
+        tab.file_ready = true;
+        self.mappings.appendAssumeCapacity(.{ .handle = owner, .create_operation = key, .legacy_id = id, .legacy_generation = tab.generation, .tab_id = tab.tab_id, .owner = tab.content_owner, .source = null, .ready_published = true });
+        self.mappingsChanged();
+        if (@import("../../../platform/runtime_mode.zig").automation) std.debug.print("SFTP_WORKSPACE_TRACE {{\"event\":\"attached\",\"owner\":{{\"session_id\":{d},\"generation\":{d}}},\"create_operation\":{d},\"tab_id\":{d},\"plugin\":\"sftp\",\"terminal_present\":{},\"runtime_present\":{}}}\n", .{ @backingInt(owner.session_id), owner.generation, key.operation_id, @backingInt(tab.tab_id), tab.terminal != null, tab.runtime != null });
+        return .{ .target = state.target, .tab_id = tab.tab_id };
+    }
+
+    pub fn supportsIntegration(self: *ApplicationHost, handle: identity.SessionHandle, comptime feature: []const u8) bool {
+        const manifest = self.sessions.manifestFor(handle) orelse return false;
+        return @field(manifest.integration, feature);
+    }
+    fn registeredServices(self: *ApplicationHost, handle: identity.SessionHandle) plugins.Services {
+        const manifest = self.sessions.manifestFor(handle) orelse return .{};
+        const registration = manifest.legacy_registration orelse return .{};
+        return registration.services;
+    }
+
+    pub fn localProcess(self: *ApplicationHost, id: LegacySessionId) !?local_mod.ProcessSnapshot {
+        const mapping = self.localMapping(id) orelse return null;
+        return try mapping.process.?.processSnapshot(mapping.handle);
+    }
+    pub fn localCwd(self: *ApplicationHost, id: LegacySessionId, allocator: std.mem.Allocator) !?local_mod.CwdSnapshot {
+        const mapping = self.localMapping(id) orelse return null;
+        return try mapping.process.?.cwdSnapshot(mapping.handle, allocator);
+    }
+    pub fn localCloseRisk(self: *ApplicationHost, id: LegacySessionId, allocator: std.mem.Allocator) !?local_mod.CloseRiskSnapshot {
+        const mapping = self.localMapping(id) orelse return null;
+        return try mapping.process.?.closeRiskSnapshot(mapping.handle, allocator);
+    }
+    pub fn terminalSnapshot(self: *ApplicationHost, id: LegacySessionId) ?*const terminal.TerminalSnapshot {
+        const mapping = self.localMapping(id) orelse return null;
+        const tab = self.workspace.sessionTab(id) orelse return null;
+        return tab.terminal.?.terminalSnapshot(mapping.handle);
+    }
+    fn localMapping(self: *ApplicationHost, id: LegacySessionId) ?*Mapping {
+        for (self.mappings.items) |*mapping| if (mapping.legacy_id == id and mapping.process != null and !mapping.local_retired) return mapping;
+        return null;
+    }
+
+    pub fn createLocal(self: *ApplicationHost, cwd: ?[]const u8) !session.Accepted {
+        const decision = try self.createLocalForInput(try self.dispatcher.issue(), cwd);
+        return switch (decision) {
+            .accepted => |key| .{ .handle = key.owner.session, .operation = key },
+            .rejected => error.CommandRejected,
+        };
+    }
+    pub fn createLocalForInput(self: *ApplicationHost, command_id: u64, cwd: ?[]const u8) !commands.Decision {
+        return self.dispatcher.submit(.{ .command_id = command_id, .kind = .create_local_session, .owner = .app, .view_revision = self.workspace.app_config.config_revision, .payload = .{ .text = cwd orelse "" } }, .{
+            .owner = .app,
+            .view_revision = self.workspace.app_config.config_revision,
+            .action_context = .{ .supported = .{ .session_factory = true }, .ready = .{ .session_factory = true }, .lifecycle_allows = !self.workspace.shutting_down and self.workspace.model.window_close == null, .permission_granted = true, .handler_ready = true },
+        }, .{ .context = self, .submit = submitCreateLocal });
+    }
+
+    pub fn retryLocal(self: *ApplicationHost, id: LegacySessionId) !session.Accepted {
+        if (self.workspace.shutting_down or self.workspace.model.window_close != null) return error.WorkspaceClosed;
+        const mapping = self.localMapping(id) orelse return error.UnknownSession;
+        const state = self.sessions.queryState(mapping.handle) orelse return error.StaleSession;
+        if (state.lifecycle != .failed and state.lifecycle != .ended) return error.LifecycleDoesNotAllowRetry;
+        if (state.create_cleanup != .released) return error.CleanupNotReleased;
+        const tab = self.workspace.sessionTab(id) orelse return error.StaleSession;
+        const index = self.workspace.model.indexOf(tab.tab_id) orelse return error.StaleSession;
+        if (self.workspace.model.tabs.items[index].revision == std.math.maxInt(u64)) return error.RevisionExhausted;
+        self.workspace.unbindLocalTerminal(id, mapping.handle);
+        return self.sessions.retry(mapping.handle);
+    }
+
+    pub fn duplicateLocal(self: *ApplicationHost, id: LegacySessionId) !session.Accepted {
+        const mapping = self.localMapping(id) orelse return error.UnknownSession;
+        const cwd = try mapping.process.?.copyCwd(mapping.handle, self.allocator);
+        defer if (cwd) |value| self.allocator.free(value);
+        const accepted = try self.createLocal(cwd);
+        if (cwd == null) self.workspace.status("当前本地目录未知，新会话使用用户主目录");
+        return accepted;
+    }
+
+    pub fn ownerForLegacy(self: *const ApplicationHost, id: LegacySessionId) ?identity.SessionHandle {
+        for (self.mappings.items) |mapping| if (mapping.legacy_id == id) return mapping.handle;
+        return null;
+    }
+
+    /// Short controller handler: capture the authorized source and enqueue.
+    /// Real creation occurs only after the Bridge handler has returned.
+    pub fn queueOwnedSession(self: *ApplicationHost, request: lifecycle.OpenRequest) !lifecycle.Snapshot {
+        if (self.lifecycle_supervisor.find(request.operation_ref)) |entry| {
+            if (!std.meta.eql(entry.request, request)) return error.IdempotencyConflict;
+            return entry.snapshot;
+        }
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        try self.validateOwnedGroup(request.group);
+        if (request.membership_revision) |revision| {
+            const group = self.workspace.group_roster.?.findById(@intCast(@backingInt(request.group.id))).?;
+            if (group.membership_revision != revision) return error.ScopeChanged;
+        }
+        if ((request.source == null) == (request.saved_source == null)) return error.InvalidSource;
+        try self.owned_sources.ensureUnusedCapacity(self.allocator, 1);
+        var source: PendingOwnedSource = .{ .operation_ref = request.operation_ref };
+        errdefer source.deinit(self.allocator);
+        if (request.source) |handle| {
+            const mapping = self.findHandle(handle) orelse return error.StaleReference;
+            const state = self.sessions.queryState(handle) orelse return error.StaleReference;
+            if (state.lifecycle != .ready and state.lifecycle != .attached) return error.SourceChanged;
+            const roster = self.workspace.group_roster orelse return error.UnknownGroup;
+            const group = roster.findById(@intCast(@backingInt(request.group.id))).?;
+            if (!group.contains(mapping.legacy_id)) return error.TargetOutsideScope;
+            if (mapping.process != null) {
+                if (request.connection_policy != .new_only) return error.UnsupportedSource;
+                source.cwd = try mapping.process.?.copyCwd(handle, self.allocator);
+            } else {
+                if (mapping.source == null) return error.UnsupportedSource;
+                source.connection = try self.freezeTabWindowConnection(mapping.legacy_id);
+            }
+        } else {
+            const index = try self.validateSavedOwnedSource(request.saved_source.?);
+            if (request.connection_policy == .reuse_only) return error.ReuseUnavailable;
+            if (request.connection_policy == .prefer_reuse and !request.allow_new_fallback) return error.FallbackAuthorizationRequired;
+            const host_id = self.workspace.hostId(index) orelse return error.StaleReference;
+            source.connection = try self.freezeWindowConnection(host_id);
+            if (source.connection.?.remote == null) {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const decoded = try connection_envelope.decodeLegacy(arena.allocator(), source.connection.?.envelope.value);
+                source.connection.?.remote = try freezeSource(self.allocator, decoded, self.workspace.app_config.*, self.workspace.registry.hosts, host_id, index, "");
+            }
+        }
+        const snapshot = try self.lifecycle_supervisor.enqueue(request);
+        self.owned_sources.appendAssumeCapacity(source);
+        self.workspace.cx.requestRedraw();
+        return snapshot;
+    }
+
+    fn ownedSource(self: *ApplicationHost, operation: identity.HostOperationId) !*PendingOwnedSource {
+        for (self.owned_sources.items) |*source| if (source.operation_ref.eql(operation)) return source;
+        return error.MissingCreateSource;
+    }
+    pub fn requireOwnedBootstrap(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !void {
+        _ = try self.lifecycle_supervisor.query(operation, context);
+        const entry = self.lifecycle_supervisor.find(operation).?;
+        if (!entry.request.context.eql(context) or entry.snapshot.state != .queued or entry.request.source == null or entry.request.connection_policy != .reuse_only) return error.BootstrapRequiresSharedSource;
+        (try self.ownedSource(operation)).bootstrap_required = true;
+    }
+    /// Starts only a fixed read-only metadata exec on the authorized source's
+    /// existing IO owner. It never creates a connection or writes to its PTY.
+    pub fn probeOwnedBootstrap(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !?BootstrapProduct.Probed {
+        _ = try self.lifecycle_supervisor.query(operation, context);
+        const entry = self.lifecycle_supervisor.find(operation).?;
+        if (!entry.request.context.eql(context) or entry.snapshot.state != .prepared or entry.cancel_requested or entry.request.source == null or entry.request.connection_policy != .reuse_only) return error.ScopeChanged;
+        const frozen = try self.ownedSource(operation);
+        if (!frozen.bootstrap_required) return error.BootstrapNotRequested;
+        if (frozen.bootstrap_probed) |probed| return probed;
+        const source = entry.request.source.?;
+        const mapping = self.findHandle(source) orelse return error.SourceChanged;
+        if (mapping.process != null) return error.UnsupportedSource;
+        const service = self.sshExecService(source) catch |err| switch (err) {
+            error.WorkerBusy => return null,
+            else => return err,
+        };
+        if (frozen.probe == null) {
+            const binding = switch (self.sessions.queryService(source, .exec)) {
+                .available => |value| value,
+                else => return error.ServiceUnavailable,
+            };
+            const probe_handle = service.exec(BootstrapProduct.probe_command, .{ .key = mapping.create_operation, .service_binding = binding, .timeout_ms = 5000, .capture_cap = 512 }) catch |err| switch (err) {
+                error.WorkerBusy => return null,
+                else => return err,
+            };
+            frozen.probe = .{ .source = source, .key = mapping.create_operation, .binding = binding, .handle = probe_handle };
+        }
+        const probe = &frozen.probe.?;
+        if (!probe.source.eql(source)) return error.ScopeChanged;
+        if (probe.facts == null and probe.failure == null) {
+            const result = service.poll(probe.handle) orelse return null;
+            if (result.key == null or !result.key.?.eql(probe.key) or result.service_binding == null or !result.service_binding.?.eql(probe.binding)) probe.failure = error.StaleBootstrapProbe else if (result.status != .completed) probe.failure = error.BootstrapProbeFailed else probe.facts = BootstrapProduct.Facts.parse(result.stdout, result.stderr, result.exit_code, result.truncated) catch |err| blk: {
+                probe.failure = err;
+                break :blk null;
+            };
+        }
+        const closed = service.closeCall(probe.handle) catch |err| switch (err) {
+            error.WorkerBusy => return null,
+            else => return err,
+        };
+        if (closed == .releasing or closed == .not_started) return null;
+        const facts = probe.facts;
+        const failure = probe.failure;
+        frozen.probe = null;
+        if (closed != .released) return error.BootstrapProbeCleanupUnknown;
+        if (failure) |err| return err;
+        const remote = frozen.connection.?.remote orelse return error.MissingCreateSource;
+        const remote_host = remote.value.host;
+        frozen.bootstrap_probed = try BootstrapProduct.Probed.init(facts orelse return error.BootstrapProbeFailed, remote_host.user, remote_host.host, remote_host.port);
+        return frozen.bootstrap_probed;
+    }
+    pub fn installOwnedBootstrap(self: *ApplicationHost, prepared: *BootstrapProduct.Prepared, context: @import("../../../ai/host_tools.zig").Context) !void {
+        _ = try self.lifecycle_supervisor.query(prepared.operation, context);
+        const entry = self.lifecycle_supervisor.find(prepared.operation).?;
+        if (entry.snapshot.state != .prepared or entry.cancel_requested or entry.snapshot.session == null or entry.request.source == null or !prepared.matches(context, entry.request.operation_ref, entry.snapshot.session.?, entry.request.source.?)) return error.ScopeChanged;
+        const frozen = try self.ownedSource(prepared.operation);
+        if (!frozen.bootstrap_required or frozen.probe != null or frozen.bootstrap != null or frozen.bootstrap_probed == null) return error.ScopeChanged;
+        const probed = frozen.bootstrap_probed.?;
+        if (!std.mem.eql(u8, probed.target(), prepared.target[0..prepared.target_len]) or !std.mem.eql(u8, probed.facts.platformName(), prepared.package.platform) or !std.mem.eql(u8, @tagName(probed.facts.shell_path), @tagName(prepared.plan.shell_path))) return error.ScopeChanged;
+        try prepared.plan.validate(entry.snapshot.session.?, @intCast(@divTrunc(@import("../../../platform/realtime.zig").monotonicNs(), std.time.ns_per_ms)));
+        frozen.bootstrap = prepared.retain();
+    }
+    /// Cancellation retires only our diagnostic exec. Never closes the source
+    /// runtime or its shell; the IO owner continues drain/close asynchronously.
+    fn tickBootstrapProbeCleanup(self: *ApplicationHost) bool {
+        var pending = false;
+        for (self.owned_sources.items) |*frozen| if (frozen.probe) |probe| {
+            const entry = self.lifecycle_supervisor.find(frozen.operation_ref) orelse continue;
+            if (!entry.cancel_requested and entry.snapshot.state == .prepared) continue;
+            const service = self.sshExecService(probe.source) catch |err| {
+                if (err == error.WorkerBusy) pending = true else frozen.probe = null;
+                continue;
+            };
+            service.abort(probe.handle);
+            const receipt = service.closeCall(probe.handle) catch {
+                pending = true;
+                continue;
+            };
+            if (receipt == .released or receipt == .unknown) frozen.probe = null else pending = true;
+        };
+        return pending;
+    }
+
+    fn validateSavedOwnedSource(self: *ApplicationHost, source: identity.AssetOwner) !usize {
+        const index = self.workspace.registry.indexOf(source.id) orelse return error.StaleReference;
+        const host = self.workspace.registry.hosts[index];
+        if (host.revision != source.revision) return error.SourceChanged;
+        // Saved SSH uses the same envelope/factory/auth UI as an ordinary user
+        // connection. Other providers need their own explicit capability.
+        if (!std.mem.eql(u8, host.protocolId(), "ssh")) return error.UnsupportedSource;
+        return index;
+    }
+
+    fn validateOwnedGroup(self: *ApplicationHost, owner: identity.GroupOwner) !void {
+        const id = std.math.cast(u32, @backingInt(owner.id)) orelse return error.StaleReference;
+        if (self.workspace.groupClosing(id)) return error.GroupClosing;
+        const tab = self.workspace.groupTabId(id) orelse return error.StaleReference;
+        const index = self.workspace.model.indexOf(tab) orelse return error.StaleReference;
+        if (!self.workspace.model.tabs.items[index].owner.eql(.{ .group = owner })) return error.StaleReference;
+        const roster = self.workspace.group_roster orelse return error.StaleReference;
+        _ = roster.findById(id) orelse return error.StaleReference;
+    }
+
+    pub fn queryOwnedSession(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !lifecycle.Snapshot {
+        return self.lifecycle_supervisor.query(operation, context);
+    }
+    pub fn resolveOwnedSession(self: *ApplicationHost, handle: identity.SessionHandle, context: @import("../../../ai/host_tools.zig").Context) !lifecycle.Snapshot {
+        const entry = self.lifecycle_supervisor.resource(handle) orelse return error.NotFound;
+        return self.lifecycle_supervisor.query(entry.request.operation_ref, context);
+    }
+    pub fn cancelOwnedSession(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !lifecycle.Snapshot {
+        _ = try self.lifecycle_supervisor.query(operation, context);
+        const entry = self.lifecycle_supervisor.find(operation).?;
+        if (entry.snapshot.state == .ready) return error.AlreadyReady;
+        entry.cancel_requested = true;
+        self.workspace.cx.requestRedraw();
+        return entry.snapshot;
+    }
+    pub fn cancelOwnedTask(self: *ApplicationHost, task: identity.TaskId) void {
+        for (self.lifecycle_supervisor.entries.items) |*entry| if (entry.request.context.task_id.eql(task)) switch (entry.snapshot.state) {
+            .queued, .prepared, .opening => entry.cancel_requested = true,
+            else => {},
+        };
+        for (self.deferred_closes.items) |*close| if (close.context.task_id.eql(task) and close.snapshot.state == .accepted) {
+            close.snapshot.state = .cancelled_unsent;
+            close.snapshot.error_code = "CancelledBeforeDispatch";
+            close.result_acknowledged = false;
+        };
+        for (self.lifecycle_supervisor.entries.items) |*entry| if (entry.request.context.task_id.eql(task) and entry.snapshot.state == .ready and entry.close_requested and !entry.close_requires_idle) {
+            entry.close_requested = false;
+            entry.close_result_acknowledged = false;
+        };
+        self.workspace.cx.requestRedraw();
+    }
+    pub fn handedToUser(self: *ApplicationHost, handle: identity.SessionHandle) !void {
+        return self.handedToUserFor(handle, .execution_takeover);
+    }
+    pub fn handedToUserFor(self: *ApplicationHost, handle: identity.SessionHandle, reason: OwnedInputReason) !void {
+        const entry = self.lifecycle_supervisor.resource(handle) orelse return;
+        if (entry.snapshot.ownership != .created_task) return;
+        const context = entry.request.context;
+        var execution_id: ?identity.ExecutionId = null;
+        for (self.domain.attachments.items) |host_app| {
+            const mapping = host_app.findHandle(handle) orelse continue;
+            const tab = host_app.workspace.sessionTab(mapping.legacy_id) orelse break;
+            const binding = switch (host_app.sessions.queryService(handle, .terminal)) {
+                .available => |value| value,
+                else => break,
+            };
+            const service = if (mapping.process) |process| process.terminalService(binding) catch break else if (tab.runtime) |runtime| runtime.terminalService() catch break else break;
+            if (service.executionSnapshot()) |snapshot| execution_id = snapshot.execution_id else |_| {}
+            break;
+        }
+        _ = try self.lifecycle_supervisor.setRetention(handle, context.task_id, .keep);
+        try self.lifecycle_supervisor.handedToUser(handle);
+        std.debug.assert(self.owned_input_event_count < self.owned_input_events.len);
+        self.owned_input_events[self.owned_input_event_count] = .{ .context = context, .handle = handle, .execution_id = execution_id, .reason = reason, .phase = if (reason == .execution_takeover) .requested else .released };
+        self.owned_input_event_count += 1;
+        // The AI host consumes input handoffs in its pass (`consumeInputHandoffs`).
+        environment.publish();
+    }
+    pub fn drainOwnedInputEvents(self: *ApplicationHost, buffer: []OwnedInputEvent) []OwnedInputEvent {
+        const count = @min(buffer.len, self.owned_input_event_count);
+        @memcpy(buffer[0..count], self.owned_input_events[0..count]);
+        std.mem.copyForwards(OwnedInputEvent, self.owned_input_events[0 .. self.owned_input_event_count - count], self.owned_input_events[count..self.owned_input_event_count]);
+        self.owned_input_event_count -= count;
+        return buffer[0..count];
+    }
+    pub fn syncOwnedUserInput(self: *ApplicationHost, task: ?identity.TaskId) !void {
+        for (self.lifecycle_supervisor.entries.items) |*entry| {
+            if (task) |id| if (!entry.request.context.task_id.eql(id)) continue;
+            if (entry.snapshot.ownership != .created_task or entry.snapshot.state != .ready) continue;
+            const handle = entry.snapshot.session orelse continue;
+            const accepted = for (self.domain.attachments.items) |host| {
+                if ((host.workspace.userInputRevision(handle) orelse 0) > 0) break true;
+            } else false;
+            if (accepted) try self.handedToUserFor(handle, .ordinary_input);
+        }
+    }
+    pub fn setOwnedLifecycleHooks(self: *ApplicationHost, hooks: OwnedLifecycleHooks) void {
+        self.owned_lifecycle_hooks = hooks;
+    }
+    pub fn setOwnedSessionRetention(self: *ApplicationHost, handle: identity.SessionHandle, task: identity.TaskId, retention: lifecycle.Retention) !lifecycle.Snapshot {
+        return self.lifecycle_supervisor.setRetention(handle, task, retention);
+    }
+    /// The worker must first receive its accepted management result. A separate
+    /// acknowledgement permits the safe point to enter ordinary close hooks.
+    pub fn queueOwnedSessionClose(self: *ApplicationHost, handle: identity.SessionHandle, task: identity.TaskId, explicit_user_close: bool, evidence: lifecycle.IdleEvidence) !lifecycle.Snapshot {
+        const entry = self.lifecycle_supervisor.resource(handle) orelse return error.OwnershipChanged;
+        if (!entry.request.context.task_id.eql(task)) return error.OwnershipChanged;
+        if (!explicit_user_close) {
+            try self.lifecycle_supervisor.requestCleanup(handle, task, evidence);
+        } else {
+            if (entry.snapshot.state == .closed) return entry.snapshot;
+            entry.close_requested = true;
+            entry.close_ownership_revision = entry.snapshot.ownership_revision;
+            entry.close_result_acknowledged = false;
+            entry.close_requires_idle = false;
+        }
+        return entry.snapshot;
+    }
+    pub fn acknowledgeSessionCloseResult(self: *ApplicationHost, operation: identity.HostOperationId) !void {
+        for (self.deferred_closes.items) |*close| if (close.snapshot.operation_ref.eql(operation)) {
+            if (close.snapshot.state == .cancelled_unsent) return error.CancelledBeforeDispatch;
+            close.result_acknowledged = true;
+            self.workspace.cx.requestRedraw();
+            return;
+        };
+        const entry = self.lifecycle_supervisor.find(operation) orelse return error.NotFound;
+        if (!entry.close_requested) return error.NoCloseRequested;
+        entry.close_result_acknowledged = true;
+        self.workspace.cx.requestRedraw();
+    }
+    pub fn finishOwnedTask(self: *ApplicationHost, task: identity.TaskId, evidence: lifecycle.FinishEvidence) !lifecycle.TaskFinishReceipt {
+        try self.syncOwnedUserInput(task);
+        return self.lifecycle_supervisor.finishTask(task, evidence);
+    }
+
+    /// Live eligibility probe. Saving a same-PTY interval cannot establish
+    /// idle: output ownership is unverified even after a real foreground exit.
+    /// Local also verifies the current foreground group and independent execs.
+    pub fn ownedIdleEvidence(self: *ApplicationHost, handle: identity.SessionHandle, task: identity.TaskId) !lifecycle.IdleEvidence {
+        const entry = self.lifecycle_supervisor.resource(handle) orelse return error.OwnershipChanged;
+        if (!entry.request.context.task_id.eql(task) or entry.snapshot.ownership != .created_task) return error.OwnershipChanged;
+        const mapping = self.findHandle(handle) orelse return error.StaleReference;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return error.StaleReference;
+        const binding = switch (self.sessions.queryService(handle, .terminal)) {
+            .available => |binding| binding,
+            else => return .{},
+        };
+        var service = if (mapping.process) |process| try process.terminalService(binding) else if (tab.runtime) |runtime| try runtime.terminalService() else return .{};
+        const execution = service.executionSnapshot() catch return .{};
+        const process = execution.process orelse return .{};
+        const recording_settled = execution.state == .sealed or (execution.state == .interval_recorded and execution.interval_saved and execution.recording_settled) or (execution.state == .recording_degraded and execution.recording_settled);
+        const impact = bridgeImpact(self, mapping.legacy_id);
+        var result: lifecycle.IdleEvidence = .{
+            .confirmed = recording_settled and process.foreground_finished and !process.background_jobs_unknown and execution.output_scope == .exact,
+            .foreground_active = !process.foreground_finished,
+            .background_jobs = process.background_jobs,
+            .pending_input = !execution.input_ready or execution.grant != null or !execution.local_released,
+            .active_references = impact.transfer != 0 or impact.socks != 0 or impact.unknown != 0 or impact.ai != 0,
+            .recording_settled = recording_settled and (execution.manifest_revision > 0 or execution.recording_settled),
+        };
+        if (mapping.process) |local| {
+            var risk = try local.closeRiskSnapshot(handle, self.allocator);
+            defer risk.deinit(self.allocator);
+            result.confirmed = result.confirmed and !risk.unknown and risk.foreground_state == .idle_shell;
+            result.active_references = result.active_references or risk.active_exec.len != 0;
+        }
+        for (self.lifecycle_supervisor.entries.items) |other| if (other.request.source) |source| {
+            if (source.eql(handle)) switch (other.snapshot.state) {
+                .queued, .prepared, .opening => result.active_references = true,
+                else => {},
+            };
+        };
+        return result;
+    }
+
+    /// Explicit host-confirmed close can also target borrowed user resources.
+    /// It has no automatic cleanup variant; that path uses owned eligibility.
+    pub fn queueSessionClose(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context, handle: identity.SessionHandle, user_authorized: bool) !DeferredCloseSnapshot {
+        try context.validate();
+        if (!user_authorized) return error.CloseApprovalRequired;
+        if (!operation.valid()) return error.InvalidOperation;
+        for (self.deferred_closes.items) |close| if (close.snapshot.operation_ref.eql(operation)) {
+            if (!close.context.eql(context) or !close.handle.eql(handle)) return error.IdempotencyConflict;
+            return close.snapshot;
+        };
+        const mapping = self.findHandle(handle) orelse return error.StaleReference;
+        _ = self.sessions.queryState(handle) orelse return error.StaleReference;
+        if (self.deferred_closes.items.len >= 512) return error.ResourceLimit;
+        const metadata = self.captureSessionMetadata(handle);
+        const snapshot: DeferredCloseSnapshot = .{ .operation_ref = operation, .recording_id = metadata.recording_id, .recording_generation = metadata.recording_generation, .recording_unavailable_reason = metadata.recording_unavailable_reason };
+        try self.deferred_closes.append(self.allocator, .{ .context = context, .handle = handle, .snapshot = snapshot, .impact = bridgeImpact(self, mapping.legacy_id), .ownership_revision = if (self.lifecycle_supervisor.resource(handle)) |entry| entry.snapshot.ownership_revision else null, .retained_metadata = metadata });
+        return snapshot;
+    }
+
+    pub fn querySessionClose(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !DeferredCloseSnapshot {
+        for (self.deferred_closes.items) |close| if (close.snapshot.operation_ref.eql(operation)) {
+            if (!close.context.conversation_id.eql(context.conversation_id) or !close.context.task_id.eql(context.task_id)) return error.PermissionDenied;
+            return close.snapshot;
+        };
+        return error.NotFound;
+    }
+
+    /// Group close remains the existing frozen all-member preflight/dialog.
+    /// Task cleanup has no path to this entry point.
+    pub fn requestExplicitGroupClose(self: *ApplicationHost, owner: identity.GroupOwner, user_authorized: bool) !void {
+        if (!user_authorized) return error.CloseApprovalRequired;
+        try self.validateOwnedGroup(owner);
+        self.workspace.requestCloseGroup(@intCast(@backingInt(owner.id)));
+    }
+
+    fn tickDeferredCloses(self: *ApplicationHost) !bool {
+        var pending = false;
+        for (self.deferred_closes.items) |*close| {
+            if (!close.result_acknowledged) continue;
+            if (close.snapshot.state == .cancelled_unsent) continue;
+            const state = self.sessions.queryState(close.handle) orelse {
+                close.snapshot.state = .cleanup_pending;
+                close.snapshot.remote_effect_unknown = true;
+                continue;
+            };
+            if (state.lifecycle == .closed) {
+                close.snapshot.state = .closed;
+                close.snapshot.local_released = true;
+            } else if (state.lifecycle == .cleanup_unknown) {
+                close.snapshot.state = .cleanup_pending;
+                close.snapshot.remote_effect_unknown = true;
+            } else {
+                if (state.close_operation == null) {
+                    const mapping = self.findHandle(close.handle) orelse return error.StaleReference;
+                    const ownership_revision = if (self.lifecycle_supervisor.resource(close.handle)) |entry| entry.snapshot.ownership_revision else null;
+                    if (ownership_revision != close.ownership_revision or !close.impact.eql(bridgeImpact(self, mapping.legacy_id))) {
+                        close.snapshot.state = .cancelled_unsent;
+                        close.snapshot.error_code = "ScopeChanged";
+                        continue;
+                    }
+                    _ = try self.requestCloseLegacy(mapping.legacy_id);
+                }
+                close.snapshot.state = .closing;
+                close.snapshot.local_released = false;
+                pending = true;
+            }
+        }
+        return pending;
+    }
+
+    fn prepareOwnedSession(self: *ApplicationHost, entry: *lifecycle.Entry, frozen: *PendingOwnedSource) !session.Accepted {
+        try self.validateOwnedGroup(entry.request.group);
+        if (self.sessions.defer_create_start) return error.ReentrantCreate;
+        self.sessions.defer_create_start = true;
+        defer self.sessions.defer_create_start = false;
+        if (frozen.connection) |*connection| return self.createWindowConnection(connection);
+        return self.sessions.openQuickAction("session.local.create", frozen.cwd, .{ .request_key = try self.dispatcher.issue(), .target = self.target() });
+    }
+
+    /// Called only after the off-UI journal owner durably wrote the exact
+    /// provisional handle and dispatch intent. No IO runs in this method.
+    pub fn authorizeOwnedSessionDispatch(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context, expected_revision: u64, handle: identity.SessionHandle) !lifecycle.Snapshot {
+        _ = try self.lifecycle_supervisor.query(operation, context);
+        const entry = self.lifecycle_supervisor.find(operation).?;
+        if (!entry.request.context.eql(context)) return error.ScopeChanged;
+        if (entry.snapshot.state != .prepared or entry.cancel_requested or entry.snapshot.revision != expected_revision or entry.snapshot.session == null or !entry.snapshot.session.?.eql(handle)) return error.ScopeChanged;
+        const frozen = try self.ownedSource(operation);
+        if (frozen.bootstrap_required) {
+            const prepared = frozen.bootstrap orelse return error.BootstrapDeploymentAuthorizationRequired;
+            if (entry.request.source == null or !prepared.matches(context, operation, handle, entry.request.source.?)) return error.ScopeChanged;
+            try prepared.plan.validate(handle, @intCast(@divTrunc(@import("../../../platform/realtime.zig").monotonicNs(), std.time.ns_per_ms)));
+        }
+        entry.dispatch_permitted = true;
+        self.workspace.cx.requestRedraw();
+        return entry.snapshot;
+    }
+
+    fn dispatchOwnedSession(self: *ApplicationHost, entry: *lifecycle.Entry, frozen: *PendingOwnedSource) !void {
+        try self.validateOwnedGroup(entry.request.group);
+        if (entry.request.membership_revision) |revision| {
+            const group = self.workspace.group_roster.?.findById(@intCast(@backingInt(entry.request.group.id))).?;
+            if (group.membership_revision != revision) return error.ScopeChanged;
+        }
+        const source: ?*Mapping = if (entry.request.source) |handle| blk: {
+            const mapping = self.findHandle(handle) orelse return error.SourceChanged;
+            const source_state = self.sessions.queryState(handle) orelse return error.SourceChanged;
+            if (source_state.lifecycle != .attached and source_state.lifecycle != .ready) return error.SourceChanged;
+            const roster = self.workspace.group_roster orelse return error.ScopeChanged;
+            const group = roster.findById(@intCast(@backingInt(entry.request.group.id))) orelse return error.ScopeChanged;
+            if (!group.contains(mapping.legacy_id)) return error.ScopeChanged;
+            break :blk mapping;
+        } else blk: {
+            _ = try self.validateSavedOwnedSource(entry.request.saved_source orelse return error.InvalidSource);
+            break :blk null;
+        };
+        const ambient_group = self.workspace.creation_group;
+        const ambient_pending = self.workspace.owned_creation_pending;
+        self.workspace.creation_group = null;
+        self.workspace.owned_creation_pending = true;
+        defer self.workspace.creation_group = ambient_group;
+        defer self.workspace.owned_creation_pending = ambient_pending;
+        const handle = entry.snapshot.session orelse return error.MissingSessionReservation;
+        const state = self.sessions.queryState(handle) orelse return error.StaleReference;
+        const accepted: session.Accepted = .{ .handle = handle, .operation = state.create_operation };
+        if (frozen.connection) |*connection| {
+            var lease: ?@import("../../../host/runtime_service.zig").SharedLease = null;
+            defer if (lease) |held| held.release();
+            if (entry.request.connection_policy != .new_only) {
+                if (source) |mapping| {
+                    const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return error.SourceChanged;
+                    if (tab.runtime) |runtime| lease = runtime.reuseConnection() catch null;
+                }
+                if (lease == null) {
+                    if (entry.request.connection_policy == .reuse_only) return error.ReuseUnavailable;
+                    if (!entry.request.allow_new_fallback) return error.FallbackAuthorizationRequired;
+                }
+            }
+            if (self.pending_shared_connection != null) return error.ReentrantCreate;
+            self.pending_shared_connection = lease;
+            defer self.pending_shared_connection = null;
+            if (self.pending_bootstrap != null) return error.ReentrantCreate;
+            if (frozen.bootstrap_required) {
+                const prepared = frozen.bootstrap orelse return error.BootstrapDeploymentAuthorizationRequired;
+                try prepared.plan.validate(handle, @intCast(@divTrunc(@import("../../../platform/realtime.zig").monotonicNs(), std.time.ns_per_ms)));
+                if (lease == null) return error.BootstrapRequiresSharedSource;
+                self.pending_bootstrap = prepared;
+            }
+            defer self.pending_bootstrap = null;
+            if (self.pending_source != null) return error.ReentrantCreate;
+            self.pending_source = if (connection.remote) |*remote| remote else null;
+            defer self.pending_source = null;
+            return self.sessions.dispatchPrepared(accepted);
+        }
+        if (source == null or source.?.process == null or entry.request.connection_policy != .new_only) return error.UnsupportedSource;
+        return self.sessions.dispatchPrepared(accepted);
+    }
+
+    /// Advance only outside Bridge/native/storage locks. No operation retries
+    /// creation. Failure cleanup owns exactly the provisional SessionHandle.
+    fn tickOwnedSessions(self: *ApplicationHost) !bool {
+        var pending = self.tickBootstrapProbeCleanup();
+        for (self.lifecycle_supervisor.entries.items) |*entry| {
+            if (entry.snapshot.state == .queued) {
+                const frozen = for (self.owned_sources.items) |*source| {
+                    if (source.operation_ref.eql(entry.request.operation_ref)) break source;
+                } else return error.MissingCreateSource;
+                if (entry.cancel_requested) {
+                    frozen.deinit(self.allocator);
+                    lifecycle.Supervisor.transition(entry, .cancelled, null);
+                    continue;
+                }
+                const accepted = self.prepareOwnedSession(entry, frozen) catch |err| {
+                    frozen.deinit(self.allocator);
+                    lifecycle.Supervisor.transition(entry, .failed, @errorName(err));
+                    continue;
+                };
+                entry.snapshot.session = accepted.handle;
+                lifecycle.Supervisor.transition(entry, .prepared, null);
+            }
+            const handle = entry.snapshot.session orelse continue;
+            const state = self.sessions.queryState(handle) orelse {
+                lifecycle.Supervisor.transition(entry, .cleanup_pending, "StaleReference");
+                entry.snapshot.remote_effect_unknown = true;
+                continue;
+            };
+            if (entry.snapshot.state == .cleanup_pending and state.lifecycle == .closed) {
+                entry.snapshot.local_released = true;
+                lifecycle.Supervisor.transition(entry, if (entry.cancel_requested) .cancelled else if (entry.snapshot.membership_committed) .closed else .failed, entry.snapshot.error_code);
+            }
+            if (entry.snapshot.state == .cleanup_pending) if (self.findHandle(handle)) |mapping| if (mapping.explicit_disconnect) {
+                const released = state.create_cleanup == .released;
+                const unknown = state.create_cleanup == .unknown;
+                if (entry.snapshot.local_released != released or entry.snapshot.remote_effect_unknown != unknown) entry.snapshot.revision +|= 1;
+                entry.snapshot.local_released = released;
+                entry.snapshot.remote_effect_unknown = unknown;
+            };
+            if (entry.snapshot.state == .ready) switch (state.lifecycle) {
+                .closed => {
+                    entry.snapshot.local_released = true;
+                    lifecycle.Supervisor.transition(entry, .closed, null);
+                },
+                .closing => {
+                    entry.snapshot.local_released = false;
+                    lifecycle.Supervisor.transition(entry, .closing, null);
+                },
+                .cleanup_unknown, .failed => {
+                    const explicitly_disconnected = if (self.findHandle(handle)) |mapping| mapping.explicit_disconnect else false;
+                    entry.snapshot.local_released = state.create_cleanup == .released;
+                    entry.snapshot.remote_effect_unknown = !explicitly_disconnected or state.create_cleanup == .unknown;
+                    lifecycle.Supervisor.transition(entry, .cleanup_pending, if (explicitly_disconnected) "ExplicitDisconnect" else "ConnectionLost");
+                },
+                .ended => {
+                    entry.snapshot.local_released = state.create_cleanup == .released;
+                    lifecycle.Supervisor.transition(entry, .cleanup_pending, "ShellEnded");
+                },
+                else => {},
+            };
+            if (entry.snapshot.state == .prepared) {
+                const frozen = for (self.owned_sources.items) |*source| {
+                    if (source.operation_ref.eql(entry.request.operation_ref)) break source;
+                } else return error.MissingCreateSource;
+                if (entry.cancel_requested) {
+                    _ = try self.sessions.cancel(state.create_operation);
+                    frozen.deinit(self.allocator);
+                    lifecycle.Supervisor.transition(entry, .failed_cleanup_pending, "CancelledBeforeDispatch");
+                } else if (entry.dispatch_permitted) {
+                    entry.dispatch_permitted = false;
+                    frozen.dispatched = true;
+                    self.dispatchOwnedSession(entry, frozen) catch |err| {
+                        _ = try self.sessions.cancel(state.create_operation);
+                        frozen.deinit(self.allocator);
+                        lifecycle.Supervisor.transition(entry, .failed_cleanup_pending, @errorName(err));
+                        continue;
+                    };
+                    frozen.deinit(self.allocator);
+                    entry.snapshot.local_released = false;
+                    lifecycle.Supervisor.transition(entry, .opening, null);
+                }
+            }
+            if (entry.snapshot.state == .opening) {
+                if (entry.cancel_requested or state.lifecycle == .failed or state.lifecycle == .ended) {
+                    if (state.lifecycle == .creating) _ = try self.sessions.cancel(state.create_operation);
+                    lifecycle.Supervisor.transition(entry, .failed_cleanup_pending, if (entry.cancel_requested) "CancelledBeforeReady" else "SessionCreateFailed");
+                } else if (state.lifecycle == .ready or state.lifecycle == .attached) {
+                    const mapping = self.findHandle(handle) orelse {
+                        lifecycle.Supervisor.transition(entry, .failed_cleanup_pending, "MissingSessionMapping");
+                        continue;
+                    };
+                    _ = self.workspace.commitOwnedSession(entry.request.group, handle, mapping.legacy_id) catch |err| {
+                        lifecycle.Supervisor.transition(entry, .failed_cleanup_pending, @errorName(err));
+                        continue;
+                    };
+                    entry.snapshot.membership_committed = true;
+                    entry.snapshot.local_released = true;
+                    lifecycle.Supervisor.transition(entry, .ready, null);
+                }
+            }
+            if (entry.snapshot.state == .ready and entry.task_finished and !entry.close_requested and entry.snapshot.ownership == .created_task and entry.snapshot.retention == .auto_idle) {
+                const evidence = self.ownedIdleEvidence(handle, entry.request.context.task_id) catch lifecycle.IdleEvidence{};
+                if (evidence.canClose()) {
+                    try self.lifecycle_supervisor.requestCleanup(handle, entry.request.context.task_id, evidence);
+                    if (entry.snapshot.retention_blocked_reason != null) entry.snapshot.revision +|= 1;
+                    entry.snapshot.retention_blocked_reason = null;
+                } else {
+                    const reason: []const u8 = if (!evidence.confirmed) "IdleUnconfirmed" else "ActiveReference";
+                    if (!std.meta.eql(entry.snapshot.retention_blocked_reason, @as(?[]const u8, reason))) entry.snapshot.revision +|= 1;
+                    entry.snapshot.retention_blocked_reason = reason;
+                }
+            }
+            if (entry.close_requested and entry.close_result_acknowledged and entry.close_ownership_revision == entry.snapshot.ownership_revision and entry.snapshot.state == .ready) {
+                if (entry.close_requires_idle) {
+                    const evidence = if (self.owned_lifecycle_hooks) |hooks| if (hooks.idle_evidence) |probe| probe(hooks.context, handle, entry.request.context.task_id) catch continue else self.ownedIdleEvidence(handle, entry.request.context.task_id) catch continue else self.ownedIdleEvidence(handle, entry.request.context.task_id) catch continue;
+                    if (entry.snapshot.ownership != .created_task or !entry.task_finished or !evidence.canClose()) continue;
+                }
+                const mapping = self.findHandle(handle) orelse return error.StaleReference;
+                _ = try self.requestCloseLegacy(mapping.legacy_id);
+                entry.snapshot.local_released = false;
+                lifecycle.Supervisor.transition(entry, .closing, null);
+            }
+            if (entry.snapshot.state == .failed_cleanup_pending or entry.snapshot.state == .closing) {
+                const current = self.sessions.queryState(handle).?;
+                if (current.lifecycle == .closed) {
+                    entry.snapshot.local_released = true;
+                    lifecycle.Supervisor.transition(entry, if (entry.cancel_requested) .cancelled else if (entry.snapshot.membership_committed) .closed else .failed, entry.snapshot.error_code);
+                } else if (current.lifecycle == .cleanup_unknown) {
+                    entry.snapshot.remote_effect_unknown = true;
+                    lifecycle.Supervisor.transition(entry, .cleanup_pending, entry.snapshot.error_code orelse "CleanupUnknown");
+                } else if (current.close_operation == null) {
+                    if (self.findHandle(handle)) |mapping| {
+                        _ = try self.requestCloseLegacy(mapping.legacy_id);
+                    } else if (current.create_cleanup == .released) {
+                        _ = try self.sessions.requestClose(handle, .{});
+                    } else {
+                        lifecycle.Supervisor.transition(entry, .cleanup_pending, "MissingSessionMapping");
+                    }
+                }
+            }
+            switch (entry.snapshot.state) {
+                .queued, .opening, .failed_cleanup_pending, .closing => pending = true,
+                .prepared => pending = entry.dispatch_permitted or entry.cancel_requested or pending,
+                else => {},
+            }
+        }
+        return pending;
+    }
+
+    /// A facade for the real IO-owner mailbox, scoped to the host's current
+    /// generation. A parked/reconnecting worker exposes no live exec binding.
+    pub fn sshExecService(self: *ApplicationHost, handle: identity.SessionHandle) !@import("../../../ai/execbridge.zig").ExecBridge {
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        const binding = switch (self.sessions.queryService(handle, .exec)) {
+            .available => |binding| binding,
+            else => return error.ServiceUnavailable,
+        };
+        if (!self.sessions.bindingIsLive(binding)) return error.StaleBinding;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return error.StaleSession;
+        if (tab.generation != mapping.legacy_generation or tab.tab_id != mapping.tab_id or !tab.content_owner.eql(mapping.owner)) return error.StaleSession;
+        const runtime = tab.runtime orelse return error.ServiceUnavailable;
+        if (runtime.torn_down) return error.ServiceUnavailable;
+        const state = runtime.reconnectSnapshot() orelse return error.ServiceUnavailable;
+        if (state.key == null or !state.key.?.eql(mapping.create_operation) or (state.phase != .active and state.phase != .ready)) return error.ServiceUnavailable;
+        return runtime.execService(binding);
+    }
+
+    /// Typed controller facade for the exact already authenticated hop. Native
+    /// forwarding stays in that hop's Worker/Relay, including reconnects.
+    pub fn sshForwardService(self: *ApplicationHost, binding: session.ServiceHandle, exit_index: ?usize) !*@import("../../../proto/ssh/forward_service.zig").Service {
+        if (!self.sessions.bindingIsLive(binding) or binding.kind != .forward or binding.origin_session == null) return error.StaleForwardBinding;
+        const handle = binding.origin_session.?;
+        const snapshot = self.sessions.queryState(handle) orelse return error.StaleSession;
+        if (snapshot.purpose == .socks_background) return (self.domain.backgrounds orelse return error.ServiceUnavailable).forwardService(binding, exit_index);
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return error.StaleSession;
+        if (tab.generation != mapping.legacy_generation or tab.tab_id != mapping.tab_id or !tab.content_owner.eql(mapping.owner)) return error.StaleSession;
+        const runtime = tab.runtime orelse return error.ServiceUnavailable;
+        if (runtime.torn_down) return error.ServiceUnavailable;
+        const state = runtime.reconnectSnapshot() orelse return error.ServiceUnavailable;
+        if (state.key == null or !state.key.?.eql(mapping.create_operation) or (state.phase != .active and state.phase != .ready)) return error.ServiceUnavailable;
+        return runtime.forwardService(binding, exit_index);
+    }
+
+    pub fn sshConnectionDetails(self: *ApplicationHost, handle: identity.SessionHandle) !@import("../../../proto/ssh/connection_details.zig").ConnectionDetailsSnapshot {
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        const state = self.sessions.queryState(handle) orelse return error.StaleSession;
+        if (state.lifecycle == .closed) return error.StaleSession;
+        const store = try self.workspace.connectionDetailsStore(mapping.legacy_id, mapping.create_operation);
+        return store.snapshot(mapping.create_operation);
+    }
+    pub fn requestSshRtt(self: *ApplicationHost, handle: identity.SessionHandle, hop: ?usize) !u64 {
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        const state = self.sessions.queryState(handle) orelse return error.StaleSession;
+        if (state.lifecycle != .attached or self.windowClosePending()) return error.ServiceUnavailable;
+        const store = try self.workspace.connectionDetailsStore(mapping.legacy_id, mapping.create_operation);
+        return store.request(mapping.create_operation, hop, 1500);
+    }
+    pub fn cancelSshRtt(self: *ApplicationHost, handle: identity.SessionHandle, request_id: u64) !void {
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        const store = try self.workspace.connectionDetailsStore(mapping.legacy_id, mapping.create_operation);
+        try store.cancel(mapping.create_operation, request_id);
+    }
+
+    pub fn supportsSessionDisconnect(self: *ApplicationHost, handle: identity.SessionHandle) bool {
+        if (!self.supportsIntegration(handle, "transport_loss")) return false;
+        const mapping = self.findHandle(handle) orelse return false;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return false;
+        const runtime = tab.runtime orelse return false;
+        return !runtime.torn_down and runtime.supportsExplicitDisconnect();
+    }
+    pub fn preflightSessionDisconnect(self: *ApplicationHost, handle: identity.SessionHandle) !DisconnectPreflight {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const mapping = self.findHandle(handle) orelse return error.StaleReference;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return error.StaleReference;
+        if (tab.generation != mapping.legacy_generation or tab.tab_id != mapping.tab_id or !tab.content_owner.eql(mapping.owner) or tab.closing or tab.isCard()) return error.StaleReference;
+        const runtime = tab.runtime orelse return error.NotSupported;
+        if (!self.supportsIntegration(handle, "transport_loss") or !runtime.supportsExplicitDisconnect()) return error.NotSupported;
+        const state = self.sessions.queryState(handle) orelse return error.StaleReference;
+        if (!state.create_operation.eql(mapping.create_operation)) return error.StaleCreateOperation;
+        if (state.lifecycle != .attached) return error.AlreadyDisconnected;
+        const binding = switch (self.sessions.queryService(handle, .terminal)) {
+            .available => |value| value,
+            else => return error.NotSupported,
+        };
+        if (!self.sessions.bindingIsLive(binding)) return error.StaleBinding;
+        const close = self.workspace.close_bridge;
+        const risk = if (close.risk) |probe| probe(close.context, mapping.legacy_id) else workspace_mod.CloseRisk{};
+        if (risk.any()) return error.ActiveReference;
+        const impact = if (close.impact) |probe| probe(close.context, mapping.legacy_id) else group_close.Impact{};
+        // impact.ai also includes the current lifecycle tool's own provider
+        // request. Concrete active execution is independently gated by risk
+        // and the runtime; the count itself is not permission to stop it.
+        if (impact.command != 0 or impact.transfer != 0 or impact.socks != 0 or impact.unknown != 0 or impact.remote_effect_unknown) return error.ActiveReference;
+        const native_revision = try runtime.preflightExplicitDisconnect(mapping.create_operation);
+        var hash = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hash, .{ risk, impact.command, impact.transfer, impact.ai, impact.socks, impact.unknown, impact.remote_effect_unknown, native_revision });
+        return .{ .create_operation = mapping.create_operation, .binding = binding, .impact_revision = hash.final() };
+    }
+    /// Enqueue only. The existing IO owner releases this channel/lease; the
+    /// runtime, pane, recording and exact SessionHost owner stay allocated.
+    pub fn requestSessionDisconnect(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context, handle: identity.SessionHandle, create_operation: OperationKey, binding: session.ServiceHandle, impact_revision: u64) !DisconnectSnapshot {
+        if (self.disconnects.find(operation, context)) |prior| {
+            if (!prior.request.session.eql(handle) or !prior.request.create_operation.eql(create_operation) or !prior.request.binding.eql(binding) or prior.request.impact_revision != impact_revision) return error.ScopeChanged;
+            return prior.snapshot;
+        } else |err| if (err != error.NotFound) return err;
+        const checked = try self.preflightSessionDisconnect(handle);
+        if (!checked.create_operation.eql(create_operation) or !checked.binding.eql(binding) or checked.impact_revision != impact_revision) return error.ScopeChanged;
+        const mapping = self.findHandle(handle).?;
+        const runtime = self.workspace.sessionTab(mapping.legacy_id).?.runtime.?;
+        const prepared = try self.disconnects.prepare(self.allocator, .{ .operation_ref = operation, .context = context, .session = handle, .create_operation = create_operation, .binding = binding, .impact_revision = impact_revision }, @import("../../../platform/realtime.zig").monotonicNs());
+        const receipt = runtime.requestExplicitDisconnect(create_operation) catch |err| {
+            self.disconnects.rejectPrepared(operation);
+            return err;
+        };
+        mapping.explicit_disconnect = true;
+        if (mapping.reconnect_ticket) |*ticket| ticket.invalidate();
+        mapping.reconnect_ticket = null;
+        mapping.reconnect_policy = .{ .automatic = false, .max = 0, .backoff = @splat(0) };
+        _ = self.sessions.transportLost(handle, create_operation, .{ .domain = .host, .code = "ExplicitDisconnect", .cleanup = switch (receipt) {
+            .released => .released,
+            .awaiting => .releasing,
+            .unknown => .unknown,
+        }, .safe_message = "会话已明确断开，不自动重连" }) catch {
+            try prepared.entry.observe(create_operation, .unknown, @import("../../../platform/realtime.zig").monotonicNs());
+            return prepared.entry.snapshot;
+        };
+        mapping.runtime_loss_received = true;
+        mapping.failed_published = true;
+        mapping.recordFailure("会话已明确断开，不自动重连");
+        self.workspace.finishSshReconnect(mapping.legacy_id, create_operation, error.ExplicitDisconnect);
+        try prepared.entry.observe(create_operation, receipt, @import("../../../platform/realtime.zig").monotonicNs());
+        self.workspace.cx.requestRedraw();
+        return prepared.entry.snapshot;
+    }
+    pub fn querySessionDisconnect(self: *ApplicationHost, operation: identity.HostOperationId, context: @import("../../../ai/host_tools.zig").Context) !DisconnectSnapshot {
+        const entry = try self.disconnects.find(operation, context);
+        if (entry.snapshot.state == .disconnected) return entry.snapshot;
+        try entry.observe(entry.request.create_operation, .awaiting, @import("../../../platform/realtime.zig").monotonicNs());
+        const mapping = self.findHandle(entry.request.session) orelse return entry.snapshot;
+        if (!mapping.create_operation.eql(entry.request.create_operation)) return entry.snapshot;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return entry.snapshot;
+        const runtime = tab.runtime orelse return entry.snapshot;
+        const notice = runtime.reconnectSnapshot() orelse return entry.snapshot;
+        if (notice.key == null or !notice.key.?.eql(entry.request.create_operation)) return error.StaleCreateOperation;
+        const receipt: disconnect.Receipt = if (notice.phase == .waiting or notice.phase == .releasing) notice.cleanup else .awaiting;
+        try entry.observe(entry.request.create_operation, receipt, @import("../../../platform/realtime.zig").monotonicNs());
+        return entry.snapshot;
+    }
+
+    /// Manual and timer retries reserve the same ticket. Native IO starts only
+    /// in safeTick, after the old attempt's real release receipt.
+    pub fn requestSshReconnect(self: *ApplicationHost, id: LegacySessionId) !void {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const mapping = self.findLegacyId(id) orelse return error.UnknownSession;
+        if (!self.supportsIntegration(mapping.handle, "transport_loss")) return error.LocalSessionDoesNotReconnect;
+        _ = try self.syncSshReconnect(mapping);
+        const state = self.sessions.queryState(mapping.handle) orelse return error.StaleSession;
+        if (state.lifecycle != .failed and state.lifecycle != .ended) return error.LifecycleDoesNotAllowRetry;
+        const tab = self.workspace.sessionTab(id) orelse return error.StaleSession;
+        if (tab.shell_init_confirmation_required and (tab.shell_init_skip_for_operation == null or !tab.shell_init_skip_for_operation.?.eql(mapping.create_operation))) return error.ShellInitializationConfirmationRequired;
+        if (mapping.reconnect_ticket == null) mapping.reconnect_ticket = .{ .key = mapping.create_operation, .deadline_ns = null };
+        if (!mapping.reconnect_ticket.?.claim(mapping.create_operation, @import("../../../platform/realtime.zig").monotonicNs(), true)) return error.ReconnectAlreadyRequested;
+        mapping.explicit_disconnect = false;
+        self.workspace.cx.requestRedraw();
+    }
+
+    pub fn legacyForHandle(self: *const ApplicationHost, handle: identity.SessionHandle) ?LegacySessionId {
+        for (self.mappings.items) |mapping| if (mapping.handle.eql(handle)) return mapping.legacy_id;
+        return null;
+    }
+
+    pub fn requestWindowClose(self: *ApplicationHost) !OperationKey {
+        if (self.windowClosePending()) return self.window_close.?.key;
+        if (self.domain.ai) |ai| _ = try ai.closeWindow(self.window_id);
+        if (self.window_auxiliary) |tasks| tasks.cancel(tasks.context);
+        const revision = @max(self.workspace.model.order_revision, 1);
+        const decision = try self.dispatcher.submit(.{ .command_id = try self.dispatcher.issue(), .kind = .request_close_window, .owner = .app, .view_revision = revision, .payload = .{ .number = @backingInt(self.window_id) } }, .{
+            .owner = .app,
+            .view_revision = revision,
+            .action_context = .{ .lifecycle_allows = !self.workspace.shutting_down, .permission_granted = true, .handler_ready = true },
+        }, .{ .context = self, .submit = submitWindowClose });
+        return switch (decision) {
+            .accepted => |key| key,
+            .rejected => error.CommandRejected,
+        };
+    }
+
+    pub fn windowClosePending(self: *const ApplicationHost) bool {
+        const close = self.window_close orelse return false;
+        return close.state == .draining or close.state == .ready;
+    }
+
+    /// 这次关窗在确认里被用户取消了（区别于已经关完的 `.closed`）。
+    pub fn windowCloseCancelled(self: *const ApplicationHost) bool {
+        const close = self.window_close orelse return false;
+        return close.state == .cancelled;
+    }
+
+    pub fn windowCloseReady(self: *const ApplicationHost) bool {
+        const close = self.window_close orelse return false;
+        if (self.window_auxiliary) |tasks| if (!tasks.released(tasks.context)) return false;
+        if (self.domain.ai) |ai| if (!ai.windowReady(self.window_id)) return false;
+        return close.state == .ready and !close.cancel_requested;
+    }
+
+    /// Called after AppKit confirms native close. Publication can be retried
+    /// without repeating any owner close or consuming another window ticket.
+    pub fn completeWindowClose(self: *ApplicationHost) !void {
+        const close = if (self.window_close) |*close| close else return error.NoWindowClose;
+        if (close.state == .closed) return;
+        if (!self.windowCloseReady()) return error.WindowCloseNotReady;
+        if (!self.windowTargetsReleased(close.targets)) {
+            close.state = .draining;
+            return error.WindowCloseNotReady;
+        }
+        if (self.domain.ai) |ai| try ai.releaseWindow(self.window_id);
+        _ = try self.sessions.journal.completeReleased(close.key, "window closed");
+        try self.windows.completeClose(close.ticket);
+        _ = self.workspace.endWindowCloseBatch(close.ticket.request);
+        close.state = .closed;
+        @import("../../../platform/applog.zig").info(.workspace, "window close complete window={d} operation={d}", .{ @backingInt(self.window_id), close.key.operation_id });
+    }
+
+    pub fn cancelWindowClose(self: *ApplicationHost) !bool {
+        const close = if (self.window_close) |*close| close else return false;
+        if (!self.windowClosePending()) return false;
+        close.cancel_requested = true;
+        _ = try self.sessions.journal.publish(close.key, .cancelled, "window close cancelled", null);
+        _ = try self.sessions.journal.publish(close.key, .cleanup_released, "window close request released", null);
+        try self.workspace.model.cancelWindowClose(close.ticket.request);
+        try self.windows.cancelClose(close.ticket);
+        _ = self.workspace.endWindowCloseBatch(close.ticket.request);
+        close.state = .cancelled;
+        return true;
+    }
+
+    pub fn create(self: *ApplicationHost, host: hosts.HostConfig, host_id: workspace_mod.HostId, source_index: usize, initial_input: []const u8) !session.Accepted {
+        if (!host.isLegacy()) {
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            return self.openEnvelope(try connection_envelope.fromLegacy(arena.allocator(), host), try self.dispatcher.issue());
+        }
+        const decision = try self.createForInput(try self.dispatcher.issue(), host, host_id, source_index, initial_input);
+        return switch (decision) {
+            .accepted => |key| .{ .handle = key.owner.session, .operation = key },
+            .rejected => error.CommandRejected,
+        };
+    }
+
+    pub fn openEnvelope(self: *ApplicationHost, value: connection_envelope.Envelope, request_key: u64) !session.Accepted {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        // 被禁用的随应用插件（Q5）：区别于未知插件，载荷原样保留、不解码。
+        const manifest = self.sessions.registry.find(value.protocol_id) orelse return if (self.domain.plugin_launch.disabled(value.protocol_id) != null) error.PluginDisabled else error.UnknownPlugin;
+        const renderer = self.sessions.registry.renderer(manifest.content_renderer) orelse return error.ContentRendererUnavailable;
+        if (renderer.mount != null) try self.plugin_attempts.ensureUnusedCapacity(self.allocator, 1);
+        const accepted = try self.sessions.open(value, .{ .request_key = request_key, .target = self.target() });
+        if (renderer.mount != null) {
+            for (self.plugin_attempts.items) |previous| if (previous.handle.eql(accepted.handle)) return accepted;
+            self.plugin_attempts.appendAssumeCapacity(accepted);
+        }
+        return accepted;
+    }
+
+    /// Capture at command acceptance; later registry edits cannot retarget the
+    /// connection while its native window is being created.
+    pub fn freezeWindowConnection(self: *ApplicationHost, host_id: workspace_mod.HostId) !WindowConnection {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const index = self.workspace.hostIndex(host_id) orelse return error.StaleAsset;
+        return WindowConnection.init(self.allocator, self.workspace.registry.hosts[index], self.workspace.app_config.*, self.workspace.registry.hosts, host_id, index);
+    }
+
+    /// Freeze the selected tab's connection, including unsaved/deleted hosts.
+    pub fn freezeTabWindowConnection(self: *ApplicationHost, id: LegacySessionId) !WindowConnection {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const mapping = self.findLegacyId(id) orelse return error.StaleSession;
+        if (mapping.source) |source| {
+            const frozen = source.value;
+            return WindowConnection.init(self.allocator, frozen.host, frozen.global_config, frozen.route_hosts, frozen.host_id, frozen.source_index);
+        }
+        const value = self.sessions.connectionEnvelope(mapping.handle) orelse return error.ConnectionEnvelopeUnavailable;
+        return .{ .envelope = try @import("../../../host/session_lifecycle.zig").Snapshot(connection_envelope.Envelope).init(self.allocator, value) };
+    }
+
+    /// Called only after the destination workspace has mounted and registered
+    /// its own WindowId. This never consults the currently active native view.
+    pub fn createWindowConnection(self: *ApplicationHost, source: *const WindowConnection) !session.Accepted {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        if (self.pending_source != null) return error.ReentrantCreate;
+        self.pending_source = if (source.remote) |*remote| remote else null;
+        defer self.pending_source = null;
+        return self.openEnvelope(source.envelope.value, try self.dispatcher.issue());
+    }
+
+    /// Saved-host sidebar entry. The normal SSH adapter receives an explicit
+    /// purpose and queues no presentation, terminal runtime, or Tab mapping.
+    pub fn createBackgroundSaved(self: *ApplicationHost, host_id: workspace_mod.HostId) !session.Accepted {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const index = self.workspace.hostIndex(host_id) orelse return error.StaleAsset;
+        const host = self.workspace.registry.hosts[index];
+        if (@backingInt(host.connection_id) == 0) return error.InvalidSessionPurpose;
+        _ = try self.ensureBackgroundHost();
+        var source = try freezeSource(self.allocator, host, self.workspace.app_config.*, self.workspace.registry.hosts, host_id, index, "");
+        defer source.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const envelope = try connection_envelope.fromLegacy(arena.allocator(), source.value.host);
+        if (self.pending_source != null) return error.ReentrantCreate;
+        self.pending_source = &source;
+        defer self.pending_source = null;
+        return self.sessions.open(envelope, .{ .request_key = try self.dispatcher.issue(), .target = self.target(), .purpose = .socks_background });
+    }
+    pub fn stopBackgroundOwner(self: *ApplicationHost, owner: identity.SessionHandle) !OperationKey {
+        const host = self.domain.backgrounds orelse return error.StaleSession;
+        if (!host.owns(owner)) return error.StaleSession;
+        _ = host.requestStop(owner);
+        return self.domain.stopBackgroundOwner(owner);
+    }
+    pub fn requestBackgroundReconnect(self: *ApplicationHost, owner: identity.SessionHandle) !void {
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        _ = try (self.domain.backgrounds orelse return error.StaleSession).retry(owner);
+    }
+    /// The caller owns this value-only slice; there is no native pointer or Tab.
+    pub fn backgroundSnapshots(self: *ApplicationHost, allocator: std.mem.Allocator) ![]background.Snapshot {
+        return if (self.domain.backgrounds) |host| host.snapshots(allocator) else allocator.alloc(background.Snapshot, 0);
+    }
+
+    fn ensureBackgroundHost(self: *ApplicationHost) !*background.Host {
+        if (self.domain.backgrounds) |host| {
+            host.policy = self.backgroundPolicy();
+            return host;
+        }
+        var paths = try @import("../../../config/paths.zig").Paths.forApplication(self.allocator);
+        defer paths.deinit();
+        const host = try background.Host.init(self.allocator, self.sessions, paths.known_hosts, self.backgroundPolicy());
+        self.domain.backgrounds = host;
+        self.installBackgroundAuth();
+        return host;
+    }
+    fn installBackgroundAuth(self: *ApplicationHost) void {
+        if (self.workspace.external_auth) |installed| if (installed.context == @as(*anyopaque, self)) return;
+        self.background_previous_auth = self.workspace.external_auth;
+        self.workspace.external_auth = .{ .context = self, .pending = backgroundPendingAuth, .submit = backgroundSubmitAuth, .cancel = backgroundCancelAuth, .host = backgroundAuthHost, .parent = backgroundAuthParent, .host_key = backgroundAuthHostKey, .totp = backgroundAuthTotp };
+    }
+    fn backgroundPolicy(self: *ApplicationHost) background.Policy {
+        const saved = self.workspace.app_config.*;
+        return .{ .presentation = if (saved.ssh.otp_modal) .otp_modal else .protected_form, .presentation_config_revision = saved.config_revision, .timeout_ms = @as(u32, saved.ssh.connect_timeout_sec) * 1000, .totp_autofill = saved.ssh.totp_autofill, .automatic_reconnect = saved.ssh.auto_reconnect, .reconnect_max = saved.ssh.reconnect_max, .reconnect_backoff = saved.ssh.reconnect_backoff };
+    }
+
+    /// An event routed through several UI layers passes the same issued ID.
+    /// All factory entry points share the real domain handler and its key.
+    pub fn createForInput(self: *ApplicationHost, command_id: u64, host: hosts.HostConfig, host_id: workspace_mod.HostId, source_index: usize, initial_input: []const u8) !commands.Decision {
+        if (self.pending_source != null) return error.ReentrantCreate;
+        var source = try freezeSource(self.allocator, host, self.workspace.app_config.*, self.workspace.registry.hosts, host_id, source_index, initial_input);
+        defer source.deinit();
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, source.value, .{});
+        defer self.allocator.free(payload);
+        const revision = source.value.host.revision;
+        const temporary = @backingInt(source.value.host.connection_id) == 0;
+        const owner: identity.CommandOwner = if (temporary) .app else .{ .asset = source.value.host.owner() };
+        const command: commands.UiCommand = .{
+            .command_id = command_id,
+            .kind = if (temporary) .create_temporary_ssh_session else .open_saved_connection,
+            .owner = owner,
+            .view_revision = revision,
+            .payload = .{ .text = payload },
+        };
+        self.pending_source = &source;
+        defer self.pending_source = null;
+        const manifest = self.sessions.registry.find(source.value.host.protocolId());
+        const connected = if (manifest) |entry| entry.session_factory != null else false;
+        const decision = try self.dispatcher.submit(command, .{
+            .owner = owner,
+            .view_revision = revision,
+            .action_context = .{
+                .supported = .{ .session_factory = true },
+                .ready = .{ .session_factory = connected },
+                .lifecycle_allows = !self.workspace.shutting_down and self.workspace.model.window_close == null,
+                .permission_granted = true,
+                .handler_ready = connected,
+            },
+        }, .{ .context = self, .submit = submitCreate });
+        self.last_rejection = switch (decision) {
+            .rejected => |failure| failure,
+            .accepted => null,
+        };
+        return decision;
+    }
+
+    /// Domain API used by the command handler; no second journal is created.
+    pub fn requestCloseLegacy(self: *ApplicationHost, id: LegacySessionId) !OperationKey {
+        const handle = self.ownerForLegacy(id) orelse return error.UnknownSession;
+        if (self.lifecycle_supervisor.resource(handle)) |entry| {
+            if (entry.retained_metadata == null) entry.retained_metadata = self.captureSessionMetadata(handle);
+        }
+        if (self.findHandle(handle)) |mapping| {
+            const state = self.sessions.queryState(handle) orelse return error.StaleSession;
+            if (state.close_operation == null and mapping.close_display == null) try self.freezeCloseDisplay(mapping);
+        }
+        if (self.findHandle(handle)) |mapping| if (mapping.reconnect_ticket) |*ticket| ticket.invalidate();
+        const retry_unknown = if (self.findHandle(handle)) |mapping| if (mapping.waiting) |waiting| waiting.unknown else false else false;
+        const key = self.sessions.requestClose(handle, self.closeHooks()) catch |err| {
+            // Once the domain has accepted a close, a later publication OOM
+            // must not turn its real operation into a rejected UI command.
+            const state = self.sessions.queryState(handle) orelse return err;
+            const key = state.close_operation orelse {
+                if (self.findHandle(handle)) |mapping| if (mapping.close_display) |*display| {
+                    display.deinit();
+                    mapping.close_display = null;
+                };
+                return err;
+            };
+            const mapping = self.findHandle(handle).?;
+            if (mapping.waiting == null) mapping.waiting = .{ .key = key, .step = .release_content };
+            return key;
+        };
+        if (retry_unknown) if (self.findHandle(handle)) |mapping| try self.retryUnknownClose(mapping);
+        return key;
+    }
+
+    fn retryUnknownClose(self: *ApplicationHost, mapping: *Mapping) !void {
+        const waiting = mapping.waiting orelse return;
+        if (!waiting.unknown) return;
+        // Retry only the uncertain step of the original operation. Awaiting
+        // work keeps polling, and release_content still waits for a safe hook.
+        mapping.waiting = null;
+        const receipt = self.runCloseStep(mapping, waiting.key, waiting.step, false);
+        if (receipt != .awaiting) _ = try self.publishCloseReceipt(mapping, waiting, receipt);
+    }
+
+    /// No archive IO or identity inference: only the live SessionHost binding
+    /// and its exact Service may supply recording identity before teardown.
+    fn captureSessionMetadata(self: *ApplicationHost, handle: identity.SessionHandle) lifecycle.SessionMetadata {
+        const mapping = self.findHandle(handle) orelse return .{};
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return .{};
+        if (tab.content_owner != .session or !tab.content_owner.session.eql(handle)) return .{};
+        const state = self.sessions.queryState(handle) orelse return .{};
+        var metadata = lifecycle.SessionMetadata.init(tab.titleSlice(), state.protocol_id);
+        const binding = switch (self.sessions.queryService(handle, .terminal)) {
+            .available => |binding| binding,
+            else => {
+                metadata.recording_unavailable_reason = "ServiceUnavailable";
+                return metadata;
+            },
+        };
+        const service = if (mapping.process) |process| process.terminalService(binding) catch return metadata else if (tab.runtime) |runtime| runtime.terminalService() catch return metadata else return metadata;
+        if (!service.binding.eql(binding) or service.binding.kind != .terminal or service.binding.resource_owner != .session or !service.binding.resource_owner.session.eql(handle) or !self.sessions.bindingIsLive(service.binding)) return metadata;
+        if (service.vtable.recording_identity != null) {
+            const facts = service.recordingIdentity() catch {
+                metadata.recording_unavailable_reason = "SnapshotUnavailable";
+                return metadata;
+            };
+            metadata.recording_id = facts.recording_id;
+            metadata.recording_generation = facts.recording_generation;
+            metadata.recording_unavailable_reason = if (facts.available) null else facts.failure orelse "RecordingUnavailable";
+            return metadata;
+        }
+        if (service.vtable.execution_snapshot == null) return metadata;
+        const facts = service.executionSnapshot() catch {
+            metadata.recording_unavailable_reason = "SnapshotUnavailable";
+            return metadata;
+        };
+        if (!facts.owner.eql(handle)) return metadata;
+        if (facts.recording_id) |id| {
+            _ = identity.RecordingId.parse(&id) catch return metadata;
+            if (facts.recording_generation == 0) return metadata;
+            metadata.recording_id = id;
+            metadata.recording_generation = facts.recording_generation;
+            metadata.recording_unavailable_reason = null;
+        } else if (facts.failure) |failure| {
+            if (std.mem.eql(u8, failure, "RecordingDisabled")) metadata.recording_unavailable_reason = "RecordingDisabled";
+        }
+        return metadata;
+    }
+
+    /// Freeze appearance while the exact live pane still owns it. The first
+    /// asynchronous close hook hands this owned snapshot to the recording owner
+    /// before protocol teardown; WorkerBusy merely requests another safe tick.
+    fn freezeCloseDisplay(self: *ApplicationHost, mapping: *Mapping) !void {
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return;
+        const view = if (tab.terminal) |*value| value else return;
+        const runtime_service = if (tab.runtime) |runtime| runtime.terminalService() catch null else null;
+        const service = runtime_service orelse if (view.terminal_surface) |surface| surface.service else return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var display: @import("../../../vt/recording_manifest.zig").Display = .{
+            .title = try a.dupe(u8, tab.titleSlice()),
+            .host = try a.dupe(u8, if (tab.host_snapshot) |saved| saved.value.host else "localhost"),
+            .user = try a.dupe(u8, if (tab.host_snapshot) |saved| saved.value.user else ""),
+            .timestamps = view.local_state.timestamp_gutter,
+            .grouped = view.terminal_grouped,
+            .final_cols = view.frame_cols,
+            .final_rows = view.frame_rows,
+            .font_family = try a.dupe(u8, view.terminal_font_family orelse "system"),
+            .font_size_px = view.terminal_font_size,
+            .line_height = view.terminal_line_height,
+        };
+        display.endpoint = if (tab.host_snapshot) |saved| try std.fmt.allocPrint(a, "{s}@{s}:{d}", .{ saved.value.user, saved.value.host, saved.value.port }) else "localhost";
+        display.cwd = if (mapping.process) |process| process.copyCwd(mapping.handle, a) catch null else if (tab.runtime) |runtime| runtime.copyCwd(a) catch null else null;
+        mapping.close_display = .{ .arena = arena, .service = service, .display = display };
+    }
+
+    pub fn closeForInput(self: *ApplicationHost, command_id: u64, tab_id: identity.TabId, owner: identity.ContentOwner) !commands.Decision {
+        const index = self.workspace.model.indexOf(tab_id) orelse return error.StaleSession;
+        if (!self.workspace.model.tabs.items[index].owner.eql(owner)) return error.StaleSession;
+        const revision = self.workspace.model.tabs.items[index].revision;
+        const command_owner: identity.CommandOwner = switch (owner) {
+            .session => .{ .session = (self.findTab(tab_id, owner) orelse return error.StaleSession).handle },
+            .card => |id| .{ .card = id },
+            .group => return error.UnsupportedOwner,
+        };
+        return self.dispatcher.submit(.{ .command_id = command_id, .kind = .request_close, .owner = command_owner, .view_revision = revision, .payload = .{ .tab = tab_id } }, .{
+            .owner = command_owner,
+            .view_revision = revision,
+            .action_context = .{ .has_tab = true, .permission_granted = true, .handler_ready = true },
+        }, .{ .context = self, .submit = submitClose });
+    }
+
+    /// Call only from an after-layout/before-render safe hook. A queued view
+    /// removal is acknowledged after Workspace's own safe hook has removed it.
+    /// The return value indicates outstanding asynchronous work.
+    /// Stage a renderer in the destination Cx, atomically rebind its controller,
+    /// then discard the source view. No create/reconnect or close is dispatched.
+    pub fn transferPluginTo(self: *ApplicationHost, destination: *ApplicationHost, owner: identity.SessionHandle, new_context: @import("../../../host/host_context.zig").HostContext) !void {
+        if (self == destination or self.domain != destination.domain) return error.InvalidTransferDestination;
+        if (self.windowClosePending() or destination.windowClosePending() or destination.workspace.shutting_down) return error.WindowClosing;
+        const original = (self.findHandle(owner) orelse return error.ContentNotAttached).*;
+        if (original.source != null or original.process != null or original.waiting != null) return error.ContentTransferUnavailable;
+        try self.workspace.validatePluginTransfer(owner, original.legacy_id);
+        const state = self.sessions.queryState(owner) orelse return error.UnknownSession;
+        const expected = state.attachment orelse return error.ContentNotAttached;
+        const manifest = self.sessions.manifestFor(owner) orelse return error.UnknownPlugin;
+        const renderer = self.sessions.registry.renderer(manifest.content_renderer) orelse return error.ContentRendererUnavailable;
+        if (!renderer.supports_window_transfer) return error.WindowTransferUnsupported;
+        if (destination.findHandle(owner) != null) return error.ContentAlreadyAttached;
+        try destination.mappings.ensureUnusedCapacity(destination.allocator, 1);
+        try destination.plugin_attempts.ensureUnusedCapacity(destination.allocator, 1);
+        const connection = self.sessions.connectionEnvelope(owner) orelse return error.ConnectionUnavailable;
+        const new_id = try destination.workspace.createPluginSession(owner, connection, renderer.*);
+        errdefer destination.workspace.discardTransferredPlugin(owner, new_id);
+        const new_tab = destination.workspace.sessionTab(new_id).?;
+        new_tab.setTitle(self.workspace.sessionTab(original.legacy_id).?.titleSlice());
+        try self.sessions.retargetAttached(owner, expected, .{ .target = destination.target(), .tab_id = new_tab.tab_id }, new_context);
+        var moved = original;
+        moved.legacy_id = new_id;
+        moved.legacy_generation = new_tab.generation;
+        moved.tab_id = new_tab.tab_id;
+        destination.mappings.appendAssumeCapacity(moved);
+        for (self.mappings.items, 0..) |entry, index| if (entry.handle.eql(owner)) {
+            _ = self.mappings.orderedRemove(index);
+            break;
+        };
+        self.mappingsChanged();
+        for (self.plugin_attempts.items, 0..) |attempt, index| if (attempt.handle.eql(owner)) {
+            destination.plugin_attempts.appendAssumeCapacity(attempt);
+            _ = self.plugin_attempts.orderedRemove(index);
+            break;
+        };
+        self.workspace.discardTransferredPlugin(owner, original.legacy_id);
+    }
+
+    /// Advance cancelled protocol owners after native ticks stop. Drain SSH
+    /// attempt receipts and discard unrendered Local output so the adapter
+    /// can finish and join even when its PTY stream filled.
+    pub fn pumpShutdown(self: *ApplicationHost) !bool {
+        self.workspace.drainCancelledConnections();
+        var scratch: [16 * 1024]u8 = undefined;
+        for (self.mappings.items) |mapping| {
+            if (mapping.process == null or mapping.local_retired) continue;
+            var budget: usize = 256 * 1024;
+            while (budget > 0) {
+                const read = mapping.process.?.readOutput(mapping.handle, &scratch) catch break;
+                switch (read) {
+                    .bytes => |count| {
+                        if (count == 0) break;
+                        budget -|= count;
+                    },
+                    .would_block, .eof => break,
+                }
+            }
+        }
+        return self.local_adapter.drain(self.sessions);
+    }
+
+    pub fn safeTick(self: *ApplicationHost) !bool {
+        if (self.domain.ai) |ai| {
+            ai.pump() catch |err| @import("../../../platform/applog.zig").warn(.ai, "shared AI receipt: {s}", .{@errorName(err)});
+            if (self.windowClosePending()) _ = ai.closeWindow(self.window_id) catch |err| blk: {
+                @import("../../../platform/applog.zig").warn(.ai, "AI window close: {s}", .{@errorName(err)});
+                break :blk false;
+            };
+        }
+        try self.syncOwnedUserInput(null);
+        const lifecycle_pending = try self.tickOwnedSessions();
+        const deferred_close_pending = try self.tickDeferredCloses();
+        // Domain-only hosts have no Cx. Render-cache policy starts only after
+        // the application installs the window's presentation callbacks.
+        if (self.installed) {
+            const now: u64 = @intCast(@import("../../../platform/realtime.zig").monotonicNs());
+            var input_epoch: u64 = 0;
+            for (self.domain.attachments.items) |host| if (host.installed) {
+                input_epoch +%= host.workspace.cx.input_epoch;
+            };
+            if (self.domain.idle_input_epoch != input_epoch) {
+                self.domain.idle_input_epoch = input_epoch;
+                self.domain.idle_memory.noteInput(now);
+            }
+            const has_views = for (self.domain.attachments.items) |host| {
+                if (host.installed and host.workspace.tabs.items.len != 0) break true;
+            } else false;
+            switch (self.domain.idle_memory.observe(has_views, now)) {
+                .none => {},
+                .wait => |delay| self.workspace.cx.scheduleRedrawAfterNs(delay),
+                .reclaim => {
+                    for (self.domain.attachments.items) |host| if (host.installed) {
+                        self.domain.idle_trimmed_bytes += host.workspace.cx.trimIdleRenderCapacity(64 * 1024);
+                    };
+                    self.domain.idle_reclaim_runs += 1;
+                },
+            }
+        }
+        self.local_adapter.configureScrollback(self.workspace.app_config.ui.scrollback_limit);
+        self.local_adapter.applyRecordingRetention(self.workspace.app_config.config_revision, self.workspace.app_config.log.retention_days);
+        var background_pending = false;
+        if (self.domain.backgrounds) |host| {
+            self.installBackgroundAuth();
+            if ((self.windowClosePending() or self.workspace.shutting_down) and self.domain.attachments.items.len == 1) {
+                const values = try host.snapshots(self.allocator);
+                defer self.allocator.free(values);
+                for (values) |value| {
+                    const state = self.sessions.queryState(value.owner) orelse continue;
+                    if (state.close_operation == null) _ = try self.stopBackgroundOwner(value.owner);
+                }
+            }
+            background_pending = try host.safeTick();
+        }
+        if (self.windowClosePending()) for (self.file_sources.items) |source| {
+            const state = self.sessions.queryState(source.handle) orelse continue;
+            if (!state.create_operation.eql(source.key) or self.findHandle(source.handle) != null) continue;
+            if (state.lifecycle == .creating or state.lifecycle == .ready) _ = try self.sessions.cancel(source.key);
+        };
+        var shared_pending = false;
+        if (self.domain.tasks) |tasks| shared_pending = try tasks.tick(@intCast(@divTrunc(@import("../../../platform/realtime.zig").monotonicNs(), std.time.ns_per_ms)), self.workspace.app_config.transfer.max_tasks);
+        const controller_pending = try self.sessions.pollControllers();
+        self.domain.retireClosedOperations();
+        // A provider may retry its released generation from its safe poll.
+        // Discover new ready owners through the registry, preserving the tab.
+        for (self.sessions.sessions.items) |entry| {
+            const state = self.sessions.queryState(entry.handle) orelse continue;
+            if (state.lifecycle != .ready or state.target.window_id != self.window_id or state.target.workspace_id != self.workspace_id or self.findHandle(entry.handle) != null) continue;
+            const manifest = self.sessions.manifestFor(entry.handle) orelse continue;
+            const renderer = self.sessions.registry.renderer(manifest.content_renderer) orelse continue;
+            if (renderer.mount == null) continue;
+            var tracked = false;
+            for (self.plugin_attempts.items) |*attempt| if (attempt.handle.session_id == entry.handle.session_id) {
+                attempt.* = .{ .handle = entry.handle, .operation = state.create_operation };
+                tracked = true;
+                break;
+            };
+            if (!tracked) try self.plugin_attempts.append(self.allocator, .{ .handle = entry.handle, .operation = state.create_operation });
+        }
+        for (self.plugin_attempts.items) |attempt| {
+            const state = self.sessions.queryState(attempt.handle) orelse continue;
+            if (state.lifecycle != .ready or self.findHandle(attempt.handle) != null) continue;
+            const manifest = self.sessions.manifestFor(attempt.handle) orelse continue;
+            const renderer = self.sessions.registry.renderer(manifest.content_renderer) orelse continue;
+            const connection = self.sessions.connectionEnvelope(attempt.handle) orelse continue;
+            var remounted = false;
+            for (self.mappings.items) |*mapping| if (mapping.handle.session_id == attempt.handle.session_id and mapping.handle.generation < attempt.handle.generation) {
+                if (self.workspace.sessionTab(mapping.legacy_id)) |tab| if (tab.plugin_renderer != null) {
+                    try self.workspace.remountPluginSession(mapping.legacy_id, mapping.handle, attempt.handle, connection, renderer.*);
+                    mapping.handle = attempt.handle;
+                    mapping.create_operation = attempt.operation;
+                    mapping.legacy_generation = attempt.handle.generation;
+                    mapping.owner = .{ .session = attempt.handle };
+                    mapping.ready_published = true;
+                    mapping.attached_published = true;
+                    self.mappingsChanged();
+                    _ = try self.sessions.attached(attempt.handle, .{ .target = self.target(), .tab_id = tab.tab_id });
+                    remounted = true;
+                };
+                break;
+            };
+            if (remounted) continue;
+            try self.mappings.ensureUnusedCapacity(self.allocator, 1);
+            const id = try self.workspace.createPluginSession(attempt.handle, connection, renderer.*);
+            const tab = self.workspace.sessionTab(id).?;
+            self.mappings.appendAssumeCapacity(.{ .handle = attempt.handle, .create_operation = attempt.operation, .legacy_id = id, .legacy_generation = tab.generation, .tab_id = tab.tab_id, .owner = tab.content_owner, .source = null, .ready_published = true, .attached_published = true });
+            self.mappingsChanged();
+            _ = try self.sessions.attached(attempt.handle, .{ .target = self.target(), .tab_id = tab.tab_id });
+        }
+        for (self.mappings.items) |*mapping| if (self.workspace.sessionTab(mapping.legacy_id)) |tab| if (tab.plugin_renderer) |renderer| if (renderer.vtable.connection_status) |project| {
+            const projection = project(renderer.context);
+            if (mapping.plugin_connection_state == null or mapping.plugin_connection_state.? != projection.state) {
+                mapping.plugin_connection_state = projection.state;
+                self.workspace.rebuildTabBar() catch {};
+                if (self.workspace.active_tab) |index| if (index < self.workspace.tabs.items.len and self.workspace.tabs.items[index].id == mapping.legacy_id) {
+                    if (self.workspace.status_node) |node| node.setTextContent(self.allocator, projection.label) catch {};
+                };
+                self.workspace.cx.requestRedraw();
+            }
+        };
+        var file_pending = false;
+        if (self.file_plugin) |plugin| file_pending = try plugin.tick(plugin.context, self.sessions);
+        for (self.mappings.items) |mapping| if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.source != null) {
+            self.workspace.pollConnectionResults();
+            break;
+        };
+        var pending = try self.local_adapter.drain(self.sessions) or controller_pending or file_pending or background_pending or shared_pending or lifecycle_pending or deferred_close_pending;
+        // Exactly one consumer drains the bounded raw stream, including before
+        // ready and after cancellation. VT/TextSlot is consumed only by views.
+        var output: [16 * 1024]u8 = undefined;
+        for (self.mappings.items) |mapping| {
+            if (mapping.process == null or mapping.local_retired) continue;
+            var budget: usize = 256 * 1024;
+            while (budget > 0) {
+                const read = mapping.process.?.readOutput(mapping.handle, &output) catch |err| switch (err) {
+                    error.StaleSession => break,
+                    else => return err,
+                };
+                switch (read) {
+                    .bytes => |count| {
+                        budget -|= count;
+                        if (count == 0) break;
+                    },
+                    .would_block, .eof => break,
+                }
+            }
+            if (budget == 0) pending = true;
+        }
+        self.domain.drainJournal();
+        for (self.mappings.items) |*mapping| {
+            if (mapping.process != null) {
+                try self.syncLocal(mapping);
+            }
+            if (self.supportsIntegration(mapping.handle, "transport_loss")) pending = try self.syncSshReconnect(mapping) or pending;
+            if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.failed_received and !mapping.failed_published) {
+                _ = try self.sessions.failed(mapping.handle, mapping.create_operation, .{
+                    .domain = .transport,
+                    .code = "connection_failed",
+                    .cleanup = if (mapping.cleanup_received) .released else if (mapping.cleanup_unknown_received) .unknown else .releasing,
+                    .safe_message = mapping.failure[0..mapping.failure_len],
+                });
+                mapping.failed_published = true;
+            }
+            if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.connected_received and !mapping.ready_published and !mapping.failed_received) {
+                _ = try self.sessions.ready(mapping.handle, mapping.create_operation, self.registeredServices(mapping.handle));
+                if (self.sessions.queryState(mapping.handle)) |state| {
+                    mapping.ready_published = state.create_operation.eql(mapping.create_operation) and (state.lifecycle == .ready or state.lifecycle == .attached);
+                }
+            }
+            if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.ready_published and !mapping.attached_published) {
+                if (self.workspace.sessionTab(mapping.legacy_id)) |tab| {
+                    if (tab.generation == mapping.legacy_generation and tab.tab_id == mapping.tab_id and tab.content_owner.eql(mapping.owner)) {
+                        // The provider can render before domain readiness, but
+                        // execution must use the binding allocated by SessionHost.
+                        // Retire the provisional view before changing the provider
+                        // so old anchors are released through their original handle.
+                        if (tab.runtime) |runtime| if (runtime.vtable.bindTerminalService != null) {
+                            const binding = switch (self.sessions.queryService(mapping.handle, .terminal)) {
+                                .available => |value| value,
+                                else => return error.ServiceUnavailable,
+                            };
+                            if (!self.sessions.bindingIsLive(binding)) return error.StaleBinding;
+                            if (tab.terminal) |*view| if (view.terminal_surface) |surface| if (!surface.service.binding.eql(binding)) view.unbindTerminalService(mapping.handle);
+                            const live = try runtime.bindTerminalService(binding);
+                            if (tab.terminal) |*view| try view.bindTerminalService(live);
+                        };
+                        _ = try self.sessions.attached(mapping.handle, .{ .target = self.target(), .tab_id = mapping.tab_id });
+                        if (self.sessions.queryState(mapping.handle)) |state| if (state.lifecycle == .attached and state.attachment != null and state.attachment.?.tab_id == mapping.tab_id) {
+                            mapping.attached_published = self.workspace.acknowledgeSessionAttached(mapping.legacy_id, mapping.legacy_generation, mapping.create_operation);
+                            if (mapping.attached_published) {
+                                mapping.reconnect_policy = null;
+                                mapping.reconnect_ticket = null;
+                                mapping.reconnect_count = 0;
+                            }
+                        };
+                    }
+                }
+            }
+            if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.cleanup_received) {
+                if (self.sessions.queryState(mapping.handle)) |state| if (state.create_cleanup != .released) {
+                    _ = try self.sessions.createCleanupReceipt(mapping.handle, mapping.create_operation, .released);
+                };
+            } else if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.cleanup_unknown_received) {
+                if (self.sessions.queryState(mapping.handle)) |state| if (state.create_cleanup != .released and state.create_cleanup != .unknown) {
+                    _ = try self.sessions.createCleanupReceipt(mapping.handle, mapping.create_operation, .unknown);
+                };
+            }
+            if (!mapping.explicit_disconnect and !self.windowClosePending()) if (self.workspace.initialConnectionRetryDeadline(mapping.create_operation)) |deadline| {
+                const state = self.sessions.queryState(mapping.handle) orelse continue;
+                if (state.lifecycle == .failed and state.create_cleanup == .released) {
+                    if (@import("../../../platform/realtime.zig").monotonicNs() >= deadline) _ = try self.sessions.retry(mapping.handle);
+                    pending = true;
+                }
+            };
+            if (self.supportsIntegration(mapping.handle, "transport_loss") and mapping.reconnect_ticket != null) {
+                const state = self.sessions.queryState(mapping.handle) orelse continue;
+                if (state.lifecycle == .closing or state.lifecycle == .closed or self.workspace.shutting_down) {
+                    mapping.reconnect_ticket.?.invalidate();
+                } else if (!self.windowClosePending()) {
+                    _ = mapping.reconnect_ticket.?.claim(mapping.create_operation, @import("../../../platform/realtime.zig").monotonicNs(), false);
+                    const ticket = mapping.reconnect_ticket.?;
+                    if (ticket.claimed and !ticket.invalidated and (state.lifecycle == .failed or state.lifecycle == .ended) and state.create_cleanup == .released) {
+                        mapping.reconnect_ticket = null;
+                        _ = self.sessions.retry(mapping.handle) catch |err| {
+                            if (mapping.create_operation.eql(ticket.key)) mapping.reconnect_ticket = ticket;
+                            return err;
+                        };
+                        mapping.reconnect_count +|= 1;
+                        pending = true;
+                    } else if (!ticket.invalidated and (ticket.deadline_ns != null or ticket.claimed)) pending = true;
+                }
+            }
+            if (mapping.waiting) |waiting| {
+                const close_now = @import("../../../platform/realtime.zig").monotonicNs();
+                if (mapping.close_log_ns == 0 or close_now - mapping.close_log_ns >= 5 * std.time.ns_per_s) {
+                    mapping.close_log_ns = close_now;
+                    @import("../../../platform/applog.zig").info(.workspace, "session close pending session={d} generation={d} operation={d} step={s} unknown={any} content_pending={any}", .{ @backingInt(mapping.handle.session_id), mapping.handle.generation, waiting.key.operation_id, @tagName(waiting.step), waiting.unknown, mapping.content_pending });
+                }
+                if (!waiting.unknown) {
+                    mapping.waiting = null;
+                    const receipt = self.runCloseStep(mapping, waiting.key, waiting.step, true);
+                    if (receipt != .awaiting) _ = try self.publishCloseReceipt(mapping, waiting, receipt);
+                }
+            }
+            if (self.sessions.queryState(mapping.handle)) |state| {
+                if (state.lifecycle == .closed) {
+                    if (mapping.process != null and !mapping.local_retired) {
+                        self.workspace.unbindLocalTerminal(mapping.legacy_id, mapping.handle);
+                        if (self.workspace.sessionTab(mapping.legacy_id) == null) {
+                            mapping.process.?.retire(mapping.handle) catch |err| switch (err) {
+                                error.StaleSession => {},
+                                error.WorkerBusy, error.CleanupIncomplete => {
+                                    pending = true;
+                                    continue;
+                                },
+                                else => return err,
+                            };
+                            mapping.local_retired = true;
+                        }
+                    }
+                    if (mapping.source) |*source| source.deinit();
+                    mapping.source = null;
+                    mapping.waiting = null;
+                } else if (state.lifecycle == .creating) {
+                    pending = true;
+                } else if (mapping.waiting) |waiting| if (!waiting.unknown) {
+                    pending = true;
+                };
+            }
+        }
+        for (self.card_closes.items) |*close| {
+            if (close.state != .pending) continue;
+            if (self.workspace.tabIndexById(close.tab_id)) |index| {
+                const tab = self.workspace.tabs.items[index];
+                if (!tab.isCard() or !tab.content_owner.eql(.{ .card = close.owner })) {
+                    _ = try self.sessions.journal.publish(close.key, .cleanup_unknown, "card owner changed", null);
+                    close.state = .unknown;
+                    continue;
+                }
+                self.workspace.receiveCloseReceipt(close.tab_id, .{ .card = close.owner }, true);
+                pending = true;
+            } else {
+                _ = try self.sessions.journal.completeReleased(close.key, "card view closed");
+                close.state = .closed;
+            }
+        }
+        if (self.window_close) |*close| {
+            if (close.cancel_requested and self.windowClosePending()) {
+                _ = try self.cancelWindowClose();
+            } else if (close.state == .draining) {
+                if (self.windowTargetsReleased(close.targets) and self.fileCreatesReleased()) {
+                    const files_released = if (self.file_plugin) |plugin| plugin.shutdown(plugin.context) == .released else true;
+                    if (files_released) {
+                        close.state = .ready;
+                        @import("../../../platform/applog.zig").info(.workspace, "window close ready window={d} operation={d}", .{ @backingInt(self.window_id), close.key.operation_id });
+                    }
+                }
+            }
+            // A native close may start after layout, including in an empty
+            // workspace with no worker to wake the next frame.
+            if (self.windowClosePending()) pending = true;
+        }
+        if (pending) self.workspace.cx.scheduleRedrawAfterNs(33 * std.time.ns_per_ms);
+        return pending;
+    }
+
+    pub fn fileFailureText(code: []const u8) []const u8 {
+        const pairs = .{
+            .{ "AuthenticationFailed", "服务器未接受认证信息" },
+            .{ "IdentityFileUnreadable", "无法读取私钥文件，请检查路径与权限" },
+            .{ "IdentityFileInvalid", "私钥文件格式无效、已损坏或当前不支持" },
+            .{ "ConnectionRefused", "连接被拒绝，请检查端口和服务" },
+            .{ "ConnectFailed", "无法建立 TCP 连接，请检查地址、端口与网络" },
+            .{ "ConnectionTimedOut", "连接超时" },
+            .{ "ConnectionTimeout", "连接超时" },
+            .{ "timeout", "连接超时" },
+            .{ "subsystem_denied", "服务器拒绝 SFTP 子系统" },
+            .{ "SftpSubsystemDenied", "服务器拒绝 SFTP 子系统" },
+            .{ "permission_denied", "没有访问目录的权限" },
+            .{ "not_found", "初始目录不存在" },
+        };
+        inline for (pairs) |pair| if (std.mem.eql(u8, code, pair[0])) return pair[1];
+        return "连接未完成，请查看连接日志中的失败阶段";
+    }
+
+    fn publishFileCreateFailure(self: *ApplicationHost, key: OperationKey, failure: @import("../../../host/operation.zig").Failure) void {
+        if (key.owner != .session) return;
+        const state = self.sessions.queryState(key.owner.session) orelse return;
+        if (!state.create_operation.eql(key) or state.lifecycle != .failed) return;
+        for (self.file_sources.items) |*source| {
+            if (!source.handle.eql(key.owner.session) or !source.key.eql(key) or source.failure_reported) continue;
+            source.failure_reported = true;
+            var detail: [1536]u8 = undefined;
+            const message = if (std.mem.eql(u8, failure.code, "ProxyJumpTransportUnavailable"))
+                "连接失败：独立 SFTP 会话暂不支持跳板链（ProxyJumpTransportUnavailable）"
+            else
+                std.fmt.bufPrint(&detail, "{s}：{s}{s}{s}（{s}）", .{ failure.safe_message, fileFailureText(failure.code), if (failure.stage != null) " · " else "", failure.stage orelse "", failure.code }) catch failure.safe_message;
+            if (self.file_failure) |feedback| feedback.publish(feedback.context, source.handle, message);
+            return;
+        }
+    }
+
+    fn fileCreatesReleased(self: *ApplicationHost) bool {
+        for (self.file_sources.items) |source| {
+            const state = self.sessions.queryState(source.handle) orelse continue;
+            if (!state.create_operation.eql(source.key) or self.findHandle(source.handle) != null) continue;
+            if (state.lifecycle == .creating or state.lifecycle == .ready or state.create_cleanup != .released) return false;
+        }
+        return true;
+    }
+
+    fn syncSshReconnect(self: *ApplicationHost, mapping: *Mapping) !bool {
+        if (mapping.source == null) return false;
+        if (!mapping.failed_received) if (self.workspace.connectionLifecycle(mapping.create_operation)) |progress| {
+            if (progress.finished and progress.failure != null) {
+                mapping.recordFailure(@errorName(progress.failure.?));
+                mapping.cleanup_received = progress.cleanup == .released;
+                mapping.cleanup_unknown_received = progress.cleanup == .unknown;
+            }
+        };
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return false;
+        const runtime = tab.runtime orelse return false;
+        if (!runtime.torn_down) runtime.setInputBufferEnabled(self.workspace.app_config.ssh.buffer_input);
+        const limit = currentScrollbackLimit(&self.workspace.registry, mapping.source.?.value.host, self.workspace.app_config.ui.scrollback_limit);
+        if (mapping.applied_scrollback_limit == null or mapping.applied_scrollback_limit.? != limit) {
+            runtime.setScrollbackLimit(limit);
+            mapping.applied_scrollback_limit = limit;
+        }
+        const notice = runtime.reconnectSnapshot() orelse return false;
+        if (notice.key == null or !notice.key.?.eql(mapping.create_operation)) return false;
+        if (notice.shell_initialized) {
+            mapping.shell_initialization_retry_used = false;
+            tab.shell_init_confirmation_required = false;
+        }
+        if (notice.phase == .ready) {
+            mapping.connected_received = true;
+            self.workspace.finishSshReconnect(mapping.legacy_id, mapping.create_operation, null);
+            return true;
+        }
+        if (notice.phase == .ended) {
+            if (tab.terminal.?.tombstone.state == .active) {
+                tab.terminal.?.tombstone.end("远端 Shell 已退出");
+                tab.terminal.?.refreshTombstone();
+                self.workspace.tab_rebuild_pending = true;
+            }
+            const cleanup: @import("../../../host/operation.zig").Cleanup = switch (notice.cleanup) {
+                .released => .released,
+                .awaiting => .releasing,
+                .unknown => .unknown,
+            };
+            _ = try self.sessions.shellEnded(mapping.handle, mapping.create_operation, cleanup);
+            _ = try self.sessions.createCleanupReceipt(mapping.handle, mapping.create_operation, switch (notice.cleanup) {
+                .released => .released,
+                .awaiting => .awaiting,
+                .unknown => .unknown,
+            });
+            mapping.runtime_loss_received = true;
+            mapping.cleanup_received = notice.cleanup == .released;
+            mapping.cleanup_unknown_received = notice.cleanup == .unknown;
+            return notice.cleanup == .awaiting;
+        }
+        if (notice.phase != .releasing and notice.phase != .waiting) return notice.phase == .connecting;
+        if (!mapping.runtime_loss_received) {
+            const state = self.sessions.queryState(mapping.handle) orelse return false;
+            const failure: @import("../../../host/operation.zig").Failure = .{
+                .domain = .transport,
+                .code = @errorName(notice.failure orelse error.ConnectionClosed),
+                .stage = "io",
+                .retryable = true,
+                .effect = .unknown,
+                .cleanup = switch (notice.cleanup) {
+                    .released => .released,
+                    .awaiting => .releasing,
+                    .unknown => .unknown,
+                },
+                .safe_message = @errorName(notice.failure orelse error.ConnectionClosed),
+            };
+            if (state.lifecycle == .attached) {
+                _ = try self.sessions.transportLost(mapping.handle, mapping.create_operation, failure);
+            } else if (state.lifecycle == .creating or state.lifecycle == .ready) {
+                _ = try self.sessions.failed(mapping.handle, mapping.create_operation, failure);
+            } else return false;
+            mapping.runtime_loss_received = true;
+            mapping.failed_published = true;
+            mapping.recordFailure(failure.safe_message);
+            self.workspace.finishSshReconnect(mapping.legacy_id, mapping.create_operation, notice.failure orelse error.ConnectionClosed);
+            const initialization_failure = (notice.failure != null and notice.failure.? == error.ShellInitializationFailed);
+            if (initialization_failure) {
+                // The worker keeps startup input gated until release, so this
+                // retry cannot replace a shell already used by the user.
+                const retry = !mapping.shell_initialization_retry_used and !mapping.explicit_disconnect;
+                mapping.shell_initialization_retry_used = true;
+                tab.shell_init_confirmation_required = !retry;
+                mapping.reconnect_policy = null;
+                mapping.reconnect_ticket = .{ .key = mapping.create_operation, .deadline_ns = if (retry) @import("../../../platform/realtime.zig").monotonicNs() else null };
+            } else {
+                if (mapping.reconnect_policy == null) {
+                    const policy = self.workspace.app_config.ssh;
+                    mapping.reconnect_policy = .{ .automatic = !mapping.shell_initialization_retry_used and !mapping.explicit_disconnect and self.lifecycle_supervisor.resource(mapping.handle) == null and policy.auto_reconnect and (notice.failure orelse error.ConnectionClosed) != error.Cancelled, .max = policy.reconnect_max, .backoff = policy.reconnect_backoff };
+                }
+                const policy = mapping.reconnect_policy.?;
+                // Every attempt's failure is classified, not only the first
+                // loss: a reconnect rejected for authentication or a changed
+                // host key waits for the user instead of burning the backoff.
+                const delay: ?i128 = if (@import("../../../vt/reconnect.zig").automaticDelay(policy.automatic, mapping.reconnect_count, policy.max, &policy.backoff, notice.failure)) |seconds|
+                    @import("../../../platform/realtime.zig").monotonicNs() + @as(i128, seconds) * std.time.ns_per_s
+                else
+                    null;
+                mapping.reconnect_ticket = .{ .key = mapping.create_operation, .deadline_ns = delay };
+            }
+        }
+        mapping.cleanup_received = notice.cleanup == .released;
+        mapping.cleanup_unknown_received = notice.cleanup == .unknown;
+        tab.remote_retry_deadline = if (mapping.reconnect_ticket) |ticket| (if (!ticket.invalidated and !ticket.claimed) ticket.deadline_ns else null) else null;
+        return notice.cleanup == .awaiting or (mapping.reconnect_ticket != null and mapping.reconnect_ticket.?.deadline_ns != null);
+    }
+
+    fn syncLocal(self: *ApplicationHost, mapping: *Mapping) !void {
+        if (mapping.local_retired) return;
+        const state = self.sessions.queryState(mapping.handle) orelse return;
+        const tab = self.workspace.sessionTab(mapping.legacy_id) orelse return;
+        if (!tab.content_owner.eql(.{ .session = mapping.handle })) return;
+        if (state.lifecycle == .ready or state.lifecycle == .attached) {
+            if (!tab.local_bound) switch (self.sessions.queryService(mapping.handle, .terminal)) {
+                .available => |binding| try self.workspace.bindLocalTerminal(mapping.legacy_id, mapping.handle, try mapping.process.?.terminalService(binding)),
+                else => {},
+            };
+            if (tab.local_bound and state.lifecycle == .ready) {
+                _ = try self.sessions.attached(mapping.handle, .{ .target = self.target(), .tab_id = mapping.tab_id });
+                mapping.attached_published = true;
+            }
+        }
+        if (state.lifecycle == .failed) {
+            if (tab.local_state != .failed) self.workspace.updateLocalState(mapping.legacy_id, .failed, if (mapping.failure_len > 0) mapping.failure[0..mapping.failure_len] else "无法启动 /bin/zsh");
+            return;
+        }
+        if (state.lifecycle == .closing or state.lifecycle == .cleanup_unknown) {
+            const next: workspace_mod.LocalState = if (state.lifecycle == .closing) .closing else .cleanup_unknown;
+            if (tab.local_state != next) self.workspace.updateLocalState(mapping.legacy_id, next, if (next == .closing) "本地会话正在结束…" else "本地资源清理结果未知");
+            return;
+        }
+        const process = mapping.process.?.processSnapshot(mapping.handle) catch |err| switch (err) {
+            error.WorkerBusy, error.StaleSession => return,
+            else => return err,
+        };
+        const next: workspace_mod.LocalState = switch (process.state) {
+            .starting => .starting,
+            .running => .running,
+            .exited => .exited,
+            .failed => .failed,
+            .closing, .closed => .closing,
+            .cleanup_unknown => .cleanup_unknown,
+        };
+        if (next != tab.local_state) {
+            var buffer: [160]u8 = undefined;
+            const text = if (process.exit) |exit| switch (exit) {
+                .exited => |code| try std.fmt.bufPrint(&buffer, "本地 zsh 已退出 · exit {d}", .{code}),
+                .signal => |signal| try std.fmt.bufPrint(&buffer, "本地 zsh 已退出 · signal {d}", .{signal}),
+            } else switch (next) {
+                .starting => "正在启动 zsh…",
+                .running => "本地 · zsh",
+                .failed => "无法启动 /bin/zsh",
+                .exited => "本地 zsh 已退出",
+                .closing => "本地会话正在结束…",
+                .cleanup_unknown => "本地资源清理结果未知",
+            };
+            self.workspace.updateLocalState(mapping.legacy_id, next, text);
+        }
+    }
+
+    /// A subsystem with an explicit completion event can resume an awaiting or
+    /// unknown step. The exact handle/key/step must still own the pending close.
+    pub fn closeReceipt(self: *ApplicationHost, handle: identity.SessionHandle, key: OperationKey, step: CloseStep, receipt: CloseReceipt) !bool {
+        const mapping = self.findHandle(handle) orelse return false;
+        const waiting = mapping.waiting orelse return false;
+        if (!waiting.key.eql(key) or waiting.step != step) return false;
+        // Protocol/view release remain grounded in their actual resource state.
+        if (receipt == .released and (step == .close_protocol or step == .release_content)) {
+            mapping.acknowledged_step = step;
+            mapping.waiting.?.unknown = false;
+            self.workspace.cx.requestRedraw();
+            return true;
+        }
+        mapping.waiting = if (receipt == .released) null else .{ .key = key, .step = step, .unknown = receipt == .unknown };
+        return self.publishCloseReceipt(mapping, waiting, receipt);
+    }
+
+    fn publishCloseReceipt(self: *ApplicationHost, mapping: *Mapping, waiting: Waiting, receipt: CloseReceipt) !bool {
+        return self.sessions.closeReceipt(mapping.handle, waiting.key, waiting.step, receipt) catch |err| {
+            // A hook for the next step may already have installed a new wait.
+            // Otherwise retain this receipt so publication can be retried.
+            if (mapping.waiting == null) mapping.waiting = waiting;
+            return err;
+        };
+    }
+
+    fn target(self: *const ApplicationHost) session.AttachmentTarget {
+        return .{ .window_id = self.window_id, .workspace_id = self.workspace_id };
+    }
+
+    fn windowTargetsReleased(self: *ApplicationHost, targets: []const CloseTarget) bool {
+        if (self.domain.attachments.items.len == 1) if (self.domain.backgrounds) |host| {
+            const values = host.snapshots(self.allocator) catch return false;
+            defer self.allocator.free(values);
+            if (values.len != 0) return false;
+        };
+        for (targets) |target_content| {
+            if (self.workspace.model.isCurrentTarget(target_content)) return false;
+            switch (target_content.owner) {
+                .session => |handle| {
+                    const state = self.sessions.queryState(handle) orelse return false;
+                    if (state.lifecycle != .closed) return false;
+                },
+                .card => |owner| {
+                    var released = false;
+                    for (self.card_closes.items) |close| if (close.tab_id == target_content.tab and close.owner.eql(owner) and close.state == .closed) {
+                        released = true;
+                        break;
+                    };
+                    if (!released) return false;
+                },
+                // Workspace retires a frozen group target only after its
+                // group controller acknowledges every member close receipt.
+                .group => {},
+            }
+        }
+        return true;
+    }
+
+    fn submitWindowClose(raw: *anyopaque, command: commands.UiCommand) !OperationKey {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (command.payload.number != @backingInt(self.window_id)) return error.WrongWindow;
+        const ticket = try self.windows.beginClose(self.window_id);
+        errdefer self.windows.cancelClose(ticket) catch {};
+        const targets = try self.workspace.beginWindowCloseBatch(ticket);
+        errdefer {
+            _ = self.workspace.endWindowCloseBatch(ticket.request);
+            self.workspace.model.cancelWindowClose(ticket.request) catch {};
+        }
+        const key = try self.sessions.journal.begin(.app, null);
+        self.window_close = .{ .ticket = ticket, .key = key, .targets = targets };
+        @import("../../../platform/applog.zig").info(.workspace, "window close begin window={d} operation={d} targets={d}", .{ @backingInt(self.window_id), key.operation_id, targets.len });
+        return key;
+    }
+
+    fn bridgeWindowCancelled(raw: ?*anyopaque, request: u64) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw orelse return));
+        const close = if (self.window_close) |*close| close else return;
+        if (close.ticket.request == request and self.windowClosePending()) close.cancel_requested = true;
+    }
+
+    /// The session ↔ tab mappings (which tab shows which session generation) are part of the AI's
+    /// environment (LIFECYCLE.md §5.3). Every add, removal or rebinding of one calls this after the
+    /// write, here and in the provider bindings (`plugins/*/application_binding.zig`).
+    pub fn mappingsChanged(self: *const ApplicationHost) void {
+        _ = self;
+        environment.publish();
+    }
+
+    pub fn findHandle(self: *ApplicationHost, handle: identity.SessionHandle) ?*Mapping {
+        for (self.mappings.items) |*mapping| if (mapping.handle.eql(handle)) return mapping;
+        return null;
+    }
+
+    fn findLegacy(self: *ApplicationHost, id: LegacySessionId, generation: u64) ?*Mapping {
+        for (self.mappings.items) |*mapping| if (mapping.legacy_id == id and mapping.legacy_generation == generation) return mapping;
+        return null;
+    }
+
+    fn findLegacyId(self: *ApplicationHost, id: LegacySessionId) ?*Mapping {
+        for (self.mappings.items) |*mapping| if (mapping.legacy_id == id) return mapping;
+        return null;
+    }
+
+    fn findTab(self: *ApplicationHost, tab_id: identity.TabId, owner: identity.ContentOwner) ?*Mapping {
+        for (self.mappings.items) |*mapping| if (mapping.tab_id == tab_id and mapping.owner.eql(owner)) return mapping;
+        return null;
+    }
+
+    fn closeHooks(self: *ApplicationHost) session.CloseHooks {
+        return .{
+            .pause_transfers = .{ .context = self, .run = pauseTransfers },
+            .stop_ai = .{ .context = self, .run = stopAi },
+            .release_forwards = .{ .context = self, .run = releaseForwards },
+            .release_content = .{ .context = self, .run = releaseContent },
+        };
+    }
+
+    pub fn runCloseStep(self: *ApplicationHost, mapping: *Mapping, key: OperationKey, step: CloseStep, safe: bool) CloseReceipt {
+        if (step == .pause_transfers) if (mapping.close_display) |*display| {
+            display.service.setRecordingDisplay(display.display) catch |err| {
+                if (err == error.WorkerBusy) {
+                    mapping.waiting = .{ .key = key, .step = step };
+                    return .awaiting;
+                }
+                if (err != error.RecordingUnavailable) std.log.warn("recording display snapshot unavailable: {s}", .{@errorName(err)});
+            };
+            display.deinit();
+            mapping.close_display = null;
+        };
+        if (step == .release_content and !safe) {
+            mapping.waiting = .{ .key = key, .step = step };
+            return .awaiting;
+        }
+        var receipt: CloseReceipt = .released;
+        if (!mapping.content_pending and mapping.acknowledged_step != step) {
+            if (self.close_extension) |extension| receipt = extension.run(extension.context, mapping.legacy_id, step);
+        }
+        if (receipt == .released) switch (step) {
+            .close_protocol => {
+                if (mapping.process != null) {
+                    self.workspace.unbindLocalTerminal(mapping.legacy_id, mapping.handle);
+                    const adapter = mapping.process.?.adapter();
+                    receipt = if (!mapping.local_started) .released else adapter.vtable.close(adapter.context, mapping.handle, key) catch .unknown;
+                } else receipt = switch (self.workspace.protocolReleaseStep(mapping.legacy_id)) {
+                    .released => .released,
+                    .awaiting => .awaiting,
+                    .unknown => .unknown,
+                };
+            },
+            .release_content => {
+                mapping.content_pending = true;
+                if (self.workspace.sessionTab(mapping.legacy_id)) |tab| {
+                    if (tab.generation != mapping.legacy_generation or tab.tab_id != mapping.tab_id or !tab.content_owner.eql(mapping.owner)) {
+                        receipt = .unknown;
+                    } else {
+                        if (safe) self.workspace.receiveCloseReceipt(mapping.tab_id, mapping.owner, true);
+                        receipt = .awaiting;
+                    }
+                }
+            },
+            else => {},
+        };
+        if (receipt != .released) mapping.waiting = .{ .key = key, .step = step, .unknown = receipt == .unknown };
+        return receipt;
+    }
+
+    fn bridgeCreate(context: ?*anyopaque, host: hosts.HostConfig, host_id: workspace_mod.HostId, index: usize, input: []const u8) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        _ = try self.create(host, host_id, index, input);
+    }
+
+    fn bridgeReuse(context: ?*anyopaque, id: LegacySessionId) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        if (self.pending_shared_connection != null or self.pending_source != null) return error.ReentrantCreate;
+        const tab = self.workspace.sessionTab(id) orelse return error.StaleSession;
+        const runtime = tab.runtime orelse return error.SessionNotConnected;
+        const mapping = self.findLegacyId(id) orelse return error.StaleSession;
+        const source = mapping.source orelse return error.ConnectionEnvelopeUnavailable;
+        const lease = try runtime.reuseConnection();
+        defer lease.release();
+        self.pending_shared_connection = lease;
+        defer self.pending_shared_connection = null;
+        // Reuse the normal frozen-source envelope path with a fresh host owner.
+        var connection = try WindowConnection.init(self.allocator, source.value.host, source.value.global_config, source.value.route_hosts, source.value.host_id, source.value.source_index);
+        defer connection.deinit();
+        _ = try self.createWindowConnection(&connection);
+    }
+
+    fn bridgeRecreate(context: ?*anyopaque, id: LegacySessionId) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        if (self.workspace.shutting_down or self.windowClosePending()) return error.WorkspaceClosed;
+        const mapping = self.findLegacyId(id) orelse return error.StaleSession;
+        if (mapping.source) |source| {
+            const frozen = source.value;
+            var host = frozen.host;
+            if (self.workspace.registry.indexOf(host.connection_id)) |index| {
+                const saved = self.workspace.registry.hosts[index];
+                if (saved.auth_mode == host.auth_mode and saved.port == host.port and
+                    std.mem.eql(u8, saved.host, host.host) and std.mem.eql(u8, saved.user, host.user))
+                {
+                    if (saved.password) |password| host.password = password;
+                }
+            }
+            _ = try self.create(host, frozen.host_id, frozen.source_index, "");
+            return;
+        }
+        const manifest = self.sessions.manifestFor(mapping.handle) orelse return error.UnknownPlugin;
+        const request_key = try self.dispatcher.issue();
+        const value = self.sessions.connectionEnvelope(mapping.handle) orelse return error.ConnectionEnvelopeUnavailable;
+        if (manifest.quick_create) |quick| {
+            const payload = if (quick.new_session_payload) |prepare| try prepare(self.allocator, value.payload) else try self.allocator.dupe(u8, value.payload);
+            defer self.allocator.free(payload);
+            _ = try self.sessions.openQuick(manifest.id, payload, .{ .request_key = request_key, .target = self.target() });
+            return;
+        }
+        _ = try self.openEnvelope(value, request_key);
+    }
+
+    fn bridgeCreateLocal(context: ?*anyopaque, cwd: ?[]const u8) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        _ = try self.createLocal(cwd);
+    }
+    fn bridgeDuplicateLocal(context: ?*anyopaque, id: LegacySessionId) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        _ = try self.duplicateLocal(id);
+    }
+    fn bridgeLocalMetadataRevision(context: ?*anyopaque) u64 {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return 0));
+        return self.local_adapter.metadataRevision();
+    }
+    /// Read-only OSC 7 directory of a Local session for presentation (pane meta).
+    fn bridgeLocalCwd(context: ?*anyopaque, id: LegacySessionId, allocator: std.mem.Allocator) ?[]u8 {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return null));
+        const mapping = self.localMapping(id) orelse return null;
+        const process = mapping.process orelse return null;
+        return process.copyCwd(mapping.handle, allocator) catch null;
+    }
+    /// The PTY foreground process group's name (kernel `pbi_name`), only when
+    /// it is a task rather than the idle shell (design-r3 稿 3 “vim · 目录”).
+    fn bridgeLocalProgram(context: ?*anyopaque, id: LegacySessionId, buffer: *[64]u8) ?[]const u8 {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return null));
+        const mapping = self.localMapping(id) orelse return null;
+        const process = mapping.process orelse return null;
+        const snapshot = process.processSnapshot(mapping.handle) catch return null;
+        if (snapshot.state != .running) return null;
+        const shell = snapshot.pid orelse return null;
+        const foreground = snapshot.foreground orelse return null;
+        if (foreground.pid == shell or foreground.process_group == shell) return null;
+        const name = std.mem.sliceTo(&foreground.name, 0);
+        if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return null;
+        @memcpy(buffer[0..name.len], name);
+        return buffer[0..name.len];
+    }
+    fn bridgeRetryLocal(context: ?*anyopaque, id: LegacySessionId) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        _ = try self.retryLocal(id);
+    }
+    fn bridgeRetrySsh(context: ?*anyopaque, id: LegacySessionId) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return error.MissingApplicationHost));
+        try self.requestSshReconnect(id);
+    }
+    fn bridgeConfirm(context: ?*anyopaque, id: LegacySessionId) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return));
+        if (self.previous_close.confirm) |confirm| confirm(self.previous_close.context, id);
+    }
+
+    fn bridgeConnected(context: ?*anyopaque, id: LegacySessionId, generation: u64) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return));
+        const mapping = self.findLegacy(id, generation) orelse return;
+        mapping.connected_received = true;
+        self.workspace.cx.requestRedraw();
+    }
+
+    fn bridgeFailed(context: ?*anyopaque, id: LegacySessionId, generation: u64, message: []const u8) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return));
+        const mapping = self.findLegacy(id, generation) orelse return;
+        mapping.recordFailure(message);
+        self.workspace.cx.requestRedraw();
+    }
+
+    fn bridgeCleanup(context: ?*anyopaque, id: LegacySessionId, generation: u64) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return));
+        const mapping = self.findLegacy(id, generation) orelse return;
+        mapping.cleanup_received = true;
+        self.workspace.cx.requestRedraw();
+    }
+
+    fn bridgeCleanupStatus(context: ?*anyopaque, id: LegacySessionId, generation: u64, receipt: @import("../../../host/runtime_service.zig").ReleaseReceipt) void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return));
+        const mapping = self.findLegacy(id, generation) orelse return;
+        switch (receipt) {
+            .released => mapping.cleanup_received = true,
+            .unknown => mapping.cleanup_unknown_received = true,
+            .awaiting => {},
+        }
+        self.workspace.cx.requestRedraw();
+    }
+
+    fn bridgeRisk(context: ?*anyopaque, id: LegacySessionId) workspace_mod.CloseRisk {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return .{}));
+        var result = if (self.previous_close.risk) |risk| risk(self.previous_close.context, id) else workspace_mod.CloseRisk{};
+        const mapping = self.localMapping(id) orelse return result;
+        var local = mapping.process.?.closeRiskSnapshot(mapping.handle, self.allocator) catch {
+            const state = self.sessions.queryState(mapping.handle);
+            result.local_unknown = state == null or state.?.create_cleanup != .released;
+            return result;
+        };
+        defer local.deinit(self.allocator);
+        result.local_process = local.foreground_state == .task or local.active_exec.len != 0;
+        result.local_unknown = local.unknown;
+        return result;
+    }
+
+    fn bridgeImpact(context: ?*anyopaque, id: LegacySessionId) group_close.Impact {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return .{}));
+        var result = if (self.previous_close.impact) |impact| impact(self.previous_close.context, id) else group_close.Impact{};
+        const mapping = self.localMapping(id) orelse return result;
+        var risk = mapping.process.?.closeRiskSnapshot(mapping.handle, self.allocator) catch {
+            result.unknown = 1;
+            return result;
+        };
+        defer risk.deinit(self.allocator);
+        var hash = std.hash.Wyhash.init(result.command);
+        std.hash.autoHash(&hash, mapping.handle);
+        if (risk.foreground) |foreground| {
+            std.hash.autoHash(&hash, foreground.pid);
+            std.hash.autoHash(&hash, foreground.process_group);
+            hash.update(std.mem.sliceTo(&foreground.name, 0));
+        }
+        for (risk.active_exec) |job| {
+            std.hash.autoHash(&hash, job.handle);
+            std.hash.autoHash(&hash, job.pid);
+            std.hash.autoHash(&hash, job.state);
+            hash.update(job.command);
+        }
+        result.command = hash.final();
+        if (risk.unknown) result.unknown = 1;
+        var details: [512]u8 = undefined;
+        var length: usize = @min(result.detail_len, details.len);
+        @memcpy(details[0..length], result.detail[0..length]);
+        if (risk.foreground_state == .task) if (risk.foreground) |foreground| {
+            const text = std.fmt.bufPrint(details[length..], "{s}进程 {s} (PID {d})", .{ if (length == 0) @as([]const u8, "") else "；", std.mem.sliceTo(&foreground.name, 0), foreground.pid }) catch "";
+            length += text.len;
+        };
+        for (risk.active_exec) |job| {
+            const text = std.fmt.bufPrint(details[length..], "{s}执行 {s}", .{ if (length == 0) @as([]const u8, "") else "；", job.command }) catch break;
+            length += text.len;
+        }
+        result.setDetail(details[0..length]);
+        return result;
+    }
+
+    fn bridgeCloseState(context: ?*anyopaque, id: LegacySessionId) ?group_close.MemberState {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return null));
+        const handle = self.ownerForLegacy(id) orelse return null;
+        const state = self.sessions.queryState(handle) orelse return null;
+        if (state.close_operation == null) return null;
+        return switch (state.lifecycle) {
+            .closing => .closing,
+            .cleanup_unknown => .cleanup_unknown,
+            .closed => .closed,
+            .failed => .failed,
+            else => null,
+        };
+    }
+
+    fn bridgeClose(context: ?*anyopaque, tab_id: identity.TabId, owner: identity.ContentOwner) workspace_mod.CloseResult {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context orelse return .rejected));
+        const decision = self.closeForInput(self.dispatcher.issue() catch return .rejected, tab_id, owner) catch return .rejected;
+        const key = switch (decision) {
+            .accepted => |key| key,
+            .rejected => return .rejected,
+        };
+        self.workspace.cx.requestRedraw();
+        if (owner == .card) {
+            for (self.card_closes.items) |close| if (close.tab_id == tab_id and close.owner.eql(owner.card) and close.key.eql(key)) {
+                return switch (close.state) {
+                    .pending => .awaiting,
+                    .closed => .released,
+                    .unknown => .unknown,
+                };
+            };
+            return .rejected;
+        }
+        const mapping = self.findTab(tab_id, owner) orelse return .rejected;
+        const state = self.sessions.queryState(mapping.handle) orelse return .rejected;
+        if (state.close_operation == null or !state.close_operation.?.eql(key)) return .rejected;
+        return switch (state.lifecycle) {
+            .closed => .released,
+            .cleanup_unknown => .unknown,
+            else => .awaiting,
+        };
+    }
+
+    fn submitCreate(context: *anyopaque, command: commands.UiCommand) !OperationKey {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context));
+        const source = self.pending_source orelse return error.MissingCreateSource;
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
+        const envelope = try connection_envelope.fromLegacy(arena.allocator(), source.value.host);
+        return (try self.sessions.open(envelope, .{ .request_key = command.command_id, .target = self.target() })).operation;
+    }
+
+    fn submitCreateLocal(context: *anyopaque, command: commands.UiCommand) !OperationKey {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context));
+        return (try self.sessions.openQuickAction("session.local.create", if (command.payload.text.len == 0) null else command.payload.text, .{ .request_key = command.command_id, .target = self.target() })).operation;
+    }
+
+    fn submitClose(context: *anyopaque, command: commands.UiCommand) !OperationKey {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context));
+        if (command.owner == .card) return self.requestCardClose(command.payload.tab, command.owner.card);
+        const handle = command.owner.session;
+        const mapping = self.findHandle(handle) orelse return error.StaleSession;
+        if (command.payload.tab != mapping.tab_id) return error.StaleTab;
+        return self.requestCloseLegacy(mapping.legacy_id);
+    }
+
+    fn requestCardClose(self: *ApplicationHost, tab_id: identity.TabId, owner: identity.CardId) !OperationKey {
+        for (self.card_closes.items) |close| if (close.tab_id == tab_id and close.owner.eql(owner)) return close.key;
+        const index = self.workspace.tabIndexById(tab_id) orelse return error.StaleTab;
+        const tab = self.workspace.tabs.items[index];
+        if (!tab.isCard() or !tab.content_owner.eql(.{ .card = owner })) return error.StaleTab;
+        // A card tab (session history) owns a view, not a transport. Its close still
+        // uses the same operation journal and waits for the real safe UI removal.
+        try self.card_closes.ensureUnusedCapacity(self.allocator, 1);
+        const key = try self.sessions.journal.begin(.{ .card = owner }, null);
+        self.card_closes.appendAssumeCapacity(.{ .tab_id = tab_id, .owner = owner, .key = key });
+        return key;
+    }
+
+    fn pauseTransfers(context: *anyopaque, handle: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return closeStep(context, handle, key, .pause_transfers);
+    }
+    fn stopAi(context: *anyopaque, handle: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return closeStep(context, handle, key, .stop_ai);
+    }
+    fn releaseForwards(context: *anyopaque, handle: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return closeStep(context, handle, key, .release_forwards);
+    }
+    fn releaseContent(context: *anyopaque, handle: identity.SessionHandle, key: OperationKey) !CloseReceipt {
+        return closeStep(context, handle, key, .release_content);
+    }
+    fn closeStep(context: *anyopaque, handle: identity.SessionHandle, key: OperationKey, step: CloseStep) CloseReceipt {
+        const self: *ApplicationHost = @ptrCast(@alignCast(context));
+        if (self.domain.backgrounds) |host| if (host.owns(handle)) return host.closeStep(handle, key, step);
+        const mapping = self.findHandle(handle) orelse return .unknown;
+        const receipt = self.runCloseStep(mapping, key, step, false);
+        if (receipt == .awaiting) self.workspace.cx.scheduleRedrawAfterNs(33 * std.time.ns_per_ms);
+        return receipt;
+    }
+
+    fn backgroundPendingAuth(raw: *anyopaque) ?background.auth.Snapshot {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.pendingAuthentication()) |value| {
+            const original = if (value.identity.key.owner == .session) self.domain.ownerForHandle(value.identity.key.owner.session) else null;
+            const recipient = original orelse if (self.domain.attachments.items.len != 0) self.domain.attachments.items[0] else null;
+            if (recipient == self) return value;
+        };
+        return if (self.background_previous_auth) |previous| previous.pending(previous.context) else null;
+    }
+    fn backgroundSubmitAuth(raw: *anyopaque, request: background.auth.RequestIdentity, reply: background.auth.Reply) !void {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.authenticationHostFor(request) != null) return host.submitAuthentication(request, reply);
+        if (self.background_previous_auth) |previous| return previous.submit(previous.context, request, reply);
+        return error.StaleAuthentication;
+    }
+    fn backgroundCancelAuth(raw: *anyopaque, request: background.auth.RequestIdentity) bool {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.cancelAuthentication(request)) return true;
+        return if (self.background_previous_auth) |previous| previous.cancel(previous.context, request) else false;
+    }
+    fn backgroundAuthHost(raw: *anyopaque, request: background.auth.RequestIdentity) ?hosts.HostConfig {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.authenticationHostFor(request)) |value| return value;
+        return if (self.background_previous_auth) |previous| previous.host(previous.context, request) else null;
+    }
+    fn backgroundAuthParent(raw: *anyopaque, request: background.auth.RequestIdentity) ?*ui.Node {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.authenticationHostFor(request) != null) return self.workspace.terminal_area;
+        return if (self.background_previous_auth) |previous| previous.parent(previous.context, request) else null;
+    }
+    fn backgroundAuthHostKey(raw: *anyopaque, request: background.auth.RequestIdentity) ?background.host_key.Request {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.authenticationHostKey(request)) |value| return value;
+        return if (self.background_previous_auth) |previous| previous.host_key(previous.context, request) else null;
+    }
+    fn backgroundAuthTotp(raw: *anyopaque, request: background.auth.RequestIdentity, now: @import("../../../proto/ssh/totp_prefill.zig").Time) !?@import("../../../proto/ssh/totp_prefill.zig").Suggestion {
+        const self: *ApplicationHost = @ptrCast(@alignCast(raw));
+        if (self.domain.backgrounds) |host| if (host.authenticationHostFor(request) != null) return host.authenticationTotp(request, now);
+        if (self.background_previous_auth) |previous| if (previous.totp) |suggest| return suggest(previous.context, request, now);
+        return null;
+    }
+};
+
+const sshServices = @import("../../../plugins/linked_plugins.zig").sshServices;
+
+test "TOTP autofill application source spec freezes saved and temporary hop seeds" {
+    var target_seed = "MZXW6".*;
+    var hop_seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".*;
+    var global: config.Config = .{};
+    global.ssh.totp_autofill = true;
+    const hop: hosts.HostConfig = .{ .connection_id = @fromBackingInt(42), .revision = 8, .name = "same", .host = "bridge", .user = "jump", .totp_secret = &hop_seed };
+    var host: hosts.HostConfig = .{ .connection_id = @fromBackingInt(43), .revision = 9, .name = "same", .host = "target", .user = "root", .route = &.{hop.connection_id}, .totp_secret = &target_seed };
+    var saved = try freezeSource(std.testing.allocator, host, global, &.{hop}, 7, 0, "");
+    defer saved.deinit();
+    host.connection_id = @fromBackingInt(0);
+    var temporary = try freezeSource(std.testing.allocator, host, global, &.{hop}, 8, workspace_mod.removed_host_index, "");
+    defer temporary.deinit();
+    @memset(&target_seed, 'A');
+    @memset(&hop_seed, 'A');
+    global.ssh.totp_autofill = false;
+    var saved_hops: [8]session.RouteHop = undefined;
+    var temporary_hops: [8]session.RouteHop = undefined;
+    const saved_spec = sourceSpec(saved.value, &saved_hops, "");
+    const temporary_spec = sourceSpec(temporary.value, &temporary_hops, "");
+    try std.testing.expectEqualStrings("MZXW6", saved_spec.saved.immutable_config.totp_secret.?);
+    try std.testing.expectEqualStrings("MZXW6", temporary_spec.temporary_ssh.totp_secret.?);
+    try std.testing.expectEqualStrings("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", saved_spec.saved.route_snapshot[0].totp_secret.?);
+    try std.testing.expectEqualStrings("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", temporary_spec.temporary_ssh.route_snapshot[0].totp_secret.?);
+    try std.testing.expect(saved.value.global_config.ssh.totp_autofill);
+    try std.testing.expect(temporary.value.global_config.ssh.totp_autofill);
+}
+
+test "application source freezes host global policy route and initial input" {
+    var address = [_]u8{ 'n', 'o', 'd', 'e' };
+    var input = [_]u8{ 'p', 'w', 'd', '\r' };
+    var global: config.Config = .{};
+    global.config_revision = 900;
+    global.ssh.keepalive_sec = 47;
+    var key_path = "/test/key".*;
+    var hop_name = "same".*;
+    var route_ids = [_]identity.ConnectionId{ @fromBackingInt(42), @fromBackingInt(43) };
+    var host: hosts.HostConfig = .{ .connection_id = @fromBackingInt(123), .revision = 27, .name = "target", .host = &address, .user = "test", .route = &route_ids, .auth_mode = .password, .password = "test-only", .strict_host_key_checking = false };
+    var registry = [_]hosts.HostConfig{
+        .{ .connection_id = @fromBackingInt(43), .revision = 8, .name = &hop_name, .host = "bridge-b", .user = "jump-b", .strict_host_key_checking = false },
+        .{ .connection_id = @fromBackingInt(42), .revision = 5, .name = &hop_name, .host = "bridge-a", .user = "jump-a", .auth_mode = .private_key, .identity_file = &key_path },
+    };
+    var frozen = try freezeSource(std.testing.allocator, host, global, &registry, 7, 2, &input);
+    defer frozen.deinit();
+    address[0] = 'x';
+    input[0] = 'x';
+    key_path[0] = 'x';
+    hop_name[0] = 'x';
+    route_ids[0] = @fromBackingInt(43);
+    registry[1].revision = 99;
+    registry[1].strict_host_key_checking = false;
+    host.protocol = .sftp;
+    host.revision = 28;
+    global.ssh.keepalive_sec = 3;
+    var route: [8]session.RouteHop = undefined;
+    const spec = sourceSpec(frozen.value, &route, "private");
+    try spec.validate();
+    try std.testing.expectEqual(@as(identity.ConnectionId, @fromBackingInt(123)), spec.saved.connection_id);
+    try std.testing.expectEqual(@as(u64, 27), spec.saved.config_revision);
+    try std.testing.expectEqual(session.RemoteProtocol.ssh, spec.saved.protocol);
+    try std.testing.expectEqualStrings("node", spec.saved.immutable_config.endpoint.host);
+    try std.testing.expectEqual(@as(u16, 47), spec.saved.immutable_config.keepalive_sec);
+    try std.testing.expect(!spec.saved.immutable_config.strict_host_key_checking);
+    try std.testing.expectEqualStrings("pwd\r", frozen.value.initial_input);
+    try std.testing.expectEqual(@as(usize, 2), spec.saved.route_snapshot.len);
+    try std.testing.expectEqualDeep(identity.AssetOwner{ .id = @fromBackingInt(42), .revision = 5 }, spec.saved.route_snapshot[0].owner.?);
+    try std.testing.expectEqualStrings("same", spec.saved.route_snapshot[0].display_name);
+    try std.testing.expectEqualStrings("bridge-a", spec.saved.route_snapshot[0].endpoint.host);
+    try std.testing.expectEqualStrings("/test/key", spec.saved.route_snapshot[0].auth.private_key.path);
+    try std.testing.expect(spec.saved.route_snapshot[0].strict_host_key_checking);
+    try std.testing.expectEqual(session.RemoteProtocol.ssh, spec.saved.route_snapshot[0].protocol);
+    try std.testing.expectEqualDeep(identity.AssetOwner{ .id = @fromBackingInt(43), .revision = 8 }, spec.saved.route_snapshot[1].owner.?);
+    try std.testing.expectEqualStrings("bridge-b", spec.saved.route_snapshot[1].endpoint.host);
+    try std.testing.expect(spec.saved.route_snapshot[1].auth == .agent);
+    try std.testing.expect(!spec.saved.route_snapshot[1].strict_host_key_checking);
+    try std.testing.expectEqualStrings("test-only", spec.saved.immutable_config.auth.password);
+}
+
+test "temporary factory has no invented saved identity and missing route rejects early" {
+    const host: hosts.HostConfig = .{ .name = "temporary", .host = "test", .user = "test" };
+    // A process-local HostId never promotes a temporary endpoint to an asset.
+    var frozen = try freezeSource(std.testing.allocator, host, .{}, &.{}, 77, workspace_mod.removed_host_index, "");
+    defer frozen.deinit();
+    var route: [8]session.RouteHop = undefined;
+    const spec = sourceSpec(frozen.value, &route, "");
+    try std.testing.expect(spec == .temporary_ssh);
+    try spec.validate();
+    var routed = host;
+    routed.route = &.{@fromBackingInt(9)};
+    try std.testing.expectError(error.MissingRouteReference, freezeSource(std.testing.allocator, routed, .{}, &.{}, 0, 0, ""));
+    routed.route = &.{};
+    routed.jump_chain = &.{"legacy-name"};
+    try std.testing.expectError(error.UnmigratedRoute, freezeSource(std.testing.allocator, routed, .{}, &.{.{ .name = "legacy-name", .host = "hop", .user = "test" }}, 0, 0, ""));
+    try std.testing.expect(sshServices().has(.terminal));
+    try std.testing.expect(!sshServices().has(.directory));
+}
+
+test "application source preserves SFTP protocol and explicit auth mode" {
+    var host: hosts.HostConfig = .{ .connection_id = @fromBackingInt(52), .revision = 6, .protocol = .sftp, .name = "files", .host = "files.test", .user = "test", .password = "unused-agent-field" };
+    var frozen = try freezeSource(std.testing.allocator, host, .{}, &.{}, 0, 0, "");
+    defer frozen.deinit();
+    var route: [8]session.RouteHop = undefined;
+    const spec = sourceSpec(frozen.value, &route, "");
+    try std.testing.expectEqual(session.RemoteProtocol.sftp, spec.saved.protocol);
+    try std.testing.expect(spec.saved.immutable_config.auth == .agent);
+    host.auth_mode = .password;
+    host.password = null;
+    try std.testing.expect(auth(host) == .password_prompt);
+    host.connection_id = @fromBackingInt(0);
+    try std.testing.expectError(error.InvalidTemporaryProtocol, freezeSource(std.testing.allocator, host, .{}, &.{}, 1, 0, ""));
+}
+
+test "application source rejects invalid numeric routes before a factory can start IO" {
+    var host: hosts.HostConfig = .{ .connection_id = @fromBackingInt(10), .revision = 2, .name = "target", .host = "target.test", .user = "test", .route = &.{@fromBackingInt(20)} };
+    var hop: hosts.HostConfig = .{ .connection_id = @fromBackingInt(20), .revision = 3, .name = "hop", .host = "hop.test", .user = "jump" };
+    try std.testing.expectError(error.MissingRouteReference, freezeSource(std.testing.allocator, host, .{}, &.{}, 1, 0, ""));
+    try std.testing.expectError(error.DuplicateConnectionId, freezeSource(std.testing.allocator, host, .{}, &.{ hop, hop }, 1, 0, ""));
+    host.route = &.{@fromBackingInt(0)};
+    try std.testing.expectError(error.InvalidIdentity, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+    host.route = &.{@fromBackingInt(10)};
+    try std.testing.expectError(error.RouteCycle, freezeSource(std.testing.allocator, host, .{}, &.{host}, 1, 0, ""));
+    host.route = &.{ @fromBackingInt(20), @fromBackingInt(20) };
+    try std.testing.expectError(error.DuplicateRoute, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+    host.route = &.{ @fromBackingInt(20), @fromBackingInt(21), @fromBackingInt(22), @fromBackingInt(23), @fromBackingInt(24), @fromBackingInt(25), @fromBackingInt(26), @fromBackingInt(27), @fromBackingInt(28) };
+    try std.testing.expectError(error.TooManyJumps, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+    host.route = &.{@fromBackingInt(20)};
+    hop.route = &.{@fromBackingInt(21)};
+    try std.testing.expectError(error.NestedRouteUnsupported, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+    hop.route = &.{};
+    hop.jump_chain = &.{"legacy-nested"};
+    try std.testing.expectError(error.NestedRouteUnsupported, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+    hop.jump_chain = &.{};
+    hop.protocol = .sftp;
+    try std.testing.expectError(error.InvalidRouteProtocol, freezeSource(std.testing.allocator, host, .{}, &.{hop}, 1, 0, ""));
+}
+
+test "application host adapter and callback signatures compile" {
+    std.testing.refAllDecls(ApplicationHost);
+}
+test "task finish controller native imports" {
+    _ = @import("../../ai/cards/view/ai_task_finish.zig");
+}
+
+const OwnedSessionFixture = struct {
+    cx: *ui.Cx,
+    scope: *ui.Scope,
+    app: *ApplicationHost,
+    workspace: *workspace_mod.Workspace,
+    fn tick(self: *@This()) !void {
+        _ = try self.app.safeTick();
+        self.cx.advanceFrameClock();
+        self.cx.layout();
+        _ = self.cx.render();
+        var empty: [1]std.c.pollfd = undefined;
+        _ = std.c.poll(&empty, 0, 2);
+    }
+    /// C needs completed controlled shell startup, not D's editing/input
+    /// capability. The shell itself writes its PID marker from precmd, and
+    /// independent process/cwd observations must identify that same shell.
+    fn waitShellStartup(self: *@This(), handle: identity.SessionHandle, directory: std.Io.Dir, expected_cwd: []const u8, deadline: i128) !void {
+        var marker_ready = false;
+        var foreground_ready = false;
+        var cwd_ready = false;
+        var observed_pid: ?i32 = null;
+        while (@import("../../../platform/realtime.zig").monotonicNs() <= deadline) {
+            try self.tick();
+            const process = self.app.local_adapter.processSnapshot(handle) catch |err| switch (err) {
+                error.WorkerBusy => continue,
+                else => return err,
+            };
+            observed_pid = process.pid;
+            const pid = process.pid orelse continue;
+            foreground_ready = process.state == .running and if (process.foreground) |foreground| foreground.pid == pid and foreground.process_group == pid and foreground.session_id == pid else false;
+            var marker_name: [64]u8 = undefined;
+            var marker_buffer: [64]u8 = undefined;
+            const marker = directory.readFile(std.testing.io, try std.fmt.bufPrint(&marker_name, "owned-startup-{d}", .{pid}), &marker_buffer) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            var expected_marker: [64]u8 = undefined;
+            marker_ready = std.mem.eql(u8, marker, try std.fmt.bufPrint(&expected_marker, "{d}\n", .{pid}));
+            var cwd = self.app.local_adapter.cwdSnapshot(handle, self.app.allocator) catch |err| switch (err) {
+                error.WorkerBusy => continue,
+                else => return err,
+            };
+            defer cwd.deinit(self.app.allocator);
+            cwd_ready = cwd.source == .process and cwd.value != null and std.mem.eql(u8, cwd.value.?, expected_cwd);
+            if (marker_ready and foreground_ready and cwd_ready) return;
+        }
+        std.debug.print("owned shell startup id={d} pid={any} marker={any} foreground={any} cwd={any}\n", .{ @backingInt(handle.session_id), observed_pid, marker_ready, foreground_ready, cwd_ready });
+        return error.ControlledShellStartupNotReady;
+    }
+    fn queueOwned(self: *@This(), request: lifecycle.OpenRequest, deadline: i128) !lifecycle.Snapshot {
+        while (true) {
+            // Copying the source cwd is a nonblocking worker query. Retry the
+            // same operation identity until it is available; no create is
+            // enqueued before that source snapshot has been captured.
+            return self.app.queueOwnedSession(request) catch |err| {
+                if (err != error.WorkerBusy or @import("../../../platform/realtime.zig").monotonicNs() >= deadline) return err;
+                try self.tick();
+                continue;
+            };
+        }
+    }
+    fn finish(self: *@This()) void {
+        for (self.app.sessions.sessions.items) |entry| {
+            if (self.app.findHandle(entry.handle)) |mapping| {
+                _ = self.app.requestCloseLegacy(mapping.legacy_id) catch {};
+            } else _ = self.app.sessions.requestClose(entry.handle, .{}) catch {};
+        }
+        const deadline = @import("../../../platform/realtime.zig").monotonicNs() + 8 * std.time.ns_per_s;
+        while (self.workspace.tabs.items.len != 0 or self.app.local_adapter.shutdownStep() != .released) {
+            self.tick() catch |err| std.debug.panic("owned session cleanup: {s}", .{@errorName(err)});
+            if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) {
+                for (self.app.mappings.items) |mapping| std.debug.print("owned cleanup id={d} lifecycle={any} waiting={any} pending={any} tab={any}\n", .{ mapping.legacy_id, self.app.sessions.queryState(mapping.handle).?.lifecycle, mapping.waiting, mapping.content_pending, self.workspace.sessionTab(mapping.legacy_id) != null });
+                @panic("owned session cleanup timed out");
+            }
+        }
+        self.cx.clearFocus();
+        self.scope.dispose();
+        self.cx.deinit();
+    }
+};
+
+test "owned Local session reserves before dispatch commits once and rolls back failed membership" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "hosts.toml", .data = "" });
+    // This fixture tests owned creation/rollback, so its real login shell must
+    // not run the developer's startup scripts and their unrelated children.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zshenv", .data = "PROMPT=''\nRPROMPT=''\n" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zshrc", .data = "bindkey -e\n_owned_fixture_started() { print -r -- \"$$\" > \"$ZDOTDIR/owned-startup-$$\"; }\nprecmd_functions+=(_owned_fixture_started)\n" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "hosts.toml", a);
+    defer a.free(path);
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(directory);
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const previous_shell = if (std.c.getenv("ZDOTDIR")) |old| try a.dupeSentinel(u8, std.mem.span(old), 0) else null;
+    defer {
+        if (previous_shell) |old| {
+            _ = Env.setenv("ZDOTDIR", old.ptr, 1);
+            a.free(old);
+        } else _ = Env.unsetenv("ZDOTDIR");
+    }
+    if (Env.setenv("ZDOTDIR", directory.ptr, 1) != 0) return error.EnvironmentFailed;
+    const cx = try ui.Cx.init(a, std.testing.io);
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    cx.setViewport(1100, 720);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .direction = .column }, .{});
+    var nodes: [4]*ui.Node = undefined;
+    for (&nodes) |*node| {
+        node.* = try ui.box(cx, .{ .width = .fill(), .height = .{ .px = 100 } }, .{});
+        try cx.root.?.appendChild(a, node.*);
+    }
+    var saved: config.Config = .{};
+    const workspace = try workspace_mod.Workspace.init(a, cx, scope, std.testing.io, &saved, path, nodes[0], nodes[1], nodes[2], nodes[3]);
+    const app = try ApplicationHost.init(a, workspace);
+    try scope.onCleanup(ApplicationHost, app, ApplicationHost.deinit);
+    app.install();
+    var fixture: OwnedSessionFixture = .{ .cx = cx, .scope = scope, .workspace = workspace, .app = app };
+    var roster = @import("../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    defer fixture.finish();
+    const source = try app.createLocal(directory);
+    const deadline = @import("../../../platform/realtime.zig").monotonicNs() + 8 * std.time.ns_per_s;
+    while (app.sessions.queryState(source.handle).?.lifecycle != .attached) {
+        try fixture.tick();
+        if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) return error.LocalSessionNotReady;
+    }
+    try fixture.waitShellStartup(source.handle, temporary.dir, directory, deadline);
+    const original = app.legacyForHandle(source.handle).?;
+    var prepared_group = try roster.prepareNew("owned-test", 0xff00ffff, original);
+    defer prepared_group.deinit();
+    var prepared_view = try workspace.prepareGroupView(prepared_group.id, "owned-test", original);
+    defer prepared_view.deinit();
+    try prepared_view.validate();
+    const group_id = try prepared_group.commit();
+    var fail_commit = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    workspace.allocator = fail_commit.allocator();
+    prepared_view.commit(&roster) catch |err| {
+        workspace.allocator = a;
+        return err;
+    };
+    workspace.allocator = a;
+    const group_owner: identity.GroupOwner = .{ .id = @fromBackingInt(group_id) };
+    var request: lifecycle.OpenRequest = .{ .operation_ref = identity.HostOperationId.generate(), .context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = group_id }, .content = .{ .group = group_id }, .binding_revision = 2, .grant_revision = 1 }, .group = group_owner, .source = source.handle, .connection_policy = .new_only, .retention = .auto_idle };
+    _ = try fixture.queueOwned(request, deadline);
+    try fixture.tick();
+    var snapshot = try app.queryOwnedSession(request.operation_ref, request.context);
+    try std.testing.expectEqual(lifecycle.State.prepared, snapshot.state);
+    try std.testing.expectEqual(@as(usize, 1), workspace.tabs.items.len);
+    try std.testing.expect(app.findHandle(snapshot.session.?) == null);
+    try std.testing.expectEqual(@as(usize, 1), roster.findById(group_id).?.members.items.len);
+    _ = try fixture.queueOwned(request, deadline);
+    try std.testing.expectEqual(@as(usize, 1), app.lifecycle_supervisor.entries.items.len);
+    try std.testing.expectError(error.ScopeChanged, app.authorizeOwnedSessionDispatch(request.operation_ref, request.context, snapshot.revision + 1, snapshot.session.?));
+    _ = try app.authorizeOwnedSessionDispatch(request.operation_ref, request.context, snapshot.revision, snapshot.session.?);
+    while (snapshot.state != .ready) {
+        try fixture.tick();
+        snapshot = try app.queryOwnedSession(request.operation_ref, request.context);
+        if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) return error.OwnedSessionNotReady;
+    }
+    const owned = snapshot.session.?;
+    try fixture.waitShellStartup(owned, temporary.dir, directory, deadline);
+    try std.testing.expectError(error.CloseApprovalRequired, app.queueSessionClose(identity.HostOperationId.generate(), request.context, source.handle, false));
+    _ = try app.finishOwnedTask(request.context.task_id, .{ .provider_finished = true, .pending_tool_slots = false, .pending_approval = false, .pending_dispatch = false, .executions_settled = true, .input_grants_released = true, .cleanup_transferred = true, .model_done = true });
+    try std.testing.expectError(error.BusyUnknown, app.queueOwnedSessionClose(owned, request.context.task_id, false, .{}));
+    try std.testing.expectError(error.OwnershipChanged, app.queueOwnedSessionClose(source.handle, request.context.task_id, false, .{}));
+    try std.testing.expect(snapshot.membership_committed);
+    try std.testing.expectEqual(@as(usize, 2), roster.findById(group_id).?.members.items.len);
+    try fixture.tick();
+    try std.testing.expectEqual(@as(usize, 2), roster.findById(group_id).?.members.items.len);
+    request.operation_ref = identity.HostOperationId.generate();
+    _ = try fixture.queueOwned(request, deadline);
+    try fixture.tick();
+    const cancelled = try app.queryOwnedSession(request.operation_ref, request.context);
+    _ = try app.cancelOwnedSession(request.operation_ref, request.context);
+    for (0..3) |_| try fixture.tick();
+    try std.testing.expectEqual(lifecycle.State.cancelled, (try app.queryOwnedSession(request.operation_ref, request.context)).state);
+    try std.testing.expect(app.findHandle(cancelled.session.?) == null);
+    request.operation_ref = identity.HostOperationId.generate();
+    _ = try fixture.queueOwned(request, deadline);
+    try fixture.tick();
+    const failed = try app.queryOwnedSession(request.operation_ref, request.context);
+    _ = try app.authorizeOwnedSessionDispatch(request.operation_ref, request.context, failed.revision, failed.session.?);
+    try fixture.tick();
+    const group_at = workspace.model.indexOf(workspace.groupTabId(group_id).?).?;
+    workspace.model.tabs.items[group_at].owner.group.revision += 1;
+    defer workspace.model.tabs.items[workspace.model.indexOf(workspace.groupTabId(group_id).?).?].owner.group.revision = 1;
+    var failed_snapshot = try app.queryOwnedSession(request.operation_ref, request.context);
+    while (failed_snapshot.state != .failed) {
+        try fixture.tick();
+        failed_snapshot = try app.queryOwnedSession(request.operation_ref, request.context);
+        if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) return error.OwnedRollbackNotReleased;
+    }
+    try std.testing.expectEqual(@as(usize, 2), workspace.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), roster.findById(group_id).?.members.items.len);
+    try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(source.handle).?.lifecycle);
+    workspace.model.tabs.items[workspace.model.indexOf(workspace.groupTabId(group_id).?).?].owner.group.revision = 1;
+    const saved_index = try workspace.appendHost(.{ .connection_id = @fromBackingInt(7001), .revision = 3, .name = "owned-saved-test", .host = "127.0.0.1", .port = 1, .user = "fixture", .auth_mode = .password, .password = "unused-no-network" });
+    request.operation_ref = identity.HostOperationId.generate();
+    request.source = null;
+    request.saved_source = .{ .id = workspace.registry.hosts[saved_index].connection_id, .revision = 3 };
+    request.connection_policy = .reuse_only;
+    try std.testing.expectError(error.ReuseUnavailable, app.queueOwnedSession(request));
+    request.connection_policy = .prefer_reuse;
+    try std.testing.expectError(error.FallbackAuthorizationRequired, app.queueOwnedSession(request));
+    request.connection_policy = .new_only;
+    _ = try fixture.queueOwned(request, deadline);
+    try fixture.tick();
+    const saved_reservation = try app.queryOwnedSession(request.operation_ref, request.context);
+    try std.testing.expectEqual(lifecycle.State.prepared, saved_reservation.state);
+    try std.testing.expect(saved_reservation.source == null);
+    try std.testing.expectEqual(@as(u64, 3), saved_reservation.saved_source.?.revision);
+    _ = try app.authorizeOwnedSessionDispatch(request.operation_ref, request.context, saved_reservation.revision, saved_reservation.session.?);
+    workspace.registry.hosts[saved_index].revision += 1;
+    for (0..3) |_| try fixture.tick();
+    const saved_failed = try app.queryOwnedSession(request.operation_ref, request.context);
+    try std.testing.expectEqual(lifecycle.State.failed, saved_failed.state);
+    try std.testing.expectEqualStrings("SourceChanged", saved_failed.error_code.?);
+    try std.testing.expect(app.findHandle(saved_failed.session.?) == null);
+    try std.testing.expectEqual(@as(usize, 2), workspace.tabs.items.len);
+    const owned_surface = workspace.sessionTab(app.legacyForHandle(owned).?).?.terminal.?.terminal_surface.?;
+    _ = try owned_surface.refresh(owned, true);
+    try owned_surface.queueText("owned-user-input");
+    while (owned_surface.user_input_revision == 0) {
+        try owned_surface.pump();
+        try fixture.tick();
+        if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) return error.UserInputNotAccepted;
+    }
+    // No intervening safe tick: the finish entry must synchronize accepted
+    // user admission before evaluating an auto-idle candidate in this frame.
+    _ = try app.finishOwnedTask(request.context.task_id, .{ .provider_finished = true, .pending_tool_slots = false, .pending_approval = false, .pending_dispatch = false, .executions_settled = true, .input_grants_released = true, .cleanup_transferred = true, .model_done = true });
+    try std.testing.expectEqual(lifecycle.Ownership.handed_to_user, app.lifecycle_supervisor.resource(owned).?.snapshot.ownership);
+    try std.testing.expectEqual(lifecycle.Retention.keep, app.lifecycle_supervisor.resource(owned).?.snapshot.retention);
+    var input_events: [4]OwnedInputEvent = undefined;
+    const observed_input = app.drainOwnedInputEvents(&input_events);
+    try std.testing.expectEqual(@as(usize, 1), observed_input.len);
+    try std.testing.expectEqual(OwnedInputReason.ordinary_input, observed_input[0].reason);
+    try std.testing.expectEqual(.released, observed_input[0].phase);
+    try std.testing.expect(observed_input[0].context.task_id.eql(request.context.task_id));
+    try std.testing.expect(observed_input[0].context.conversation_id.eql(request.context.conversation_id));
+    try std.testing.expect(observed_input[0].handle.eql(owned));
+    try app.syncOwnedUserInput(request.context.task_id);
+    try std.testing.expectEqual(@as(usize, 0), app.drainOwnedInputEvents(&input_events).len);
+    try fixture.tick();
+    try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(owned).?.lifecycle);
+    try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(source.handle).?.lifecycle);
+}
+
+test "task finish takeover keeps round live and accepts a later fresh grant" {
+    const finish = @import("../../ai/cards/view/ai_task_finish.zig");
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "hosts.toml", .data = "" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "hosts.toml", a);
+    defer a.free(path);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    cx.setViewport(1100, 720);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .direction = .column }, .{});
+    var nodes: [4]*ui.Node = undefined;
+    for (&nodes) |*node| {
+        node.* = try ui.box(cx, .{ .width = .fill(), .height = .{ .px = 100 } }, .{});
+        try cx.root.?.appendChild(a, node.*);
+    }
+    var saved: config.Config = .{};
+    const workspace = try workspace_mod.Workspace.init(a, cx, scope, std.testing.io, &saved, path, nodes[0], nodes[1], nodes[2], nodes[3]);
+    const app = try ApplicationHost.init(a, workspace);
+    try scope.onCleanup(ApplicationHost, app, ApplicationHost.deinit);
+    app.install();
+    var fixture: OwnedSessionFixture = .{ .cx = cx, .scope = scope, .workspace = workspace, .app = app };
+    defer fixture.finish();
+    const context: @import("../../../ai/host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    const Source = struct {
+        fact: finish.ExecutionEvidence,
+        finishes: usize = 0,
+        stops: usize = 0,
+        takeovers: usize = 0,
+        target: finish.InputTarget,
+        other: finish.InputTarget,
+        target_released: bool = false,
+        input: ?finish.InputEvidence = null,
+        input_busy: bool = false,
+        fn targets(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context, buffer: []finish.InputTarget) ![]finish.InputTarget {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            buffer[0] = self.other;
+            if (self.target_released) return buffer[0..1];
+            buffer[1] = self.target;
+            return buffer[0..2];
+        }
+        fn inputEvidence(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context, id: identity.ExecutionId) ?finish.InputEvidence {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.input_busy) return null;
+            if (self.input) |fact| return if (fact.execution_id.eql(id)) fact else null;
+            if (!self.target.execution_id.eql(id)) return null;
+            return .{ .execution_id = id, .target = self.target.handle, .revision = self.fact.revision, .state = .running, .terminal = false, .input_handed_off = self.target_released, .local_released = self.target_released, .input_ready = self.target_released, .has_grant = !self.target_released };
+        }
+        fn finishModel(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+            self.fact.model_done = true;
+        }
+        fn stop(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) !void {
+            (@as(*@This(), @ptrCast(@alignCast(raw)))).stops += 1;
+        }
+        fn takeover(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context, id: identity.ExecutionId) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.target.execution_id.eql(id)) return error.UnexpectedTarget;
+            self.takeovers += 1;
+        }
+        fn evidence(raw: *anyopaque, _: identity.TaskId) ?finish.ExecutionEvidence {
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).fact;
+        }
+        fn gates(_: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) ?finish.Gates {
+            return .{ .resource_references_transferred = true };
+        }
+    };
+    // Controlled owner facts test routing; no native execution/exit is claimed.
+    var source: Source = .{ .fact = .{ .conversation_id = context.conversation_id, .task_id = context.task_id, .active_executions = 2 }, .target = .{ .handle = .{ .session_id = @fromBackingInt(1) }, .execution_id = .generate() }, .other = .{ .handle = .{ .session_id = @fromBackingInt(2) }, .execution_id = .generate() } };
+    const callbacks: finish.ExecutionSource = .{ .context = &source, .finish_model = Source.finishModel, .stop = Source.stop, .takeover_execution = Source.takeover, .input_targets = Source.targets, .input_evidence = Source.inputEvidence, .evidence = Source.evidence };
+    const gates: finish.GatesProvider = .{ .context = &source, .read = Source.gates };
+    var controller = finish.Controller.init(a);
+    defer controller.deinit();
+    try controller.registerTask(context);
+    _ = try controller.tick(app, callbacks, gates);
+    for (0..2) |_| {
+        try std.testing.expectEqual(@as(usize, 1), controller.snapshotFor(context).?.targets.len);
+        try std.testing.expectError(error.ScopeChanged, controller.controlTarget(context.task_id, controller.snapshotFor(context).?.revision, source.other.handle, source.other.execution_id));
+        try controller.controlCurrentTarget(context.task_id, source.target.handle, source.target.execution_id);
+        _ = try controller.tick(app, callbacks, gates);
+        try std.testing.expect(controller.snapshotFor(context).?.control_pending);
+        try std.testing.expectEqual(@as(usize, 0), source.finishes);
+        try std.testing.expectEqual(@as(usize, 0), source.stops);
+        try std.testing.expect(!controller.snapshotFor(context).?.model_done);
+        source.target_released = true;
+        _ = try controller.tick(app, callbacks, gates);
+        try std.testing.expect(!source.fact.input_grants_released); // B still holds its AI input
+        try std.testing.expect(!controller.snapshotFor(context).?.control_pending);
+        // A later fresh grant can become active in the same live AI round.
+        source.target_released = false;
+        const old_execution = source.target.execution_id;
+        source.target.execution_id = .generate();
+        source.fact.revision += 1;
+        _ = try controller.tick(app, callbacks, gates);
+        try std.testing.expectError(error.ScopeChanged, controller.controlTarget(context.task_id, controller.snapshotFor(context).?.revision, source.target.handle, old_execution));
+    }
+    var notices: [4]finish.ControlEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 4), controller.drainControlEvents(&notices).len);
+    for (notices, 0..) |event, i| {
+        try std.testing.expect(event.handle.eql(source.target.handle));
+        try std.testing.expect(event.context.task_id.eql(context.task_id));
+        try std.testing.expect(event.context.conversation_id.eql(context.conversation_id));
+        try std.testing.expectEqual(@as(@FieldType(finish.ControlEvent, "phase"), if (i % 2 == 0) .requested else .released), event.phase);
+    }
+    try std.testing.expectEqual(@as(usize, 2), source.takeovers);
+    // Enqueued old x1 loses the race to natural completion and a fresh lease.
+    // No cache/busy observation may be guessed from the new native epoch.
+    const ended_without_handoff = source.target.execution_id;
+    try controller.controlCurrentTarget(context.task_id, source.target.handle, ended_without_handoff);
+    _ = try controller.tick(app, callbacks, gates);
+    source.target.execution_id = .generate();
+    source.target.input_epoch += 10;
+    source.input_busy = true;
+    _ = try controller.tick(app, callbacks, gates);
+    try std.testing.expect(controller.snapshotFor(context).?.control_pending);
+    source.input_busy = false;
+    source.input = .{ .execution_id = ended_without_handoff, .target = source.target.handle, .revision = 9, .state = .sealed, .terminal = true, .input_handed_off = false, .local_released = true, .input_ready = true, .has_grant = false };
+    _ = try controller.tick(app, callbacks, gates);
+    try std.testing.expect(!controller.snapshotFor(context).?.control_pending);
+    try std.testing.expect(std.mem.indexOf(u8, controller.snapshotFor(context).?.feedback.?, "接管未生效") != null);
+    const expired_events = controller.drainControlEvents(&notices);
+    try std.testing.expectEqual(@as(usize, 1), expired_events.len);
+    try std.testing.expectEqual(.requested, expired_events[0].phase);
+    try std.testing.expect(expired_events[0].execution_id.eql(ended_without_handoff));
+    // Conversely, the retained original receipt confirms a real handoff even
+    // after that execution seals and the same Session has a different grant.
+    source.input = null;
+    const handed_before_fresh = source.target.execution_id;
+    try controller.controlCurrentTarget(context.task_id, source.target.handle, handed_before_fresh);
+    _ = try controller.tick(app, callbacks, gates);
+    source.target.execution_id = .generate();
+    source.target.input_epoch += 10;
+    source.input = .{ .execution_id = handed_before_fresh, .target = source.target.handle, .revision = 11, .state = .sealed, .terminal = true, .input_handed_off = true, .local_released = true, .input_ready = true, .has_grant = false };
+    _ = try controller.tick(app, callbacks, gates);
+    try std.testing.expect(!controller.snapshotFor(context).?.control_pending);
+    const handed_events = controller.drainControlEvents(&notices);
+    try std.testing.expectEqual(@as(usize, 2), handed_events.len);
+    try std.testing.expectEqual(.requested, handed_events[0].phase);
+    try std.testing.expectEqual(.released, handed_events[1].phase);
+    for (handed_events) |event| try std.testing.expect(event.execution_id.eql(handed_before_fresh));
+    try std.testing.expect(!source.fact.input_grants_released); // fresh A/B grants unchanged
+    try std.testing.expectEqual(@as(usize, 4), source.takeovers);
+    try std.testing.expectEqual(@as(usize, 0), source.stops);
+    try std.testing.expectEqual(@as(usize, 0), source.finishes);
+    try std.testing.expect(controller.receiptFor(context) == null);
+    try controller.control(context.task_id, controller.snapshotFor(context).?.revision, .stop);
+    _ = try controller.tick(app, callbacks, gates);
+    try std.testing.expectEqual(@as(usize, 1), source.stops);
+    try std.testing.expectEqual(@as(usize, 0), source.finishes);
+    source.fact.active_executions = 0;
+    source.fact.input_grants_released = true;
+    source.fact.executions_settled = true;
+    source.fact.recordings_settled = true;
+    try controller.modelEnded(context, .cancelled);
+    _ = try controller.tick(app, callbacks, gates);
+    try std.testing.expectEqual(@as(usize, 1), source.finishes);
+    try std.testing.expectEqual(@as(usize, 1), source.stops);
+    try std.testing.expect(controller.receiptFor(context) != null);
+}
+
+test "task finish real Local records observed intervals and retains unverified auto idle sessions" {
+    const finish = @import("../../ai/cards/view/ai_task_finish.zig");
+    const execution = @import("../../../host/terminal_execution.zig");
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "hosts.toml", .data = "" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zshenv", .data = "PROMPT=''\nRPROMPT=''\n" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zshrc", .data = "bindkey -e\nzmodload zsh/zselect\n" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "hosts.toml", a);
+    defer a.free(path);
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(directory);
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const previous_shell = if (std.c.getenv("ZDOTDIR")) |old| try a.dupeSentinel(u8, std.mem.span(old), 0) else null;
+    const previous_data = if (std.c.getenv("ZEROWORK_DATA_DIR")) |old| try a.dupeSentinel(u8, std.mem.span(old), 0) else null;
+    defer {
+        if (previous_shell) |old| {
+            _ = Env.setenv("ZDOTDIR", old.ptr, 1);
+            a.free(old);
+        } else _ = Env.unsetenv("ZDOTDIR");
+        if (previous_data) |old| {
+            _ = Env.setenv("ZEROWORK_DATA_DIR", old.ptr, 1);
+            a.free(old);
+        } else _ = Env.unsetenv("ZEROWORK_DATA_DIR");
+    }
+    if (Env.setenv("ZDOTDIR", directory.ptr, 1) != 0 or Env.setenv("ZEROWORK_DATA_DIR", directory.ptr, 1) != 0) return error.EnvironmentFailed;
+    const cx = try ui.Cx.init(a, std.testing.io);
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    cx.setViewport(1100, 720);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .direction = .column }, .{});
+    var nodes: [4]*ui.Node = undefined;
+    for (&nodes) |*node| {
+        node.* = try ui.box(cx, .{ .width = .fill(), .height = .{ .px = 100 } }, .{});
+        try cx.root.?.appendChild(a, node.*);
+    }
+    var saved: config.Config = .{};
+    const workspace = try workspace_mod.Workspace.init(a, cx, scope, std.testing.io, &saved, path, nodes[0], nodes[1], nodes[2], nodes[3]);
+    const app = try ApplicationHost.init(a, workspace);
+    try scope.onCleanup(ApplicationHost, app, ApplicationHost.deinit);
+    app.install();
+    var fixture: OwnedSessionFixture = .{ .cx = cx, .scope = scope, .workspace = workspace, .app = app };
+    var roster = @import("../../workspace/model/group_model.zig").Roster.init(a);
+    defer roster.deinit();
+    defer fixture.finish();
+    const source = try app.createLocal(directory);
+    const first_deadline = @import("../../../platform/realtime.zig").monotonicNs() + 8 * std.time.ns_per_s;
+    while (app.sessions.queryState(source.handle).?.lifecycle != .attached) {
+        try fixture.tick();
+        if (@import("../../../platform/realtime.zig").monotonicNs() > first_deadline) return error.LocalSessionNotReady;
+    }
+    var group_plan = try roster.prepareNew("retention-test", 0xff00ffff, app.legacyForHandle(source.handle).?);
+    defer group_plan.deinit();
+    const group_id = try group_plan.commit();
+    try workspace.openGroup(&roster, group_id);
+    var controller = finish.Controller.init(a);
+    defer controller.deinit();
+    const Gates = struct {
+        approvals: usize = 0,
+        fn read(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) ?finish.Gates {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .pending_approvals = self.approvals, .resource_references_transferred = true };
+        }
+    };
+    var gates: Gates = .{};
+    const gate_source: finish.GatesProvider = .{ .context = &gates, .read = Gates.read };
+    const Facts = struct {
+        context: @import("../../../ai/host_tools.zig").Context,
+        service: terminal.Service,
+        app: *ApplicationHost,
+        target: identity.SessionHandle,
+        model_done: bool = false,
+        stops: usize = 0,
+        takeovers: usize = 0,
+        fn finishModel(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) !void {
+            (@as(*@This(), @ptrCast(@alignCast(raw)))).model_done = true;
+        }
+        fn stop(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const snapshot = try self.service.executionSnapshot();
+            if (snapshot.grant) |grant| try self.service.executionRevoke(grant, false);
+            self.stops += 1;
+        }
+        fn takeover(raw: *anyopaque, _: @import("../../../ai/host_tools.zig").Context, execution_id: identity.ExecutionId) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const snapshot = try self.service.executionSnapshot();
+            const grant = snapshot.grant orelse return error.NoExecutionGrant;
+            if (!grant.execution_id.eql(execution_id)) return error.ScopeChanged;
+            try self.service.executionRevoke(grant, true);
+            try self.app.handedToUser(self.target);
+            self.takeovers += 1;
+        }
+        fn read(raw: *anyopaque, task: identity.TaskId) ?finish.ExecutionEvidence {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!task.eql(self.context.task_id)) return null;
+            const snapshot = self.service.executionSnapshot() catch return null;
+            const settled = (snapshot.state == .sealed or snapshot.state == .interval_recorded or snapshot.state == .handed_off or snapshot.state == .outcome_unknown or snapshot.state == .recording_degraded) and snapshot.recording_settled;
+            return .{ .conversation_id = self.context.conversation_id, .task_id = task, .revision = snapshot.revision, .model_done = self.model_done, .execution_count = 1, .active_executions = if (settled) 0 else 1, .executions_settled = settled, .input_grants_released = snapshot.grant == null and snapshot.local_released and snapshot.input_ready, .recordings_settled = settled, .remote_effect_unknown = snapshot.remote_effect_unknown, .output_attribution_unverified = snapshot.output_scope == .session_interval and snapshot.command_accepted };
+        }
+    };
+    const cases = [_]struct { retention: lifecycle.Retention, choice: ?finish.Decision = null, control: ?finish.Control = null, user_input: bool = false }{ .{ .retention = .auto_idle }, .{ .retention = .keep }, .{ .retention = .ask, .choice = .keep }, .{ .retention = .ask, .choice = .close }, .{ .retention = .auto_idle, .user_input = true }, .{ .retention = .auto_idle, .control = .takeover }, .{ .retention = .keep, .control = .stop } };
+    for (cases, 0..) |case, case_index| {
+        const context: @import("../../../ai/host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = group_id }, .content = .{ .group = group_id }, .binding_revision = 1, .grant_revision = 1 };
+        const request: lifecycle.OpenRequest = .{ .operation_ref = .generate(), .context = context, .group = .{ .id = @fromBackingInt(group_id) }, .source = source.handle, .connection_policy = .new_only, .retention = case.retention };
+        const until = @import("../../../platform/realtime.zig").monotonicNs() + 12 * std.time.ns_per_s;
+        _ = try fixture.queueOwned(request, until);
+        try fixture.tick();
+        var opened = try app.queryOwnedSession(request.operation_ref, context);
+        _ = try app.authorizeOwnedSessionDispatch(request.operation_ref, context, opened.revision, opened.session.?);
+        while (opened.state != .ready) {
+            try fixture.tick();
+            opened = try app.queryOwnedSession(request.operation_ref, context);
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.OwnedSessionNotReady;
+        }
+        const owner = opened.session.?;
+        const binding = app.sessions.queryService(owner, .terminal).available;
+        const service = try app.local_adapter.terminalService(binding);
+        var starting: execution.Snapshot = undefined;
+        while (true) {
+            try fixture.tick();
+            starting = service.executionSnapshot() catch {
+                continue;
+            };
+            if (starting.interactive_execution) {
+                if (service.trustedSnapshot(a) catch null) |value| {
+                    var edit = value;
+                    defer edit.deinit(a);
+                    if (edit.editable() and edit.buffer.len == 0) break;
+                }
+            }
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.IntegrationUnavailable;
+        }
+        // Keep the real foreground execution alive until the UI has actually
+        // observed START/running. A short sleep can complete between frames
+        // under the full-suite load and falsely report ExecutionNeverRan.
+        const release_name = try std.fmt.allocPrint(a, "retention-release-{d}", .{case_index});
+        defer a.free(release_name);
+        defer temporary.dir.writeFile(std.testing.io, .{ .sub_path = release_name, .data = "release\n" }) catch {};
+        const command = try std.fmt.allocPrint(a, "while [[ ! -f '{s}/{s}' ]]; do zselect -t 2; done; printf 'TASK_RETENTION_OK\\n'", .{ directory, release_name });
+        defer a.free(command);
+        const execution_request: execution.Request = .{ .execution_id = .generate(), .task_id = context.task_id, .expected_input_epoch = starting.input_epoch, .ownership_revision = opened.ownership_revision, .command = command, .command_hash = execution.digest(command) };
+        while (true) {
+            service.executionRequest(execution_request) catch |err| {
+                if (err != error.WorkerBusy) return err;
+                try fixture.tick();
+                continue;
+            };
+            break;
+        }
+        var current: execution.Snapshot = undefined;
+        while (true) {
+            try fixture.tick();
+            current = service.executionSnapshot() catch {
+                continue;
+            };
+            if (current.state == .running) break;
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) {
+                std.debug.print("task finish execution case={d} never running: state={s} failure={?s} input_ready={any} local_released={any}\n", .{ case_index, @tagName(current.state), current.failure, current.input_ready, current.local_released });
+                return error.ExecutionNeverRan;
+            }
+        }
+        const surface = workspace.sessionTab(app.legacyForHandle(owner).?).?.terminal.?.terminal_surface.?;
+        _ = try surface.refresh(owner, true);
+        try surface.queueText("x");
+        for (0..3) |_| {
+            try surface.pump();
+            try fixture.tick();
+        }
+        try std.testing.expectEqual(@as(u64, 0), surface.user_input_revision); // real lease rejects ordinary admission
+        try app.syncOwnedUserInput(context.task_id);
+        try std.testing.expectEqual(lifecycle.Ownership.created_task, app.lifecycle_supervisor.resource(owner).?.snapshot.ownership);
+        var facts: Facts = .{ .context = context, .service = service, .app = app, .target = owner };
+        const execution_source: finish.ExecutionSource = .{ .context = &facts, .finish_model = Facts.finishModel, .stop = Facts.stop, .takeover_execution = Facts.takeover, .evidence = Facts.read };
+        gates.approvals = 1;
+        try controller.registerTask(context);
+        _ = try controller.tick(app, execution_source, gate_source);
+        // A busy worker can defer the first nonblocking evidence read. Wait
+        // for the controller to observe it before submitting a real control.
+        if (case.control != null) while (controller.snapshotFor(context).?.active_executions == 0) {
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.ExecutionNeverRan;
+            try fixture.tick();
+            _ = try controller.tick(app, execution_source, gate_source);
+        };
+        try std.testing.expect(!facts.model_done);
+        try std.testing.expect(!controller.snapshotFor(context).?.model_done);
+        if (case.control == .takeover) {
+            try controller.control(context.task_id, controller.snapshotFor(context).?.revision, .takeover);
+            _ = try controller.tick(app, execution_source, gate_source);
+            try std.testing.expect(!facts.model_done); // user takeover does not end AI admission
+            try std.testing.expect(!controller.snapshotFor(context).?.model_done); // provider still alive
+            try std.testing.expect(controller.receiptFor(context) == null);
+        } else try controller.modelEnded(context, .completed);
+        _ = try controller.tick(app, execution_source, gate_source);
+        if (case.control != .takeover) try std.testing.expectEqual(finish.Phase.working, controller.snapshotFor(context).?.phase);
+        try std.testing.expect(controller.receiptFor(context) == null);
+        if (case.control) |action| if (action != .takeover) {
+            try controller.control(context.task_id, controller.snapshotFor(context).?.revision, action);
+            _ = try controller.tick(app, execution_source, gate_source);
+        };
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = release_name, .data = "release\n" });
+        while (true) {
+            if (Facts.read(&facts, context.task_id)) |evidence| if (evidence.executions_settled) break;
+            try fixture.tick();
+            _ = try controller.tick(app, execution_source, gate_source);
+            current = service.executionSnapshot() catch {
+                continue;
+            };
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.ExecutionIntervalNeverSettled;
+        }
+        if (case.control != .stop) {
+            // Settled execution does not reserve the worker's entry mutex.
+            // Await this independent observation within the same case budget.
+            while (true) {
+                current = service.executionSnapshot() catch |err| {
+                    if (err != error.WorkerBusy or @import("../../../platform/realtime.zig").monotonicNs() >= until) return err;
+                    try fixture.tick();
+                    continue;
+                };
+                break;
+            }
+            try std.testing.expectEqual(execution.State.interval_recorded, current.state);
+            try std.testing.expectEqual(execution.OutputScope.session_interval, current.output_scope);
+            try std.testing.expect(current.interval_saved and current.recording_settled and !current.recording_failed);
+            try std.testing.expect(current.process != null and current.process.?.foreground_finished);
+            try std.testing.expect(!current.remote_effect_unknown);
+            if (case.control != .takeover) {
+                // This independent live probe may race the worker guard and
+                // conservatively report unknown even after the prior snapshot
+                // settled. Await its evidence within the same case deadline.
+                while (true) {
+                    const idle: ?lifecycle.IdleEvidence = app.ownedIdleEvidence(owner, context.task_id) catch |err| switch (err) {
+                        error.WorkerBusy => null,
+                        else => return err,
+                    };
+                    if (idle) |value| {
+                        try std.testing.expect(!value.confirmed);
+                        if (value.recording_settled and !value.foreground_active) break;
+                    }
+                    if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.IdleEvidenceUnavailable;
+                    try fixture.tick();
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (case.control == .stop) 1 else 0), facts.stops);
+        try std.testing.expectEqual(@as(usize, if (case.control == .takeover) 1 else 0), facts.takeovers);
+        try std.testing.expect(controller.receiptFor(context) == null); // real pending approval still fences finish
+        if (case.user_input) {
+            _ = try surface.refresh(owner, true);
+            try surface.queueText("x");
+            while (surface.user_input_revision == 0) {
+                try fixture.tick();
+                // Pump retains bytes rejected by a stale VT mode. The native
+                // render loop refreshes that snapshot before its next retry.
+                _ = try surface.refresh(owner, true);
+                try surface.pump();
+                if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.UserInputNotAccepted;
+            }
+        }
+        if (case.control == .takeover) {
+            try std.testing.expect(!facts.model_done);
+            try controller.modelEnded(context, .completed);
+        }
+        gates.approvals = 0;
+        _ = try controller.tick(app, execution_source, gate_source);
+        // Releasing the gate does not make the independent worker snapshot
+        // synchronous. Await the receipt within the original case deadline.
+        while (controller.receiptFor(context) == null) {
+            try fixture.tick();
+            _ = try controller.tick(app, execution_source, gate_source);
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) return error.FinishReceiptUnavailable;
+        }
+        if (case.choice) |choice| {
+            const snapshot = controller.snapshotFor(context).?;
+            try std.testing.expectEqual(finish.Phase.choice, snapshot.phase);
+            for (0..3) |_| {
+                try fixture.tick();
+                _ = try controller.tick(app, execution_source, gate_source);
+            }
+            try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(owner).?.lifecycle);
+            try controller.decide(context.task_id, controller.snapshotFor(context).?.revision, choice);
+        }
+        while (true) {
+            try fixture.tick();
+            _ = try controller.tick(app, execution_source, gate_source);
+            if (workspace.confirming_id) |confirmed| {
+                const legacy = app.legacyForHandle(owner).?;
+                try std.testing.expectEqual(workspace.sessionTab(legacy).?.tab_id, confirmed);
+                workspace.resolveLocalCloseConfirmation(legacy, true);
+            }
+            const snapshot = controller.snapshotFor(context).?;
+            if (case.retention == .keep or case.retention == .auto_idle or case.choice == .keep or case.user_input or case.control == .takeover) {
+                if (snapshot.phase == .kept or snapshot.phase == .retained) {
+                    try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(owner).?.lifecycle);
+                    try std.testing.expect(app.sessions.queryState(owner).?.close_operation == null);
+                    if (case.choice == .keep or case.user_input or case.control == .takeover) {
+                        try std.testing.expectEqual(lifecycle.Ownership.handed_to_user, app.lifecycle_supervisor.resource(owner).?.snapshot.ownership);
+                        try std.testing.expectEqual(lifecycle.Retention.keep, app.lifecycle_supervisor.resource(owner).?.snapshot.retention);
+                    }
+                    break;
+                }
+            } else if (snapshot.phase == .closed) {
+                try std.testing.expectEqual(session.Lifecycle.closed, app.sessions.queryState(owner).?.lifecycle);
+                break;
+            }
+            if (@import("../../../platform/realtime.zig").monotonicNs() >= until) {
+                std.debug.print("task retention case={d} phase={s} lifecycle={s} resource={any} execution={any}\n", .{ case_index, @tagName(snapshot.phase), @tagName(app.sessions.queryState(owner).?.lifecycle), app.lifecycle_supervisor.resource(owner).?.snapshot, service.executionSnapshot() catch null });
+                return error.TaskRetentionNeverSettled;
+            }
+        }
+        try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(source.handle).?.lifecycle);
+        try std.testing.expect(workspace.groupTabId(group_id) != null);
+    }
+    const cancelled_context: @import("../../../ai/host_tools.zig").Context = .{ .conversation_id = .generate(), .task_id = .generate(), .binding = .{ .tab = group_id }, .content = .{ .group = group_id }, .binding_revision = 1, .grant_revision = 1 };
+    const close_operation = identity.HostOperationId.generate();
+    _ = try app.queueSessionClose(close_operation, cancelled_context, source.handle, true);
+    try controller.modelEnded(cancelled_context, .cancelled);
+    _ = try controller.tick(app, null, gate_source);
+    try std.testing.expectEqual(@TypeOf((try app.querySessionClose(close_operation, cancelled_context)).state).cancelled_unsent, (try app.querySessionClose(close_operation, cancelled_context)).state);
+    try std.testing.expectError(error.CancelledBeforeDispatch, app.acknowledgeSessionCloseResult(close_operation));
+    try fixture.tick();
+    try std.testing.expectEqual(session.Lifecycle.attached, app.sessions.queryState(source.handle).?.lifecycle);
+    const driver_adapter = finish.ExecutionSource.fromDriver(@as(*@import("../../../ai/host_execution_driver.zig").Driver, @ptrFromInt(8)));
+    _ = driver_adapter; // instantiate the production Driver adapter without calling an invalid pointer
+}
+
+test "background application entry keeps Tabs and connect jobs empty through actual queued cancellation" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "hosts.toml", .data = "" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "hosts.toml", a);
+    defer a.free(path);
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(directory);
+    const known = try std.fs.path.join(a, &.{ directory, "known_hosts" });
+    defer a.free(known);
+    const cx = try ui.Cx.init(a, std.testing.io);
+    defer cx.deinit();
+    const scope = try ui.Scope.init(a, null, cx.owner);
+    defer scope.dispose();
+    cx.setViewport(1100, 720);
+    cx.root = try ui.box(cx, .{ .width = .fill(), .height = .fill(), .direction = .column }, .{});
+    var nodes: [4]*ui.Node = undefined;
+    for (&nodes) |*node| {
+        node.* = try ui.box(cx, .{ .width = .fill(), .height = .fill() }, .{});
+        try cx.root.?.appendChild(a, node.*);
+    }
+    var saved: config.Config = .{};
+    saved.ssh.auto_reconnect = false;
+    const workspace = try workspace_mod.Workspace.init(a, cx, scope, std.testing.io, &saved, path, nodes[0], nodes[1], nodes[2], nodes[3]);
+    const index = try workspace.appendHost(.{ .connection_id = @fromBackingInt(73), .revision = 5, .name = "background-original", .host = "127.0.0.1", .port = 1, .user = "owned-loopback", .auth_mode = .password, .password = "unused", .strict_host_key_checking = false });
+    const app = try ApplicationHost.init(a, workspace);
+    // The isolated trust path is installed before the real create; the tested
+    // adapter still queues its actual SourceFactory/worker and close receipts.
+    app.domain.backgrounds = try background.Host.init(a, app.sessions, known, .{ .automatic_reconnect = false });
+    defer app.deinit();
+    app.install();
+    const accepted = try app.createBackgroundSaved(workspace.hostId(index).?);
+    try std.testing.expectEqual(@as(usize, 0), workspace.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workspace.model.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workspace.connect_jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.mappings.items.len);
+    try std.testing.expectEqual(session.SessionPurpose.socks_background, app.sessions.queryState(accepted.handle).?.purpose);
+    try std.testing.expect(app.sessions.queryService(accepted.handle, .terminal) == .unsupported);
+    const close_key = try app.stopBackgroundOwner(accepted.handle);
+    const deadline = @import("../../../platform/realtime.zig").monotonicNs() + 3 * std.time.ns_per_s;
+    while (app.sessions.queryState(accepted.handle).?.lifecycle != .closed) {
+        if (@import("../../../platform/realtime.zig").monotonicNs() > deadline) return error.BackgroundCancellationNotReleased;
+        _ = try app.safeTick();
+        var empty: [1]std.c.pollfd = undefined;
+        _ = std.c.poll(&empty, 0, 2);
+    }
+    try std.testing.expect(app.sessions.queryState(accepted.handle).?.close_operation.?.eql(close_key));
+    const remaining = try app.backgroundSnapshots(a);
+    defer a.free(remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+    try std.testing.expectEqual(@as(usize, 0), workspace.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workspace.connect_jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.mappings.items.len);
+}
+
+test "application installs real SSH and Local availability and restores prior bridges" {
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.session_bridge = .{};
+    workspace.close_bridge = .{};
+    workspace.window_close_bridge = .{};
+    const app = try ApplicationHost.init(std.testing.allocator, &workspace);
+    defer app.deinit();
+    try std.testing.expectEqual(app.window_id, workspace.model.window);
+    try std.testing.expectEqual(app.workspace_id, workspace.model.workspace);
+    try std.testing.expectEqual(plugins.Availability.available, app.registry().availability(.ssh));
+    try std.testing.expectEqual(plugins.Availability.available, app.registry().availability(.local));
+    try std.testing.expectEqual(plugins.Availability.adapter_not_connected, app.registry().availability(.sftp));
+    app.install();
+    try std.testing.expect(workspace.session_bridge.create != null);
+    try std.testing.expect(workspace.session_bridge.create_local != null);
+    try std.testing.expect(workspace.close_bridge.request_close != null);
+    try std.testing.expect(workspace.close_bridge.cleanup == null);
+    app.uninstall();
+    try std.testing.expect(workspace.session_bridge.create == null);
+    try std.testing.expect(workspace.session_bridge.create_local == null);
+    try std.testing.expect(workspace.close_bridge.request_close == null);
+}
+
+test "application file plugin queues frozen source without constructing terminal and retains unknown shutdown" {
+    // Controller-only provider fixture: it intentionally never reports ready
+    // and is not registered by the production main application.
+    const Provider = struct {
+        queued: ?session.CreateRequest = null,
+        ticks: usize = 0,
+        release: CloseReceipt = .unknown,
+        cancel_receipt: CloseReceipt = .unknown,
+        fn create(raw: *anyopaque, request: session.CreateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.queued = request;
+        }
+        fn cancel(raw: *anyopaque, _: OperationKey) CloseReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.cancel_receipt;
+        }
+        fn close(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) !CloseReceipt {
+            return .released;
+        }
+        fn stale(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) void {}
+        fn tick(raw: *anyopaque, _: *session.SessionHost) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ticks += 1;
+            return false;
+        }
+        fn shutdown(raw: *anyopaque) CloseReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.release;
+        }
+        fn plugin(self: *@This()) FilePlugin {
+            return .{ .adapter = .{ .registration = .{ .plugin_id = .sftp, .workspace_kind = .file, .services = plugins.requiredServices(.sftp) }, .context = self, .vtable = &.{ .create = create, .cancel = cancel, .close = close, .release_stale = stale } }, .context = self, .tick = tick, .shutdown = shutdown };
+        }
+    };
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.session_bridge = .{};
+    workspace.close_bridge = .{};
+    workspace.window_close_bridge = .{};
+    workspace.shutting_down = false;
+    var global: config.Config = .{};
+    workspace.app_config = &global;
+    workspace.registry.hosts = &.{};
+    var provider: Provider = .{};
+    const app = try ApplicationHost.initWithFilePlugin(std.testing.allocator, &workspace, provider.plugin());
+    defer {
+        provider.release = .released;
+        app.deinit();
+    }
+    var name = "Original Files".*;
+    var address = "files.test".*;
+    const accepted = try app.create(.{ .connection_id = @fromBackingInt(19), .revision = 7, .protocol = .sftp, .name = &name, .host = &address, .user = "operator" }, 91, 4, "");
+    try std.testing.expect(provider.queued.?.handle.eql(accepted.handle));
+    try std.testing.expectEqual(session.Lifecycle.creating, app.sessions.queryState(accepted.handle).?.lifecycle);
+    try std.testing.expect(app.sessions.queryService(accepted.handle, .transfer) == .temporarily_unavailable);
+    name[0] = 'X';
+    address[0] = 'X';
+    const source = try app.fileSource(accepted.handle, accepted.operation);
+    try std.testing.expectEqualStrings("Original Files", source.host.name);
+    try std.testing.expectEqualStrings("files.test", source.host.host);
+    try std.testing.expectEqual(@as(workspace_mod.HostId, 91), source.host_id);
+    try std.testing.expectEqual(@as(usize, 4), source.source_index);
+    try std.testing.expectEqual(@as(usize, 0), app.mappings.items.len);
+    try std.testing.expect(!app.fileCreatesReleased());
+    var foreign = accepted.operation;
+    foreign.owner.session.generation += 1;
+    try std.testing.expectError(error.StaleFileCreate, app.fileSource(accepted.handle, foreign));
+    // Shutdown unknown must retain the owner and immutable snapshots.
+    app.deinit();
+    try std.testing.expectEqualStrings("files.test", (try app.fileSource(accepted.handle, accepted.operation)).host.host);
+    try std.testing.expect(try app.sessions.cancel(accepted.operation));
+    try std.testing.expect(!app.fileCreatesReleased());
+    provider.cancel_receipt = .released;
+    try std.testing.expect(try app.sessions.createCleanupReceipt(accepted.handle, accepted.operation, .released));
+    try std.testing.expect(app.fileCreatesReleased());
+}
+
+const ReceiptTestAdapter = struct {
+    fn create(_: *anyopaque, _: session.CreateRequest) !void {}
+    fn cancel(_: *anyopaque, _: OperationKey) CloseReceipt {
+        return .released;
+    }
+    fn close(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) !CloseReceipt {
+        return .released;
+    }
+    fn stale(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) void {}
+    fn holdContent(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) !CloseReceipt {
+        return .awaiting;
+    }
+};
+
+test "SSH reconnect polls lifecycle failure and cleanup without diagnostic snapshots" {
+    const owner: identity.SessionHandle = .{ .session_id = @fromBackingInt(71), .generation = 3 };
+    const key: OperationKey = .{ .owner = .{ .session = owner }, .operation_id = 81, .attempt_id = 2 };
+    var source = try freezeSource(std.testing.allocator, .{ .name = "target", .host = "target.invalid", .user = "tester" }, .{}, &.{}, 17, 0, "");
+    defer source.deinit();
+    var mapping: Mapping = .{ .handle = owner, .create_operation = key, .legacy_id = 31, .legacy_generation = 1, .tab_id = @fromBackingInt(7), .owner = .{ .session = owner }, .source = source };
+    var tab: workspace_mod.SessionTab = undefined;
+    tab.id = mapping.legacy_id;
+    tab.generation = mapping.legacy_generation;
+    tab.runtime = null;
+    var job: @import("../../../plugins/ssh/connect_job.zig").ConnectJob = undefined;
+    job.ticket = tab.ticket();
+    job.operation_key = key;
+    job.ready = .init(false);
+    job.cancelled = .init(false);
+    job.cleanup_unknown = false;
+    job.automatic_retry_deadline_ns = null;
+    job.resource_ledger = try @import("../../../proto/ssh/session.zig").ResourceLedger.init(key, 1);
+    var tabs = [_]*workspace_mod.SessionTab{&tab};
+    var jobs = [_]*@import("../../../plugins/ssh/connect_job.zig").ConnectJob{&job};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.tabs = .empty;
+    workspace.tabs.items = &tabs;
+    workspace.connect_jobs = .empty;
+    workspace.connect_jobs.items = &jobs;
+    var app: ApplicationHost = undefined;
+    app.workspace = &workspace;
+    try std.testing.expect(!try app.syncSshReconnect(&mapping));
+    try std.testing.expect(!mapping.failed_received);
+
+    job.err = error.AuthenticationFailed;
+    job.ready.store(true, .release);
+    job.automatic_retry_deadline_ns = 1;
+    try std.testing.expect(!try app.syncSshReconnect(&mapping));
+    try std.testing.expect(!mapping.failed_received);
+    job.automatic_retry_deadline_ns = null;
+    try std.testing.expect(job.resource_ledger.record(key, 0, .transport, .owned));
+    try std.testing.expect(job.resource_ledger.record(key, 0, .transport, .unknown));
+    try std.testing.expect(!try app.syncSshReconnect(&mapping));
+    try std.testing.expect(mapping.failed_received and mapping.cleanup_unknown_received and !mapping.cleanup_received);
+    try std.testing.expectEqualStrings("AuthenticationFailed", mapping.failure[0..mapping.failure_len]);
+
+    mapping.failed_received = false;
+    try std.testing.expect(job.resource_ledger.record(key, 0, .transport, .released));
+    try std.testing.expect(!try app.syncSshReconnect(&mapping));
+    try std.testing.expect(mapping.failed_received and mapping.cleanup_received and !mapping.cleanup_unknown_received);
+    mapping.failed_received = false;
+    mapping.create_operation.attempt_id = 1;
+    try std.testing.expect(!try app.syncSshReconnect(&mapping));
+    try std.testing.expect(!mapping.failed_received);
+}
+
+test "cancelled SSH late ready never attaches and unknown cleanup retains retry gate" {
+    const Pending = struct {
+        fn cancel(_: *anyopaque, _: OperationKey) CloseReceipt {
+            return .awaiting;
+        }
+    };
+    var context: u8 = 0;
+    const adapter: session.Adapter = .{ .registration = .{ .plugin_id = .ssh, .workspace_kind = .terminal, .services = sshServices() }, .context = &context, .vtable = &.{ .create = ReceiptTestAdapter.create, .cancel = Pending.cancel, .close = ReceiptTestAdapter.close, .release_stale = ReceiptTestAdapter.stale } };
+    const saved: config.Config = .{};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.app_config = &saved;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.tabs = .empty;
+    workspace.connect_jobs = .empty;
+    workspace.shutting_down = false;
+    const app = try ApplicationHost.init(std.testing.allocator, &workspace);
+    defer app.deinit();
+    const receipt_domain = try session.SessionHost.init(std.testing.allocator, &.{adapter});
+    app.sessions.deinit();
+    app.sessions.* = receipt_domain;
+    const accepted = try app.sessions.create(.{ .temporary_ssh = .{ .structured_endpoint = .{ .host = "test.invalid", .user = "test" } } }, .{ .window_id = @fromBackingInt(1), .workspace_id = @fromBackingInt(1) });
+    try std.testing.expect(try app.sessions.cancel(accepted.operation));
+    app.card_closes = .empty;
+    app.window_close = null;
+    try app.mappings.append(app.allocator, .{ .handle = accepted.handle, .create_operation = accepted.operation, .legacy_id = 31, .legacy_generation = 1, .tab_id = @fromBackingInt(7), .owner = .{ .session = accepted.handle }, .source = null, .connected_received = true, .cleanup_unknown_received = true });
+    const mappings = app.mappings.items;
+    try std.testing.expect(!try app.safeTick());
+    try std.testing.expect(!mappings[0].ready_published);
+    try std.testing.expect(!mappings[0].attached_published);
+    try std.testing.expectEqual(@import("../../../host/operation.zig").Cleanup.unknown, app.sessions.queryState(accepted.handle).?.create_cleanup);
+    try std.testing.expectError(error.CleanupNotReleased, app.sessions.retry(accepted.handle));
+    mappings[0].cleanup_received = true;
+    try std.testing.expect(!try app.safeTick());
+    const retry = try app.sessions.retry(accepted.handle);
+    try std.testing.expectEqual(accepted.handle.session_id, retry.handle.session_id);
+    try std.testing.expect(!accepted.handle.eql(retry.handle));
+}
+
+test "application close keeps its receipt when completion publication runs out of memory" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var context: u8 = 0;
+    const adapter: session.Adapter = .{ .registration = .{ .plugin_id = .ssh, .workspace_kind = .terminal, .services = sshServices() }, .context = &context, .vtable = &.{ .create = ReceiptTestAdapter.create, .cancel = ReceiptTestAdapter.cancel, .close = ReceiptTestAdapter.close, .release_stale = ReceiptTestAdapter.stale } };
+    const saved: config.Config = .{};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.app_config = &saved;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.tabs = .empty;
+    workspace.connect_jobs = .empty;
+    workspace.shutting_down = false;
+    const app = try ApplicationHost.init(std.testing.allocator, &workspace);
+    defer app.deinit();
+    const receipt_domain = try session.SessionHost.init(failing.allocator(), &.{adapter});
+    app.sessions.deinit();
+    app.sessions.* = receipt_domain;
+    const accepted = try app.sessions.create(.{ .temporary_ssh = .{ .structured_endpoint = .{ .host = "test", .user = "test" } } }, .{ .window_id = @fromBackingInt(1), .workspace_id = @fromBackingInt(1) });
+    const key = try app.sessions.requestClose(accepted.handle, .{ .release_content = .{ .context = &context, .run = ReceiptTestAdapter.holdContent } });
+    app.close_extension = null;
+    app.card_closes = .empty;
+    app.window_close = null;
+    try app.mappings.append(app.allocator, .{ .handle = accepted.handle, .create_operation = accepted.operation, .legacy_id = 31, .legacy_generation = 1, .tab_id = @fromBackingInt(7), .owner = .{ .session = accepted.handle }, .source = null, .waiting = .{ .key = key, .step = .release_content }, .content_pending = true });
+    const mappings = app.mappings.items;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, app.safeTick());
+    try std.testing.expect(mappings[0].waiting != null);
+    try std.testing.expect(mappings[0].waiting.?.key.eql(key));
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(!try app.safeTick());
+    try std.testing.expectEqual(session.Lifecycle.closed, app.sessions.queryState(accepted.handle).?.lifecycle);
+    try std.testing.expect(mappings[0].waiting == null);
+    try std.testing.expect(app.findLegacy(31, 2) == null);
+    try std.testing.expect(app.legacyForHandle(try accepted.handle.nextGeneration()) == null);
+}
+
+test "card tab close shares dispatcher and journal without a transport session" {
+    const saved: config.Config = .{};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.app_config = &saved;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.session_bridge = .{};
+    workspace.close_bridge = .{};
+    const app = try ApplicationHost.init(std.testing.allocator, &workspace);
+    defer app.deinit();
+    const tab_id: identity.TabId = @fromBackingInt(9);
+    const owner: identity.ContentOwner = .{ .card = .{ .slot = 3, .generation = 1 } };
+    try workspace.model.append(tab_id, owner, "record");
+    var tab: workspace_mod.SessionTab = undefined;
+    tab.id = 50;
+    tab.tab_id = tab_id;
+    tab.content_owner = owner;
+    tab.closing = false;
+    var tabs = [_]*workspace_mod.SessionTab{&tab};
+    workspace.tabs = .empty;
+    workspace.tabs.items = &tabs;
+    workspace.tabs.capacity = tabs.len;
+    const input = try app.dispatcher.issue();
+    const first = (try app.closeForInput(input, tab_id, owner)).accepted;
+    const repeated = (try app.closeForInput(input, tab_id, owner)).accepted;
+    try std.testing.expect(first.eql(repeated));
+    try std.testing.expect(owner.card.eql(first.owner.card));
+    try std.testing.expectEqual(@as(usize, 1), app.card_closes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions.sessions.items.len);
+    // The controller acknowledges only after the workspace no longer exposes
+    // the view; actual node destruction remains the workspace safe hook's job.
+    workspace.tabs = .empty;
+    try workspace.model.completeClose(tab_id, owner);
+    try std.testing.expect(!try app.safeTick());
+    try std.testing.expect(app.card_closes.items[0].state == .closed);
+    var completed: usize = 0;
+    var released: usize = 0;
+    while (app.sessions.journal.take()) |received| {
+        var event = received;
+        defer event.deinit();
+        try std.testing.expect(event.value.key.eql(first));
+        if (event.value.kind == .completed) completed += 1;
+        if (event.value.kind == .cleanup_released) released += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), completed);
+    try std.testing.expectEqual(@as(usize, 1), released);
+}
+
+test "release content defers even its extension until the safe hook" {
+    const Extension = struct {
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: LegacySessionId, _: CloseStep) CloseReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .released;
+        }
+    };
+    var extension: Extension = .{};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.tabs = .empty;
+    var app: ApplicationHost = undefined;
+    app.file_plugin = null;
+    app.file_sources = .empty;
+    app.workspace = &workspace;
+    app.close_extension = .{ .context = &extension, .run = Extension.run };
+    const handle: identity.SessionHandle = .{ .session_id = @fromBackingInt(4) };
+    const key: OperationKey = .{ .owner = .{ .session = handle }, .operation_id = 8 };
+    var mapping: Mapping = .{ .handle = handle, .create_operation = key, .legacy_id = 20, .legacy_generation = 1, .tab_id = @fromBackingInt(2), .owner = .{ .session = handle }, .source = null };
+    try std.testing.expectEqual(CloseReceipt.awaiting, app.runCloseStep(&mapping, key, .release_content, false));
+    try std.testing.expectEqual(@as(usize, 0), extension.calls);
+    try std.testing.expect(!mapping.content_pending);
+    try std.testing.expectEqual(CloseReceipt.released, app.runCloseStep(&mapping, key, .release_content, true));
+    try std.testing.expectEqual(@as(usize, 1), extension.calls);
+}
+
+test "shared application domain routes independent window sessions and preserves sibling on close" {
+    const Provider = struct {
+        queued: ?session.CreateRequest = null,
+        closes: usize = 0,
+        fn create(raw: *anyopaque, request: session.CreateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.queued = request;
+        }
+        fn cancel(_: *anyopaque, _: OperationKey) CloseReceipt {
+            return .released;
+        }
+        fn close(raw: *anyopaque, _: identity.SessionHandle, _: OperationKey) !CloseReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+            return .released;
+        }
+        fn stale(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) void {}
+        fn tick(_: *anyopaque, _: *session.SessionHost) !bool {
+            return false;
+        }
+        fn shutdown(_: *anyopaque) CloseReceipt {
+            return .released;
+        }
+        fn plugin(self: *@This()) FilePlugin {
+            return .{ .adapter = .{ .registration = .{ .plugin_id = .sftp, .workspace_kind = .file, .services = plugins.requiredServices(.sftp) }, .context = self, .vtable = &.{ .create = create, .cancel = cancel, .close = close, .release_stale = stale } }, .context = self, .tick = tick, .shutdown = shutdown };
+        }
+    };
+    const a = std.testing.allocator;
+    const saved: config.Config = .{};
+    var first_workspace: workspace_mod.Workspace = undefined;
+    first_workspace.app_config = &saved;
+    first_workspace.model = .{ .allocator = a, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer first_workspace.model.deinit();
+    first_workspace.shutting_down = false;
+    first_workspace.tabs = .empty;
+    var second_workspace: workspace_mod.Workspace = undefined;
+    second_workspace.app_config = &saved;
+    second_workspace.model = .{ .allocator = a, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer second_workspace.model.deinit();
+    second_workspace.shutting_down = false;
+    second_workspace.tabs = .empty;
+    var first_provider: Provider = .{};
+    var second_provider: Provider = .{};
+    const domain = try Domain.init(a, true);
+    defer domain.deinit();
+    const first = try ApplicationHost.initInDomain(domain, &first_workspace, first_provider.plugin());
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    const second = try ApplicationHost.initInDomain(domain, &second_workspace, second_provider.plugin());
+    defer second.deinit();
+    try std.testing.expect(first.sessions == second.sessions);
+    try std.testing.expect(first.local_adapter == second.local_adapter);
+    try std.testing.expect(first.dispatcher == second.dispatcher);
+    try std.testing.expect(first.windows == second.windows);
+    try std.testing.expect(first.window_id != second.window_id);
+    try std.testing.expect(first.workspace_id != second.workspace_id);
+    const host: hosts.HostConfig = .{ .name = "original target", .host = "test.invalid", .user = "tester", .protocol = .sftp, .connection_id = @fromBackingInt(17), .revision = 1 };
+    var frozen = try WindowConnection.init(a, host, saved, &.{}, 17, 0);
+    defer frozen.deinit();
+    const one = try first.createWindowConnection(&frozen);
+    const two = try second.createWindowConnection(&frozen);
+    try std.testing.expect(!one.handle.eql(two.handle));
+    try std.testing.expectEqual(first.window_id, first_provider.queued.?.target.window_id);
+    try std.testing.expectEqual(second.window_id, second_provider.queued.?.target.window_id);
+    try std.testing.expectEqual(first, domain.ownerForHandle(one.handle).?);
+    try std.testing.expectEqual(second, domain.ownerForHandle(two.handle).?);
+    _ = try domain.sessions.ready(one.handle, one.operation, plugins.requiredServices(.sftp));
+    _ = try domain.sessions.ready(two.handle, two.operation, plugins.requiredServices(.sftp));
+    _ = try domain.sessions.attached(one.handle, .{ .target = first.target(), .tab_id = @fromBackingInt(1) });
+    _ = try domain.sessions.attached(two.handle, .{ .target = second.target(), .tab_id = @fromBackingInt(1) });
+    // Looking through another window uses the same live binding and owner.
+    const binding = first.sessions.queryService(two.handle, .directory).available;
+    try std.testing.expect(second.sessions.bindingIsLive(binding));
+    try std.testing.expect(binding.origin_session.?.eql(two.handle));
+    const closed_window = first.window_id;
+    _ = try first.sessions.requestClose(one.handle, .{});
+    try std.testing.expectEqual(session.Lifecycle.closed, second.sessions.queryState(one.handle).?.lifecycle);
+    try std.testing.expectEqual(@as(usize, 1), first_provider.closes);
+    try std.testing.expectEqual(@as(usize, 0), second_provider.closes);
+    first.deinit();
+    first_live = false;
+    try std.testing.expect(domain.windows.find(closed_window) == null);
+    try std.testing.expect(domain.windows.find(second.window_id) != null);
+    try std.testing.expectEqual(session.Lifecycle.attached, second.sessions.queryState(two.handle).?.lifecycle);
+    try std.testing.expect(second.sessions.bindingIsLive(binding));
+    _ = try second.sessions.requestClose(two.handle, .{});
+    try std.testing.expectEqual(@as(usize, 1), second_provider.closes);
+}
+
+test "shared application journal delivers failure to the original window" {
+    const a = std.testing.allocator;
+    const saved: config.Config = .{};
+    var workspace_a: workspace_mod.Workspace = undefined;
+    workspace_a.app_config = &saved;
+    workspace_a.model = .{ .allocator = a, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace_a.model.deinit();
+    workspace_a.tabs = .empty;
+    var workspace_b: workspace_mod.Workspace = undefined;
+    workspace_b.app_config = &saved;
+    workspace_b.model = .{ .allocator = a, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace_b.model.deinit();
+    workspace_b.tabs = .empty;
+    const domain = try Domain.init(a, false);
+    defer domain.deinit();
+    const one = try ApplicationHost.initInDomain(domain, &workspace_a, null);
+    defer one.deinit();
+    const two = try ApplicationHost.initInDomain(domain, &workspace_b, null);
+    defer two.deinit();
+    // Isolate journal dispatch from native transports: the fixture adapter is
+    // registered on the same shared registry, without creating a view.
+    var context: u8 = 0;
+    const adapter: session.Adapter = .{ .registration = .{ .plugin_id = .ssh, .workspace_kind = .terminal, .services = sshServices() }, .context = &context, .vtable = &.{ .create = ReceiptTestAdapter.create, .cancel = ReceiptTestAdapter.cancel, .close = ReceiptTestAdapter.close, .release_stale = ReceiptTestAdapter.stale } };
+    domain.sessions.deinit();
+    domain.sessions = try session.SessionHost.init(a, &.{adapter});
+    const accepted = try domain.sessions.create(.{ .temporary_ssh = .{ .structured_endpoint = .{ .host = "test.invalid", .user = "tester" } } }, two.target());
+    try two.mappings.append(a, .{ .handle = accepted.handle, .create_operation = accepted.operation, .legacy_id = 1, .legacy_generation = 1, .tab_id = @fromBackingInt(1), .owner = .{ .session = accepted.handle }, .source = null });
+    _ = try domain.sessions.failed(accepted.handle, accepted.operation, .{ .domain = .transport, .code = "test_failure", .safe_message = "second window failure", .cleanup = .released });
+    one.domain.drainJournal();
+    try std.testing.expectEqual(@as(usize, 0), one.mappings.items.len);
+    try std.testing.expect(two.mappings.items[0].failed_received);
+    try std.testing.expectEqualStrings("second window failure", two.mappings.items[0].failure[0..two.mappings.items[0].failure_len]);
+}
+
+test "production creation entries obey removed and replacement Registry contributions" {
+    const Counter = struct {
+        creates: usize = 0,
+        local_payload: bool = false,
+        fn create(raw: *anyopaque, request: session.CreateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.spec == .plugin);
+            self.creates += 1;
+            if (std.mem.eql(u8, request.spec.plugin.protocol_id, "replacement.local")) self.local_payload = std.mem.indexOf(u8, request.spec.plugin.payload, "provider_encoded") != null;
+        }
+        fn cancel(_: *anyopaque, _: OperationKey) CloseReceipt {
+            return .released;
+        }
+        fn close(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) !CloseReceipt {
+            return .released;
+        }
+        fn stale(_: *anyopaque, _: identity.SessionHandle, _: OperationKey) void {}
+        fn validate(_: []const u8) !void {}
+        fn codec(allocator: std.mem.Allocator, value: connection_envelope.Envelope) !connection_envelope.Envelope {
+            return value.clone(allocator);
+        }
+        fn migrate(allocator: std.mem.Allocator, value: connection_envelope.Envelope, _: u32) !connection_envelope.Envelope {
+            return value.clone(allocator);
+        }
+        fn editor(_: ?*anyopaque, _: @import("../../../host/plugin_ui_contract.zig").EditorMount) !@import("../../../host/plugin_ui_contract.zig").EditorInstance {
+            return error.UnusedEditor;
+        }
+        fn encode(allocator: std.mem.Allocator, argument: ?[]const u8) ![]u8 {
+            return std.json.Stringify.valueAlloc(allocator, .{ .provider_encoded = true, .argument = argument }, .{});
+        }
+        fn manifest(self: *@This(), id: []const u8) plugins.PluginManifest {
+            var value: plugins.PluginManifest = .{ .id = id, .display_name = id, .workspace_kind = "terminal", .content_renderer = "terminal", .session_factory = .{ .context = self, .vtable = &.{ .create = create, .cancel = cancel, .close = close, .release_stale = stale } } };
+            if (std.mem.eql(u8, id, "replacement.local")) value.quick_create = .{ .validate_payload = validate, .action_id = "session.local.create", .encode_creation_payload = encode } else value.connection = .{ .editor_factory = .{ .mount = editor }, .create_kind = .saved_or_temporary, .validate_payload = validate, .encode = codec, .decode = codec, .migrate = migrate };
+            return value;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |replaced| {
+        var counter: Counter = .{};
+        const definitions = [_]plugins.PluginManifest{ counter.manifest("replacement.local"), counter.manifest("ssh"), counter.manifest("sftp"), counter.manifest("fixture.replacement") };
+        const domain = try Domain.init(a, false);
+        defer domain.deinit();
+        domain.sessions.deinit();
+        domain.sessions = try session.SessionHost.initPlugins(a, if (replaced) &definitions else &.{}, &.{});
+        var saved: config.Config = .{};
+        var workspace: workspace_mod.Workspace = undefined;
+        workspace.model = .{ .allocator = a, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+        defer workspace.model.deinit();
+        workspace.registry = try hosts.Registry.parse(a, "");
+        defer workspace.registry.deinit();
+        workspace.app_config = &saved;
+        workspace.shutting_down = false;
+        workspace.external_auth = null;
+        workspace.tabs = .empty;
+        workspace.connect_jobs = .empty;
+        const app = try ApplicationHost.initInDomain(domain, &workspace, null);
+        defer app.deinit();
+        const local = try app.createLocalForInput(try app.dispatcher.issue(), "/tmp");
+        try std.testing.expectEqual(replaced, local == .accepted);
+        for ([_]hosts.Protocol{ .ssh, .sftp }) |protocol| {
+            const host: hosts.HostConfig = .{ .connection_id = @fromBackingInt(8), .revision = 2, .protocol = protocol, .name = "frozen", .host = "not-opened.test", .user = "operator" };
+            const decision = try app.createForInput(try app.dispatcher.issue(), host, 8, 0, "");
+            try std.testing.expectEqual(replaced, decision == .accepted);
+        }
+        const unknown: connection_envelope.Envelope = .{ .protocol_id = "fixture.replacement", .name = "unlisted protocol", .payload = "{}" };
+        if (replaced) {
+            _ = try app.openEnvelope(unknown, try app.dispatcher.issue());
+            try std.testing.expectEqual(@as(usize, 4), counter.creates);
+            try std.testing.expect(counter.local_payload);
+        } else {
+            try std.testing.expectError(error.UnknownPlugin, app.openEnvelope(unknown, try app.dispatcher.issue()));
+            // 已链接但被禁用的插件（Q5）：给出“已禁用”而不是“未知插件”，同样不创建任何会话。
+            const saved_launch = app.domain.plugin_launch;
+            defer app.domain.plugin_launch = saved_launch;
+            app.domain.plugin_launch = @import("../../../host/plugin_enablement.zig").Launch.init(&.{.{ .id = "fixture.replacement", .display_name = "Replacement", .plugin_version = "1" }}, .{ .preferences = &.{.{ .plugin_id = "fixture.replacement", .key = "host.enabled", .value = "false" }} });
+            try std.testing.expectError(error.PluginDisabled, app.openEnvelope(unknown, try app.dispatcher.issue()));
+            try std.testing.expectEqual(@as(usize, 0), counter.creates);
+            try std.testing.expectEqual(@as(usize, 0), app.sessions.sessions.items.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), workspace.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), workspace.connect_jobs.items.len);
+    }
+}
+
+test "file create failure without a tab reaches original window once" {
+    const Feedback = struct {
+        calls: usize = 0,
+        owner: ?identity.SessionHandle = null,
+        fn publish(raw: *anyopaque, owner: identity.SessionHandle, message: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.owner = owner;
+            std.testing.expectEqualStrings("连接失败：独立 SFTP 会话暂不支持跳板链（ProxyJumpTransportUnavailable）", message) catch @panic("incorrect failure");
+        }
+        fn tick(_: *anyopaque, _: *session.SessionHost) !bool {
+            return false;
+        }
+        fn shutdown(_: *anyopaque) CloseReceipt {
+            return .released;
+        }
+    };
+    var feedback: Feedback = .{};
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.model = .{ .allocator = std.testing.allocator, .window = @fromBackingInt(0), .workspace = @fromBackingInt(0) };
+    defer workspace.model.deinit();
+    workspace.session_bridge = .{};
+    workspace.close_bridge = .{};
+    workspace.window_close_bridge = .{};
+    workspace.shutting_down = false;
+    var global: config.Config = .{};
+    workspace.app_config = &global;
+    workspace.registry.hosts = &.{};
+    const adapter: session.Adapter = .{ .registration = .{ .plugin_id = .sftp, .workspace_kind = .file, .services = plugins.requiredServices(.sftp) }, .context = &feedback, .vtable = &.{ .create = ReceiptTestAdapter.create, .cancel = ReceiptTestAdapter.cancel, .close = ReceiptTestAdapter.close, .release_stale = ReceiptTestAdapter.stale } };
+    const app = try ApplicationHost.initWithFilePlugin(std.testing.allocator, &workspace, .{ .adapter = adapter, .context = &feedback, .tick = Feedback.tick, .shutdown = Feedback.shutdown });
+    defer app.deinit();
+    app.file_failure = .{ .context = &feedback, .publish = Feedback.publish };
+    const accepted = try app.create(.{ .connection_id = @fromBackingInt(19), .revision = 7, .protocol = .sftp, .name = "Route Files", .host = "test.invalid", .user = "operator" }, 91, 4, "");
+    try std.testing.expectEqual(@as(usize, 0), app.mappings.items.len);
+    const failure: @import("../../../host/operation.zig").Failure = .{ .domain = .plugin, .code = "ProxyJumpTransportUnavailable", .cleanup = .released, .safe_message = "SFTP 文件会话启动失败" };
+    try std.testing.expect(try app.sessions.failed(accepted.handle, accepted.operation, failure));
+    app.domain.drainJournal();
+    try std.testing.expectEqual(@as(usize, 1), feedback.calls);
+    try std.testing.expect(feedback.owner.?.eql(accepted.handle));
+    app.publishFileCreateFailure(accepted.operation, failure);
+    var stale = accepted.operation;
+    stale.operation_id += 1;
+    app.publishFileCreateFailure(stale, failure);
+    try std.testing.expectEqual(@as(usize, 1), feedback.calls);
+}
+
+test "running SSH scrollback follows host edits and restored global inheritance by stable identity" {
+    const a = std.testing.allocator;
+    var registry = try hosts.Registry.parse(a, "[[hosts]]\nname=\"same\"\nhost=\"one\"\nuser=\"u\"\n");
+    defer registry.deinit();
+    const source = registry.hosts[0];
+    try std.testing.expectEqual(@as(u32, 25000), currentScrollbackLimit(&registry, source, 25000));
+    registry.hosts[0].revision += 1;
+    registry.hosts[0].scrollback = 128;
+    registry.hosts[0].scrollback_explicit = true;
+    try std.testing.expectEqual(@as(u32, 128), currentScrollbackLimit(&registry, source, 25000));
+    try std.testing.expectEqual(@as(u32, 128), currentScrollbackLimit(&registry, source, 40000));
+    registry.hosts[0].scrollback = 0;
+    try std.testing.expectEqual(@as(u32, 0), currentScrollbackLimit(&registry, source, 40000));
+    registry.hosts[0].scrollback = 25000;
+    registry.hosts[0].scrollback_explicit = false;
+    try std.testing.expectEqual(@as(u32, 40000), currentScrollbackLimit(&registry, source, 40000));
+    try std.testing.expectEqual(@as(u32, 0), currentScrollbackLimit(&registry, source, 0));
+}
+
+test "tab new window freezes source after its saved host is removed" {
+    const a = std.testing.allocator;
+    const owner: identity.SessionHandle = .{ .session_id = @fromBackingInt(71) };
+    const key: OperationKey = .{ .owner = .{ .session = owner }, .operation_id = 1 };
+    const target: hosts.HostConfig = .{ .connection_id = @fromBackingInt(17), .revision = 1, .name = "original", .host = "original.invalid", .user = "tester" };
+    var source = try freezeSource(a, target, .{}, &.{}, 17, 0, "");
+    defer source.deinit();
+    var workspace: workspace_mod.Workspace = undefined;
+    workspace.shutting_down = false;
+    // No registry access is valid here: the source tab may outlive its asset.
+    var app: ApplicationHost = undefined;
+    app.allocator = a;
+    app.workspace = &workspace;
+    app.window_close = null;
+    app.mappings = .empty;
+    defer app.mappings.deinit(a);
+    try app.mappings.append(a, .{ .handle = owner, .create_operation = key, .legacy_id = 41, .legacy_generation = 1, .tab_id = @fromBackingInt(8), .owner = .{ .session = owner }, .source = source });
+    var frozen = try app.freezeTabWindowConnection(41);
+    defer frozen.deinit();
+    try std.testing.expectEqualStrings("original.invalid", frozen.remote.?.value.host.host);
+    try std.testing.expectEqualStrings("tester", frozen.remote.?.value.host.user);
+    try std.testing.expectEqual(@as(u64, 17), frozen.remote.?.value.host_id);
+    try std.testing.expectError(error.StaleSession, app.freezeTabWindowConnection(42));
+}
+
+test {
+    _ = @import("../../../ai/ssh_bootstrap_product.zig");
+    _ = @import("../../../host/runtime_service.zig");
+    _ = @import("../../../plugins/ssh/terminal_service.zig");
+}
+
+test "repeated close retries the original unknown step and resumes safe polling" {
+    const Extension = struct {
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: LegacySessionId, step: CloseStep) CloseReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(step == .stop_ai);
+            self.calls += 1;
+            return .awaiting;
+        }
+    };
+    var extension: Extension = .{};
+    var app: ApplicationHost = undefined;
+    app.close_extension = .{ .context = &extension, .run = Extension.run };
+    const handle: identity.SessionHandle = .{ .session_id = @fromBackingInt(4) };
+    const key: OperationKey = .{ .owner = .{ .session = handle }, .operation_id = 8 };
+    var mapping: Mapping = .{ .handle = handle, .create_operation = key, .legacy_id = 20, .legacy_generation = 1, .tab_id = @fromBackingInt(2), .owner = .{ .session = handle }, .source = null, .waiting = .{ .key = key, .step = .stop_ai, .unknown = true } };
+    try app.retryUnknownClose(&mapping);
+    try std.testing.expectEqual(@as(usize, 1), extension.calls);
+    try std.testing.expect(mapping.waiting.?.key.eql(key));
+    try std.testing.expect(mapping.waiting.?.step == .stop_ai and !mapping.waiting.?.unknown);
+    try app.retryUnknownClose(&mapping);
+    try std.testing.expectEqual(@as(usize, 1), extension.calls);
+}
+
+/// The contribution codec, rather than a public consumer, understands secret refs.
+fn resolveCredentialReferences(raw: *const anyopaque, protocol_id: []const u8, payload_version: u32) ?@import("../../../config/plugin_credential_references.zig").Enumerator {
+    const registry: *const plugins.Registry = @ptrCast(@alignCast(raw));
+    const connection = (registry.find(protocol_id) orelse return null).connection orelse return null;
+    if (connection.payload_version != payload_version) return null;
+    return connection.credential_references;
+}

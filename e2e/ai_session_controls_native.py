@@ -8,12 +8,17 @@ Uses a loopback provider and an isolated Local session. No saved user data,
 remote connection, real model account or shell business command is used.
 """
 import argparse, http.server, json, os, pathlib, shutil, subprocess, tempfile, threading, time, uuid
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py).
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--prefix',required=True,help='Output prefix of the explicit test-mode build')
 parser.add_argument('--out',required=True,help='Evidence directory')
 args=parser.parse_args()
 root=pathlib.Path(__file__).resolve().parent.parent
 prefix=pathlib.Path(args.prefix).resolve()
+build_mode_guard.assert_test_mode_binary(prefix/'bin/zerowork')
 iso=pathlib.Path(tempfile.mkdtemp(prefix='zerowork-ai-session-check-')).resolve()
 out=pathlib.Path(args.out).resolve();out.mkdir(parents=True,exist_ok=True)
 rpc_dir=iso/'rpc';data=iso/'data';zdot=iso/'zdot'
@@ -103,7 +108,7 @@ try:
  rpc('/resize',{'width':1440,'height':1000})
  print('phase: native app ready',flush=True)
  click('workspace.empty.local');visible('terminal.surface');time.sleep(1)
- click('toolbar.ai');click('ai.prompt');text('FIRST_LINE');key('return',shift=True);text('第二行')
+ click('ai.launcher');click('ai.prompt');text('FIRST_LINE');key('return',shift=True);text('第二行')
  assert rpc('/input_state',{'test_id':'ai.prompt'})['buffer']=='FIRST_LINE\n第二行'
  assert len(requests)==0
  shot('multiline-composer.png');key('return')
@@ -112,7 +117,7 @@ try:
  print('phase: multiline submit passed',flush=True)
  report['multiline']='Shift+Return inserts one newline without submitting; Return sends both lines'
  click('ai.collapse');click('terminal.input');text('@');visible('terminal.commands');text('grp SessionFix');key('right');time.sleep(.1);key('return');visible('groups.workspace')
- click('toolbar.ai');click('ai.prompt');text('GROUP_REASONING_TEST');key('return')
+ click('ai.launcher');click('ai.prompt');text('GROUP_REASONING_TEST');key('return')
  print('phase: group message submitted',flush=True)
  wait(group_started.is_set)
  click('ai.composer.model');click('ai.effort.slider.track');key('end')

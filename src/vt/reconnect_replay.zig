@@ -118,6 +118,20 @@ pub const Replay = struct {
         return self.phase != .closed and self.phase != .ended and (self.phase == .active or self.enabled);
     }
 
+    /// Native input can arrive after the connected view is published but
+    /// before the IO owner drains startup bytes and opens admission. Report
+    /// backpressure so that the view keeps its original input order.
+    pub fn requireActive(self: *Replay) !void {
+        self.lock();
+        defer self.unlock();
+        switch (self.phase) {
+            .active => {},
+            .awaiting_attach => return error.WorkerBusy,
+            .disconnected => return error.DisconnectedApplicationInput,
+            .ended, .closed => return error.SessionClosed,
+        }
+    }
+
     fn observeLocked(self: *Replay, queue: *const InputQueue) void {
         const read = queue.read_index.load(.acquire);
         var retired: usize = 0;

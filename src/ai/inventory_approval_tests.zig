@@ -4,7 +4,7 @@ const inventory = @import("inventory_grants.zig");
 const host = @import("host_tools.zig");
 const identity = @import("../host/identity.zig");
 fn context() host.Context {
-    return .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 2 };
+    return .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 4 }, .content = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 2 };
 }
 fn selection() !inventory.Selection {
     return inventory.captureSelection(std.testing.allocator, &.{.{ .session_id = @fromBackingInt(4), .generation = 1 }}, &.{});

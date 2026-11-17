@@ -310,9 +310,9 @@ pub fn encodeTarget(target: notifications.Target) !RawTarget {
             raw.owner_id = @backingInt(owner.id);
             raw.owner_revision = owner.revision;
         },
-        .history => |owner| {
+        .card => |owner| {
             raw.owner_kind = 3;
-            raw.owner_id = @backingInt(owner);
+            raw.owner_id = owner.pack();
         },
     }
     _ = try decodeTarget(raw);
@@ -325,7 +325,7 @@ pub fn decodeTarget(raw: RawTarget) !notifications.Target {
     const owner: notifications.Owner = switch (raw.owner_kind) {
         1 => if (raw.owner_revision != 0) .{ .session = .{ .session_id = @fromBackingInt(raw.owner_id), .generation = raw.owner_revision } } else return error.InvalidNotificationIdentity,
         2 => if (raw.owner_revision != 0) .{ .group = .{ .id = @fromBackingInt(raw.owner_id), .revision = raw.owner_revision } } else return error.InvalidNotificationIdentity,
-        3 => if (raw.owner_revision == 0) .{ .history = @fromBackingInt(raw.owner_id) } else return error.InvalidNotificationIdentity,
+        3 => if (raw.owner_revision == 0 and @FieldType(notifications.Owner, "card").unpack(raw.owner_id).valid()) .{ .card = @FieldType(notifications.Owner, "card").unpack(raw.owner_id) } else return error.InvalidNotificationIdentity,
         else => return error.InvalidNotificationIdentity,
     };
     return .{

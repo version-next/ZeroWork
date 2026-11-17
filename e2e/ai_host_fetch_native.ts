@@ -1,11 +1,14 @@
 /** Complete App host.fetch_url acceptance. The SSE fixture emits only the real
  * registered fetch tool. No user config, proxy bypass, SSH or remote model. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,open,realpath,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {execFileSync} from 'node:child_process';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-patch-integrated');
 const binary=resolve(process.env.ZW_AI_TEST_BINARY??join(prefix,'bin/zerowork'));
@@ -38,7 +41,7 @@ const checkUnsent=(envelope:any)=>{
 const server=createServer(async(req,res)=>{
  try{
   if(req.method!=='POST'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'host-fetch-fixture'}]}));return;}
-  let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw),stage=stageOf(body);
+  const raw=await readRequestText(req);const body=JSON.parse(raw),stage=stageOf(body);
   const current=body.messages.slice(body.messages.findLastIndex((m:any)=>m.role==='user')+1),result=current.find((m:any)=>m.role==='tool'&&m.tool_call_id===callId(stage));
   const definition=body.tools?.find((tool:any)=>tool.function.name==='host__fetch_uurl');assert(definition,'host.fetch_url must be advertised by the production catalog');
   assert.deepEqual(Object.keys(definition.function.parameters.properties),['url']);assert.deepEqual(definition.function.parameters.required,['url']);assert.equal(definition.function.parameters.additionalProperties,false);
@@ -94,7 +97,7 @@ try{
  // Inspect the actual local proxy state without changing it. This test is
  // intentionally specific to the current required production proxy boundary.
  const proxy=execFileSync('/usr/sbin/scutil',['--proxy'],{encoding:'utf8'});assert(/HTTPSEnable\s*:\s*1/.test(proxy),'this acceptance case requires the configured HTTPS proxy');report.system_https_proxy_enabled=true;
- await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');
+ await h.resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');
  await send('REJECT');await pending();await h.resizeWindow(860,480);
  await h.waitFor(async()=>{const node=(await h.query('ai.panel')).find(shown);return node&&node.rect.x+node.rect.w<=860.5&&node.rect.y+node.rect.h<=480.5?true:null;},10000);
  const panel=await visible('ai.panel'),viewport=await visible('ai.conversation.viewport'),bar=await visible('ai.host_approval.address_bar'),accept=await visible('ai.host_approval.accept'),reject=await visible('ai.host_approval.reject');
@@ -134,6 +137,6 @@ try{
  assert.equal(fixtureFailure,null);assert.deepEqual(requests.flatMap(request=>request.tool_calls).map(call=>call.name).filter((value,index,all)=>all.indexOf(value)===index),['host__fetch_uurl']);
  const events=await traceEvents();assert(!events.some(event=>event.event==='exec_started'),'fetch must never dispatch the terminal command backend');
  report.status='passed';report.requests=requests;report.observations=observations;
-}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;report.requests=requests;report.observations=observations;process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree(),null,2)).catch(()=>{});}
+}catch(error){report.status='failed';report.error=String(error);report.fixture_failure=fixtureFailure;report.requests=requests;report.observations=observations;process.exitCode=1;await capture('failure').catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2)).catch(()=>{});}
 finally{background?.destroy();if(app.exitCode===null&&app.signalCode===null)app.kill('SIGTERM');await ended;server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));await log.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));await rm(iso,{recursive:true,force:true});}
 console.log(JSON.stringify(report,null,2));

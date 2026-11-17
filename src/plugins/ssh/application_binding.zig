@@ -33,6 +33,7 @@ pub fn Binding(comptime Host: type) type {
                 mapping.cleanup_unknown_received = false;
                 mapping.runtime_loss_received = false;
                 mapping.failure_len = 0;
+                self.mappingsChanged();
                 return;
             };
             const source = if (self.pending_source) |source| source.value else blk: {
@@ -62,6 +63,7 @@ pub fn Binding(comptime Host: type) type {
             const id = try self.workspace.createSessionDirectForOperation(frozen.value.host, frozen.value.host_id, frozen.value.source_index, frozen.value.initial_input, request.key);
             const tab = self.workspace.sessionTab(id) orelse unreachable;
             self.mappings.appendAssumeCapacity(.{ .handle = request.handle, .create_operation = request.key, .legacy_id = id, .legacy_generation = tab.generation, .tab_id = tab.tab_id, .owner = tab.content_owner, .source = frozen });
+            self.mappingsChanged();
             const mapping = &self.mappings.items[self.mappings.items.len - 1];
             // Once the tab/job exists, failures use receipts rather than throwing a
             // factory error that would incorrectly claim no resource was acquired.
@@ -70,7 +72,10 @@ pub fn Binding(comptime Host: type) type {
                 self.workspace.cancelSessionCreation(id);
                 return;
             };
-            mapping.owner = .{ .session = request.handle };
+            if (!mapping.owner.eql(.{ .session = request.handle })) {
+                mapping.owner = .{ .session = request.handle };
+                self.mappingsChanged();
+            }
         }
 
         fn adapterCancel(context: *anyopaque, key: OperationKey) CloseReceipt {

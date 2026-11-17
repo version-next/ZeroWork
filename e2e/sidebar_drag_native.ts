@@ -1,4 +1,5 @@
 /** Real pointer drag, atomic saved order/group changes and restart restoration. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,writeFile,readFile,open} from 'node:fs/promises';
@@ -22,7 +23,7 @@ const row=async(name:string)=> await h.waitFor(async()=> (await rows()).find(n=>
 const group=async(name:string)=> await h.waitFor(async()=> (await h.query('sidebar.group')).filter(shown).find(n=>text(n).includes(name))??null,10000);
 const order=async()=> (await rows()).map(n=>names.find(name=>text(n).includes(name)));
 const expectOrder=async(expected:string[])=>h.waitFor(async()=>JSON.stringify(await order())===JSON.stringify(expected)||null,10000);
-const capture=async(name:string)=>{assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.tree(),null,2));report.captures.push(name);};
+const capture=async(name:string)=>{assert((await h.screenshot(join(out,name+'.png'))).ok);await writeFile(join(out,name+'.json'),JSON.stringify(await h.tree({visibleOnly:true}),null,2));report.captures.push(name);};
 async function begin(name:string){const n=await row(name),x=n.rect.x+45,y=n.rect.y+n.rect.h/2;assert((await h.mouseDown(x,y)).ok);assert((await h.mouseMove(x+7,y)).ok);}
 async function drop(name:string,target:()=>Promise<any>,after=false,cancel=false){
  await begin(name);const n=await target(),x=n.rect.x+55,y=n.rect.y+n.rect.h*(after?.8:.2);assert((await h.mouseMove(x,y)).ok);
@@ -30,7 +31,7 @@ async function drop(name:string,target:()=>Promise<any>,after=false,cancel=false
  await capture(cancel?'cancel-drag':'drop-'+name+'-'+report.captures.length);
  if(cancel)await h.key('escape');assert((await h.mouseUp(x,y)).ok);
  await h.waitFor(async()=>!(await h.query('sidebar.drop_hint')).some(shown)||null,10000);
- assert(!(await h.query('tabs.tab')).some(shown),'drag must not create a connection');
+ assert(!(await h.query('tabs.title')).some(shown),'drag must not create a connection'); // 每个页签一个 tabs.title（页签节点自身是 tabs.tab.<id>）
 }
 async function launch(round:number,run:()=>Promise<void>){
  const rpc=join(isolated,'rpc-'+round);await mkdir(rpc);process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
@@ -54,7 +55,7 @@ try{
   const before=await readFile(join(data,'hosts.toml'),'utf8');
   await drop('Delta',()=>group('Empty group'),false,true);assert.equal(await readFile(join(data,'hosts.toml'),'utf8'),before);report.checks.push('Escape cancels without saving');
   await begin('Echo');await h.mouseMove(1000,700);await h.mouseUp(1000,700);assert.equal(await readFile(join(data,'hosts.toml'),'utf8'),before);report.checks.push('outside drop leaves configuration intact');
-  await h.clickTestId('sidebar.search.toggle');await h.waitFor(async()=>(await h.query('sidebar.search')).some(shown)||null);await h.type_('a');
+  /* Island B v3（e1372d88）：搜索框常驻在侧栏头部下方，头部的搜索开关 sidebar.search.toggle 已移除 */await h.waitFor(async()=>(await h.query('sidebar.search')).some(shown)||null);await h.clickTestId('sidebar.search');await h.type_('a');
   await expectOrder(['Beta','Delta','Gamma','Alpha']);
   await drop('Gamma',()=>row('Delta'));await expectOrder(['Beta','Gamma','Delta','Alpha']);
   await h.clickTestId('sidebar.search.clear');await expectOrder(['Beta','Gamma','Delta','Echo','Alpha']);

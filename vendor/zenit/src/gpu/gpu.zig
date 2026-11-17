@@ -10,6 +10,15 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const rhi = @import("rhi.zig");
+/// Glass pass trace (metal/glass_trace.zig; docs/WEB_GLASS_DESIGN.md P0).
+pub const glass_trace = if (backend_kind == .metal) @import("metal/glass_trace.zig") else if (backend_kind == .record) Backend.glass_events else struct {
+    pub fn enter(_: u32, _: [4]f32) void {}
+    pub fn leave() void {}
+    pub fn onComposite(_: anytype, _: f32, _: f32, _: [4]f32, _: [4]f32, _: [4]f32, _: [6]f32, _: f32, _: f32, _: u32, _: bool, _: [4]f32) void {}
+    pub fn active() bool {
+        return false;
+    }
+};
 pub const DriverInfo = @import("driver_info.zig").DriverInfo;
 pub const driver_bugs = @import("driver_bugs.zig");
 pub const DriverBugs = driver_bugs.DriverBugs;
@@ -26,7 +35,7 @@ pub const backend_contract = @import("backend_contract.zig");
 /// deterministic reference, **falsify abstraction**: only second implementation
 /// truly compiling confirms `Backend.*` backend-neutral, Metal semantics not
 /// baked in.
-pub const BackendKind = enum { metal, null_backend, d3d12, d3d11, vulkan, opengl };
+pub const BackendKind = enum { metal, null_backend, d3d12, d3d11, vulkan, opengl, record };
 
 /// Selected backend kind.
 ///
@@ -37,6 +46,8 @@ pub const backend_kind: BackendKind = blk: {
     const opts = @import("build_options");
     if (@hasDecl(opts, "gpu_backend")) {
         if (std.mem.eql(u8, opts.gpu_backend, "null")) break :blk .null_backend;
+        // Web: the renderer's GPU work as a command stream the browser replays.
+        if (std.mem.eql(u8, opts.gpu_backend, "record")) break :blk .record;
         if (std.mem.eql(u8, opts.gpu_backend, "metal")) break :blk .metal;
         if (std.mem.eql(u8, opts.gpu_backend, "d3d12")) {
             if (builtin.target.os.tag != .windows) @compileError("D3D12 backend requires Windows");
@@ -79,6 +90,7 @@ pub const is_direct3d = backend_kind == .d3d12 or backend_kind == .d3d11;
 pub const Backend = switch (backend_kind) {
     .metal => @import("metal/backend.zig"),
     .null_backend => @import("null/backend.zig"),
+    .record => @import("record/backend.zig"),
     .d3d12, .d3d11 => @import("d3d12/renderer_device.zig"),
     .vulkan => @import("vulkan/renderer_device.zig"),
     .opengl => @import("opengl/renderer_device.zig"),
@@ -88,6 +100,30 @@ pub const Backend = switch (backend_kind) {
 // names specifically, not deferred undefined at instantiation.
 comptime {
     backend_contract.verify(Backend, @tagName(backend_kind));
+}
+
+/// Diagnostic GPU pass attribution (ZENIT_GPU_PASS_TIMING=1 on Metal): the
+/// tag current when a render pass begins labels that pass's GPU time in the
+/// perf trace. The app renderer installs the hook; without it this is a no-op.
+pub const PassTag = enum(u32) {
+    other = 0,
+    glass_restore,
+    glass_capture,
+    glass_kawase,
+    glass_luminance,
+    glass_quarter,
+    glass_eighth,
+    glass_gauss_main,
+    glass_gauss_alt,
+    glass_gauss_fine,
+    glass_ambient_half,
+    glass_ambient_gauss,
+    glass_composite,
+    glass_fallback,
+};
+pub var pass_tag_hook: ?*const fn (u32) callconv(.c) void = null;
+pub fn setPassTag(tag: PassTag) void {
+    if (pass_tag_hook) |hook| hook(@backingInt(tag));
 }
 
 // Core Types (main entry points like wgpu)
@@ -303,6 +339,15 @@ pub const TextureMemory = enum {
     host_upload,
 };
 
+/// CPU access pattern of a `host_upload` texture. `write_only` promises the
+/// CPU never reads it back (no readBgra8, getBytes or CPU rasterizer reads):
+/// Metal then maps it write-combined, which makes uploads cheaper and CPU
+/// reads very slow. Ignored for `device_local`.
+pub const HostAccess = enum {
+    read_write,
+    write_only,
+};
+
 /// Texture view dimension.
 pub const TextureViewDimension = enum {
     @"1d",
@@ -326,6 +371,9 @@ pub const TextureUsages = packed struct(u32) {
 /// Buffer usage flags.
 pub const BufferUsages = packed struct(u32) {
     map_read: bool = false,
+    /// CPU-writable. Without `map_read` the CPU must only write the mapping:
+    /// Metal maps such buffers write-combined (reads stay correct but uncached
+    /// and slow). Set `map_read` for any buffer the CPU reads back.
     map_write: bool = false,
     copy_src: bool = false,
     copy_dst: bool = false,
@@ -608,6 +656,12 @@ pub const TextureDescriptor = struct {
     format: TextureFormat,
     usage: TextureUsages,
     memory: TextureMemory = .device_local,
+    host_access: HostAccess = .read_write,
+    /// Pixel formats other than `format` this texture will be viewed or
+    /// reinterpreted as (WebGPU `viewFormats`). Leave empty unless a view in a
+    /// different format is really created: on Metal a foreign entry adds
+    /// MTLTextureUsagePixelFormatView, which disables lossless compression of
+    /// Private render targets. D3D12 rejects foreign entries.
     view_formats: []const TextureFormat = &.{},
 };
 
@@ -961,6 +1015,7 @@ test {
     //
     // Without explicit references, resource_pool / bind_group / conv tests (including key
     // invariants like ABA, epoch retirement) never ran.
+    _ = driver_bugs; // Required portable driver-rule regressions (not just type re-exports).
     _ = rhi;
     _ = backend_contract;
     _ = resource_pool;
@@ -971,6 +1026,7 @@ test {
     if (backend_kind == .metal) {
         _ = @import("metal/bind_group.zig");
         _ = @import("metal/conv.zig");
+        _ = @import("metal/surface.zig");
     }
 }
 
@@ -982,6 +1038,7 @@ test "both backends satisfy the renderer contract" {
     // body itself needs no runtime assertions.
     backend_contract.verify(@import("metal/backend.zig"), "metal");
     backend_contract.verify(@import("null/backend.zig"), "null");
+    backend_contract.verify(@import("record/backend.zig"), "record");
 }
 
 test "backend selection is compile-time and matches the built backend" {
@@ -994,6 +1051,7 @@ test "backend selection is compile-time and matches the built backend" {
         .d3d12, .d3d11 => try std.testing.expect(Backend == @import("d3d12/renderer_device.zig")),
         .vulkan => try std.testing.expect(Backend == @import("vulkan/renderer_device.zig")),
         .opengl => try std.testing.expect(Backend == @import("opengl/renderer_device.zig")),
+        .record => try std.testing.expect(Backend == @import("record/backend.zig")),
     }
 }
 

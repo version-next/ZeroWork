@@ -3,6 +3,7 @@
  * loopback only; local writes remain in this run's private temporary directory.
  * No synthetic Snapshot, injected transfer JobSpec, VM or remote mutation.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";

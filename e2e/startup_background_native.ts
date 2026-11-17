@@ -1,9 +1,12 @@
 /** Native startup checks with disposable data; a FIFO models slow image IO. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, rm, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {decodePng} from '../vendor/zenit/e2e/png.ts';
+import {settingsNav} from './settings_nav.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 
 const binary = resolve(process.argv[2] ?? 'zig-out/bin/zerowork');
@@ -74,16 +77,21 @@ for (const scenario of ['ready', 'missing', 'disabled', 'slow', 'timeout']) {
         assert((await h.query('workspace.shell')).some(shown));
         assert((await h.screenshot(join(out, `${scenario}-workspace.png`))).ok);
         if (scenario === 'ready' || scenario === 'slow') {
-            const brightness = Number(execFileSync('python3', ['-c', 'from PIL import Image\nimport sys\nim=Image.open(sys.argv[1]).convert("RGB")\nprint(sum(im.getpixel((im.width-100,im.height//2)))/3)', join(out, `${scenario}-workspace.png`)], {encoding:'utf8'}));
+            const {width, height, channels, pixels} = decodePng(join(out, `${scenario}-workspace.png`));
+            const offset = (Math.floor(height / 2) * width + width - 100) * channels;
+            const brightness = (pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) / 3;
             assert(brightness > 60, 'workspace was revealed before the white background painted');
         }
         if (scenario === 'disabled') assert.equal((await h.query('startup.overlay')).length, 0);
         // A completed splash must remain hidden after late resource completion.
         if (writer) {await writerEnded; await h.sleep(250); assert(!(await h.query('startup.overlay')).some(shown));}
         if (scenario === 'ready') {
-            assert((await h.clickTestId('toolbar.settings')).ok);
-            assert((await h.clickTestId('settings.nav.appearance')).ok);
+            // Two-level settings (settings_nav.ts): 外观与主题 › 主题 holds the materials pane with the background state.
+            const nav = settingsNav();
+            await nav.toPane('settings.appearance.materials');
             await h.waitFor(async () => (await h.query('settings.background.state')).some(n => n.text?.includes('2.png')) || null, 5000);
+            // The preferences window is its own window: close it (Cmd+W) so /quit below quits the app instead of closing it.
+            await nav.close();
         }
         assert.equal(await readFile(join(data, 'config.toml'), 'utf8'), config);
         assert((await h.request('POST', '/quit')).ok);
@@ -101,5 +109,6 @@ for (const scenario of ['ready', 'missing', 'disabled', 'slow', 'timeout']) {
         await rm(iso, {recursive:true, force:true});
     }
 }
-await writeFile(join(out, 'native-report.json'), JSON.stringify(reports, null, 2));
+// run.ts reads the verdict from a report's `status` (a bare array read as status=none); every scenario passed to get here.
+await writeFile(join(out, 'native-report.json'), JSON.stringify({status: 'passed', scenarios: reports}, null, 2));
 console.log(JSON.stringify(reports));

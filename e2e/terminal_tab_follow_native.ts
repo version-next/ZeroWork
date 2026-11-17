@@ -1,4 +1,5 @@
 /** Live output keeps the current bottom as the wheel origin after switching tabs. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, realpath, rm, writeFile} from 'node:fs/promises';
@@ -39,6 +40,20 @@ async function lastLine() { return (await rows()).at(-1)?.line ?? -1; }
 async function wheel(delta: number) {
   const n = await visible('terminal.surface');
   assert((await h.scrollAt(n.rect.x + n.rect.w * .6, n.rect.y + n.rect.h * .5, 0, delta)).ok);
+}
+/** Ctrl-C reaches the foreground program: its live output stops advancing. */
+async function interrupt(label: string) {
+  await h.key('c', {ctrl: true});
+  await h.waitFor(async () => { const a = await lastLine(); await h.sleep(400); return (await lastLine()) === a || null; }, 5000)
+    .catch(() => { throw new Error(`${label}: Ctrl-C did not interrupt the program producing live output`); });
+}
+/** The session of this tab has ended: the strip marks it 已退出 and its ended banner is shown. */
+async function sessionEnded(tab: string) {
+  await h.waitFor(async () => {
+    const node = (await h.query(tab)).find(shown);
+    const ended = node && flat(node).some((x: any) => /已退出/.test(x.text ?? ''));
+    return ended && (await h.query('local.ended.close')).some(shown) || null;
+  }, 15000).catch(() => { throw new Error(`${tab}: session did not end after exit`); });
 }
 async function capture(name: string) {
   const path = join(out, name + '.png');
@@ -85,10 +100,48 @@ try {
   await h.waitFor(async () => (await lastLine()) > resumed + 10 || null, 15000);
   await capture('resumed-following');
   report.checks.push('Returning to the bottom resumes following continuous output');
-  await click('terminal.surface'); await h.key('c', {ctrl: true}); await h.sleep(150);
-  await h.type_('exit'); await h.key('return'); await visible('local.ended.close');
-  await click('tabs.tab.2'); await click('terminal.surface'); await h.type_('exit'); await h.key('return');
-  await visible('local.ended.close');
+  // Ending both sessions. Each step asserts its own observable contract, so a failure names the
+  // broken link (interrupt not delivered / session not ended) instead of a generic close timeout.
+  await click('terminal.surface');
+  await interrupt('tab 1');
+  await h.type_('exit'); await h.key('return');
+  await sessionEnded('tabs.tab.1');
+  await click('tabs.tab.2'); await click('terminal.surface');
+  await h.type_('exit'); await h.key('return');
+  await sessionEnded('tabs.tab.2');
+  report.checks.push('Ctrl-C interrupts live output and exit ends each Local session (banner and tab state)');
+  // Optional regression (ZW_TTF_CTRLC_ROUNDS=N, not in the default batch): Ctrl-C, text and Return
+  // typed into a tab that is producing live output must every time reach the PTY. A raw-mode reader
+  // echoes each byte it receives as "GOT:<hex>", so a dropped key is observed directly, per round.
+  const rounds = Number(process.env.ZW_TTF_CTRLC_ROUNDS ?? 0);
+  if (rounds > 0) {
+    await click('toolbar.new_session'); await click('session.menu.local'); await visible('tabs.tab.3');
+    await click('terminal.surface'); await h.sleep(800);
+    await h.type_("/usr/bin/perl -e 'use IO::Select; system(\"stty raw -echo\"); $|=1; $s=IO::Select->new(\\*STDIN); for $i (0..1000000){ printf \"TAB-LIVE-%06d\\r\\n\",$i; while($s->can_read(0)){ sysread(STDIN,$b,64); printf \"GOT:%s\\r\\n\", unpack(\"H*\",$b);} select undef,undef,undef,0.015 }'");
+    await h.key('return'); await h.waitFor(async () => (await lastLine()) >= 30 || null, 15000);
+    await click('toolbar.new_session'); await click('session.menu.local'); await visible('tabs.tab.4');
+    const received = new Set<string>();
+    const collect = async () => {
+      const surface = (await h.query('terminal.surface')).find(shown);
+      for (const t of surface ? flat(surface).map((x: any) => x.text ?? '') : []) { const m = /^GOT:([0-9a-f]+)$/.exec(t); if (m) received.add(m[1]); }
+    };
+    const misses: any[] = [];
+    for (let k = 0; k < rounds; k++) {
+      // Leave and return to the producing tab (the original failure path), then type into it.
+      await click('tabs.tab.4'); await h.sleep(k % 5 * 60); await click('tabs.tab.3');
+      const before = await lastLine(); await h.waitFor(async () => (await lastLine()) > before || null, 5000);
+      await click('terminal.surface');
+      const a = String.fromCharCode(0x61 + k % 26), b = String.fromCharCode(0x61 + (k + 7) % 26);
+      const want = {ctrlc: '03', text: Buffer.from(a + b).toString('hex'), ret: '0d'};
+      received.clear();
+      await h.key('c', {ctrl: true}); await h.type_(a + b); await h.key('return');
+      const all = await h.waitFor(async () => { await collect(); const v = [...received].join(' '); return Object.values(want).every(x => v.includes(x)) ? v : null; }, 3000).catch(async () => { await collect(); return null; });
+      if (all === null) { misses.push({round: k, want, received: [...received]}); await capture(`ctrlc-round-${k}-missing`).catch(() => {}); }
+    }
+    report.ctrlc_rounds = {rounds, misses};
+    assert.equal(misses.length, 0, `keys typed into a live-output tab never reached the PTY: ${JSON.stringify(misses)}`);
+    report.checks.push(`Ctrl-C, text and Return reach the PTY of a live-output tab in all ${rounds} rounds`);
+  }
   report.status = 'passed';
 } catch (error) {
   report.status = 'failed'; report.error = String(error); process.exitCode = 1;

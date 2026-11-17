@@ -88,7 +88,11 @@ pub const Reader = struct {
     }
 
     fn run(self: *Reader) void {
-        defer self.done.store(true, .release);
+        defer {
+            self.done.store(true, .release);
+            // The owner polls readers in its pass; a reader has no window of its own yet.
+            @import("../ai/publication.zig").publishAll();
+        }
         var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
         defer threaded.deinit();
         self.result = capture(self.allocator, threaded.io(), self.path, &self.cancel_token);

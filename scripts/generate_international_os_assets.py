@@ -2,7 +2,7 @@
 """Regenerate international OS artwork from official project/vendor sources.
 
 Uses the same source-colour SVG and 72px RGBA conversion as domestic artwork.
-Requires Pillow and resvg-py; see src/ui/assets/host-os/README.md.
+Requires Pillow and resvg-py; see src/shared/ui/assets/host-os/README.md.
 """
 import argparse
 from pathlib import Path

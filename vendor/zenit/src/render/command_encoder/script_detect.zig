@@ -21,15 +21,26 @@ pub fn isAllAscii(content: []const u8) bool {
     return true;
 }
 
-/// fixed advance per char under monospace font; return 0 if inapplicable.
+/// fixed advance per ASCII char on an explicit cell grid; return 0 if inapplicable.
 ///
 /// Monospace long-line path measurement, scroll, hit, selection all use same fixed ASCII cell,
 /// rendering must use same width or accumulate glyph-advance drift under large horizontal offset.
+/// A positive `monospace_char_width` is itself the opt-in: terminals and editors that configure
+/// their own face through `font_family` get the same grid as the global monospace face. The
+/// default cell width is 0, so ordinary text never takes this path.
 pub fn fixedMonospaceAdvance(content: []const u8, use_monospace_font: bool, monospace_char_width: f32) f32 {
-    // Explicit grid advances are independent of selecting the global mono face.
     _ = use_monospace_font;
-    if (monospace_char_width <= 0) return 0;
+    if (!(monospace_char_width > 0)) return 0;
     return if (isAllAscii(content)) monospace_char_width else 0;
+}
+
+test "fixed ASCII grid applies to any explicitly configured cell width" {
+    try std.testing.expectEqual(@as(f32, 0), fixedMonospaceAdvance("abc", false, 0));
+    try std.testing.expectEqual(@as(f32, 0), fixedMonospaceAdvance("abc", true, 0));
+    try std.testing.expectEqual(@as(f32, 0), fixedMonospaceAdvance("abc", false, std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 8.25), fixedMonospaceAdvance("abc", true, 8.25));
+    try std.testing.expectEqual(@as(f32, 8.25), fixedMonospaceAdvance("abc", false, 8.25));
+    try std.testing.expectEqual(@as(f32, 0), fixedMonospaceAdvance("a\u{4E16}", false, 8.25));
 }
 
 /// Korean preferred fallback: contains Hangul and no Han/Kana.
@@ -91,4 +102,42 @@ pub fn containsHangul(text: []const u8) bool {
 
 pub fn containsHanOrKana(text: []const u8) bool {
     return anyCodepoint(text, isHanOrKanaCodepoint);
+}
+
+/// Han/Kana always wins over Hangul. Checking it first avoids walking a
+/// whole CJK suffix just to prove it contains no Hangul before finding Han.
+pub fn preferredFallback(text: []const u8) enum { none, korean, cjk } {
+    if (containsHanOrKana(text)) return .cjk;
+    if (containsHangul(text)) return .korean;
+    return .none;
+}
+
+test "preferred fallback preserves legacy script priority for every partial stream" {
+    const samples = [_][]const u8{
+        "plain ASCII and 123",
+        "한국어 English",
+        "中文 suffix 한국어",
+        "한국어 prefix 日本語",
+        "한글\xff\xed\xa0\x80かな",
+        "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb English",
+        "\xe4\xb8\xff\xe3\x81\x82",
+        "\xe1\x84\x80\xe3\x80\x80",
+        "\xc0\xaf\xf5\x80\x80\x80",
+    };
+    for (samples) |text| {
+        for (0..text.len + 1) |end| {
+            for (0..end + 1) |start| {
+                const part = text[start..end];
+                const old: @TypeOf(preferredFallback(part)) = if (preferKoreanFallback(part)) .korean else if (preferCjkFallback(part)) .cjk else .none;
+                try std.testing.expectEqual(old, preferredFallback(part));
+            }
+        }
+    }
+    var suffix: [16384]u8 = @splat('x');
+    @memcpy(suffix[0..3], "中");
+    try std.testing.expectEqual(.cjk, preferredFallback(&suffix));
+    @memcpy(suffix[0..3], "한");
+    try std.testing.expectEqual(.korean, preferredFallback(&suffix));
+    @memcpy(suffix[suffix.len - 3 ..], "日");
+    try std.testing.expectEqual(.cjk, preferredFallback(&suffix));
 }

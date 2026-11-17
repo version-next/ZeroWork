@@ -2,12 +2,15 @@
  * npm install --prefix /tmp/zw-mcp-reference --registry=https://registry.npmjs.org
  *   @modelcontextprotocol/server-everything@2.2.1 @modelcontextprotocol/sdk@1.32.2
  * No production configuration, account or cloud data is used. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {createServer as tcpServer} from 'node:net';
 import {mkdir,mkdtemp,writeFile,readFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-standard-mcp-build'), reference=resolve(process.env.ZW_MCP_REFERENCE??'/tmp/zw-mcp-reference');
 const out=resolve(process.argv[2]??'/tmp/zw-mcp-reference-evidence');await mkdir(out,{recursive:true,mode:0o700});
 const iso=await realpath(await mkdtemp('/tmp/zw-mcp-ref-')),data=join(iso,'data'),rpc=join(iso,'rpc'),zdot=join(iso,'zdot');
@@ -18,12 +21,12 @@ const everything=join(reference,'node_modules/@modelcontextprotocol/server-every
 const urlExample=join(reference,'node_modules/@modelcontextprotocol/sdk/dist/esm/examples/server/elicitationUrlExample.js');
 const logs=await open(join(out,'servers.log'),'w',0o600);
 const children=[spawn(process.execPath,[everything,'streamableHttp'],{env:{...process.env,PORT:String(httpPort)},stdio:['ignore',logs.fd,logs.fd]}),spawn(process.execPath,[sdk,'--oauth','--oauth-strict'],{env:{...process.env,MCP_PORT:String(oauthPort),MCP_AUTH_PORT:String(authPort)},stdio:['ignore',logs.fd,logs.fd]}),spawn(process.execPath,[urlExample],{env:{...process.env,MCP_PORT:String(urlPort),MCP_AUTH_PORT:String(urlAuthPort)},stdio:['ignore',logs.fd,logs.fd]})];
-for(const port of [httpPort,oauthPort,authPort,urlPort,urlAuthPort])for(let i=0;i<100;i++){try{await fetch(`http://localhost:${port}/.well-known/oauth-authorization-server`);break}catch{await new Promise(d=>setTimeout(d,50));if(i===99)throw Error('Reference server not ready')}}
+for(const port of [httpPort,oauthPort,authPort,urlPort,urlAuthPort])for(const deadline=performance.now()+15000;;){try{await fetch(`http://localhost:${port}/.well-known/oauth-authorization-server`);break}catch{if(performance.now()>=deadline)throw Error('Reference server not ready');await new Promise(d=>setTimeout(d,50))}}
 let phase=0,round=0,error:string|null=null,uri='',refs:any={},sampleRequests=0;
 const report:any={status:'running',reference:{everything:JSON.parse(await readFile(join(reference,'node_modules/@modelcontextprotocol/server-everything/package.json'),'utf8')).version,sdk:JSON.parse(await readFile(join(reference,'node_modules/@modelcontextprotocol/sdk/package.json'),'utf8')).version},steps:[],questions:[],reviews:[],screenshots:[],isolation:iso};
 const deep=(value:any,test:(o:any)=>boolean):any=>{if(value&&typeof value==='object'){if(test(value))return value;for(const v of Object.values(value)){const f=deep(v,test);if(f)return f}}else if(typeof value==='string'&&value.trimStart().startsWith('{')){try{return deep(JSON.parse(value),test)}catch{}}return null};
 const frame=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\n\n';
-const provider=createServer(async(req,res)=>{try{if(req.method!=='POST'){res.end('{"data":[{"id":"gpt-4o"}]}');return}let raw='';for await(const p of req)raw+=p;const body=JSON.parse(raw);res.writeHead(200,{'content-type':'text/event-stream'});
+const provider=createServer(async(req,res)=>{try{if(req.method!=='POST'){res.end('{"data":[{"id":"gpt-4o"}]}');return}const body=await readRequestJson(req);res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length){sampleRequests++;res.end(frame({content:'REFERENCE_SAMPLING_RESPONSE'})+'data: [DONE]\n\n');return}
  round++;const server=phase===0?'reference-stdio':phase===1?'reference-http':phase===2?'reference-oauth':'reference-url';
  const tool=(name:string,args:any)=>res.end(frame({tool_calls:[{index:0,id:`ref-${phase}-${round}`,type:'function',function:{name,arguments:JSON.stringify(args)}}]})+'data: [DONE]\n\n');
@@ -91,7 +94,7 @@ const drive=async()=>{if(error)throw Error(error);
  }
 };
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1280,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1280,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  for(phase=Number(process.env.ZW_MCP_START_PHASE??0);phase<2&&!process.env.ZW_MCP_UI_ONLY;phase++){
   round=0;lastQuestion='';await click('ai.prompt');await h.type_('Run official MCP reference acceptance phase '+phase);await click('ai.send');
   await until(async()=>{await drive();return text(await h.query('ai.response')).includes(`MCP_REFERENCE_PHASE_${phase}_PASSED`)?true:null},180000);await capture(`phase-${phase}-passed`);

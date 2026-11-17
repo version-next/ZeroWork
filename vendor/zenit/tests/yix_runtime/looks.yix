@@ -1,0 +1,24 @@
+//! Runtime fixture for `look` on W.Button (ui.view.Look): a style with token colors and state
+//! blocks, and a recipe part whose dimension reads a parameter (derived, then carried).
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub const glass = ui.css(.{ .background = .bg_secondary, ._hover = .{ .background = .bg_hover } });
+
+const Tint = ui.cva(.{
+    .base = .{ .background = .bg_secondary },
+    .variants = .{ .on = .{ .false = .{}, .true = .{ .background = .accent } } },
+    .defaults = .{ .on = false },
+});
+
+pub fn Glass(off: bool = false) View {
+    return <W.Button label="Glass" variant={.ghost} disabled={off} look={glass} />;
+}
+
+pub fn Tinted(on: bool = false) View {
+    return <W.Button label="Tinted" variant={.ghost} look={Tint.of(.{ .on = on })} />;
+}
+
+pub fn TintedNot(on: bool = false) View {
+    return <W.Button label="Tinted" variant={.ghost} look={Tint.of(.{ .on = !on })} />;
+}

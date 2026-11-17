@@ -1,12 +1,15 @@
 /** Continuous synthetic frames through the production KVM view and Metal sink.
- * No target, credentials, or remote input. Requires Python Pillow for pixel checks.
+ * No target, credentials, or remote input.
  * node e2e/bmc_kvm_video_frames_native.ts --binary PATH --out DIR
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { query, request, screenshot, sleep, waitFor, waitForServerReady } from "../vendor/zenit/e2e/client.ts";
+
+import { decodePng } from "../vendor/zenit/e2e/png.ts";
 
 const options: Record<string, string> = {};
 for (let i = 2; i < process.argv.length; i += 2) {
@@ -51,22 +54,19 @@ try {
   }
   const manifest = join(out, "captures.json");
   await writeFile(manifest, JSON.stringify({ window: root.rect, frame: frame.rect, captures }, null, 2));
-  const python = `
-import json, sys
-from PIL import Image
-with open(sys.argv[1]) as f: data = json.load(f)
-window, frame = data['window'], data['frame']
-for capture in data['captures']:
-    with Image.open(capture['path']) as source:
-        image = source.convert('RGB')
-        for x, y in ((.25, .25), (.5, .5), (.75, .75)):
-            point = (round((frame['x'] + frame['w'] * x) * image.width / window['w']),
-                     round((frame['y'] + frame['h'] * y) * image.height / window['h']))
-            actual = image.getpixel(point)
-            assert max(abs(a - b) for a, b in zip(actual, capture['rgb'])) <= 2, (capture['path'], point, actual, capture['rgb'])
-print('Verified', len(data['captures']), 'native presentations at three points each')
-`;
-  process.stdout.write(execFileSync("python3", ["-c", python, manifest], { encoding: "utf8" }));
+  for (const capture of captures) {
+    const image = decodePng(capture.path);
+    for (const fraction of [0.25, 0.5, 0.75]) {
+      const x = Math.round((frame.rect.x + frame.rect.w * fraction) * image.width / root.rect.w);
+      const y = Math.round((frame.rect.y + frame.rect.h * fraction) * image.height / root.rect.h);
+      assert(x >= 0 && x < image.width && y >= 0 && y < image.height, "sample is inside the screenshot");
+      const offset = (y * image.width + x) * image.channels;
+      const actual = Array.from(image.pixels.subarray(offset, offset + 3));
+      assert(actual.every((channel, index) => Math.abs(channel - capture.rgb[index]) <= 2),
+        `${capture.path} at (${x}, ${y}): expected ${capture.rgb}, got ${actual}`);
+    }
+  }
+  console.log(`Verified ${captures.length} native presentations at three points each`);
   assert((await request("POST", "/quit")).ok);
   await Promise.race([exited, sleep(5000)]);
   assert.equal(app.exitCode, 0, "Fixture must close cleanly");

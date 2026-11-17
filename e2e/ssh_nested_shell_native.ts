@@ -1,4 +1,5 @@
 /** Native command palette + real isolated SSH PTY. No user's app/config is used. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,readFile,writeFile} from 'node:fs/promises';

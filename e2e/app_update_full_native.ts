@@ -3,12 +3,15 @@
  * Only HTTP response bytes are local fixtures. Never replaces an installed app.
  * Run: node e2e/app_update_full_native.ts <test-prefix> <out>
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {isolatedHome} from './regression/home_guard.mjs';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,mkdir,copyFile,writeFile,readFile,open,rm,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createHash} from 'node:crypto';
+import {aiToggleId} from './ai_entry.ts';
 const force=process.argv[4]==='force';
 const build=resolve(process.argv[2]??'zig-out'),out=resolve(process.argv[3]??'/tmp/zw-full-update');await mkdir(out,{recursive:true});
 const h=await import(pathToFileURL(join(build,'share/zenit/harness/client.ts')).href);
@@ -32,7 +35,7 @@ run('ditto',['-c','-k','--keepParent','--norsrc','--noextattr',candidate,archive
 run('python3',['scripts/update_manifest.py','manifest',archive,'--version','0.3.1','--output',envelope]);
 run('python3',['scripts/update_manifest.py','verify',archive,envelope]);
 await writeFile(join(data,'config.toml'),'[updates]\nauto_check = false\n');await writeFile(join(data,'keep-user-data.txt'),'ISOLATED_USER_DATA_MUST_SURVIVE');
-const digest=createHash('sha256').update(target+'\n'+data).digest('hex').slice(0,32),root=join(process.env.HOME!,'Library/Application Support/com.zerowork.updater',digest);
+const digest=createHash('sha256').update(target+'\n'+data).digest('hex').slice(0,32),root=join(isolatedHome(),'Library/Application Support/com.zerowork.updater',digest);
 const log=await open(join(out,'app.log'),'w');process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;
 const app=spawn(join(target,'Contents/MacOS/ZeroWork'),[],{env:{...process.env,ZEROWORK_DATA_DIR:data,ZENIT_E2E_FILE_RPC_DIR:rpc,ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1',ZEROWORK_AUTOCONNECT:'0',ZW_UPDATE_HEADLESS:'1',OPENAI_API_KEY:'',ANTHROPIC_API_KEY:''},stdio:['ignore',log.fd,log.fd]});
 const ended=new Promise<any>(done=>app.once('close',(code,signal)=>done({code,signal})));
@@ -49,7 +52,7 @@ const report:any={status:'running',case:force?'force-with-unsent-input':'delete-
 async function transaction(){const active=await readJSON(join(root,'active.json'));if(active?.transaction)txn=active.transaction;return txn?readJSON(join(txn,'record.json')):null;}
 try{
  await h.waitForServerReady();await h.resizeWindow(1100,800);const initial=await route();assert.equal(initial.pid,app.pid);assert.equal(initial.app_version,'0.3.0-rc1');run('codesign',['--verify','--deep','--strict',target]);report.checks.push('Starting the real signed app and applying its Dock icon leaves the installed bundle signature valid');
- await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.prompt');await h.type_('DRAFT_BEFORE_FULL_UPDATE');
+ await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.prompt');await h.type_('DRAFT_BEFORE_FULL_UPDATE');
  await route('fixture_feed',{envelope,archive});await route('open');
  await h.waitFor(async()=> (await route()).update_state===2||null,15000);assert((await text('update.primary')).includes('下载更新'));await click('update.primary');
  const download=await h.waitFor(async()=>{const s=await route();assert.notEqual(s.update_state,10,JSON.stringify(s));return s.received>0?s:null;},15000);report.download=download;await cap('01-downloaded-bytes');
@@ -61,7 +64,7 @@ try{
  await click('update.cancel');
  await click('ai.session.new');await click('ai.session.close.accept');await h.mouseMove(1,1);await click('ai.sessions');
  const menu=await visible('ai.sessions.menu'),ids=[...new Set(flat([menu]).filter(shown).map(n=>n.test_id??'').filter(id=>/^ai.session.delete.\d+$/.test(id)))];assert(ids.length>0);
- for(const [i,id] of ids.entries()){await click(id);await click('ai.session.close.accept');await h.waitFor(async()=>!(await h.query(id)).some(shown)||null);if(i<ids.length-1){if(!(await h.query('ai.panel')).some(shown))await click('toolbar.ai');await click('ai.sessions');}}
+ for(const [i,id] of ids.entries()){await click(id);await click('ai.session.close.accept');await h.waitFor(async()=>!(await h.query(id)).some(shown)||null);if(i<ids.length-1){if(!(await h.query('ai.panel')).some(shown))await click(await aiToggleId());await click('ai.sessions');}}
  const drafts=await route('drafts');for(const w of drafts.windows){assert.equal(w.prompt_len,0);assert.equal(w.legacy_reason,null);for(const state of w.states){assert.equal(state.draft_len,0);assert.equal(state.journal_draft_len,0);}}
  await route('open');await visible('update.modal');assert.equal((await route()).message,'');await click('update.primary');await h.waitFor(async()=> (await route()).phase==='confirm'||null);assert.equal((await route()).allow_unsaved,false);await cap('03-install-confirm');await click('update.primary');
  }

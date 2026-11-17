@@ -1,6 +1,7 @@
 //! Durable, exclusively locked session outbox. Replaying data never starts a
 //! worker. Model credentials and live pointers are not part of this format.
 const std = @import("std");
+const persist = @import("../shared/base/persist.zig");
 const lifecycle = @import("session_lifecycle.zig");
 const input = @import("session_input.zig");
 const provider = @import("provider.zig");
@@ -53,6 +54,15 @@ const StoredEvent = struct {
     }
 };
 const QueueOrder = struct { fence: input.Fence, ids: []const @import("../host/identity.zig").SubmissionId };
+/// 日志是追加写入的，旧行从不改写。schema 1–3 是 M10 之前的格式（归属为 session / group，只读回放）；
+/// 本版本写出的每一行都是 schema 4（PLUGIN_ARCH_PLAN 2.5.8 M10：归属统一为 tab）。M10 之前的版本只接受
+/// 1–3，读到 schema 4 的行会报 `InvalidSessionJournal`。
+pub const current_schema: u8 = 4;
+const schema: persist.SchemaRange = .{ .min = 1, .max = current_schema };
+/// Session journal file (schema 4 rows, M10 tab ownership). Earlier versions read only
+/// `legacy_file_name`; it is migrated once and then left untouched.
+pub const file_name = "ai-sessions.v4.jsonl";
+pub const legacy_file_name = "ai-sessions.jsonl";
 const Line = struct { schema: u8 = 1, event: ?StoredEvent = null, receipt: ?input.Receipt = null, order: ?QueueOrder = null, messages: []const Message = &.{}, transcript: []const Message = &.{} };
 pub const Journal = struct {
     allocator: std.mem.Allocator,
@@ -65,6 +75,8 @@ pub const Journal = struct {
     compact_at: usize = compact_bytes,
     mutex: std.atomic.Mutex = .unlocked,
     checkpoint_job: ?*Checkpoint = null,
+    /// Bytes came from the legacy file (`openMigrating`): written to `path` once bind validates them.
+    migrated: bool = false,
 
     const Stamp = struct {
         inode: std.Io.File.INode,
@@ -80,9 +92,7 @@ pub const Journal = struct {
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Journal {
         if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOf(u8, path, "..") != null) return error.InvalidJournalPath;
         if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
-        const lock_name = try std.fmt.allocPrint(a, "{s}.lock", .{path});
-        defer a.free(lock_name);
-        const lock_file = try dir.createFile(io, lock_name, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true, .permissions = @fromBackingInt(0o600) });
+        const lock_file = try persist.acquireLock(io, dir, path);
         errdefer lock_file.close(io);
         const owned = try a.dupe(u8, path);
         errdefer a.free(owned);
@@ -95,10 +105,24 @@ pub const Journal = struct {
         defer a.free(source);
         // A crash can interrupt an unacknowledged append. Only complete lines
         // are committed; bind validates all of them before repairing the tail.
-        const committed = if (source.len == 0 or source[source.len - 1] == '\n') source.len else if (std.mem.lastIndexOfScalar(u8, source, '\n')) |index| index + 1 else 0;
-        if (source.len != 0 and committed == 0) return error.InvalidSessionJournal;
+        const committed = persist.committedLength(source) orelse return error.InvalidSessionJournal;
         try result.bytes.appendSlice(a, source[0..committed]);
         result.stamp = Stamp.of(try dir.statFile(io, path, .{}));
+        return result;
+    }
+    /// Open `path`; when it does not exist yet, start from the committed lines of `legacy` (read
+    /// only, never written or locked): bind validates them and writes them to `path`. Later
+    /// versions keep writing only `path`, so an older version reading `legacy` still sees the
+    /// conversations it understood instead of failing on rows it cannot parse.
+    pub fn openMigrating(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, legacy: []const u8) !Journal {
+        var result = try open(a, io, dir, path);
+        errdefer result.deinit();
+        if (result.stamp != null) return result;
+        const source = try persist.readLegacy(a, io, dir, path, legacy, .unlimited) orelse return result;
+        defer a.free(source);
+        const committed = persist.committedLength(source) orelse return error.InvalidSessionJournal;
+        try result.bytes.appendSlice(a, source[0..committed]);
+        result.migrated = true;
         return result;
     }
     pub fn deinit(self: *Journal) void {
@@ -114,13 +138,15 @@ pub const Journal = struct {
             store.deinit();
             store.* = lifecycle.Store.init(allocator);
         }
-        var lines = std.mem.splitScalar(u8, self.bytes.items, '\n');
+        // 已提交的行任何一行坏掉都整份失败（残行已在 open 时丢弃）。
+        var lines = persist.lines(self.bytes.items);
         while (lines.next()) |line| {
-            if (line.len == 0) continue;
             const parsed = try std.json.parseFromSlice(Line, self.allocator, line, .{});
             defer parsed.deinit();
             const row = parsed.value;
-            if ((row.schema != 1 and row.schema != 2 and row.schema != 3) or @as(u8, @intFromBool(row.event != null)) + @intFromBool(row.receipt != null) + @intFromBool(row.order != null) != 1) return error.InvalidSessionJournal;
+            if (!schema.accepts(row.schema) or @as(u8, @intFromBool(row.event != null)) + @intFromBool(row.receipt != null) + @intFromBool(row.order != null) != 1) return error.InvalidSessionJournal;
+            // tab 归属（M10）只出现在 schema 4 起的行；更早的行只能是旧的 session / group 归属。
+            if (row.schema < 4) if (row.event) |event| if ((event.owner != null and event.owner.? == .tab) or (event.initial_origin != null and event.initial_origin.? == .tab)) return error.InvalidSessionJournal;
             if (row.schema < 3) if (row.event) |event| if (event.kind == .task_fact or event.kind == .child_launch or event.task_fact != null or event.initial_text != null) return error.InvalidSessionJournal;
             if (row.schema == 1) if (row.event) |event| if (event.kind == .child_config or event.child_settings != null or event.kind == .child_create or event.kind == .child_bind or event.kind == .remove_family or event.child_info != null or event.parent_binding != null or event.targets != null or event.children != null or event.task_fact != null or event.kind == .task_fact or event.kind == .child_launch or event.initial_text != null) return error.InvalidSessionJournal;
             if (row.order) |order| {
@@ -167,9 +193,12 @@ pub const Journal = struct {
         // events replace a full display snapshot, not individual chat messages.
         if (self.bytes.items.len >= self.compact_at) {
             try self.compactLocked();
+        } else if (self.migrated) {
+            try self.replaceBytes(self.bytes.items);
         } else if (self.stamp) |stamp| if (stamp.size != self.bytes.items.len) {
             try self.replaceBytes(self.bytes.items);
         };
+        self.migrated = false;
         store.persist = .{ .context = self, .write = writeEvent, .checkpoint = checkpoint };
         store.input_persist = .{ .context = self, .write = writeInput, .consumed = writeConsumed, .order = writeOrder };
         for (store.records.items) |record| record.inbox.persist = store.input_persist;
@@ -217,6 +246,8 @@ pub const Journal = struct {
             self.journal.checkpoint_job = null;
             self.journal.mutex.unlock();
             self.done.store(true, .release);
+            // The runner waiting for this write (`write.ready`) is polled by the UI's pass.
+            @import("publication.zig").publishAll();
         }
         fn ready(raw: *anyopaque) bool {
             const self: *Checkpoint = @ptrCast(@alignCast(raw));
@@ -251,20 +282,19 @@ pub const Journal = struct {
         const self: *Journal = @ptrCast(@alignCast(raw));
         var event: StoredEvent = undefined;
         inline for (@typeInfo(StoredEvent).@"struct".field_names) |name| @field(event, name) = @field(original, name);
-        const extended = event.kind == .child_config or event.child_settings != null or event.kind == .child_create or event.kind == .child_bind or event.kind == .remove_family or event.kind == .task_fact or event.kind == .child_launch;
-        try self.append(.{ .schema = if (event.kind == .task_fact or event.kind == .child_launch) 3 else if (extended) 2 else 1, .event = event }, original.messages, &.{});
+        try self.append(.{ .schema = current_schema, .event = event }, original.messages, &.{});
     }
     fn writeInput(raw: *anyopaque, receipt: input.Receipt, messages: []const provider.Message) !void {
         const self: *Journal = @ptrCast(@alignCast(raw));
-        try self.append(.{ .receipt = receipt }, messages, &.{});
+        try self.append(.{ .schema = current_schema, .receipt = receipt }, messages, &.{});
     }
     fn writeConsumed(raw: *anyopaque, receipt: input.Receipt, messages: []const provider.Message, transcript: []const provider.Message) !void {
         const self: *Journal = @ptrCast(@alignCast(raw));
-        try self.append(.{ .receipt = receipt }, messages, transcript);
+        try self.append(.{ .schema = current_schema, .receipt = receipt }, messages, transcript);
     }
     fn writeOrder(raw: *anyopaque, fence: input.Fence, ids: []const @import("../host/identity.zig").SubmissionId) !void {
         const self: *Journal = @ptrCast(@alignCast(raw));
-        try self.append(.{ .order = .{ .fence = fence, .ids = ids } }, &.{}, &.{});
+        try self.append(.{ .schema = current_schema, .order = .{ .fence = fence, .ids = ids } }, &.{}, &.{});
     }
     pub fn encode(a: std.mem.Allocator, source: []const provider.Message) ![]Message {
         const messages = try a.alloc(Message, source.len);
@@ -314,7 +344,7 @@ pub const Journal = struct {
         const file = if (self.stamp != null) self.dir.openFile(self.io, self.path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => return error.JournalConflict,
             else => return err,
-        } else self.dir.createFile(self.io, self.path, .{ .exclusive = true, .read = true, .permissions = @fromBackingInt(0o600) }) catch |err| switch (err) {
+        } else self.dir.createFile(self.io, self.path, .{ .exclusive = true, .read = true, .permissions = persist.private_file }) catch |err| switch (err) {
             error.PathAlreadyExists => return error.JournalConflict,
             else => return err,
         };
@@ -352,11 +382,7 @@ pub const Journal = struct {
 
     fn replaceBytes(self: *Journal, bytes: []const u8) !void {
         try self.checkUnchanged();
-        var atomic = try self.dir.createFileAtomic(self.io, self.path, .{ .permissions = @fromBackingInt(0o600), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        try atomic.file.writeStreamingAll(self.io, bytes);
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try persist.writeAtomic(self.io, self.dir, self.path, bytes, .{ .make_path = true, .sync_dir = true });
         self.stamp = Stamp.of(try self.dir.statFile(self.io, self.path, .{}));
     }
 

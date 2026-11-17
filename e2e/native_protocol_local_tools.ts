@@ -1,6 +1,7 @@
 /** Real native Anthropic/Ollama -> production Local approval/tool feedback.
  * Uses a private background app and public synthetic file-RPC input.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -8,6 +9,7 @@ import { copyFile, mkdir, mkdtemp, open, readFile, writeFile, chmod, rm } from "
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { waitForServerReady, waitFor, query, clickTestId, inputState, key, type_, resizeWindow, screenshot, sleep } from "../zig-out/share/zenit/harness/client.ts";
+import {aiToggleId} from './ai_entry.ts';
 
 const args = process.argv.slice(2), options: Record<string, string> = {};
 for (let i = 0; i < args.length; i += 2) {
@@ -125,7 +127,7 @@ try {
   await waitForServerReady();
   const owner = JSON.parse(await readFile(join(rpc, "owner.json"), "utf8")); assert.equal(Number(owner.pid), child.pid);
   assert((await resizeWindow(1440, 900)).ok);
-  await click("workspace.empty.local"); await visible("terminal.surface"); await click("toolbar.ai"); await visible("ai.prompt");
+  await click("workspace.empty.local"); await visible("terminal.surface"); await click(await aiToggleId()); await visible("ai.prompt");
   await capture("00-local-native-provider-ready");
   await runCase(true); await runCase(false);
   report.status = "passed";

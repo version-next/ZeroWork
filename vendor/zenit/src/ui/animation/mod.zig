@@ -68,6 +68,10 @@ pub const AnimatableProp = node_animator.AnimatableProp;
 pub const AnimateConfig = node_animator.AnimateConfig;
 pub const animateNode = node_animator.animateNode;
 
+// -- Anchor motion (collapse into / expand from an anchor rect; geometry + clock) --
+
+pub const anchor_motion = @import("anchor_motion.zig");
+
 // -- Global management --
 
 pub const manager = @import("manager.zig");

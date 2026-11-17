@@ -1,3 +1,4 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Settings and themes in a real isolated native application using file RPC. */
 import assert from 'node:assert/strict';
@@ -6,7 +7,10 @@ import {spawn} from 'node:child_process';
 import {mkdtemp,mkdir,writeFile,readFile,realpath,open} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {resolve,join} from 'node:path';
-import {waitForServerReady,waitFor,query,clickTestId,resizeWindow,screenshot,sleep,scrollAt} from '../vendor/zenit/e2e/client.ts';
+import {waitForServerReady,waitFor,query,clickTestId,resizeWindow,screenshot,sleep,scrollAt,request} from '../vendor/zenit/e2e/client.ts';
+import {settingsNav} from './settings_nav.ts';
+// Two-level settings (settings_nav.ts): category overview → subpage; no close button (Cmd+W); the Save Bar only shows with a draft.
+const nav=settingsNav();
 const [argBinary,argOutput]=process.argv.slice(2);assert(argBinary&&argOutput);
 const binary=resolve(argBinary),output=resolve(argOutput);await mkdir(output,{recursive:true});
 const root=await realpath(await mkdtemp(join(tmpdir(),'zw-settings-followup-'))),rpc=join(root,'rpc'),data=join(root,'data');await mkdir(rpc);await mkdir(data);
@@ -25,23 +29,25 @@ const click=async(id:string)=>{
 };
 const capture=async(name:string)=>{await sleep(250);await screenshot(join(output,name+'.png'));report.captures.push(name);};
 try{
- await waitForServerReady();await click('toolbar.settings');await click('settings.nav.appearance');
+ await waitForServerReady();await nav.toSub('appearance','theme');
  const preset=nativeThemeData;
  for(const id of Object.keys(preset.themes)){
-  await click('settings.theme.'+id);await click('settings.save');
+  await nav.pickTheme(id);await nav.saveIfDirty(); // the already-current theme makes no draft (no Save Bar)
   await waitFor(async()=> (await readFile(join(data,'config.toml'),'utf8')).includes('theme = "'+id+'"')?true:null,10000);
   const remove=await node('settings.theme.remove.current');assert.notEqual(remove.focusable,true,'builtin remove disabled');
   await capture('theme-'+id);report.checks.push('select/save/protected '+id);
  }
- await click('settings.close');await click('toolbar.settings');await click('settings.nav.appearance');await node('settings.theme.ice');report.checks.push('saved ice theme reopens');
- await click('settings.nav.data');assert.equal((await query('settings.data.open_config_dir')).filter(shown).length,0);await capture('data-readonly');report.checks.push('configuration directory action removed');
- await resizeWindow(860,480);await click('settings.nav.appearance');await capture('appearance-compact');
- await click('settings.nav.data');await capture('data-compact');report.checks.push('860x480 appearance/data visible');
+ await nav.close();await nav.toSub('appearance','theme');await node('settings.theme.ice');report.checks.push('saved ice theme reopens');
+ await nav.toSub('data','location');assert.equal((await query('settings.data.open_config_dir')).filter(shown).length,0);await capture('data-readonly');report.checks.push('configuration directory action removed');
+ await resizeWindow(860,480);await nav.toCategory('appearance');await capture('appearance-compact');
+ await nav.toCategory('data');await capture('data-compact');report.checks.push('860x480 appearance/data visible');
  for(const [width,height] of [[860,480],[1440,900]]){
-  await resizeWindow(width,height);await click('settings.nav.appearance');
-  if(!(await query('settings.materials.preview.open')).some(shown))await click('settings.materials.header');
-  await click('settings.materials.preview.open');const save=await node('settings.materials.preview.save'),bar=await node('settings.materials.preview.actions');
-  assert.equal(save.rect.w,128);assert(save.rect.x+save.rect.w<=bar.rect.x+bar.rect.w,'save label fits preview bar');await capture('preview-save-'+width);await click('settings.materials.preview.return');
+  await resizeWindow(width,height);await nav.toPane('settings.appearance.materials');await nav.reveal('settings.materials.preview.open');
+  // The material preview hides the Settings window and previews over the main window: follow it there (as appearance.ts does).
+  await click('settings.materials.preview.open');{const snap=await request('POST','/zerowork/windows',{action:'snapshot'});assert((await request('POST','/zerowork/windows',{action:'select',window:snap.windows[0].window})).ok,'bind main window');}const save=await node('settings.materials.preview.save'),bar=await node('settings.materials.preview.actions');
+  assert.equal(save.rect.w,120); // native auto-width W.Button “保存全部设置” + icon (material_preview_bar.yix), was 128
+ assert(save.rect.x+save.rect.w<=bar.rect.x+bar.rect.w,'save label fits preview bar');await capture('preview-save-'+width);await click('settings.materials.preview.return');await waitFor(async()=>!(await query('settings.materials.preview.actions')).some(shown)||null,10000);
+  {const bound=async()=>(await request('GET','/windows')).windows.find((w:any)=>w.bound)?.window_id;const main=await bound();await clickTestId('toolbar.settings');await waitFor(async()=>(await bound())!==main||null,10000);await node('settings.panel');}
  }
  report.checks.push('preview save 128px and inside bar at860/1440');
  report.status='passed_pending_pixel_review';

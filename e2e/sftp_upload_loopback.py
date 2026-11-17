@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import paramiko
+import sys as _sys; from pathlib import Path as _Path; _sys.path.insert(0, str(_Path(__file__).resolve().parent))  # run under `python -I`: siblings in e2e/ only, never the cwd
 import sftp_conflict_loopback as base
 
 TARGET = '/fixture/upload-main.txt'
@@ -93,16 +94,7 @@ class Files(base.Files):
                 return paramiko.SFTP_NO_SUCH_FILE
         return Handle(self, flags)
 
-class Server(base.Server):
-    def check_channel_exec_request(self, channel, command):
-        # Production probes the peer OS on its directory transport. Reject
-        # execution, but distinguish this exact read-only probe from other execs.
-        if command == b'sh -c "uname -s; cat /etc/os-release" || cmd /c ver':
-            self.state.record(self.connection, 'OS_PROBE')
-            return False
-        return super().check_channel_exec_request(channel, command)
-
-
-base.State, base.Files, base.Server = State, Files, Server
+# The base Server forbids every exec/shell/PTY request: an SFTP-only host never receives one.
+base.State, base.Files = State, Files
 if __name__ == '__main__':
     base.main()

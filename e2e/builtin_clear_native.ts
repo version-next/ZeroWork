@@ -1,4 +1,5 @@
 /** @log followed by repeated clear through an isolated real Local PTY. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, realpath, readFile, writeFile, open, rm} from 'node:fs/promises';

@@ -1,0 +1,40 @@
+//! Empty view. Styles in styles.yss, tests in mod.zig.
+const ui = @import("../../ui.zig");
+const S = @import("styles.yss");
+const B = @import("../button/mod.zig");
+
+/// Empty: the empty state of a list, panel or view — icon, title, a description that says what
+/// will appear here (or what to do), and an optional single action (secondary sm Button).
+/// Centered in the space it is given; title and description wrap inside a column of at most 280.
+/// `<W.Empty icon={ui.icons.bell} title="没有提醒" description="…" />`
+/// `titleTestId` / `descriptionTestId` / `actionTestId` name the parts (a `testId` on the element
+/// names only the root); null = nothing written; read at mount, like every test id.
+pub fn Empty(
+    icon: ?ui.SvgAsset = null,
+    title: []const u8 = "",
+    description: []const u8 = "",
+    actionLabel: []const u8 = "",
+    actionIconAsset: ?ui.SvgAsset = null,
+    onAction: ?Handler(void) = null,
+    actionDisabled: bool = false,
+    titleTestId: ?[]const u8 = null,
+    descriptionTestId: ?[]const u8 = null,
+    actionTestId: ?[]const u8 = null,
+) View {
+    return (
+        <col style={S.root} a11y={.{ .role = .group, .label = title }}>
+            {if (icon) |asset| <row style={S.line}><icon style={S.icon} src={asset} /></row>}
+            <row style={S.line}>
+                <col style={S.copy}>
+                    <text testId={titleTestId} style={S.title}>{title}</text>
+                    <text testId={descriptionTestId} style={S.description}>{description}</text>
+                </col>
+            </row>
+            {if (actionLabel.len != 0)
+                <row style={S.action}>
+                    <B.Button testId={actionTestId} label={actionLabel} iconAsset={actionIconAsset} variant={.secondary} size={.sm} disabled={actionDisabled} onClick={onAction} />
+                </row>
+            }
+        </col>
+    );
+}

@@ -207,7 +207,7 @@ pub const Controller = struct {
 };
 
 fn testContext() host.Context {
-    return .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 1 };
+    return .{ .conversation_id = .{ .bytes = @splat(1) }, .task_id = .{ .bytes = @splat(2) }, .binding = .{ .tab = 4 }, .content = .{ .session = 4 }, .binding_revision = 1, .grant_revision = 1 };
 }
 fn testSelection() !Selection {
     return captureSelection(std.testing.allocator, &.{.{ .session_id = @fromBackingInt(4), .generation = 2 }}, &.{});

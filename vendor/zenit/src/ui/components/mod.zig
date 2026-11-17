@@ -23,9 +23,8 @@ pub const control_shell = @import("control_shell/mod.zig");
 /// Test support: per-allocation OOM sweep during component mount. Export for consumers
 /// to reuse same criteria.
 pub const oom_sweep = @import("oom_sweep.zig");
-pub const controlShell = control_shell.controlShell;
-pub const ControlShellConfig = control_shell.ControlShellConfig;
-pub const ControlShellResult = control_shell.ControlShellResult;
+pub const ControlShell = control_shell.ControlShell;
+pub const IconFit = control_shell.IconFit;
 pub const ControlVariant = control_shell.ControlVariant;
 pub const ControlSize = control_shell.ControlSize;
 
@@ -34,6 +33,11 @@ pub const button = @import("button/mod.zig");
 pub const Button = button.Button;
 pub const ButtonVariant = ControlVariant;
 pub const ButtonSize = ControlSize;
+pub const ButtonIconPosition = button.ButtonIconPosition;
+/// Look-less clickable root with a children slot (rows whose content is the caller's).
+pub const pressable = @import("pressable/mod.zig");
+pub const Pressable = pressable.Pressable;
+pub const PressableProps = pressable.PressableProps;
 
 pub const number_stepper = @import("number_stepper/mod.zig");
 pub const NumberStepper = number_stepper.NumberStepper;
@@ -68,6 +72,9 @@ pub const SelectMode = select.SelectMode;
 pub const input = @import("input/mod.zig");
 pub const Input = input.Input;
 pub const Textarea = input.Textarea;
+pub const TextDecoration = input.TextDecoration;
+pub const TextareaState = input.TextareaState;
+pub const TextareaResult = input.TextareaResult;
 pub const EditableText = input.EditableText;
 pub const EditableTextResult = input.EditableTextResult;
 pub const EditableTextProps = input.EditableTextProps;
@@ -96,6 +103,7 @@ pub const glass_box = @import("glass_box/mod.zig");
 pub const GlassBox = glass_box.GlassBox;
 pub const GlassBoxReadability = glass_box.GlassBoxReadability;
 pub const GlassBoxEmphasis = glass_box.GlassBoxEmphasis;
+pub const GlassBoxFill = glass_box.GlassBoxFill;
 pub const glass_group = @import("glass_group/mod.zig");
 pub const GlassGroup = glass_group.GlassGroup;
 pub const GlassShape = glass_group.GlassShape;
@@ -103,12 +111,21 @@ pub const glass_controls = @import("glass_controls/mod.zig");
 /// ConcentricRectangle / containerShape (concentric corners, SwiftUI macOS 26).
 pub const concentric = @import("../concentric.zig");
 pub const ConcentricRectangle = concentric.ConcentricRectangle;
+/// Joined outline: rounded rectangles chained into one continuous surface (folder tabs,
+/// multi-line selections); see docs/design/joined-surface.md.
+pub const joined = @import("../joined.zig");
+/// Box painted as a joined outline whose members follow other nodes (morphs on retarget).
+pub const joined_surface = @import("../joined_surface.zig");
+pub const JoinedSurface = joined_surface.JoinedSurface;
 pub const background_extension = @import("background_extension/mod.zig");
 pub const BackgroundExtension = background_extension.BackgroundExtension;
 pub const GlassSlider = glass_controls.GlassSlider;
 pub const GlassToggle = glass_controls.GlassToggle;
 pub const glass_toolbar = @import("glass_toolbar/mod.zig");
 pub const GlassToolbar = glass_toolbar.GlassToolbar;
+pub const TitlebarEdge = glass_toolbar.TitlebarEdge;
+pub const GlassToolbarGroup = glass_toolbar.GlassToolbarGroup;
+pub const GlassToolbarButton = glass_toolbar.GlassToolbarButton;
 pub const glass_bars = @import("glass_bars/mod.zig");
 pub const GlassNavigationBar = glass_bars.GlassNavigationBar;
 pub const GlassTabBar = glass_bars.GlassTabBar;
@@ -121,6 +138,13 @@ pub const addGroupItem = group.addGroupItem;
 
 pub const divider = @import("divider/mod.zig");
 pub const Divider = divider.Divider;
+pub const grabber = @import("grabber/mod.zig");
+pub const Grabber = grabber.Grabber;
+pub const empty = @import("empty/mod.zig");
+pub const Empty = empty.Empty;
+pub const disclosure = @import("disclosure/mod.zig");
+pub const Disclosure = disclosure.Disclosure;
+pub const DisclosureTone = disclosure.DisclosureTone;
 
 // Interactive.
 pub const tabs = @import("tabs/mod.zig");
@@ -149,10 +173,17 @@ pub const GridProps = grid.GridProps;
 pub const tooltip = @import("tooltip/mod.zig");
 pub const Tooltip = tooltip.Tooltip;
 pub const TooltipResult = tooltip.TooltipResult;
+pub const TooltipSurface = tooltip.surface.TooltipSurface;
+pub const TooltipSurfaceProps = tooltip.surface.TooltipSurfaceProps;
 
 pub const modal = @import("modal/mod.zig");
 pub const Modal = modal.Modal;
 pub const ModalResult = modal.ModalResult;
+pub const ConfirmDialog = modal.ConfirmDialog;
+pub const ConfirmDialogResult = modal.ConfirmDialogResult;
+pub const ConfirmTone = modal.ConfirmTone;
+pub const ConfirmFocus = modal.ConfirmFocus;
+pub const ConfirmTestIds = modal.ConfirmTestIds;
 
 pub const sheet = @import("sheet/mod.zig");
 pub const Sheet = sheet.Sheet;
@@ -167,6 +198,8 @@ pub const markdown = @import("markdown/mod.zig");
 pub const Markdown = markdown.Markdown;
 pub const MarkdownOptions = markdown.MarkdownOptions;
 pub const renderMarkdownInto = markdown.renderInto;
+pub const CodeBlock = markdown.CodeBlock;
+pub const CodeBlockProps = markdown.CodeBlockProps;
 
 pub const tag = @import("tag/mod.zig");
 pub const Tag = tag.Tag;
@@ -174,14 +207,25 @@ pub const TagColor = tag.TagColor;
 pub const TagVariant = tag.TagVariant;
 pub const TagSize = tag.TagSize;
 
+pub const kbd = @import("kbd/mod.zig");
+pub const Kbd = kbd.Kbd;
+pub const KbdSize = kbd.KbdSize;
+pub const KbdTone = kbd.KbdTone;
+
 pub const chip = @import("chip/mod.zig");
 pub const Chip = chip.Chip;
 pub const ChipSize = chip.ChipSize;
 pub const ChipVariant = chip.ChipVariant;
+pub const AttachmentChip = chip.AttachmentChip;
 
 pub const progress = @import("progress/mod.zig");
 pub const Progress = progress.Progress;
 pub const ProgressStatus = progress.ProgressStatus;
+pub const ProgressSweep = progress.ProgressSweep;
+pub const ProgressRing = progress.ProgressRing;
+pub const ProgressSegments = progress.ProgressSegments;
+pub const ProgressSegment = progress.ProgressSegment;
+pub const ProgressTone = progress.ProgressTone;
 
 pub const snapshot_layer = @import("snapshot_layer.zig");
 pub const SnapshotLayer = snapshot_layer.SnapshotLayer;
@@ -202,6 +246,8 @@ pub const MenuState = menu.MenuState;
 pub const slider = @import("slider/mod.zig");
 pub const Slider = slider.Slider;
 pub const SliderResult = slider.SliderResult;
+pub const SliderMark = slider.SliderMark;
+pub const SliderLook = slider.SliderLook;
 
 pub const alert = @import("alert/mod.zig");
 pub const Alert = alert.Alert;
@@ -211,6 +257,8 @@ pub const notification = @import("notification/mod.zig");
 pub const Notifier = notification.Notifier;
 pub const NotifierOptions = notification.Options;
 pub const Notification = notification.Notification;
+pub const NotificationHost = notification.NotificationHost;
+pub const NotificationPost = notification.NotificationPost;
 pub const NotificationId = notification.Id;
 pub const NotificationKind = notification.Kind;
 pub const NotificationTone = notification.Tone;
@@ -225,6 +273,8 @@ pub const NotificationStrings = notification.Strings;
 pub const NotificationHint = notification.Hint;
 pub const NotificationHintMark = notification.HintMark;
 pub const NotificationHintKeycap = notification.HintKeycap;
+pub const HintCapsule = notification.inline_hint.HintCapsule;
+pub const HintCapsuleProps = notification.inline_hint.HintCapsuleProps;
 
 pub const breadcrumb = @import("breadcrumb/mod.zig");
 pub const Breadcrumb = breadcrumb.Breadcrumb;
@@ -301,4 +351,5 @@ test {
     // Cross-component control height contract tests (extracted file must be explicitly imported;
     // else silently lost).
     _ = @import("control_height_tests.zig");
+    _ = @import("theme_switch_tests.zig");
 }

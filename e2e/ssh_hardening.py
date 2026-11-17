@@ -10,6 +10,11 @@ import threading
 import time
 import paramiko
 from paramiko.common import MSG_GLOBAL_REQUEST
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 logging.getLogger('paramiko').setLevel(logging.CRITICAL)
 
 class Server(paramiko.ServerInterface):
@@ -61,6 +66,7 @@ def run(runner, key, mode):
 def main():
     p = argparse.ArgumentParser(); p.add_argument('--runner', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True); args = p.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     key = paramiko.RSAKey.generate(2048)
     records = []
     for mode in ('fallback', 'unsupported', 'tunnel-timeout', 'silent', 'alive'):

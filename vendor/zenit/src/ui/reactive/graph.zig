@@ -91,6 +91,9 @@ pub const NodeId = packed struct(u32) {
 pub const RecomputeFn = *const fn (ctx: *anyopaque) bool; // returns true if value changed
 
 pub const GraphNode = struct {
+    /// Test provenance: an observer that replaces a release theme replay.
+    /// Dependency checks must still reject any business signal capture.
+    test_preview_style_infrastructure: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     kind: NodeKind,
     state: NodeState,
     /// Value version; incremented on signal write or memo recompute with value change
@@ -121,6 +124,13 @@ pub const GraphNode = struct {
     is_running: bool = false,
     /// Failed dependency capture must never publish this run as clean.
     tracking_failed: bool = false,
+    /// Ownership depth of the scope that owns this effect (0 = root scope / owner arena / raw
+    /// node). The drain runs shallower owners first, so a control-flow effect that removes a row
+    /// or unloads a branch runs before any effect inside that subtree (see drainPendingEffects).
+    owner_depth: u32 = 0,
+    /// The owning scope is queued for disposal (deferred while a reactive callback is on the
+    /// stack): the effect is never run again; destroyNode follows when the callback unwinds.
+    retired: bool = false,
 };
 
 // ============================================================================
@@ -154,7 +164,8 @@ pub const ReactiveGraph = struct {
     /// Tracking enabled (disabled by untrack)
     tracking_enabled: bool,
 
-    /// Pending effects queue; sorted by depth and drained at endBatch
+    /// Pending effects queue; sorted by depth and drained at endBatch. Capacity >= node slots
+    /// (see `reserveNotification`).
     pending_effects: std.ArrayListUnmanaged(NodeId),
     /// A committed write could not finish propagation. Recover unqueued effects
     /// by scanning nodes; memo reads recover through conservative `.check` states.
@@ -317,9 +328,25 @@ pub const ReactiveGraph = struct {
         try self.nodes.ensureTotalCapacity(self.allocator, idx + 1);
         try self.generations.ensureTotalCapacity(self.allocator, idx + 1);
         try self.free_list.ensureTotalCapacity(self.allocator, idx + 1);
+        try self.reserveNotification(idx + 1);
         self.nodes.appendAssumeCapacity(node);
         self.generations.appendAssumeCapacity(0);
         return .{ .index = @intCast(idx), .generation = 0 };
+    }
+
+    /// Notification capacity invariant: the propagation worklist and both effect queues hold
+    /// at least one entry per node slot. A walk visits each node at most once and a queue holds
+    /// each effect at most once (it is enqueued only while clean), so a signal write
+    /// (`markSignalWritten`) never allocates to notify its observers: `Signal.set` cannot
+    /// report an error, and an allocation failure there used to leave a committed value whose
+    /// observers only caught up on some later write. The growth is reserved where it can fail
+    /// visibly, when a node is created (signals, memos and effects are created while mounting).
+    fn reserveNotification(self: *ReactiveGraph, slots: usize) !void {
+        try self.propagation_stack.ensureTotalCapacity(self.allocator, slots);
+        try self.pending_effects.ensureTotalCapacity(self.allocator, slots);
+        // During a drain `drain_buffer` holds the batch being run (read by index, so growing it
+        // here is safe); it is the queue that receives the next batch after the swap.
+        try self.drain_buffer.ensureTotalCapacity(self.allocator, slots);
     }
 
     pub fn destroyNode(self: *ReactiveGraph, id: NodeId) void {
@@ -353,6 +380,18 @@ pub const ReactiveGraph = struct {
         n.source_runs.deinit(self.allocator);
         n.alive = false;
         self.free_list.appendAssumeCapacity(id.index);
+    }
+
+    /// Record the ownership depth of an effect's scope (drain order key, see drainPendingEffects).
+    pub fn setOwnerDepth(self: *ReactiveGraph, id: NodeId, owner_depth: u32) void {
+        const n = self.getNode(id) orelse return;
+        n.owner_depth = owner_depth;
+    }
+
+    /// The effect's scope is queued for disposal: drains skip it until destroyNode removes it.
+    pub fn retire(self: *ReactiveGraph, id: NodeId) void {
+        const n = self.getNode(id) orelse return;
+        n.retired = true;
     }
 
     pub fn isAlive(self: *const ReactiveGraph, id: NodeId) bool {
@@ -654,6 +693,9 @@ pub const ReactiveGraph = struct {
         // Log and count at least.
         self.pushTracking(id) catch |err| {
             reactive_tracking_failures += 1;
+            // A failed effect run is not in any queue any more: schedule the drain's rescan so it
+            // is retried (memos stay dirty and recompute on their next read).
+            if (n.kind == .effect) self.rescan_effects = true;
             if (!suppress_reactive_error_log) {
                 std.log.scoped(.zenit_reactive).err(
                     "pushTracking failed ({s}) for node {d}: recompute skipped, value stays stale",
@@ -669,6 +711,9 @@ pub const ReactiveGraph = struct {
         const after = self.getNode(id) orelse return;
         if (after.tracking_failed) {
             after.state = .dirty;
+            // Dirty but unqueued, a later write would skip it (observers already dirty are not
+            // re-queued): retry it from the drain's rescan instead.
+            if (after.kind == .effect) self.rescan_effects = true;
             return;
         }
 
@@ -722,8 +767,19 @@ pub const ReactiveGraph = struct {
         }
     }
 
-    /// Drain sorted by topological depth; shallower deps update before deeper ones. Each
-    /// effect runs at most once per loop (state check deduplicates; after run, state -> clean).
+    /// Drain sorted by ownership depth, then topological depth. Each effect runs at most once per
+    /// loop (state check deduplicates; after run, state -> clean).
+    ///
+    /// Ownership first: a list / branch effect and an effect inside one of its rows / branches
+    /// can depend on the same signal at the same topological depth (`{for (items(vm)) |row|
+    /// <text>{name(vm, row.i)}</text>}` reads `vm.page` in both). Run by topological depth
+    /// alone, the row's text could go first and evaluate the new page with an index that page
+    /// does not have, although the reconcile about to run removes the row (ZeroWork G21).
+    /// Every effect a control-flow effect can dispose lives in a descendant scope, so running
+    /// shallower owners first lets the structure settle before its contents; a removed row's
+    /// effects are destroyed (or retired, when disposal is deferred) and skipped. Effects are
+    /// leaves that pull memos on read, so their relative order is otherwise not observable
+    /// beyond the order in which their writes happen.
     fn drainPendingEffects(self: *ReactiveGraph) !void {
         if (self.flushing) return;
         self.flushing = true;
@@ -752,11 +808,16 @@ pub const ReactiveGraph = struct {
             // entering during drain go to fresh pending_effects (next loop).
             std.mem.swap(std.ArrayListUnmanaged(NodeId), &self.pending_effects, &self.drain_buffer);
 
-            // Drain: state == .clean effects skip (checked inside updateIfNecessary).
-            for (self.drain_buffer.items) |id| {
+            // Drain: state == .clean effects skip (checked inside updateIfNecessary). Read by
+            // index: an effect may create graph nodes, whose capacity reservation can move this
+            // buffer (its length does not change during the drain).
+            var drained: usize = 0;
+            while (drained < self.drain_buffer.items.len) : (drained += 1) {
+                const id = self.drain_buffer.items[drained];
                 const n = self.getNode(id) orelse continue;
                 if (n.state == .clean) continue;
                 if (n.kind != .effect) continue;
+                if (n.retired) continue;
                 self.updateIfNecessary(id);
             }
             self.drain_buffer.clearRetainingCapacity();
@@ -764,44 +825,50 @@ pub const ReactiveGraph = struct {
         }
     }
 
-    /// Rare OOM recovery path. Select effects in depth/index order without a
+    /// Rare OOM recovery path. Select effects in drain-key/index order without a
     /// worklist. Re-fetch nodes after every callback, which may resize the graph.
     /// Each effect is attempted once per scan; persistent OOM remains retryable
     /// at the next flush rather than spinning on the same failed recompute.
     fn drainUnqueuedEffects(self: *ReactiveGraph) !void {
         self.rescan_effects = false;
         self.pending_effects.clearRetainingCapacity();
-        var cursor: ?struct { depth: u32, index: usize } = null;
+        var cursor: ?struct { key: u64, index: usize } = null;
         while (true) {
             var best: ?NodeId = null;
-            var best_depth: u32 = std.math.maxInt(u32);
+            var best_key: u64 = std.math.maxInt(u64);
             for (self.nodes.items, 0..) |node, index| {
-                if (!node.alive or node.kind != .effect or node.state == .clean or node.is_running) continue;
+                if (!node.alive or node.kind != .effect or node.state == .clean or node.is_running or node.retired) continue;
+                const key = drainKey(&node);
                 if (cursor) |prev| {
-                    if (node.depth < prev.depth or (node.depth == prev.depth and index <= prev.index)) continue;
+                    if (key < prev.key or (key == prev.key and index <= prev.index)) continue;
                 }
-                if (best == null or node.depth < best_depth) {
+                if (best == null or key < best_key) {
                     best = .{ .index = @intCast(index), .generation = self.generations.items[index] };
-                    best_depth = node.depth;
+                    best_key = key;
                 }
             }
             const id = best orelse break;
-            cursor = .{ .depth = best_depth, .index = id.index };
+            cursor = .{ .key = best_key, .index = id.index };
             self.updateIfNecessary(id);
         }
         // Includes effects dirtied by callbacks below the scan cursor, as well
         // as recomputations that still could not capture dependencies.
         for (self.nodes.items) |node| {
-            if (node.alive and node.kind == .effect and node.state != .clean and !node.is_running) {
+            if (node.alive and node.kind == .effect and node.state != .clean and !node.is_running and !node.retired) {
                 self.rescan_effects = true;
                 return error.OutOfMemory;
             }
         }
     }
 
+    /// Drain order: ownership depth, then topological depth (see drainPendingEffects).
+    fn drainKey(n: *const GraphNode) u64 {
+        return (@as(u64, n.owner_depth) << 32) | n.depth;
+    }
+
     fn sortByDepth(self: *ReactiveGraph, a: NodeId, b: NodeId) bool {
-        const an = if (a.index < self.nodes.items.len) self.nodes.items[a.index].depth else 0;
-        const bn = if (b.index < self.nodes.items.len) self.nodes.items[b.index].depth else 0;
+        const an = if (a.index < self.nodes.items.len) drainKey(&self.nodes.items[a.index]) else 0;
+        const bn = if (b.index < self.nodes.items.len) drainKey(&self.nodes.items[b.index]) else 0;
         return an < bn;
     }
 
@@ -1113,81 +1180,101 @@ const OneShotFailingAllocator = struct {
     }
 };
 
-test "propagate: 一次瞬时 OOM 不得把 effect 永久毒聋" {
-    // Regression (enqueue then set): old order was obs.state = .dirty then try append;
-    // append OOM -> effect stuck dirty-but-not-pending, subsequent writes skipped due to
-    // `state == .dirty`, one OOM silences forever.
-    var one_shot = OneShotFailingAllocator{ .backing = testing.allocator };
-    var g = ReactiveGraph.init(one_shot.allocator());
-    defer g.deinit();
-
-    const s = try g.createSignal();
-
-    const Ctx = struct { g: *ReactiveGraph, s: NodeId, runs: usize = 0 };
-    var ctx = Ctx{ .g = &g, .s = s };
-    const cb = struct {
-        fn run(opaque_ctx: *anyopaque) bool {
-            const c: *Ctx = @ptrCast(@alignCast(opaque_ctx));
-            c.runs += 1;
-            c.g.trackRead(c.s) catch {};
-            return true;
-        }
-    }.run;
-
-    _ = try g.createEffect(&cb, &ctx);
-    try testing.expectEqual(@as(usize, 1), ctx.runs);
-
-    // Trigger one OOM at pending_effects.append in propagate (this write may fail).
-    try g.propagation_stack.ensureTotalCapacity(g.allocator, g.nodes.items.len);
-    suppress_reactive_error_log = true;
-    defer suppress_reactive_error_log = false;
-    one_shot.armed = true;
-    _ = g.markSignalWritten(s) catch {};
-    one_shot.armed = false;
-
-    // Subsequent write must still wake effect after recovery.
-    const runs_before = ctx.runs;
-    try g.markSignalWritten(s);
-    try testing.expect(ctx.runs > runs_before);
-}
-
-test "propagate: one observer OOM does not skip successfully queued tail observers" {
-    var one_shot = OneShotFailingAllocator{ .backing = testing.allocator };
-    var g = ReactiveGraph.init(one_shot.allocator());
+test "signal write notifies every observer without allocating, even when every allocation fails" {
+    // Signal.set cannot report an error: a write used to allocate its propagation worklist
+    // and effect queue entries, and on failure the committed value's observers only caught up
+    // on some later write. Node creation now reserves that capacity (reserveNotification).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var g = ReactiveGraph.init(failing.allocator());
     defer g.deinit();
 
     const source = try g.createSignal();
-    const Ctx = struct {
-        graph: *ReactiveGraph,
-        source: NodeId,
-        runs: usize = 0,
-    };
+    const Ctx = struct { graph: *ReactiveGraph, source: NodeId, runs: usize = 0 };
     const callback = struct {
         fn run(raw: *anyopaque) bool {
             const ctx: *Ctx = @ptrCast(@alignCast(raw));
             ctx.runs += 1;
-            ctx.graph.trackRead(ctx.source) catch @panic("test trackRead failed");
+            ctx.graph.trackRead(ctx.source) catch {};
             return false;
         }
     }.run;
-
     var first = Ctx{ .graph = &g, .source = source };
     var tail = Ctx{ .graph = &g, .source = source };
     _ = try g.createEffect(&callback, &first);
     _ = try g.createEffect(&callback, &tail);
+    const memo = try g.createMemo(&struct {
+        fn recompute(_: *anyopaque) bool {
+            return true;
+        }
+    }.recompute, &first);
+    try g.addEdge(memo, source);
 
-    // Keep the injected failure focused on the first pending-effect append;
-    // propagation's reusable worklist reserves transactionally up front.
-    try g.propagation_stack.ensureTotalCapacity(g.allocator, g.nodes.items.len);
-    suppress_reactive_error_log = true;
-    defer suppress_reactive_error_log = false;
-    one_shot.armed = true;
-    try testing.expectError(error.OutOfMemory, g.markSignalWritten(source));
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    for (0..3) |round| {
+        try g.markSignalWritten(source);
+        try testing.expectEqual(round + 2, first.runs);
+        try testing.expectEqual(round + 2, tail.runs);
+        try testing.expect(g.getNode(memo).?.state != .clean);
+    }
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(!g.rescan_effects);
+}
 
-    // Both observers must recover from this committed write, including the
-    // effect whose first enqueue failed. No second source write is needed.
-    try testing.expectEqual(@as(usize, 2), first.runs);
-    try testing.expectEqual(@as(usize, 2), tail.runs);
+test "node creation fails cleanly when the notification reservation cannot grow" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var g = ReactiveGraph.init(failing.allocator());
+    defer g.deinit();
+    _ = try g.createSignal();
+    const live_before = g.nodes.items.len;
+    var created: usize = 0;
+    // Fail every allocation step of the next creation in turn: it either succeeds whole or
+    // leaves no published node, and later writes still never allocate.
+    for (0..16) |step| {
+        failing.fail_index = failing.alloc_index + step;
+        failing.resize_fail_index = failing.resize_index;
+        const result = g.createSignal();
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        if (result) |_| {
+            created += 1;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+        try testing.expectEqual(live_before + created, g.nodes.items.len);
+        try testing.expect(g.propagation_stack.capacity >= g.nodes.items.len);
+        try testing.expect(g.pending_effects.capacity >= g.nodes.items.len);
+        try testing.expect(g.drain_buffer.capacity >= g.nodes.items.len);
+    }
+    try testing.expect(created > 0);
+}
+
+test "an effect creating many nodes during a drain does not disturb the batch being drained" {
+    // The drain reads its batch by index: creating nodes may move the buffer it is reading.
+    var g = ReactiveGraph.init(testing.allocator);
+    defer g.deinit();
+    const source = try g.createSignal();
+    const Ctx = struct { graph: *ReactiveGraph, source: NodeId, runs: usize = 0, spawn: bool };
+    const callback = struct {
+        fn run(raw: *anyopaque) bool {
+            const ctx: *Ctx = @ptrCast(@alignCast(raw));
+            ctx.runs += 1;
+            ctx.graph.trackRead(ctx.source) catch @panic("trackRead");
+            if (ctx.spawn and ctx.runs > 1) for (0..512) |_| {
+                _ = ctx.graph.createSignal() catch @panic("createSignal");
+            };
+            return false;
+        }
+    }.run;
+    var effects: [8]Ctx = undefined;
+    for (&effects, 0..) |*e, i| {
+        e.* = .{ .graph = &g, .source = source, .spawn = i == 0 };
+        _ = try g.createEffect(&callback, e);
+    }
+    const capacity_before = g.drain_buffer.capacity;
+    try g.markSignalWritten(source);
+    try testing.expect(g.drain_buffer.capacity > capacity_before);
+    for (effects) |e| try testing.expectEqual(@as(usize, 2), e.runs);
 }
 
 test "updateIfNecessary rescans when nested recompute removes an earlier sibling source" {
@@ -1269,7 +1356,7 @@ test "propagation uses heap worklist for very deep observer chains" {
     try testing.expectEqual(NodeState.check, g.getNode(ids[ids.len - 1]).?.state);
 }
 
-test "propagation worklist OOM leaves every observer retryable" {
+test "a write marks every observer at once even when the next allocation would fail" {
     var one_shot = OneShotFailingAllocator{ .backing = testing.allocator };
     var g = ReactiveGraph.init(one_shot.allocator());
     defer g.deinit();
@@ -1280,14 +1367,15 @@ test "propagation worklist OOM leaves every observer retryable" {
     try g.addEdge(direct, source);
     try g.addEdge(tail, direct);
 
+    // The worklist capacity was reserved when the nodes were created: the write consumes no
+    // allocation and leaves nothing for a later write to recover.
     one_shot.armed = true;
-    try testing.expectError(error.OutOfMemory, g.markSignalWritten(source));
-    try testing.expectEqual(NodeState.clean, g.getNode(direct).?.state);
-    try testing.expectEqual(NodeState.clean, g.getNode(tail).?.state);
-
     try g.markSignalWritten(source);
+    try testing.expect(one_shot.armed);
+    one_shot.armed = false;
     try testing.expectEqual(NodeState.dirty, g.getNode(direct).?.state);
     try testing.expectEqual(NodeState.check, g.getNode(tail).?.state);
+    try testing.expect(!g.rescan_effects);
 }
 
 test "reactive recompute chain stops at explicit recursion budget" {
@@ -1462,7 +1550,7 @@ test "createNode: 世代回卷前 slot 永久退役（悬垂 NodeId 不复活）
     try testing.expect(!g.isAlive(first));
 }
 
-test "committed propagation OOM recovers nested memo effects at batch end without rerunning unrelated effects" {
+test "a batched write reaches nested memo effects at batch end without allocating or rerunning unrelated effects" {
     var failing = OneShotFailingAllocator{ .backing = testing.allocator };
     var graph = ReactiveGraph.init(failing.allocator());
     defer graph.deinit();
@@ -1506,7 +1594,9 @@ test "committed propagation OOM recovers nested memo effects at batch end withou
     graph.beginBatch();
     ctx.value = 42;
     failing.armed = true;
-    try testing.expectError(error.OutOfMemory, graph.markSignalWritten(source));
+    try graph.markSignalWritten(source);
+    try testing.expect(failing.armed);
+    failing.armed = false;
     try testing.expectEqual(@as(usize, 1), ctx.runs);
     try graph.endBatch();
     try testing.expectEqual(@as(u32, 42), ctx.observed);
@@ -1537,7 +1627,9 @@ test "failed effect recompute remains scheduled until memory recovers without an
     defer suppress_reactive_error_log = false;
     graph.beginBatch();
     ctx.value = 42;
-    try testing.expectError(error.OutOfMemory, graph.markSignalWritten(source));
+    // The write itself never allocates (its capacity was reserved at creation); the effect's
+    // own recompute fails at the batch end and stays scheduled.
+    try graph.markSignalWritten(source);
     try testing.expectError(error.OutOfMemory, graph.endBatch());
     try testing.expect(graph.rescan_effects);
     try testing.expectEqual(@as(u32, 0), ctx.observed);
@@ -1548,7 +1640,50 @@ test "failed effect recompute remains scheduled until memory recovers without an
     try testing.expect(!graph.rescan_effects);
 }
 
-test "a memo read recovers after one propagation OOM without another write" {
+test "an effect whose run fails is retried by the next drain instead of going deaf" {
+    // The failed effect stays dirty and leaves the queue; propagation skips dirty observers, so
+    // without a rescan no later write would ever reach it.
+    var graph = ReactiveGraph.init(testing.allocator);
+    defer graph.deinit();
+    const source = try graph.createSignal();
+    const unrelated = try graph.createSignal();
+    const Ctx = struct { graph: *ReactiveGraph, source: NodeId, value: u32 = 0, observed: u32 = 0 };
+    const callback = struct {
+        fn run(raw: *anyopaque) bool {
+            const c: *Ctx = @ptrCast(@alignCast(raw));
+            c.graph.trackRead(c.source) catch unreachable;
+            c.observed = c.value;
+            return false;
+        }
+    }.run;
+    var ctx = Ctx{ .graph = &graph, .source = source };
+    _ = try graph.createEffect(callback, &ctx);
+    var other = Ctx{ .graph = &graph, .source = unrelated };
+    _ = try graph.createEffect(callback, &other);
+
+    // Make the effect's next run fail: its tracking stack has to grow and nothing can be had.
+    graph.tracking_stack.deinit(graph.allocator);
+    graph.tracking_stack = .empty;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    graph.allocator = failing.allocator();
+    suppress_reactive_error_log = true;
+    defer suppress_reactive_error_log = false;
+    ctx.value = 42;
+    try testing.expectError(error.OutOfMemory, graph.markSignalWritten(source));
+    try testing.expectEqual(@as(u32, 0), ctx.observed);
+    try testing.expect(graph.rescan_effects);
+
+    // Memory is back; a write to an unrelated signal drains and the failed effect catches up
+    // without its own source being written again.
+    graph.allocator = testing.allocator;
+    other.value = 7;
+    try graph.markSignalWritten(unrelated);
+    try testing.expectEqual(@as(u32, 7), other.observed);
+    try testing.expectEqual(@as(u32, 42), ctx.observed);
+    try testing.expect(!graph.rescan_effects);
+}
+
+test "a memo read sees a write made while the next allocation would fail" {
     var failing = OneShotFailingAllocator{ .backing = std.testing.allocator };
     var graph = ReactiveGraph.init(failing.allocator());
     defer graph.deinit();
@@ -1567,7 +1702,9 @@ test "a memo read recovers after one propagation OOM without another write" {
     graph.updateIfNecessary(memo);
     context.source = 42;
     failing.armed = true;
-    try std.testing.expectError(error.OutOfMemory, graph.markSignalWritten(signal));
+    try graph.markSignalWritten(signal);
+    try std.testing.expect(failing.armed);
+    failing.armed = false;
     graph.updateIfNecessary(memo);
     try std.testing.expectEqual(@as(u32, 42), context.memo);
 }

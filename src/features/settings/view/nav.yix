@@ -1,0 +1,59 @@
+//! 左侧 Settings Nav（Pencil `Bt1FV`）：窗口顶部（红绿灯占位，`ZeTFX`）、搜索、分类行、本机说明。
+//! 浮层本身是 zenit 原生 liquid glass 容器 `W.GlassBox`（人工验收反馈 1）：216 宽、高度随父容器（`fill={.height}`，G29）、圆角 14、
+//! 内边距 [10, 8]、子项间距 12 全部是组件参数；材质、描边、投影、明暗族适配都用组件默认，不再用 Yss 模仿。
+//! 分类行是 `W.Pressable`（可点击根 = test_id 所在节点），外观全部来自 `styles.yss` 的 `NavRow` / `NavIcon` / `NavLabel`。
+//! 搜索框是原生 `W.Input`（sm），外观全用默认（不再照搬旧实现“首次聚焦后圆角 14 → 4”的隐性行为）。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const S = @import("styles.yss");
+const Shell = @import("settings_shell.zig");
+
+fn items(vm: *m.ViewModel) []const m.NavItem {
+    return vm.navItems();
+}
+fn searchField(vm: *m.ViewModel) []const u8 {
+    return vm.searchField();
+}
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn navId(page: u8) []const u8 {
+    return m.ids.nav[page];
+}
+fn pageName(page: u8) []const u8 {
+    return m.catalog.pages.pages[page].name;
+}
+fn pageIcon(page: u8) ui.SvgAsset {
+    return Shell.icons[page];
+}
+
+pub fn SettingsNav(vm: *m.ViewModel) View {
+    return (
+        <box style={S.nav_column}>
+            <box style={S.nav_window_inset} windowRegion={.drag} />
+            <W.GlassBox testId="settings.navigation" width={216} fill={.height} cornerRadius={14} padding={.{ .top = 0, .right = 8, .bottom = 10, .left = 8 }} bodyGap={12} style={S.nav_glass}>
+                <box style={S.nav_title_band} windowRegion={.drag}>
+                    <box testId="settings.header" style={S.nav_top}>
+                        <box testId="settings.header.traffic_lights" style={S.traffic_lights} />
+                        <text testId="settings.header.title" style={S.window_title} visible={false}>设置</text>
+                        <box style={S.top_spacer} />
+                    </box>
+                </box>
+                <box testId="settings.search.slot" style={S.search_slot}>
+                    <W.Input testId={m.ids.search} value={searchField(vm)} placeholder="搜索设置" leadingIconAsset={ui.icons.search} size={.sm} style={S.search} onChange={|q| send(vm, m.Intent.searchFor(q))} />
+                </box>
+                <W.ScrollArea direction={.vertical} testId={m.ids.navigation_scroll} style={S.nav_scroll} parts={.{ .content = .{ .style = S.nav_list } }}>
+                    {for (items(vm)) |item| <W.Pressable key={item.key} testId={navId(item.page)} a11yLabel={pageName(item.page)} selected={item.selected} disabled={item.locked} onClick={send(vm, m.Intent.selectCategory(item.page))} style={S.NavRow.of(.{ .selected = item.selected, .locked = item.locked })}>
+                        <icon src={pageIcon(item.page)} style={S.NavIcon.of(.{ .selected = item.selected })} />
+                        <text style={S.NavLabel.of(.{ .selected = item.selected })} box={S.nav_label_box}>{pageName(item.page)}</text>
+                    </W.Pressable>}
+                </W.ScrollArea>
+                <box testId="settings.navigation.note" style={S.nav_note}>
+                    <icon src={ui.icons.lock} style={.{ S.note_icon, S.note_icon_ink }} />
+                    <text style={S.note_text}>配置与凭据保留在本机</text>
+                </box>
+            </W.GlassBox>
+        </box>
+    );
+}

@@ -93,7 +93,7 @@ const EditorView = struct {
             self.feedback(@errorName(err));
             return;
         };
-        self.feedback(if (intent == .save) "已离线保存" else if (intent == .temporary) "已提交临时连接" else "已提交探测");
+        self.feedback(if (intent == .save) "已保存（未连接）" else if (intent == .temporary) "已提交临时连接" else "已提交探测");
     }
     fn feedback(self: *EditorView, value: []const u8) void {
         if (self.message) |node| node.setTextContent(self.mount.cx.allocator, value) catch {};

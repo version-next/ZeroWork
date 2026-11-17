@@ -54,6 +54,9 @@ pub const Broker = struct {
     live_context: ?host.Context = null,
     next_sequence: u64 = 1,
     entry: ?struct { snapshot: Snapshot, answer: ?Answer = null } = null,
+    /// The UI that shows the question (its owner binds it): a question appearing or going away
+    /// publishes to it (LIFECYCLE.md §5.3).
+    wake: ?*const @import("publication.zig").Wake = null,
     fn lock(self: *Broker) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -87,6 +90,8 @@ pub const Broker = struct {
         defer parsed.deinit();
         const request = parsed.value;
         if (std.mem.trim(u8, request.question, " \t\r\n").len == 0 or request.options.len > max_options or (request.options.len == 0 and !request.allow_custom)) return error.InvalidUserQuestion;
+        // After the unlock below (defers run last-in first-out).
+        defer @import("publication.zig").publish(self.wake);
         var snapshot_value: Snapshot = .{ .ticket = undefined, .call = try Text(provider.max_tool_call_id_bytes).init(invocation.call_id), .question = try Text(1024).init(request.question), .allow_custom = request.allow_custom, .option_count = request.options.len };
         for (request.options, 0..) |option, index| {
             if (std.mem.trim(u8, option.id, " \t\r\n").len == 0 or std.mem.trim(u8, option.label, " \t\r\n").len == 0) return error.InvalidUserQuestion;
@@ -124,6 +129,7 @@ pub const Broker = struct {
         entry.answer = .{ .text = try Text(4096).init(std.mem.trim(u8, custom, " \t\r\n")) };
     }
     pub fn finish(self: *Broker, ticket: Ticket) void {
+        defer @import("publication.zig").publish(self.wake);
         self.lock();
         defer self.mutex.unlock();
         if (self.entry) |entry| if (entry.snapshot.ticket.eql(ticket)) {

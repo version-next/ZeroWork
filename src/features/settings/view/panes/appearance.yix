@@ -1,0 +1,868 @@
+//! 外观与主题（第 0 类）面板正文（P3 3e 外观包）：主题、应用图标、背景图片、预览（“主题”子页面），字体与排版，终端与工作区。
+//! 文案 / id / 搜索词在 `model/pane_fields.zig` 的 `appearance`；主题库、字体校验、背景缩略图与 worker 状态来自宿主
+//! （`Ports.appearance`，宿主在它们变化时 `sync`），草稿编辑经 `Intent.appearance` 写 Controller，资源操作经 `Effect.appearance` 交宿主。
+//!
+//! 草稿变化按信号局部更新，不整页重挂（S-11：切换开关时同一个原生 `W.Switch` 原地滑动）。
+//! 控件全部是 zenit 原生默认外观（`W.Switch` / `W.Input` / `W.Select` / `W.Slider` / `W.Tabs` / `W.RadioGroup` / `W.Radio` /
+//! `W.Button` / `W.Tooltip` / `W.Menu` / `W.Popover` / `W.Tag`）；主题卡片是自定义内容（色板 + 名称 + 原生单选圆点，根是 `W.Pressable`）。
+//! 唯一留在 Zig 的是行内材质预览：它复用宿主的窗口材质图层（`components/material_preview.zig`，例外 S-18）。
+const std = @import("std");
+const ui = @import("ui");
+/// 浮层规则的唯一来源（OverlayHost `panel`）。
+const O = @import("../../../../shared/ui/overlay/overlay_host.zig");
+const W = ui.widgets;
+const Confirm = @import("../../../../shared/ui/confirm/confirm.zig");
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const MP = @import("../components/material_preview.zig");
+const Frame = @import("../window_frame.zig").Frame;
+const S = @import("../styles.yss");
+const A = @import("appearance.yss");
+const P = m.fields.appearance;
+
+const themes_pane = &P.themes;
+const icon_pane = &P.app_icon;
+const materials_pane = &P.materials;
+const preview_pane = &P.preview;
+const font_pane = &P.font;
+const aids_pane = &P.aids;
+
+fn send(vm: *m.ViewModel, intent: m.Intent) void {
+    vm.dispatch(intent);
+}
+fn popup(vm: *m.ViewModel, id: []const u8) bool {
+    return vm.popupOpen(id);
+}
+fn setPopup(vm: *m.ViewModel, id: []const u8, open: bool) void {
+    vm.dispatch(m.Intent.popupChanged(id, open));
+}
+fn shown(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.rowShown(pane, row);
+}
+/// 面板 / 行只在内容页挂载时显示才建（形态在挂载时定下，位置与搜索词变化会整页重挂；同旧实现不建未命中的部分）：
+/// 全建再隐藏会让搜索结果页的子树超出自动化查询的结果缓冲（同 `keys.yix` 的 `built`）。
+fn built(vm: *m.ViewModel, pane: *const m.PaneSpec) bool {
+    return vm.paneShown(pane);
+}
+fn rowBuilt(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.paneShown(pane) and vm.rowShown(pane, row);
+}
+fn last(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) bool {
+    return vm.rowLast(pane, row);
+}
+fn label(row: m.Row) []const u8 {
+    return row.label;
+}
+fn help(row: m.Row) []const u8 {
+    return row.help;
+}
+fn fieldId(row: m.Row) []const u8 {
+    return row.ids.field;
+}
+fn errorId(row: m.Row) []const u8 {
+    return row.ids.err;
+}
+fn helpId(row: m.Row) []const u8 {
+    return row.ids.help;
+}
+fn helpTipId(row: m.Row) []const u8 {
+    return row.ids.help_tip;
+}
+fn focusId(row: m.Row) []const u8 {
+    return row.ids.focus;
+}
+fn chooserId(row: m.Row) []const u8 {
+    return row.ids.chooser;
+}
+fn sliderId(row: m.Row) []const u8 {
+    return row.ids.slider;
+}
+fn unit(row: m.Row) ?[]const u8 {
+    return row.unit;
+}
+fn locked(vm: *m.ViewModel) bool {
+    return vm.appearanceLocked();
+}
+fn setBool(vm: *m.ViewModel, row: m.Row, value: bool) void {
+    vm.dispatch(m.Intent.appearanceValue(row.key.?, .{ .boolean = value }));
+}
+fn editText(vm: *m.ViewModel, row: m.Row, text: []const u8) void {
+    vm.dispatch(m.Intent.appearanceText(row.key.?, text));
+}
+fn submit(vm: *m.ViewModel, row: m.Row, text: []const u8) void {
+    vm.dispatch(m.Intent.appearanceSubmit(row.key.?, text));
+}
+fn pickText(vm: *m.ViewModel, row: m.Row, value: ?[]const u8) void {
+    const picked = value orelse return;
+    vm.dispatch(m.Intent.appearanceValue(row.key.?, .{ .text = picked }));
+}
+/// 滑块落地：透明度是小数、模糊是整数、字重写成数值字重（同旧 `SliderEdit.change`）。
+fn slide(vm: *m.ViewModel, row: m.Row, value: f32) void {
+    const key = row.key.?;
+    var buffer: [16]u8 = undefined;
+    const next: m.Value = if (std.mem.eql(u8, key.key, "font_weight"))
+        .{ .text = std.fmt.bufPrint(&buffer, "{d}", .{@as(u16, @intFromFloat(@round(value)))}) catch return }
+    else if (std.mem.eql(u8, key.key, "transparency"))
+        .{ .decimal = value }
+    else
+        .{ .unsigned = @intFromFloat(@round(value)) };
+    vm.dispatch(m.Intent.appearanceValue(key, next));
+}
+fn switchA11y(vm: *m.ViewModel, row: m.Row) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = row.label, .checked = vm.boolOf(row.key.?), .disabled = vm.appearanceLocked() };
+}
+
+// ── 通用行（标签 + “?”、开关、输入框、校验提示） ──
+
+/// 标题旁的“?”：原生 ghost 图标按钮 + 原生 Tooltip（上方、450ms、宽 292），开合归 view-model 的 `popup`（Escape 先收起它）。
+fn Hint(vm: *m.ViewModel, row: m.Row, text: []const u8) View {
+    const tip = computed(helpTipId(row));
+    return (
+        <box style={S.help_slot}>
+            <W.Tooltip text={text} position={.top} width={292} open={popup(vm, tip)} onOpenChange={|o| setPopup(vm, tip, o)} parts={.{ .content = tip }}>
+                <W.Button testId={helpId(row)} variant={.ghost} size={.xs} iconOnly={true} iconAsset={ui.icons.circle_help} iconSize={14} a11yLabel={text} onClick={setPopup(vm, tip, true)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+fn Heading(vm: *m.ViewModel, row: m.Row, text: []const u8) View {
+    return (
+        <box style={S.setting_copy}>
+            <box style={S.setting_heading}>
+                <text style={S.setting_label}>{label(row)}</text>
+                {if (text.len != 0) <Hint vm={vm} row={row} text={text} />}
+            </box>
+        </box>
+    );
+}
+fn Problem(vm: *m.ViewModel, row: m.Row) View {
+    return <text testId={errorId(row)} style={S.setting_error} visible={vm.appearanceInvalid(row)}>{vm.appearanceProblem(row)}</text>;
+}
+/// 开关行：原生 `W.Switch`（sm），值跟随草稿，切换时原地滑动（不重挂）。
+fn Toggle(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row) View {
+    const a11y = computed(switchA11y(vm, row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Heading vm={vm} row={row} text={help(row)} />
+                <W.Switch testId={fieldId(row)} size={.sm} checked={vm.boolOf(row.key.?)} disabled={locked(vm)} a11y={a11y} onChange={|v| setBool(vm, row, v)} />
+            </box>
+        </box>
+    );
+}
+/// 数值输入行：原生 `W.Input`（受控原文、原生单位后缀），校验问题标红并在行下提示；Enter 提交（字体字段重新校验字体）。
+fn Number(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, width: f32) View {
+    const fid = computed(fieldId(row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Heading vm={vm} row={row} text={help(row)} />
+                <W.Input value={vm.appearanceText(row)} appendText={unit(row)} width={width} invalid={vm.appearanceInvalid(row)} disabled={locked(vm)} focusId={focusId(row)} onChange={|t| editText(vm, row, t)} onSubmit={|t| submit(vm, row, t)} parts={.{ .input_container = fid }} />
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+/// 滑块行（全局透明度、背景与浮层模糊、可变字体的基准字重）：原生 `W.Slider` + 原生 `W.Input`，两者跟随同一个草稿值。
+fn Slider(vm: *m.ViewModel, pane: *const m.PaneSpec, row: m.Row, text: []const u8, min: f32, max: f32, step: f32) View {
+    const fid = computed(fieldId(row));
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, pane, row) })} visible={shown(vm, pane, row)}>
+            <box style={S.setting_line}>
+                <Heading vm={vm} row={row} text={text} />
+                <box style={A.slider_group}>
+                    <box style={A.slider_box}>
+                        <W.Slider testId={sliderId(row)} min={min} max={max} step={step} width={208} value={vm.appearanceNumber(row)} disabled={locked(vm)} onChange={|v| slide(vm, row, v)} />
+                    </box>
+                    <W.Input value={vm.appearanceText(row)} appendText={unit(row)} width={90} invalid={vm.appearanceInvalid(row)} disabled={locked(vm)} focusId={focusId(row)} onChange={|t| editText(vm, row, t)} onSubmit={|t| submit(vm, row, t)} parts={.{ .input_container = fid }} />
+                </box>
+            </box>
+            <Problem vm={vm} row={row} />
+        </box>
+    );
+}
+/// 页头（标题 + 右侧说明），与 `R.Pane` 同样式；说明文字由调用方给（主题名、预览摘要）。
+fn Header(id: []const u8, summary: []const u8, title: []const u8, meta: Text) View {
+    return (
+        <box testId={id} style={S.pane_header}>
+            <text style={S.pane_title}>{title}</text>
+            <spacer />
+            <text testId={summary} style={S.pane_meta} box={S.pane_meta_box}>{meta}</text>
+        </box>
+    );
+}
+
+// ── 主题 ──
+
+fn cardId(card: m.ThemeCard) []const u8 {
+    return card.test_id;
+}
+fn cardMenuId(card: m.ThemeCard) []const u8 {
+    return card.menu_id;
+}
+fn cardName(card: m.ThemeCard) []const u8 {
+    return card.record.theme.name;
+}
+fn cardSelected(card: m.ThemeCard) bool {
+    return card.selected;
+}
+fn cardImported(card: m.ThemeCard) bool {
+    return card.imported;
+}
+fn pickCard(vm: *m.ViewModel, card: m.ThemeCard) void {
+    vm.dispatch(m.Intent.selectTheme(card.id));
+}
+fn removeCard(vm: *m.ViewModel, card: m.ThemeCard) void {
+    vm.dispatch(m.Intent.requestRemoveTheme(card.id, card.record.theme.name));
+}
+fn requestRemoveCurrent(vm: *m.ViewModel) void {
+    vm.dispatch(m.Intent.requestRemoveTheme(currentTheme(vm), vm.themeName()));
+}
+fn confirmRemoveTheme(vm: *m.ViewModel) void {
+    vm.dispatch(m.Intent.removeTheme(vm.themeDeleteId()));
+}
+const delete_theme_label = Confirm.label(.delete, "导入主题");
+/// 导入主题的右键菜单：右键或 Shift+F10 打开（同旧 `ThemeContextMenu`）。
+fn cardPointer(vm: *m.ViewModel, card: m.ThemeCard, e: ui.view.Pointer) void {
+    if (!card.imported or e.button != .right) return;
+    vm.dispatch(m.Intent.popupChanged(card.menu_id, true));
+    e.consume();
+}
+fn cardKey(vm: *m.ViewModel, card: m.ThemeCard, e: ui.view.KeyPress) void {
+    if (!card.imported or e.key != .f10 or !e.modifiers.shift or e.modifiers.ctrl or e.modifiers.alt or e.modifiers.super) return;
+    vm.dispatch(m.Intent.popupChanged(card.menu_id, true));
+    e.stop();
+}
+/// 右键菜单的一项：删除（不可删时禁用并写明原因，同旧菜单文字）。
+fn removeItems(vm: *m.ViewModel, card: m.ThemeCard) []const W.MenuItem {
+    const removal = vm.themeRemoval(card.id);
+    const off = vm.appearanceLocked();
+    return switch (removal) {
+        .removable => if (off) remove_off else remove_on,
+        .in_use => remove_in_use,
+        .previewing => remove_previewing,
+        .builtin => remove_builtin,
+        .unavailable => remove_unavailable,
+    };
+}
+/// 经菜单唯一的投影（`app_menu.static`，menus 包）：不可删时置灰，原因写在标题后（不再顶替标题）。
+const app_menu = @import("../../../shell/mod.zig").app_menu;
+const remove_on = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true }});
+const remove_off = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true, .disabled = true }});
+const remove_in_use = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true, .disabled_reason = "使用中 · 请先切换并保存" }});
+const remove_previewing = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true, .disabled_reason = "预览中 · 请先切换待选主题" }});
+const remove_builtin = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true, .disabled_reason = "内置主题不可删除" }});
+const remove_unavailable = app_menu.static(&.{.{ .id = "remove", .label = "删除导入主题", .icon_asset = &ui.icons.trash, .danger = true, .disabled_reason = "主题库不可用" }});
+
+/// 主题卡片（`J91kn`）：色板（主题自己的终端底色 + 强调色 / 次表面色三条，选中时强调色描边）+ 名称 + 原生单选圆点。
+fn ThemeCardView(vm: *m.ViewModel, card: m.ThemeCard) View {
+    return (
+        <W.Pressable testId={cardId(card)} a11yLabel={cardName(card)} selected={cardSelected(card)} disabled={locked(vm)} style={A.ThemeCard.of(.{ .off = locked(vm) })} onClick={pickCard(vm, card)} onPointerDown={|e| cardPointer(vm, card, e)} onKeyDown={|e| cardKey(vm, card, e)}>
+            <box style={ui.view.styleBy(card, A.swatch)}>
+                <box style={ui.view.styleBy(card, A.swatchAccent)} />
+                <box style={ui.view.styleBy(card, A.swatchFill)} />
+                <box style={ui.view.styleBy(card, A.swatchShort)} />
+            </box>
+            <box style={A.theme_caption}>
+                <text style={A.theme_name} box={A.theme_name_box}>{cardName(card)}</text>
+                <W.Radio checked={cardSelected(card)} />
+            </box>
+        </W.Pressable>
+    );
+}
+/// 一张卡片的位置：导入的主题包一层原生 `W.Menu`（手动打开：右键 / Shift+F10）。
+fn ThemeTile(vm: *m.ViewModel, card: m.ThemeCard) View {
+    return (
+        <box style={A.theme_tile}>
+            {if (cardImported(card)) <W.Menu testId={cardMenuId(card)} trigger={.manual} width={210} open={popup(vm, cardMenuId(card))} onOpenChange={|o| setPopup(vm, card.menu_id, o)} items={removeItems(vm, card)} onSelect={|_| removeCard(vm, card)}>
+                <ThemeCardView vm={vm} card={card} />
+            </W.Menu> else <ThemeCardView vm={vm} card={card} />}
+        </box>
+    );
+}
+fn AnsiCell(vm: *m.ViewModel, index: usize) View {
+    const color = computed(vm.ansiColor(index));
+    return <box style={ui.view.styleBy(color, A.ansiCell)} />;
+}
+/// 当前主题的终端配色（ANSI 16，`settings.theme.ansi`）。
+fn AnsiPalette(vm: *m.ViewModel) View {
+    const colors = computed(vm.terminalColors());
+    return (
+        <box testId="settings.theme.ansi" style={ui.view.styleBy(colors, A.ansiPanel)}>
+            <text style={ui.view.styleBy(colors, A.ansiTitle)}>终端配色 · ANSI 16</text>
+            <box style={A.ansi_strip}>
+                {for (0..16) |i| <AnsiCell vm={vm} index={i} />}
+            </box>
+        </box>
+    );
+}
+fn removeLabel(vm: *m.ViewModel) []const u8 {
+    return if (vm.themeBuiltin()) "内置主题不可删除" else "删除当前主题";
+}
+/// 删除导入主题是破坏性操作：原生 danger 按钮（同旧“删除当前主题”的危险色）；内置主题只显示说明，用 secondary。
+fn removeVariant(vm: *m.ViewModel) W.ButtonVariant {
+    return if (vm.themeBuiltin()) .secondary else .danger;
+}
+fn currentTheme(vm: *m.ViewModel) []const u8 {
+    return vm.controller.model.value.ui.theme;
+}
+fn hasProblem(vm: *m.ViewModel) bool {
+    return vm.themeProblem().len != 0;
+}
+fn importEnabled(vm: *m.ViewModel) bool {
+    return vm.appearanceReady() and !vm.appearanceLocked();
+}
+
+/// 主题（`settings.appearance.themes`）：主题条、主题数与动作、ANSI 色板、导入 / 删除失败的提示。
+fn ThemesPane(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.appearance.themes" style={S.pane} visible={vm.paneShown(themes_pane)}>
+            <Header id="settings.appearance.themes.header" summary="settings.appearance.themes.summary" title="主题" meta={vm.themeName()} />
+            <box style={A.theme_body}>
+                <W.ScrollArea testId="settings.theme.strip" direction={.horizontal} scrollX={vm.themeStripStart()} style={A.theme_strip}>
+                    <box style={A.theme_row}>
+                        {for (vm.themeCards()) |card| <ThemeTile vm={vm} card={card} />}
+                    </box>
+                </W.ScrollArea>
+                <box testId="settings.theme.current" style={A.theme_actions}>
+                    <text style={A.note} box={A.fill_text}>{vm.themeCountText()}</text>
+                    <W.Tag label="预览中" color={.accent} size={.sm} visible={vm.themePreviewing()} />
+                    <W.Tooltip text={vm.themeRemoveReason()} position={.top}>
+                        <W.Button testId="settings.theme.remove.current" label={removeLabel(vm)} variant={removeVariant(vm)} size={.sm} disabled={!vm.themeRemoveEnabled()} onClick={requestRemoveCurrent(vm)} />
+                    </W.Tooltip>
+                    <W.Tooltip text="仅支持 iTerm2 .itermcolors 主题文件" position={.top}>
+                        <W.Button testId="settings.theme.import" label="导入 .itermcolors" variant={.secondary} size={.sm} disabled={!importEnabled(vm)} onClick={send(vm, m.Intent.runCommand(.import_theme))} />
+                    </W.Tooltip>
+                </box>
+                {if (vm.miniPreviewShown()) <AnsiPalette vm={vm} />}
+                <box style={A.notice} visible={hasProblem(vm)}>
+                    <icon src={ui.icons.circle_alert} style={A.notice_error_icon} />
+                    <text style={A.error_note} box={A.fill_text}>{vm.themeProblem()}</text>
+                </box>
+            </box>
+            <W.ConfirmDialog testId={m.ids.theme_delete} open={popup(vm, m.ids.theme_delete)} onCancel={setPopup(vm, m.ids.theme_delete, false)} onConfirm={confirmRemoveTheme(vm)} closeOnOverlay={Confirm.close_on_overlay} title="删除导入主题？" message={vm.themeDeleteMessage()} confirmLabel={delete_theme_label} cancelLabel={Confirm.cancel_label} testIds={.{ .cancel = m.ids.theme_delete_cancel, .confirm = m.ids.theme_delete_accept }} />
+        </box>
+    );
+}
+
+// ── 应用图标 ──
+
+const icon_options = [_]W.checkbox.RadioOption{
+    .{ .value = "transparent", .label = "透明背景", .test_id = "settings.option.icon_background.transparent" },
+    .{ .value = "dark", .label = "黑底", .test_id = "settings.option.icon_background.dark" },
+    .{ .value = "light", .label = "白底", .test_id = "settings.option.icon_background.light" },
+};
+fn pickIcon(vm: *m.ViewModel, value: []const u8) void {
+    vm.dispatch(m.Intent.appearanceValue(P.icon_background.key.?, .{ .text = value }));
+}
+
+/// 应用图标（`settings.appearance.app_icon`）：Dock 图标底色，原生 `W.RadioGroup`（横排，默认外观）。
+fn IconPane(vm: *m.ViewModel) View {
+    return (
+        <R.Pane vm={vm} pane={icon_pane}>
+            <box style={S.SettingRow.of(.{ .last = true })}>
+                <box style={S.setting_line}>
+                    <Heading vm={vm} row={P.icon_background} text={help(P.icon_background)} />
+                    <box style={A.radio_slot}>
+                        <W.RadioGroup testId="settings.field.icon_background" options={&icon_options} value={vm.iconBackground()} horizontal={true} disabled={locked(vm)} onChange={|v| pickIcon(vm, v)} />
+                    </box>
+                </box>
+            </box>
+        </R.Pane>
+    );
+}
+
+// ── 背景图片 ──
+
+const order_options = [_]W.SelectOption{
+    .{ .value = "sequential", .label = "顺序", .test_id = "settings.option.order.sequential" },
+    .{ .value = "random", .label = "随机", .test_id = "settings.option.order.random" },
+};
+const interval_options = [_]W.SelectOption{
+    .{ .value = "1", .label = "1 分钟", .test_id = "settings.option.interval_minutes.1" },
+    .{ .value = "5", .label = "5 分钟", .test_id = "settings.option.interval_minutes.5" },
+    .{ .value = "15", .label = "15 分钟", .test_id = "settings.option.interval_minutes.15" },
+    .{ .value = "30", .label = "30 分钟", .test_id = "settings.option.interval_minutes.30" },
+    .{ .value = "60", .label = "60 分钟", .test_id = "settings.option.interval_minutes.60" },
+};
+const fit_options = [_]W.SelectOption{
+    .{ .value = "fill", .label = "填充 · Fill", .test_id = "settings.option.fit.fill" },
+    .{ .value = "fit", .label = "适应 · Fit", .test_id = "settings.option.fit.fit" },
+    .{ .value = "center", .label = "居中 · Center", .test_id = "settings.option.fit.center" },
+    .{ .value = "tile", .label = "平铺 · Tile", .test_id = "settings.option.fit.tile" },
+};
+const alignment_popup = "settings.chooser.alignment";
+fn enableA11y(vm: *m.ViewModel) ?ui.A11yProps {
+    return .{ .role = .switch_role, .label = "开启背景图片", .checked = vm.backgroundEnabled(), .disabled = vm.appearanceLocked() };
+}
+fn backgroundOff(vm: *m.ViewModel) bool {
+    return !vm.backgroundEnabled();
+}
+fn previewable(vm: *m.ViewModel) bool {
+    return vm.appearanceReady() and !vm.appearanceLocked();
+}
+fn removable(vm: *m.ViewModel) bool {
+    return vm.backgroundHasPath() and !vm.appearanceLocked();
+}
+fn textureId(texture: m.Texture) u32 {
+    return texture.id;
+}
+
+/// 两列并排的选择框里的一列：标签（+“?”）+ 原生 `W.Select`（填满这一列）。
+fn PairSelect(vm: *m.ViewModel, row: m.Row, options: []const W.SelectOption) View {
+    const fid = computed(fieldId(row));
+    const panel = computed(chooserId(row));
+    return (
+        <box style={A.pair_field}>
+            <box style={A.pair_label}>
+                <text style={S.setting_label}>{label(row)}</text>
+                {if (help(row).len != 0) <Hint vm={vm} row={row} text={help(row)} />}
+            </box>
+            <box style={A.pair_control}>
+                <W.Select fill={true} panelWidth={.trigger} options={options} value={vm.backgroundChoice(row)} disabled={locked(vm)} open={popup(vm, fid)} onOpenChange={|o| setPopup(vm, fid, o)} onChange={|v| pickText(vm, row, v)} parts={.{ .trigger = fid, .panel = panel }} />
+            </box>
+        </box>
+    );
+}
+fn alignTo(vm: *m.ViewModel, x: usize, y: usize) void {
+    vm.dispatch(m.Intent.alignBackground(@enumFromInt(x), @enumFromInt(y)));
+}
+fn cellId(x: usize, y: usize) []const u8 {
+    return alignment_ids[y][x];
+}
+fn cellName(x: usize, y: usize) []const u8 {
+    return m.ViewModel.alignment_names[y][x];
+}
+const alignment_ids = blk: {
+    var table: [3][3][]const u8 = undefined;
+    for (m.ViewModel.alignment_names, 0..) |row, y| for (row, 0..) |name, x| {
+        table[y][x] = "settings.alignment." ++ name;
+    };
+    break :blk table;
+};
+/// 九宫格的一格：可点的根（`W.Pressable`）里一个原生单选圆点。
+fn AlignmentCell(vm: *m.ViewModel, x: usize, y: usize) View {
+    return (
+        <W.Pressable testId={cellId(x, y)} a11yLabel={cellName(x, y)} selected={vm.alignmentChosen(x, y)} disabled={locked(vm)} style={A.alignment_cell} onClick={alignTo(vm, x, y)}>
+            <W.Radio checked={vm.alignmentChosen(x, y)} />
+        </W.Pressable>
+    );
+}
+/// 图片对齐：原生 `W.Popover`（触发器是原生 secondary 按钮，显示当前对齐，尾随下拉箭头 `iconPosition={.trailing}`，G33），里面是 3 × 3 的原生单选。
+fn AlignmentField(vm: *m.ViewModel) View {
+    return (
+        <box style={A.pair_field}>
+            <box style={A.pair_label}>
+                <text style={S.setting_label}>图片对齐</text>
+            </box>
+            <box style={A.pair_control}>
+                <W.Popover open={popup(vm, alignment_popup)} onOpenChange={|o| setPopup(vm, alignment_popup, o)} parts={.{ .chrome = alignment_popup }} closeOnEscape={O.panel.escape} closeOnOutsideClick={O.panel.outside} consumeOutsideClick={O.consume_outside_click} trapFocus={O.panel.trap_focus} trigger={<W.Button testId="settings.field.alignment" label={vm.alignmentLabel()} variant={.secondary} size={.sm} iconAsset={ui.icons.chevron_down} iconPosition={.trailing} disabled={locked(vm)} />}>
+                    <box style={A.alignment_grid}>
+                        <box style={A.alignment_row}>
+                            <AlignmentCell vm={vm} x={0} y={0} />
+                            <AlignmentCell vm={vm} x={1} y={0} />
+                            <AlignmentCell vm={vm} x={2} y={0} />
+                        </box>
+                        <box style={A.alignment_row}>
+                            <AlignmentCell vm={vm} x={0} y={1} />
+                            <AlignmentCell vm={vm} x={1} y={1} />
+                            <AlignmentCell vm={vm} x={2} y={1} />
+                        </box>
+                        <box style={A.alignment_row}>
+                            <AlignmentCell vm={vm} x={0} y={2} />
+                            <AlignmentCell vm={vm} x={1} y={2} />
+                            <AlignmentCell vm={vm} x={2} y={2} />
+                        </box>
+                    </box>
+                </W.Popover>
+            </box>
+        </box>
+    );
+}
+/// 缩略图（宿主上传的纹理，cover 缩放居中）或占位图标。
+fn Thumbnail(vm: *m.ViewModel) View {
+    const texture = computed(vm.backgroundThumbnail());
+    return (
+        <W.Pressable testId="settings.materials.preview.open" a11yLabel="材质预览" disabled={!previewable(vm)} style={A.Thumbnail.of(.{ .off = !previewable(vm) })} onClick={send(vm, m.Intent.previewMaterial(true))}>
+            {if (texture) |t| <image src={textureId(t)} style={ui.view.styleBy(texture, A.thumbnailImage)} /> else <icon src={ui.icons.image} style={A.thumbnail_icon} />}
+        </W.Pressable>
+    );
+}
+/// 行内材质预览（`settings.background.preview`）：宿主的材质图层 + “背景预览”标签 + 示例终端文字 + “全窗口预览”。
+fn MaterialInline(vm: *m.ViewModel, frame: *Frame) View {
+    return (
+        <box testId="settings.background.preview" style={A.material_preview}>
+            <MP.MaterialPreview frame={frame} />
+            <box style={A.material_label}>
+                <text style={A.note}>背景预览</text>
+            </box>
+            <box style={A.material_code}>
+                <text style={A.material_code_line}>user@ZeroWork ~</text>
+                <text style={A.material_code_line}>$ ssh prod-web-01</text>
+            </box>
+            <box style={A.material_action}>
+                <W.Tooltip text="使用整个工作区预览当前材质草稿" position={.top}>
+                    <W.Button testId="settings.materials.preview.full" label="全窗口预览" variant={.secondary} size={.xs} disabled={!previewable(vm)} onClick={send(vm, m.Intent.previewMaterial(true))} />
+                </W.Tooltip>
+            </box>
+        </box>
+    );
+}
+
+/// 背景图片（`settings.appearance.materials`）：页头右侧摘要 + 开启开关；正文是身份行（缩略图、文件名与状态、选择 / 移除）、
+/// 目录轮播的两项（仅目录来源）、适配与对齐、透明度与模糊、行内材质预览（有图片时）。关闭背景图片时其余控件仍可编辑。
+fn MaterialsPane(vm: *m.ViewModel, frame: *Frame) View {
+    const enable_a11y = computed(enableA11y(vm));
+    return (
+        <box testId="settings.appearance.materials" style={S.pane} visible={vm.paneShown(materials_pane)}>
+            <box testId="settings.materials.header" style={S.pane_header}>
+                <text style={S.pane_title}>背景图片</text>
+                <spacer />
+                <text testId="settings.appearance.materials.summary" style={S.pane_meta} box={S.pane_meta_box}>{vm.paneMeta(materials_pane)}</text>
+                <W.Switch testId="settings.toggle.enabled" size={.sm} checked={vm.backgroundEnabled()} disabled={locked(vm)} a11y={enable_a11y} onChange={|v| setBool(vm, P.background_enabled, v)} />
+            </box>
+            <box style={S.pane_body}>
+                <box style={A.notice} visible={backgroundOff(vm)}>
+                    <icon src={ui.icons.info} style={A.notice_icon} />
+                    <text style={A.note} box={A.fill_text}>背景图片已关闭。透明度和模糊仍对界面生效。</text>
+                </box>
+                <box style={S.SettingRow.of(.{ .last = false })}>
+                    <box testId="settings.background.identity" style={A.identity}>
+                        <Thumbnail vm={vm} />
+                        <box style={A.identity_copy}>
+                            <W.Tooltip text={vm.backgroundPath()} position={.top} style={A.tip_fill}>
+                                <box style={A.tip_fill}>
+                                    <text testId="settings.background.filename" style={A.file_name} box={A.file_name_box}>{vm.backgroundName()}</text>
+                                </box>
+                            </W.Tooltip>
+                            <text testId="settings.background.state" style={A.StateNote.of(.{ .failed = vm.backgroundFailed() })}>{vm.backgroundState()}</text>
+                        </box>
+                        <W.Button testId="settings.background.choose" label={vm.backgroundChooseLabel()} iconAsset={ui.icons.folder_open} iconSize={14} variant={.secondary} size={.sm} disabled={!previewable(vm)} onClick={send(vm, m.Intent.appearanceAction(.choose_background))} />
+                        <W.Tooltip text="移除背景图片" position={.top}>
+                            <W.Button testId="settings.background.remove" variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.trash} iconSize={16} a11yLabel="移除背景图片" disabled={!removable(vm)} onClick={send(vm, m.Intent.appearanceAction(.remove_background))} />
+                        </W.Tooltip>
+                    </box>
+                </box>
+                {if (vm.backgroundDirectory()) <box testId="settings.background.rotation_fields" style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={A.pair}>
+                        <PairSelect vm={vm} row={P.order} options={&order_options} />
+                        <PairSelect vm={vm} row={P.interval_minutes} options={&interval_options} />
+                    </box>
+                </box>}
+                <box testId="settings.background.position_fields" style={S.SettingRow.of(.{ .last = false })}>
+                    <box style={A.pair}>
+                        <PairSelect vm={vm} row={P.fit} options={&fit_options} />
+                        <AlignmentField vm={vm} />
+                    </box>
+                </box>
+                <Slider vm={vm} pane={materials_pane} row={P.transparency} text={help(P.transparency)} min={0} max={100} step={0.1} />
+                <Slider vm={vm} pane={materials_pane} row={P.blur_px} text="" min={0} max={96} step={1} />
+                {if (vm.backgroundHasPath()) <MaterialInline vm={vm} frame={frame} />}
+            </box>
+        </box>
+    );
+}
+
+// ── 预览 ──
+
+fn hasFallback(vm: *m.ViewModel) bool {
+    return vm.previewFallback().len != 0;
+}
+
+/// 预览（`settings.appearance.preview`，`EGpsf`）：草稿主题的终端底色上，用草稿字号 / 字重 / 行高与解析出的字体排三行示例，
+/// 光标按草稿形状闪烁（半周期 550ms）。
+fn PreviewPane(vm: *m.ViewModel) View {
+    const text = computed(vm.previewText());
+    return (
+        <box testId="settings.appearance.preview" style={S.pane} visible={vm.paneShown(preview_pane)}>
+            <Header id="settings.appearance.preview.header" summary="settings.appearance.preview.summary" title="预览" meta={vm.previewMeta()} />
+            <box style={A.preview_body}>
+                <box testId="settings.font.preview" style={ui.view.styleBy(text, A.previewSurface)}>
+                    <text style={A.preview_fallback} visible={hasFallback(vm)}>{vm.previewFallback()}</text>
+                    <box style={A.preview_code}>
+                        <text testId="settings.font.preview.prompt" style={ui.view.styleBy(text, A.previewPrompt)}>user@ZeroWork ~</text>
+                        <box style={ui.view.styleBy(text, A.previewCommandRow)}>
+                            <text testId="settings.font.preview.command" style={ui.view.styleBy(text, A.previewCommand)}>$ ssh prod-web-01</text>
+                            <box testId="settings.font.preview.caret" style={.{ ui.view.styleBy(text, A.previewCaret), ui.view.loop(.{ .period_ms = 1100 }, A.caretBlink) }} />
+                        </box>
+                        <text testId="settings.font.preview.multilingual" style={ui.view.styleBy(text, A.previewMultilingual)}>中文终端 · Aa 0O 1Il</text>
+                    </box>
+                </box>
+            </box>
+        </box>
+    );
+}
+
+// ── 字体与排版 ──
+
+/// 字体族选项（view-model 的数据 → 原生选项；两份交替，Select 按内容 / 地址判断换选项）。
+var family_options: [2][max_family_options]W.SelectOption = undefined;
+var family_flip: u1 = 0;
+const max_family_options = 1024;
+fn familyOptions(vm: *m.ViewModel) []const W.SelectOption {
+    const choices = vm.fontChoices();
+    family_flip +%= 1;
+    const out = &family_options[family_flip];
+    const n = @min(choices.len, out.len);
+    for (choices[0..n], out[0..n]) |choice, *option| option.* = .{ .value = choice.value, .label = choice.label, .icon = kindIcon(choice.kind), .test_id = choice.test_id };
+    return out[0..n];
+}
+/// 字体来源图标：方盒 = 内置、显示器 = 系统已安装、警告 = 已保存但未安装、加号 = 自定义。
+fn kindIcon(kind: m.FontKind) ui.SvgAsset {
+    return switch (kind) {
+        .bundled => ui.icons.package,
+        .installed => ui.icons.monitor,
+        .missing => ui.icons.triangle_alert,
+        .custom => ui.icons.plus,
+    };
+}
+fn familyIcon(vm: *m.ViewModel) ?ui.SvgAsset {
+    return kindIcon(vm.fontKind());
+}
+/// 选了“自定义字体…”：换成输入框（选项值不写草稿）；其它选项写草稿。搜索框打字只过滤，不改草稿（`null`）。
+fn pickFamily(vm: *m.ViewModel, value: ?[]const u8) void {
+    const family = value orelse return;
+    if (std.mem.eql(u8, family, "custom")) {
+        vm.dispatch(m.Intent.appearanceAction(.custom_font));
+        return;
+    }
+    vm.dispatch(m.Intent.appearanceValue(P.font_family.key.?, .{ .text = family }));
+}
+fn familyHelp(vm: *m.ViewModel) []const u8 {
+    return if (vm.customFont()) P.font_family_custom_help else P.font_family.help;
+}
+const family_id = "settings.field.font_family";
+/// 字体族选择框：原生可搜索 `W.Select`（虚拟列表，280 宽），字体族变了整行重挂（前置图标在挂载时定）。
+fn FamilySelect(vm: *m.ViewModel) View {
+    return <W.Select panelWidth={.trigger} options={familyOptions(vm)} value={vm.fontFamily()} width={280} searchable={true} virtualize={true} maxDropdownHeight={240} leadingIcon={familyIcon(vm)} placeholder="搜索字体…" disabled={locked(vm)} open={popup(vm, family_id)} onOpenChange={|o| setPopup(vm, family_id, o)} onChange={|v| pickFamily(vm, v)} parts={.{ .trigger = family_id, .panel = "settings.font.options" }} />;
+}
+fn FamilyRow(vm: *m.ViewModel) View {
+    return (
+        <box style={S.SettingRow.of(.{ .last = last(vm, font_pane, P.font_family) })} visible={shown(vm, font_pane, P.font_family)}>
+            <box style={S.setting_line}>
+                <Heading vm={vm} row={P.font_family} text={familyHelp(vm)} />
+                {if (vm.customFont()) <W.Input value={vm.appearanceText(P.font_family)} width={280} invalid={vm.appearanceInvalid(P.font_family)} disabled={locked(vm)} focusId={focusId(P.font_family)} onChange={|t| editText(vm, P.font_family, t)} onSubmit={|t| submit(vm, P.font_family, t)} parts={.{ .input_container = family_id }} /> else <box style={A.radio_slot}>
+                    {for (vm.fontFamilyKeys()) |k| <FamilySelect key={k} vm={vm} />}
+                </box>}
+            </box>
+            <Problem vm={vm} row={P.font_family} />
+        </box>
+    );
+}
+
+/// 字重选项：全部字重的原生选项表（静态），按当前字体支持的取子集（两份交替）。
+const all_weight_options = blk: {
+    const list = std.enums.values(m.FontWeight);
+    var table: [list.len]W.SelectOption = undefined;
+    for (list, 0..) |weight, i| table[i] = .{ .value = @tagName(weight), .label = weight.label(), .test_id = "settings.option.font_weight." ++ @tagName(weight) };
+    break :blk table;
+};
+var weight_options: [2][all_weight_options.len]W.SelectOption = undefined;
+var weight_flip: u1 = 0;
+fn weightOptions(vm: *m.ViewModel) []const W.SelectOption {
+    const supported = vm.weightChoices();
+    weight_flip +%= 1;
+    const out = &weight_options[weight_flip];
+    var n: usize = 0;
+    for (supported) |weight| for (all_weight_options) |option| if (std.mem.eql(u8, option.value, @tagName(weight))) {
+        out[n] = option;
+        n += 1;
+    };
+    return out[0..n];
+}
+fn weightPlaceholder(vm: *m.ViewModel) []const u8 {
+    return if (vm.weightChoices().len == 0) "暂无可用字重" else "选择字重";
+}
+fn rangeMin(range: m.WeightRange) f32 {
+    return @floatFromInt(range.min);
+}
+fn rangeMax(range: m.WeightRange) f32 {
+    return @floatFromInt(range.max);
+}
+const weight_id = "settings.field.font_weight";
+/// 基准字重：可变字体是滑块 + 输入框（范围在挂载时定，字体换了整行重挂）与范围说明；否则是当前字体支持的字重选择框。
+fn WeightBody(vm: *m.ViewModel) View {
+    return (
+        <box style={A.weight_body}>
+            {if (vm.weightRange()) |range| <box style={A.weight_body}>
+                <Slider vm={vm} pane={font_pane} row={P.font_weight} text="" min={rangeMin(range)} max={rangeMax(range)} step={1} />
+                <text style={A.note}>{vm.weightRangeText()}</text>
+            </box> else <box style={S.SettingRow.of(.{ .last = last(vm, font_pane, P.font_weight) })}>
+                <box style={S.setting_line}>
+                    <Heading vm={vm} row={P.font_weight} text={help(P.font_weight)} />
+                    <W.Select panelWidth={.trigger} options={weightOptions(vm)} value={vm.weightValue()} width={180} placeholder={weightPlaceholder(vm)} disabled={locked(vm)} open={popup(vm, weight_id)} onOpenChange={|o| setPopup(vm, weight_id, o)} onChange={|v| pickText(vm, P.font_weight, v)} parts={.{ .trigger = weight_id, .panel = "settings.chooser.font_weight" }} />
+                </box>
+            </box>}
+        </box>
+    );
+}
+fn WeightRow(vm: *m.ViewModel) View {
+    return (
+        <box style={A.weight_body} visible={shown(vm, font_pane, P.font_weight)}>
+            {for (vm.weightKeys()) |k| <WeightBody key={k} vm={vm} />}
+        </box>
+    );
+}
+
+const cursor_tabs = [_]W.tabs.TabItem{
+    .{ .id = "block", .label = "方块" },
+    .{ .id = "bar", .label = "竖线" },
+    .{ .id = "underline", .label = "下划线" },
+};
+/// 保存中或外观宿主忙时三项都不可选（原生 `W.Tabs` 的逐项 `disabled`；同旧光标分段的“不接收点击”）。
+const cursor_tabs_locked = blk: {
+    var items = cursor_tabs;
+    for (&items) |*item| item.disabled = true;
+    break :blk items;
+};
+fn cursorItems(vm: *m.ViewModel) []const W.tabs.TabItem {
+    return if (vm.appearanceLocked()) &cursor_tabs_locked else &cursor_tabs;
+}
+fn pickCursor(vm: *m.ViewModel, value: []const u8) void {
+    vm.dispatch(m.Intent.appearanceValue(P.cursor_style.key.?, .{ .text = value }));
+}
+fn hasStatus(vm: *m.ViewModel) bool {
+    return vm.fontStatusText().len != 0;
+}
+
+/// 字体与排版（`settings.appearance.font`）：字体族、字号、基准字重、行高、光标形状（原生 `W.Tabs` 分段），字体校验状态，
+/// 最后是紧凑实时预览（`LivePreview`）。
+fn FontPane(vm: *m.ViewModel) View {
+    return (
+        <R.Pane vm={vm} pane={font_pane}>
+            {if (rowBuilt(vm, font_pane, P.font_family)) <FamilyRow vm={vm} />}
+            {if (rowBuilt(vm, font_pane, P.font_size)) <Number vm={vm} pane={font_pane} row={P.font_size} width={112} />}
+            {if (rowBuilt(vm, font_pane, P.font_weight)) <WeightRow vm={vm} />}
+            {if (rowBuilt(vm, font_pane, P.line_height)) <Number vm={vm} pane={font_pane} row={P.line_height} width={112} />}
+            <box style={S.SettingRow.of(.{ .last = last(vm, font_pane, P.cursor_style) })} visible={shown(vm, font_pane, P.cursor_style)}>
+                <box style={S.setting_line}>
+                    <Heading vm={vm} row={P.cursor_style} text={help(P.cursor_style)} />
+                    <W.Tabs testId="settings.field.cursor_style" items={cursorItems(vm)} active={vm.cursorStyle()} variant={.pill} size={.sm} onChange={|v| pickCursor(vm, v)} />
+                </box>
+            </box>
+            <text testId="settings.font.status" style={A.error_note} visible={hasStatus(vm)}>{vm.fontStatusText()}</text>
+            <LivePreview vm={vm} />
+        </R.Pane>
+    );
+}
+
+/// 紧凑实时预览（`settings.font.live_preview`，settings-copy）：调字号、字重、行高时就在本子页看到效果。
+/// 复用“主题”子页终端预览的同一份草稿排版（`vm.previewText()` 与 `previewPrompt` / `previewCommand` / `previewCaret` 样式），
+/// 两行：提示符 + 命令 + 光标（按草稿形状闪烁），多语言样例行。
+fn LivePreview(vm: *m.ViewModel) View {
+    const text = computed(vm.previewText());
+    return (
+        <box testId="settings.font.live_preview" style={A.live_preview} visible={vm.paneShown(font_pane)}>
+            <box testId="settings.font.live_preview.surface" style={ui.view.styleBy(text, A.livePreviewSurface)}>
+                <box style={ui.view.styleBy(text, A.previewCommandRow)}>
+                    <text style={ui.view.styleBy(text, A.previewPrompt)}>user@ZeroWork ~ $ </text>
+                    <text testId="settings.font.live_preview.command" style={ui.view.styleBy(text, A.previewCommand)}>ssh prod-web-01</text>
+                    <box style={.{ ui.view.styleBy(text, A.previewCaret), ui.view.loop(.{ .period_ms = 1100 }, A.caretBlink) }} />
+                </box>
+                <text testId="settings.font.live_preview.multilingual" style={ui.view.styleBy(text, A.previewMultilingual)}>中文终端 · Aa 0O 1Il</text>
+            </box>
+            <text style={A.note}>按草稿的字体、字号、字重、行高与光标形状实时显示；配色随当前主题。</text>
+        </box>
+    );
+}
+
+// ── 终端与工作区 ──
+
+/// 工作区缩略预览（`settings.appearance.mini_preview`）：当前主题的应用底色、侧栏（默认隐藏侧栏时不画）、终端两行
+/// （时间戳侧栏开时带时间戳，输入行相对高亮开时第二行带选区底色）。
+fn MiniPreview(vm: *m.ViewModel) View {
+    return (
+        <box style={A.weight_body}>
+            {if (vm.miniPreview()) |p| <box testId="settings.appearance.mini_preview" style={ui.view.styleBy(p, A.miniRoot)}>
+                <box style={A.mini_top}>
+                    <icon src={ui.icons.terminal} style={A.mini_icon} tint={ui.view.tintBy(p, A.miniIcon)} />
+                    <text style={ui.view.styleBy(p, A.miniLabel)}>ZeroWork</text>
+                    <spacer />
+                    <icon src={ui.icons.settings} style={A.mini_icon} tint={ui.view.tintBy(p, A.miniIcon)} />
+                </box>
+                <box style={A.mini_body}>
+                    <box style={ui.view.styleBy(p, A.miniSidebar)} visible={miniSidebarShown(p)}>
+                        <icon src={ui.icons.server} style={A.mini_server} tint={ui.view.tintBy(p, A.miniAccentIcon)} />
+                    </box>
+                    <box style={ui.view.styleBy(p, A.miniTerminal)}>
+                        <box style={ui.view.styleBy(p, A.miniLine)}>
+                            <text style={ui.view.styleBy(p, A.miniStamp)} visible={miniStamps(p)}>14:20:01</text>
+                            <text style={ui.view.styleBy(p, A.miniRunning)}>api   Running</text>
+                        </box>
+                        <box style={ui.view.styleBy(p, A.miniInputLine)}>
+                            <text style={ui.view.styleBy(p, A.miniStamp)} visible={miniStamps(p)}>14:20:02</text>
+                            <text style={ui.view.styleBy(p, A.miniCommand)}>$ ssh prod-01</text>
+                        </box>
+                    </box>
+                </box>
+            </box>}
+        </box>
+    );
+}
+fn miniSidebarShown(p: m.MiniPreview) bool {
+    return !p.collapsed;
+}
+fn miniStamps(p: m.MiniPreview) bool {
+    return p.timestamps;
+}
+
+const right_click_options = [_]W.checkbox.RadioOption{
+    .{ .value = "menu", .label = "弹出菜单", .test_id = "settings.option.terminal_right_click.menu" },
+    .{ .value = "paste", .label = "直接粘贴", .test_id = "settings.option.terminal_right_click.paste" },
+};
+fn pickRightClick(vm: *m.ViewModel, value: []const u8) void {
+    vm.dispatch(m.Intent.appearanceValue(P.terminal_right_click.key.?, .{ .text = value }));
+}
+
+const float_card_transition_options = [_]W.checkbox.RadioOption{
+    .{ .value = "anchor", .label = "收向所属标签", .test_id = "settings.option.float_card_transition.anchor" },
+    .{ .value = "fade", .label = "淡出", .test_id = "settings.option.float_card_transition.fade" },
+};
+fn pickFloatCardTransition(vm: *m.ViewModel, value: []const u8) void {
+    vm.dispatch(m.Intent.appearanceValue(P.float_card_transition.key.?, .{ .text = value }));
+}
+
+/// 终端与工作区（`settings.appearance.aids`）：五个开关、右键行为（原生 `W.RadioGroup`，横排，design-r3 B1）、
+/// 浮动卡片切换动画（原生 `W.RadioGroup`，横排，Z12b）、终端最大显示行数、工作区缩略预览。
+fn AidsPane(vm: *m.ViewModel) View {
+    return (
+        <R.Pane vm={vm} pane={aids_pane}>
+            <Toggle vm={vm} pane={aids_pane} row={P.timestamp_gutter} />
+            <Toggle vm={vm} pane={aids_pane} row={P.command_info} />
+            <Toggle vm={vm} pane={aids_pane} row={P.completion} />
+            <Toggle vm={vm} pane={aids_pane} row={P.input_line_highlight} />
+            <Toggle vm={vm} pane={aids_pane} row={P.sidebar_collapsed} />
+            <box style={S.SettingRow.of(.{ .last = last(vm, aids_pane, P.terminal_right_click) })} visible={shown(vm, aids_pane, P.terminal_right_click)}>
+                <box style={S.setting_line}>
+                    <Heading vm={vm} row={P.terminal_right_click} text={help(P.terminal_right_click)} />
+                    <box style={A.radio_slot}>
+                        <W.RadioGroup testId="settings.field.terminal_right_click" options={&right_click_options} value={vm.terminalRightClick()} horizontal={true} disabled={locked(vm)} onChange={|v| pickRightClick(vm, v)} />
+                    </box>
+                </box>
+            </box>
+            <box style={S.SettingRow.of(.{ .last = last(vm, aids_pane, P.float_card_transition) })} visible={shown(vm, aids_pane, P.float_card_transition)}>
+                <box style={S.setting_line}>
+                    <Heading vm={vm} row={P.float_card_transition} text={help(P.float_card_transition)} />
+                    <box style={A.radio_slot}>
+                        <W.RadioGroup testId="settings.field.float_card_transition" options={&float_card_transition_options} value={vm.floatCardTransition()} horizontal={true} disabled={locked(vm)} onChange={|v| pickFloatCardTransition(vm, v)} />
+                    </box>
+                </box>
+            </box>
+            <Number vm={vm} pane={aids_pane} row={P.scrollback_limit} width={120} />
+            <MiniPreview vm={vm} />
+        </R.Pane>
+    );
+}
+
+pub fn AppearancePanes(vm: *m.ViewModel, frame: *Frame) View {
+    return (
+        <box testId="settings.appearance" style={S.category_panes}>
+            {if (built(vm, themes_pane)) <ThemesPane vm={vm} />}
+            {if (built(vm, icon_pane)) <IconPane vm={vm} />}
+            {if (built(vm, materials_pane)) <MaterialsPane vm={vm} frame={frame} />}
+            {if (built(vm, preview_pane)) <PreviewPane vm={vm} />}
+            {if (built(vm, font_pane)) <FontPane vm={vm} />}
+            {if (built(vm, aids_pane)) <AidsPane vm={vm} />}
+        </box>
+    );
+}

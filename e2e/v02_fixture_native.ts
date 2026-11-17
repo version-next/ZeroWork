@@ -1,6 +1,7 @@
 /** Test-only fixture through the production main application and public slots.
  * No alternate App/shell is created. Credentials/config supplied privately.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
@@ -8,6 +9,7 @@ import {mkdir,mkdtemp,open,readFile,writeFile,rm,copyFile,chmod,stat} from 'node
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {request,waitForServerReady,waitFor,query,clickAt,key,type_,inputState,resizeWindow,screenshot,sleep} from '../vendor/zenit/e2e/client.ts';
+import {aiToggleId} from './ai_entry.ts';
 const opts:Record<string,string>={};for(let i=2;i<process.argv.length;i+=2){assert(['--binary','--out','--config','--no-ai','--skip-child','--shared-presenter-only','--fresh-chat-per-turn','--continuous-ai','--expected-sha'].includes(process.argv[i])&&process.argv[i+1]);opts[process.argv[i]]=process.argv[i+1];}
 assert(opts['--binary']&&opts['--out']&&opts['--config']);
 const binary=resolve(opts['--binary']),out=resolve(opts['--out']);await mkdir(out,{recursive:true});
@@ -115,7 +117,7 @@ try{
  const after=await readFile(join(data,'hosts.toml'),'utf8');assert(!after.includes(secret),'Connect-time secret is never persisted');assert.equal(after,saved);report.checks.push('Public per-owner connect-time secret challenge precedes ready; answer remains ephemeral','Independent non-terminal content renders a real synthetic RGBA texture without terminal/exec placeholders');await capture('02-real-nonterminal-canvas');
  const tab=(nodes(await visible('tabs.strip')).find(n=>shown(n)&&/^tabs\.tab\.\d+$/.test(n.test_id??'')));assert(tab);report.tab=tab.test_id;
  if(opts['--no-ai']!=='1'){
-  await click('toolbar.ai');await visible('ai.prompt');
+  await click(await aiToggleId());await visible('ai.prompt');
   const observe=await turn('03-observe','Call fixture_uprobe__observe exactly once for the current assistant_session_id. Do not call another tool. After the actual image is received, describe the visible synthetic grid and pointer in one short sentence.');
   verifyTurn(observe,'observe');
   const observed=observe.flatMap(e=>e.event==='wire_request'?e.images??[]:[]);assert(observed.some(i=>i.mime==='image/png'&&i.width===64&&i.height===40),'Actual serialized provider request contains the 64x40 PNG observation');

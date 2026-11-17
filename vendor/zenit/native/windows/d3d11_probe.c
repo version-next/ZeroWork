@@ -1,6 +1,7 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "../automation_environment.h"
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d2d1.h>
@@ -258,7 +259,7 @@ ZenitD3D11Probe *zenit_d3d11_probe_create(void *native_hwnd) {
     ZenitD3D11Probe *probe = (ZenitD3D11Probe *)calloc(1, sizeof(*probe));
     if (!probe) return NULL;
     probe->hwnd = (HWND)native_hwnd;
-    if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0)) {
+    if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0)) {
         if (!desktop_display_leases) {
             desktop_previous_execution_state=SetThreadExecutionState(ES_CONTINUOUS|ES_DISPLAY_REQUIRED|ES_SYSTEM_REQUIRED);
             if (!desktop_previous_execution_state) goto failed;
@@ -267,7 +268,7 @@ ZenitD3D11Probe *zenit_d3d11_probe_create(void *native_hwnd) {
         probe->desktop_display_lease=1;
         // Zero displacement leaves the guest pointer in place, while giving
         // the guest a native activity event before a desktop-only test job.
-        if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_DESKTOP_WAKE_INPUT",NULL,0)) {
+        if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DESKTOP_WAKE_INPUT",NULL,0)) {
             INPUT wake={0}; wake.type=INPUT_MOUSE; wake.mi.dwFlags=MOUSEEVENTF_MOVE;
             fprintf(stderr,"[windows-desktop-wake] native_activity=%u\n",SendInput(1,&wake,sizeof(wake)));
         }
@@ -806,7 +807,7 @@ static ZenitShadowEntry *shadow_bitmap(ZenitD3D11Probe *probe, const ZenitPaintI
         }
     }
     ++probe->shadow_misses;
-    if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_FRAME_TIMING",NULL,0))
+    if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_FRAME_TIMING",NULL,0))
         fprintf(stderr,"[windows-shadow-miss] w=%.3f h=%.3f r=%.3f blur=%.3f ox=%.3f oy=%.3f spread=%.3f inset=%u\n",key.w,key.h,key.radii[0],key.blur,key.offset_x,key.offset_y,key.spread,key.inset);
     float pad = key.inset ? 1.0f/key.scale :
         ceilf(fmaxf(0,key.blur) + fmaxf(fabsf(key.offset_x),fabsf(key.offset_y)) + fmaxf(0,key.spread) + 1);
@@ -1013,7 +1014,7 @@ static int draw_items(ZenitD3D11Probe *probe) {
                 fabsf(matrix._11-1)<.00001f && fabsf(matrix._22-1)<.00001f &&
                 fabsf(matrix._12)<.00001f && fabsf(matrix._21)<.00001f &&
                 item->retained.id!=UINT32_MAX && item->retained.hash &&
-                !GetEnvironmentVariableW(L"ZENIT_WINDOWS_DISABLE_RETAINED",NULL,0)) {
+                !zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DISABLE_RETAINED",NULL,0)) {
                 D2D1_RECT_F source={item->to_r,item->to_g,item->to_r+item->to_b,item->to_g+item->to_a};
                 int mode=0;
                 entry.composite=zenit_d2d_retained_begin(probe->d2d_device,&probe->d2d_target,
@@ -1411,7 +1412,7 @@ void *zenit_windows_desktop_observer_create(void *hwnd) {
         }
     }
     ++desktop_display_leases; p->desktop_display_lease=1;
-    if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_DESKTOP_WAKE_INPUT",NULL,0)) {
+    if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DESKTOP_WAKE_INPUT",NULL,0)) {
         INPUT wake={0}; wake.type=INPUT_MOUSE; wake.mi.dwFlags=MOUSEEVENTF_MOVE;
         SendInput(1,&wake,sizeof(wake));
     }
@@ -1439,7 +1440,7 @@ int zenit_windows_desktop_observer_capture(void *observer,unsigned index,unsigne
    Capture incurs GPU readback/disk cost; use a separate uncaptured run for pacing. */
 static void trace_presented_frame(ZenitD3D11Probe *probe) {
     wchar_t directory[MAX_PATH], path[MAX_PATH];
-    DWORD length = GetEnvironmentVariableW(L"ZENIT_WINDOWS_FRAME_CAPTURE_DIR", directory, MAX_PATH);
+    DWORD length = zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_FRAME_CAPTURE_DIR", directory, MAX_PATH);
     if (!length || length >= MAX_PATH - 40 || probe->capture_count >= 256) return;
     int animated = 0;
     for (uint32_t i = 0; i < probe->item_count; ++i)
@@ -1498,7 +1499,7 @@ static void trace_presented_frame(ZenitD3D11Probe *probe) {
 
 static int render_frame(ZenitD3D11Probe *probe, int present) {
     if (!probe) return 0;
-    const int trace_timing=GetEnvironmentVariableW(L"ZENIT_WINDOWS_FRAME_TIMING",NULL,0)!=0;
+    const int trace_timing=zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_FRAME_TIMING",NULL,0)!=0;
     LARGE_INTEGER render_start, draw_end;
     QueryPerformanceCounter(&render_start);
     RECT rect;
@@ -1576,7 +1577,7 @@ static int render_frame(ZenitD3D11Probe *probe, int present) {
     LARGE_INTEGER retained_end, capture_end, present_end;
     if (trace_timing) QueryPerformanceCounter(&retained_end);
     unsigned capture_before=probe->capture_count;
-    if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0) &&
+    if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0) &&
         !stamp_desktop_frame(probe)) {
         fprintf(stderr,"[windows-desktop-unavailable] index=%u stage=stamp\n",capture_before);
         return 0;
@@ -1598,7 +1599,7 @@ static int render_frame(ZenitD3D11Probe *probe, int present) {
     }
     if (probe->capture_count>capture_before) {
         fprintf(stderr,"[windows-capture-present] index=%u hr=0x%08lx\n",capture_before,(unsigned long)present_status);
-        if (GetEnvironmentVariableW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0)) {
+        if (zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_DESKTOP_CAPTURE",NULL,0)) {
             int captured=0;
             if (present_status==S_OK) captured=capture_desktop_bmp(probe,capture_before,present_not_before.QuadPart);
             else fprintf(stderr,"[windows-desktop-unavailable] index=%u stage=present hr=0x%08lx\n",capture_before,(unsigned long)present_status);

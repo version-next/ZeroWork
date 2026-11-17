@@ -1,0 +1,5 @@
+//! 主机行“连接”按钮的挂载点：只排位置，不写按钮外观（原生默认）。
+const ui = @import("ui");
+
+/// 行尾一格：按钮自身宽度，不收缩，竖直居中。
+style slot { width: fit; height: fit; direction: row; align-items: center; flex-shrink: 0; }

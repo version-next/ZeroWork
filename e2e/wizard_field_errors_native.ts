@@ -1,11 +1,12 @@
 /** Whole production wizard flow, isolated config and own delayed SSH handshake peer. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {mkdir,mkdtemp,realpath,open,readFile,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
-import {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,screenPos,sleep,scrollAt} from '../zig-out/share/zenit/harness/client.ts';
+import {waitForServerReady,waitFor,query,clickAt,key,type_,resizeWindow,screenshot,screenPos,sleep,scrollAt,focused} from '../zig-out/share/zenit/harness/client.ts';
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]),theme=process.argv[4]??'dark';
 assert(['dark','light','sauber'].includes(theme));
 await mkdir(out,{recursive:true});
@@ -23,6 +24,9 @@ const flatten=(n:any):any[]=>[n,...(n.children??[]).flatMap(flatten)];
 const text=(n:any)=>flatten(n).map(x=>x.text??'').join(' ');
 async function current(id:string){
  if(id==='wizard.dialog'){
+  // Production opens the editor in its own native window (`wizard.window`; its close is the traffic light, so the
+  // in-panel `wizard.close` is hidden there); the in-window Modal is the fallback.
+  const win=(await query('wizard.window')).find(shown);if(win)return win;
   if(!(await query('wizard.close')).some(shown))return null;
   return {rect:await screenPos(id)};
  }
@@ -31,7 +35,7 @@ async function current(id:string){
 async function visible(id:string){return waitFor(()=>current(id));}
 async function click(id:string){let prior='';let repeats=0;const n=await waitFor(async()=>{const n=await current(id);if(!n)return null;const at=JSON.stringify(n.rect);repeats=at===prior?repeats+1:0;prior=at;await sleep(80);return repeats>=2?n:null;});assert((await clickAt(n.rect.x+n.rect.w/2,n.rect.y+n.rect.h/2)).ok);}
 async function fill(id:string,value:string){await click(id);await key('a',{cmd:true});await type_(value);await waitFor(async()=>{const n=await current(id);return n&&text(n).includes(value)?true:null});}
-async function closed(){await waitFor(async()=>!(await query('wizard.close')).some(shown)||null);}
+async function closed(){await waitFor(async()=>!((await query('wizard.close')).some(shown)||(await query('wizard.window')).some(shown))||null);}
 async function capture(name:string){await sleep(200);const dialog=await visible('wizard.dialog');await writeFile(join(out,name+'.json'),JSON.stringify(dialog,null,2));assert((await screenshot(join(out,name+'.png'))).ok);report.stages.push({name,rect:dialog.rect});}
 try{
  await waitForServerReady(30000);assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),child.pid);
@@ -43,9 +47,14 @@ try{
  await click('wizard.user');await click('wizard.port');await key('a',{cmd:true});await type_('+22');await click('wizard.group');
  assert.match(text(await visible('wizard.host.error')),/请输入主机地址/);assert.match(text(await visible('wizard.user.error')),/请输入登录用户/);
  assert.match(text(await visible('wizard.port.error')),/1–65535/);assert.match(text(await visible('wizard.port')),/\+22/);
+ // The fields are zenit's native Inputs at their default size: one height with the other native md controls of the
+ // form (the group Input and the group Select). Each error line is the view's own 11/16 text (editor.zig FieldFeedback,
+ // wizard_styles.zig text(11) line 16) spanning its field's column, 4 under the field (L.cell gap 4).
+ const groupInput=await visible('wizard.group'),groupPick=await visible('wizard.group.pick');assert.equal(groupPick.rect.h,groupInput.rect.h,'native Input and Select share one height');
  for(const id of ['name','host','user','port']){
   const input=await visible(`wizard.${id}`),error=await visible(`wizard.${id}.error`);
-  assert.equal(input.rect.h,34);assert.equal(error.rect.h,16);assert.equal(error.rect.y-input.rect.y-input.rect.h,4);
+  assert.equal(input.rect.h,groupInput.rect.h,`${id} field height`);assert.equal(error.rect.h,16);assert(Math.abs(error.rect.y-input.rect.y-input.rect.h-4)<0.05,`${id} error 4 under its field`);
+  assert.equal(error.rect.x,input.rect.x,`${id} error x`);assert.equal(error.rect.w,input.rect.w,`${id} error width`);
  }
  await capture('02-errors-after-blur');
  await fill('wizard.name','DB-Validation');assert(!(await current('wizard.name.error')));
@@ -55,14 +64,26 @@ try{
  await click('wizard.auth');await click('wizard.auth.key');await click('wizard.key_path');await click('wizard.name');await visible('wizard.key_path.error');await capture('04-key-error');
  await click('wizard.auth');await click('wizard.auth.password');assert(!(await current('wizard.key_path.error')));
  await click('wizard.next.identity');await click('wizard.next.route');await capture('05-review-after-recovery');
- await click('wizard.cancel');await closed();await click('sidebar.empty.new');
- await resizeWindow(860,480);await click('wizard.name');await key('return');
- await visible('wizard.name.error');await visible('wizard.host.error');await visible('wizard.user.error');await visible('wizard.step.identity.check');await capture('06-errors-compact');
- const dialog=await visible('wizard.dialog'),footer=await visible('wizard.footer');assert(footer.rect.y+footer.rect.h<=480);
- const err=await visible('wizard.name.error');assert(err.rect.y>=dialog.rect.y&&err.rect.y+err.rect.h<=footer.rect.y);
+ await click('wizard.cancel');await closed();await click('sidebar.empty.new');await visible('wizard.dialog');
+ for(const id of ['name','host','user','port'])assert(!(await current('wizard.'+id+'.error')),'new draft starts without '+id+' error');
+ // The harness resizes the window it is bound to — the editor window while it is open (its own size, not the main window's).
+ await resizeWindow(860,480);const dialog=await waitFor(async()=>{const d=await visible('wizard.dialog');return d.rect.w===860&&d.rect.h===480?d:null;});
+ // Enter in a later field validates the step and moves focus to the first invalid field (editor.zig validateFields).
+ await click('wizard.user');await key('return');
+ await visible('wizard.name.error');await visible('wizard.host.error');await visible('wizard.user.error');await visible('wizard.step.identity.check');
+ assert.equal((await waitFor(async()=>{const f=await focused();return f.test_id==='wizard.name'?f:null;})).test_id,'wizard.name');await capture('06-errors-compact');
+ // Footer pinned to the pane bottom inside the window frame (Stage 6 + island 4, wizard_styles.zig), 56 high (footer_height).
+ const pane=flatten(await visible('wizard.dialog')).find(n=>n.test_id==='wizard.pane'&&shown(n)),footer=await visible('wizard.footer');
+ assert(pane,'pane');
+ // The layout uses f32; summing an origin and a height can differ by a few ULPs.
+ const footerBottom=footer.rect.y+footer.rect.h,paneBottom=pane.rect.y+pane.rect.h;
+ assert.equal(footer.rect.h,56);
+ assert(Math.abs(footerBottom-paneBottom)<0.05,'footer is flush with the pane bottom');
+ assert(Math.abs(paneBottom-(dialog.rect.y+dialog.rect.h-10))<0.05,'pane bottom preserves the 10 pt frame inset');
+ const err=await visible('wizard.name.error');assert(err.rect.y>=pane.rect.y&&err.rect.y+err.rect.h<=footer.rect.y,'name error visible above the footer');
  await fill('wizard.name','Recovered');await fill('wizard.host','127.0.0.1');const compactScroll=await visible('wizard.scroll.identity');await scrollAt(compactScroll.rect.x+compactScroll.rect.w-20,compactScroll.rect.y+compactScroll.rect.h/2,0,-280);await sleep(200);await fill('wizard.user','fixture');await key('return');
  await visible('wizard.access.direct');await capture('07-route-compact');
  assert.equal((await readFile(join(data,'hosts.toml'),'utf8')).trim(),'');
- report.checks=['No errors before interaction','Blur shows only concrete touched-field errors','Invalid raw +22 retained','Typing valid values clears errors immediately','Private-key error only applies to key authentication','Corrected fields navigate to actual review','Enter reveals required errors and focuses first invalid field','860x480 error text and footer reachable','New draft clears old errors','No hosts saved and no network requests'];report.status='passed';
+ report.checks=['No errors before interaction','Blur shows only concrete touched-field errors','Invalid raw +22 retained','Typing valid values clears errors immediately','Private-key error only applies to key authentication','Corrected fields navigate to actual review','Enter in a later field reveals required errors and focuses the first invalid field','Editor window resized to 860x480: error text above the pinned footer, footer reachable','New draft clears old errors','No hosts saved and no network requests'];report.status='passed';
 }catch(e){report.status='failed';report.error=String(e);await screenshot(join(out,'failure.png')).catch(()=>{});throw e;}
 finally{await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));child.kill('SIGTERM');await ended;await log.close();await rm(isolated,{recursive:true,force:true});}

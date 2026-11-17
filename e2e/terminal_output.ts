@@ -1,8 +1,10 @@
 /** Owned SSH burst-output probe. No real remote host or terminal payload is logged.
  * Usage: node e2e/terminal_output.ts BINARY OUTPUT_DIRECTORY
- * Optional: ZEROWORK_OUTPUT_TIMING=1 enables read/wait diagnostics in test builds.
- * Requires Python paramiko; all fixture processes and data are cleaned up.
+ * The app runs with ZEROWORK_OUTPUT_TIMING=1 (test builds: src/vt/output_timing.zig) so the exact byte count is always checked.
+ * The peer runs under the audited interpreter $ZW_TEST_PYTHON -I (paramiko); all fixture processes and data are cleaned up.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
+import {psCompat} from './ps_compat.ts';
 import assert from 'node:assert/strict';
 import {spawn,execFileSync} from 'node:child_process';
 import {mkdtemp,realpath,mkdir,readFile,writeFile,open,rm} from 'node:fs/promises';
@@ -11,6 +13,7 @@ import {resolve,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
 import {waitForServerReady,waitFor,query,clickTestId,type_,key,resizeWindow,screenshot,stats,resetTiming} from '../zig-out/share/zenit/harness/client.ts';
+const python=process.env.ZW_TEST_PYTHON;assert(python,'ZW_TEST_PYTHON (audited Python with paramiko, run with -I) is required');
 const binary=resolve(process.argv[2]),out=resolve(process.argv[3]),mode='ssh';
 await mkdir(out,{recursive:false});
 const iso=await realpath(await mkdtemp(join(tmpdir(),'zw-output-burst-'))),data=join(iso,'data'),rpc=join(iso,'rpc');
@@ -21,8 +24,8 @@ const flat=(n:any):any[]=>n?[n,...(n.children??[]).flatMap(flat)]:[];
 const text=(n:any):string=>flat(n).map(x=>x.text??'').join('');
 const visible=async(id:string)=>(await query(id)).find(shown);
 const report:any={mode,binary,sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),limits:['Output-only synthetic dmesg-like numbered ASCII lines; not a real kernel dmesg capture.','Bounded last-five-row query every 250ms; observed gaps include Harness overhead.','Source completion is write/sendall completion, not proof of receipt by the application.'],phases:{}};
-const appLog=await open(join(out,'app.log'),'w');let app:any,peer:any;let peerEnd:Promise<any>|undefined,appEnd:Promise<any>|undefined;
-async function command(command:string){await type_(command);await key('enter');}
+const appLog=await open(join(out,'app.log'),'w');const peerLog=await open(join(out,'peer.log'),'w');let app:any,peer:any;let peerEnd:Promise<any>|undefined,appEnd:Promise<any>|undefined;
+async function command(command:string){assert((await type_(command)).ok);assert((await key('return')).ok);}
 function outputDiagnostics(log:string){
  const records=log.split('\n').filter(x=>x.startsWith('[terminal-output-')).map(line=>Object.fromEntries([...line.matchAll(/(\w+)=([^ ]+)/g)].map(m=>[m[1],/^\d+$/.test(m[2])?Number(m[2]):m[2]]))) as any[];
  const first=records.findIndex(x=>x.bytes>=83),last=records.findLastIndex(x=>x.bytes>0);
@@ -85,14 +88,18 @@ finally:
  for t in transports:t.close()
  server.close()
 `;
-  peer=spawn('python3',['-u','-c',code,join(iso,'peer.json'),join(out,'source-progress.jsonl')],{stdio:'ignore'});peerEnd=new Promise(r=>peer.once('close',r));
+  peer=spawn(python,['-I','-u','-c',code,join(iso,'peer.json'),join(out,'source-progress.jsonl')],{stdio:['ignore',peerLog.fd,peerLog.fd]});peerEnd=new Promise(r=>peer.once('close',r));
   ready=await waitFor(async()=>{try{return JSON.parse(await readFile(join(iso,'peer.json'),'utf8'))}catch{return null}},10000);
-  await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Burst output owned peer"\nhost="127.0.0.1"\nport=${ready.port}\nuser="fixture"\n`);
+  await writeFile(join(data,'hosts.toml'),`[registry]\nschema_version=2\nrevision=1\nnext_connection_id=2\nnext_group_id=1\n[[hosts]]\nconnection_id=1\nrevision=1\nprotocol="ssh"\nauth_mode="password"\noptions={strict_host_key=true}\nname="Burst output owned peer"\nhost="127.0.0.1"\nport=${ready.port}\nuser="fixture"\nauto_shell_integration=false\n`);
+  // The owned peer is a raw echo PTY, not a POSIX shell: it never runs the shell-integration initializer, and the
+  // worker ends a session whose initializer is never acknowledged (src/vt/ssh_worker.zig enqueueStartupIfReady →
+  // ShellInitializationTimedOut). This probe measures the output path only, so the host opts out (config/hosts.zig auto_shell_integration).
  }
  await writeFile(join(data,'config.toml'),'[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_family="Menlo"\nfont_size=14\n[log]\nring_mb=8\ncheckpoint_sec=1\n');
- app=spawn(binary,[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',appLog.fd,appLog.fd]});appEnd=new Promise(r=>app.once('close',r));report.pid=app.pid;
+ app=spawn(binary,[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZEROWORK_OUTPUT_TIMING:'1',ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',appLog.fd,appLog.fd]});appEnd=new Promise(r=>app.once('close',r));report.pid=app.pid;
  await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);await resizeWindow(1200,800);
- assert((await clickTestId('sidebar.host')).ok);
+ // design-r3 A2: a row click only selects; the selected row's native “连接” (sidebar.host.connect_button) connects (src/features/shell/view/sidebar_view.zig onEvent).
+ assert((await clickTestId('sidebar.host')).ok);assert((await waitFor(async()=>await visible('sidebar.host.connect_button')??null,10000)));assert((await clickTestId('sidebar.host.connect_button')).ok);
  if(mode==='ssh')await waitFor(async()=>{
   const modal=await visible('plugin.challenge.modal');
   if(modal){
@@ -104,14 +111,18 @@ finally:
   return text(await visible('status.connection.identity')).includes('已连接')||null;
  },30000);
  const surface=await waitFor(async()=>{const n=await visible('terminal.surface');return flat(n).some(x=>x.test_id?.startsWith('terminal.surface.row.'))?n:null},15000);
- await clickTestId('terminal.surface');await sleep(500);
- await sleep(1000);
- const rowIds=flat(await visible('terminal.surface')).filter(n=>n.test_id?.startsWith('terminal.surface.row.')&&shown(n)).sort((a,b)=>a.rect.y-b.rect.y).slice(-5).map(n=>n.test_id);
+ await clickTestId('terminal.surface');
+ // The owned shell greets with BENCH_READY once the PTY channel is up; wait for it instead of a fixed delay.
+ await waitFor(async()=>text(await visible('terminal.surface')).includes('BENCH_READY')||null,15000);
+  const rowIds=flat(await visible('terminal.surface')).filter(n=>n.test_id?.startsWith('terminal.surface.row.')&&shown(n)).sort((a,b)=>a.rect.y-b.rect.y).slice(-5).map(n=>n.test_id);
  const tail=async()=>(await Promise.all(rowIds.map(id=>query(id)))).flat().filter(shown).map(text).join('');
- const cpu=()=>{const v=execFileSync('/bin/ps',['-p',String(app.pid),'-o','time=,rss='],{encoding:'utf8'}).trim().split(/\s+/);return {seconds:v[0].split(':').map(Number).reduce((s,x)=>s*60+x,0),rss_kib:Number(v[1])}};
+ const cpu=()=>{const v=psCompat(['-p',String(app.pid),'-o','time=,rss=']).trim().split(/\s+/);return {seconds:v[0].split(':').map(Number).reduce((s,x)=>s*60+x,0),rss_kib:Number(v[1])}};
  for(const [label,batch,rounds,delay] of [['flood',4096,64,0]] as const){
   await resetTiming();const before=cpu(),at=Date.now(),frameStart=(await stats()).frame_count;
   await command('ZW_'+label.toUpperCase());
+  // Typed right after the shell greeting, as a user would: the command must reach the shell (the peer echoes it and
+  // starts the burst). Losing it is a product failure, not a reason to wait longer before typing.
+  await waitFor(async()=>(await tail()).includes('ZW_'+label.toUpperCase())||(await readFile(join(out,'source-progress.jsonl'),'utf8').catch(()=>'')).length>0||null,5000).catch(()=>{throw new Error(`typed command ZW_${label.toUpperCase()} never reached the shell (typeahead right after the greeting was lost)`)});
   const observations:any[]=[];let done=false;
   while(Date.now()-at<45000){
    const queryAt=Date.now();const value=await tail();const visibleSeq=Math.max(-1,...[...value.matchAll(/seq=(\d+)/g)].map(x=>Number(x[1])));
@@ -125,8 +136,9 @@ finally:
   await screenshot(join(out,label+'.png'));
   assert(done,label+' output tail did not arrive');await sleep(500);
  }
- report.diagnostics=outputDiagnostics(await readFile(join(out,'app.log'),'utf8'));
- if(report.diagnostics){
+report.diagnostics=outputDiagnostics(await readFile(join(out,'app.log'),'utf8'));
+ assert(report.diagnostics,'ZEROWORK_OUTPUT_TIMING read records are present');
+ {
   const expected=83*262144+'STREAM_FLOOD_DONE\r\n'.length;
   // The command echo may share the first data read; it is ten bytes at most.
   assert(report.diagnostics.bytes>=expected&&report.diagnostics.bytes<=expected+10);
@@ -137,5 +149,5 @@ finally{
  if(app&&app.exitCode===null){app.kill('SIGTERM');await Promise.race([appEnd,sleep(2000)]);if(app.exitCode===null&&app.signalCode===null){app.kill('SIGKILL');await appEnd;}}
  if(peer&&peer.exitCode===null){peer.kill('SIGTERM');await Promise.race([peerEnd,sleep(2000)]);if(peer.exitCode===null&&peer.signalCode===null){peer.kill('SIGKILL');await peerEnd;}}
  if(app?.pid)await cleanupOwnedBridgeDirectories(app.pid);
- await appLog.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));await rm(iso,{recursive:true,force:true});console.log(JSON.stringify({status:report.status,mode,out,error:report.error}));
+ await appLog.close();await peerLog.close();await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));await rm(iso,{recursive:true,force:true});console.log(JSON.stringify({status:report.status,mode,out,error:report.error}));
 }

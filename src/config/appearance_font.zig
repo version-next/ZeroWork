@@ -246,6 +246,9 @@ pub fn resolve(allocator: std.mem.Allocator, registry: *FontRegistry, request: R
     if (!supported.contains(request.weight)) return error.UnsupportedWeight;
 
     const family_id = try registry.intern(selected);
+    // Variable families honour any numeric weight (e.g. 450) through zenit's
+    // opt-in exact-weight path; fixed families keep the nearest-instance path.
+    if (supported.variable != null) registry.setExactWeight(family_id, true);
     const font = registry.resolve(family_id, request.size, @backingInt(weight), false) orelse return error.FontUnavailable;
     // Font.weight contains the requested number. Query the actual native face
     // instead; no second font system, face creation, or debug-name parsing.

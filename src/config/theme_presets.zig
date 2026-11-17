@@ -62,61 +62,67 @@ pub fn tokens(comptime T: type, id: []const u8) ?T {
         .border = 0xdad4e4ff,
         .shadow = 0x30243d18,
     };
+    // Island B v3 dark (Pencil design): zenit default dark palette + zw island tokens.
     if (std.mem.eql(u8, id, "dark")) return .{
-        .app = 0x060608ff,
-        .surface_1 = 0x131316ff,
-        .surface_2 = 0x1b1b1fff,
-        .well = 0x0c0c0fff,
-        .well_border = 0x26262cff,
-        .terminal = 0x0a0a0dff,
-        .overlay = 0x292a30ff,
-        .hover = 0x202026ff,
-        .tab_on = 0x1e1e23ff,
-        .fg_1 = 0xf4f4f5ff,
-        .fg_2 = 0xb4b4bcff,
-        .fg_3 = 0xa8a8adff,
-        .accent = 0x6366f1ff,
-        .accent_ink = 0x999bf5ff,
-        .action_accent = 0x6164ecff,
+        .app = 0x08080bff, // zw.island.ground
+        .surface_1 = 0x1d1d22ff, // zw.island.focus / zw.list.active
+        .surface_2 = 0x131317ff, // zw.island.rest
+        .well = 0x09090bff, // bg_inset (app_gray.950)
+        .well_border = 0x3f3f46ff, // app_gray.700
+        .terminal = 0x1d1d22ff,
+        .overlay = 0x18181bff, // bg_primary (app_gray.800)
+        .hover = 0x27272cff, // #FFFFFF0D over focus
+        .tab_on = 0x1d1d22ff,
+        .fg_1 = 0xf6f6f7ff, // app_gray.100
+        .fg_2 = 0xc4c4caff, // app_gray.450
+        .fg_3 = 0xa1a1aaff, // app_gray.500
+        .accent = 0x8c98eeff, // blue.400
+        .accent_ink = 0x8c98eeff,
+        .action_accent = 0x8c98eeff,
         .action_accent_2 = 0x8457eaff,
-        .action_danger = 0xd53d3dff,
+        .action_danger = 0xef4444ff,
         .ok = 0x22c55eff,
         .ok_ink = 0x22c55eff,
         .warn = 0xf59e0bff,
         .warn_ink = 0xf59e0bff,
         .danger = 0xef4444ff,
         .danger_ink = 0xf48282ff,
-        .selection = 0x6366f124,
-        .border = 0x26262cff,
+        .selection = 0x8c98ee33,
+        .border = 0x27272aff,
         .shadow = 0x0000005c,
     };
+    // Island B v3 light (Pencil design): zenit default light palette + zw island tokens.
     if (std.mem.eql(u8, id, "light")) return .{
-        .app = 0xe6e6eaff,
-        .surface_1 = 0xfbfbfcff,
-        .surface_2 = 0xf4f4f7ff,
-        .well = 0xececf0ff,
-        .well_border = 0xd9d9e0ff,
-        .terminal = 0xfbfbfcff,
-        .overlay = 0xffffffff,
-        .hover = 0xececf1ff,
+        .app = 0xefeff1ff, // zw.island.ground (app_gray.200)
+        .surface_1 = 0xffffffff, // zw.island.focus / zw.list.active
+        .surface_2 = 0xf4f5f8ff, // zw.island.rest
+        .well = 0xf6f6f7ff, // bg_inset (app_gray.100)
+        .well_border = 0xe4e4e7ff, // app_gray.300
+        .terminal = 0xffffffff,
+        .overlay = 0xffffffff, // bg_primary
+        .hover = 0xf5f5f6ff, // #18181B0A over focus
         .tab_on = 0xffffffff,
-        .fg_1 = 0x18181bff,
-        .fg_2 = 0x52525bff,
-        .fg_3 = 0x636369ff,
-        .accent = 0x4f46e5ff,
-        .accent_ink = 0x4f46e5ff,
-        .action_accent = 0x4f46e5ff,
+        .fg_1 = 0x18181bff, // app_gray.800
+        .fg_2 = 0x5c5c64ff, // app_gray.650
+        // Design tertiary is app_gray.550 (#80808A), 3.3:1 on the light ground; the
+        // readable-helper-text contract (>= 4.5:1 on every material and interaction
+        // surface, app_theme "auxiliary inks" test) darkens it to the nearest
+        // passing zinc step while staying lighter than fg_2.
+        .fg_3 = 0x68686fff,
+        .accent = 0x4f5ed9ff, // blue.600
+        .accent_ink = 0x4f5ed9ff,
+        .action_accent = 0x4f5ed9ff,
         .action_accent_2 = 0x7c3aedff,
         .action_danger = 0xdc2626ff,
-        .ok = 0x16a34aff,
+        .ok = 0x15803dff,
         .ok_ink = 0x107435ff,
         .warn = 0xd97706ff,
         .warn_ink = 0x985304ff,
         .danger = 0xdc2626ff,
         .danger_ink = 0xc32222ff,
-        .selection = 0x4f46e517,
-        .border = 0xd9d9e0ff,
-        .shadow = 0x0f172a24,
+        .selection = 0x4f5ed917,
+        .border = 0xe4e4e7ff, // app_gray.300
+        .shadow = 0x0a0a0f24,
     };
     if (std.mem.eql(u8, id, "sauber")) return .{
         .app = 0xd9eccfff,

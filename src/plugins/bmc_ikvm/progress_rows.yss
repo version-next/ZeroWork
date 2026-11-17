@@ -1,0 +1,6 @@
+//! 连接进度的分组标题行：原生 `W.Pressable` 的 `look`（随主题由 zenit 按行自身状态解析）。
+//! 当前步骤的底色画在行外的背板上（视图按进度状态切换），这一行本身没有悬停 / 按下底色。
+const ui = @import("ui");
+
+/// 分组标题行：整宽、按内容高（至少 34），上下 8 左右 10，间距 8，圆角 8；状态 / 名称 / 时长 / 展开列是它的内容。
+style progress_step { width: fill; height: fit; min-height: 34; min-width: 0; flex-shrink: 0; justify: start; gap: 8; padding: 8 10; corner-radius: 8; }

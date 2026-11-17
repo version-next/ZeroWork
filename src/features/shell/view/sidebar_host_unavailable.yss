@@ -1,0 +1,7 @@
+//! 主机行“已禁用”的挂载点与文字（qQaos：右侧“已禁用”代替终端数，次要墨色）。只排位置与字号，不写 Tooltip 外观（原生默认）。
+const ui = @import("ui");
+
+/// 行尾一格：文字自身宽度，不收缩，竖直居中。
+style slot { width: fit; height: fit; direction: row; align-items: center; flex-shrink: 0; }
+/// “已禁用”：11.5、三级墨色，单行。
+style label { font-size: 11.5; font-weight: 400; line-height: {16.0 / 11.5}; color: zw-fg-faint; wrap: none; }

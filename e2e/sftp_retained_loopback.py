@@ -25,6 +25,11 @@ import time
 
 import paramiko
 from paramiko.sftp import CMD_OPEN, CMD_WRITE
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 SOURCE = bytes(33 + index % 89 for index in range(2 * 1024 * 1024 + 17))
@@ -84,11 +89,12 @@ class Handle(paramiko.SFTPHandle):
         state = self.peer.state
         state.record(state.reads, connection=self.peer.identity, open=self.ordinal,
                      path=SOURCE_PATH, offset=offset, length=length)
-        # First OPEN hashes the complete source. Second OPEN transfers it.
-        # libssh2 prefetches several packets; gate a later READ after actual
-        # 32 KiB writes can have reached Manager and the local owned .part.
+        # The engine now streams the transfer on its first OPEN and hashes the source for the MD5 check afterwards
+        # (an earlier engine hashed first, so this used to be "the second OPEN"). Gate the first READ past
+        # 6 * 32 KiB, whichever OPEN carries it: libssh2 prefetches several packets, and by then actual 32 KiB
+        # writes can have reached Manager and the local owned .part.
         with state.lock:
-            should_gate = self.ordinal == 2 and offset >= 6 * 32768 and state.gate is None
+            should_gate = offset >= 6 * 32768 and state.gate is None
             if should_gate:
                 state.gate = {"connection": self.peer.identity, "open": self.ordinal,
                               "offset": offset, "length": length,
@@ -237,7 +243,9 @@ class Peer(paramiko.ServerInterface):
         return False
 
     def check_channel_exec_request(self, channel, command):
-        self.deny("EXEC")
+        # Always refused and forbidden: an SFTP-only host never receives exec (OS identification uses SFTP itself).
+        self.state.record(self.state.forbidden, connection=self.identity, operation="EXEC",
+                          command=bytes(command).decode("utf-8", "replace"))
         return False
 
     def check_channel_pty_request(self, *args):
@@ -253,6 +261,7 @@ def main():
     parser.add_argument("--node", default=shutil.which("node") or "/usr/local/bin/node")
     parser.add_argument("--prepare-only", choices=("1",))
     args = parser.parse_args()
+    if args.binary: build_mode_guard.assert_runner_binary(args.binary)
     if not args.prepare_only and (not args.binary or not args.expected_sha):
         parser.error("native run requires --binary and --expected-sha")
     output = args.out.resolve()
@@ -380,6 +389,9 @@ def main():
                    snapshot["gate"].get("pause_requested_before_release") and
                    snapshot["gate"].get("pausing_visible_before_release") and
                    not snapshot["gate"].get("failure_cleanup_release"))
+    # Guardrail: an SFTP-only host gets zero exec / shell requests over every connection (forbidden must stay empty).
+    exec_requests = sum(1 for item in snapshot["forbidden"] if item.get("operation") == "EXEC")
+    shell_requests = sum(1 for item in snapshot["forbidden"] if item.get("operation") == "SHELL")
     readonly = all(item["flags"] == 1 for item in snapshot["wire_opens"])
     prepared = bool(args.prepare_only and code == 0 and app.get("status") == "prepared_not_run")
     passed = (not args.prepare_only and code == 0 and app.get("status") == "passed" and
@@ -388,7 +400,7 @@ def main():
     report = {"status": "prepared_not_run" if prepared else "passed" if passed else "failed",
               "visual_status": "not_run" if prepared else "needs_review",
               "scope": "actual native main app + actual libssh2 + bounded read-only in-memory loopback; synthetic Harness input",
-              "binary_sha256": app.get("binary_sha256"), "runner_exit_code": code,
+              "binary_sha256": app.get("binary_sha256"), "exec_requests": exec_requests, "shell_requests": shell_requests, "runner_exit_code": code,
               "app_report": str(app_report_path), "peer": metadata,
               "gate_pause_receipt_verified": gate_ok, "readonly_open_flags": readonly,
               "every_open_has_exact_close": opens == closes,

@@ -9,7 +9,6 @@ pub const RetainedTransferOwnerId = enum(u64) { _ };
 pub const TabId = enum(u64) { _ };
 pub const PaneId = enum(u64) { _ };
 pub const GroupId = enum(u64) { _ };
-pub const HistoryId = enum(u64) { _ };
 pub const WindowId = enum(u64) { _ };
 pub const WorkspaceId = enum(u64) { _ };
 
@@ -79,10 +78,32 @@ pub const GroupOwner = struct { id: GroupId, revision: u64 = 1 };
 pub const AssetOwner = struct { id: ConnectionId, revision: u64 = 1 };
 pub const TransferOwner = struct { id: RetainedTransferOwnerId, original_handle: SessionHandle };
 
+/// 非会话卡片（如会话记录 `history`）的身份（PLUGIN_ARCH_PLAN 2.5.3）：卡片宿主分配的槽位加代次。
+/// 代次是值的一部分，所以 `ContentOwner.eql`（逐字段比较）不会把复用槽位的新实例误判为同一张卡片。
+/// 代次从 1 开始；全零值保留给未初始化的夹具。
+pub const CardId = struct {
+    slot: u32,
+    generation: u32,
+
+    pub fn eql(self: CardId, other: CardId) bool {
+        return self.slot == other.slot and self.generation == other.generation;
+    }
+    pub fn valid(self: CardId) bool {
+        return self.generation != 0;
+    }
+    /// 平铺为一个 u64（通知目标等只能携带一个整数的边界）：高 32 位槽位、低 32 位代次。
+    pub fn pack(self: CardId) u64 {
+        return (@as(u64, self.slot) << 32) | self.generation;
+    }
+    pub fn unpack(value: u64) CardId {
+        return .{ .slot = @truncate(value >> 32), .generation = @truncate(value) };
+    }
+};
+
 pub const ContentOwner = union(enum) {
     session: SessionHandle,
     group: GroupOwner,
-    history: HistoryId,
+    card: CardId,
 
     pub fn eql(self: ContentOwner, other: ContentOwner) bool {
         return std.meta.eql(self, other);
@@ -94,7 +115,7 @@ pub const CommandOwner = union(enum) {
     asset: AssetOwner,
     session: SessionHandle,
     group: GroupOwner,
-    history: HistoryId,
+    card: CardId,
     transfer_owner: TransferOwner,
 
     pub fn eql(self: CommandOwner, other: CommandOwner) bool {
@@ -161,4 +182,17 @@ test "session reconstruction advances generation with an explicit limit" {
     try std.testing.expect(!handle.eql(next));
     try std.testing.expectEqual(handle.session_id, next.session_id);
     try std.testing.expectError(error.RevisionExhausted, advance(std.math.maxInt(u64)));
+}
+
+test "card owners with the same slot and a different generation are different owners" {
+    const first: ContentOwner = .{ .card = .{ .slot = 4, .generation = 1 } };
+    const reused: ContentOwner = .{ .card = .{ .slot = 4, .generation = 2 } };
+    try std.testing.expect(first.eql(first));
+    try std.testing.expect(!first.eql(reused));
+    try std.testing.expect(!first.card.eql(reused.card));
+    try std.testing.expect(!first.eql(.{ .card = .{ .slot = 5, .generation = 1 } }));
+    const command_first: CommandOwner = .{ .card = first.card };
+    try std.testing.expect(!command_first.eql(.{ .card = reused.card }));
+    try std.testing.expect(CardId.unpack(reused.card.pack()).eql(reused.card));
+    try std.testing.expect(!(CardId{ .slot = 0, .generation = 0 }).valid());
 }

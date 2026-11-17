@@ -53,14 +53,14 @@ pub const ShaderModule = struct {
             buf[name.len] = 0;
             const raw = mtl.metal_library_new_function(self.library, @ptrCast(buf[0..name.len :0])) orelse
                 return error.FunctionNotFound;
-            return .{ .raw = raw };
+            return .{ .raw = raw, .name = ShaderFunction.traceName(name) };
         }
         // Very long names fall back to page_allocator.
         const name_z = try std.heap.page_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.page_allocator.free(name_z);
         const raw = mtl.metal_library_new_function(self.library, name_z.ptr) orelse
             return error.FunctionNotFound;
-        return .{ .raw = raw };
+        return .{ .raw = raw, .name = ShaderFunction.traceName(name) };
     }
 
     pub fn deinit(self: *ShaderModule) void {
@@ -74,6 +74,15 @@ pub const ShaderModule = struct {
 /// `MTLFunction`. The raw handle is consumed only inside this backend module.
 pub const ShaderFunction = struct {
     raw: *mtl.MTLFunction,
+    /// Entry point name (truncated), for the glass pass trace.
+    name: [48]u8 = @splat(0),
+
+    fn traceName(name: []const u8) [48]u8 {
+        var out: [48]u8 = @splat(0);
+        const n = @min(name.len, out.len - 1);
+        @memcpy(out[0..n], name[0..n]);
+        return out;
+    }
 
     pub fn deinit(self: *ShaderFunction) void {
         mtl.release(self.raw);
@@ -84,6 +93,15 @@ pub const ShaderFunction = struct {
 /// RenderPipeline - render pipeline. Encapsulates MTLRenderPipelineState.
 pub const RenderPipeline = struct {
     raw: *mtl.MTLRenderPipelineState,
+    /// What the glass pass trace needs to rebuild this pipeline on WebGPU.
+    trace: TraceInfo = .{},
+
+    pub const TraceInfo = struct {
+        vertex: [48]u8 = @splat(0),
+        fragment: [48]u8 = @splat(0),
+        format: ?gpu.TextureFormat = null,
+        blend: ?BlendState = null,
+    };
 
     pub fn deinit(self: *RenderPipeline) void {
         mtl.release(self.raw);
@@ -308,6 +326,12 @@ pub fn createRenderPipeline(
 
     return RenderPipeline{
         .raw = pipeline_state,
+        .trace = .{
+            .vertex = if (desc.vertex_function) |f| f.name else @splat(0),
+            .fragment = if (desc.fragment_function) |f| f.name else @splat(0),
+            .format = if (desc.color_attachment_formats.len > 0) desc.color_attachment_formats[0] else null,
+            .blend = desc.blend_state,
+        },
     };
 }
 

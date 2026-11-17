@@ -2,6 +2,7 @@
  * node e2e/settings_material_regressions_native.ts BINARY OUTPUT_DIR
  * Uses private configuration, a synthetic PNG, and background Harness input.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn, execFileSync} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, realpath, rm, writeFile} from 'node:fs/promises';
@@ -9,6 +10,7 @@ import {join, resolve} from 'node:path';
 import {deflateSync} from 'node:zlib';
 import * as h from '../vendor/zenit/e2e/client.ts';
 import {cleanupOwnedBridgeDirectories} from './native_owned_cleanup.ts';
+import {chooseTheme} from './theme_settings_entry.ts';
 
 const binary = resolve(process.argv[2]), out = resolve(process.argv[3]);
 const iso = await realpath(await mkdtemp('/private/tmp/zw-settings-regressions-'));
@@ -96,9 +98,10 @@ try {
   await click('workspace.empty.local'); await visible('terminal.surface'); await click('terminal.surface');
   const terminalFocus = await h.focused(); assert(terminalFocus.id !== undefined);
   await capture('workspace-t50-blur0', 'workspace.shell');
-  report.canvas_pixels = JSON.parse(execFileSync('python3', [resolve('e2e/canvas_material_pixels.py'), join(out, 'workspace-t50-blur0.png'), JSON.stringify((await visible('ai.strip.lip')).rect)], {encoding: 'utf8'}));
-  report.checks.push('All four cards and the AI entry actual pixels use one 50% canvas mix; no extra card opacity is applied.');
-  await h.type_('@theme sauber'); await h.key('return'); await h.sleep(350);
+  report.canvas_pixels = JSON.parse(execFileSync('python3', [resolve('e2e/canvas_material_pixels.py'), join(out, 'workspace-t50-blur0.png')], {encoding: 'utf8'}));
+  report.checks.push('All four cards use one 50% canvas mix; no extra card opacity is applied. (PL4c: the AI entry is the GlassButton ai.launcher with its own glass material, so the L0-canvas entry check no longer applies.)');
+  /* copy-terms: @theme only opens 设置 › 外观; pick the theme there (the single theme entry). */
+  await chooseTheme(h, 'sauber', join(data, 'config.toml')); await click('terminal.surface'); await h.sleep(350);
   await capture('sauber-t50-blur0', 'workspace.shell');
   await click('toolbar.settings'); await click('settings.search');
   const card = (await visible('settings.panel')).rect;

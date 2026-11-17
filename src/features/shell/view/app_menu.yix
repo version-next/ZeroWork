@@ -1,0 +1,17 @@
+//! 菜单的唯一挂载点（CONSISTENCY_AUDIT #3，menus 包）：原生 `W.Menu`，默认外观，不覆盖任何样式。
+//!
+//! - 右键 / 快捷键打开的菜单（侧栏主机、页签、会话组页签、终端右键与中键、新建会话、文件区）：
+//!   `trigger = .manual`，宿主写入项与锚点矩形并把 `open` 置真，虚拟锚点让面板从按下处 / 触发控件下方弹出。
+//! - 项只来自 `model/menu_spec.zig` 的声明（`app_menu.zig` 的 `build` 投影成 `W.MenuItem`）；
+//!   选中只把动作 id 交回宿主，由宿主对打开菜单时捕获的对象执行。危险项不在这里确认。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("app_menu.yss");
+
+pub fn ContextMenu(open: bool, items: []const W.MenuItem, anchor: W.popover.Anchor, panelTestId: []const u8, width: ?f32, maxHeight: ?f32, position: W.PopoverPosition, onOpenChange: Handler(bool), onSelect: Handler([]const u8)) View {
+    return (
+        <box style={S.anchor}>
+            <W.Menu panelTestId={panelTestId} trigger={.manual} open={open} onOpenChange={onOpenChange} items={items} anchor={anchor} width={width} maxHeight={maxHeight} position={position} onSelect={onSelect} />
+        </box>
+    );
+}

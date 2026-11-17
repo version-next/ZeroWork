@@ -1,0 +1,174 @@
+//! AI 辅助的对话框（F-set-ai）：模型编辑器（添加 / 编辑模型）与删除确认（服务提供方 / 模型），都是原生 `W.Modal`
+//! 默认外观（默认遮罩、面板、标题栏），正文只用原生控件。照 `save_bar.yix` 的 `Confirmation`：只在打开时挂载——`W.Modal` 的
+//! `title` 是挂载期取值，而标题随打开方式变（添加 / 编辑模型、删除提供方 / 模型）；初始焦点用 `autoFocus` 声明。
+//! 开合与表单状态在 view-model（`m.ai`），Escape / 关闭按钮 / 点遮罩都按“取消”处理。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const P = @import("ai.yss");
+const A = m.ai;
+const Confirm = @import("../../../../shared/ui/confirm/confirm.zig");
+
+fn send(vm: *m.ViewModel, command: A.Command) void {
+    vm.dispatch(m.Intent.aiDo(command));
+}
+fn editorClosed(vm: *m.ViewModel, open: bool) void {
+    if (!open) send(vm, .editor_cancel);
+}
+fn setId(vm: *m.ViewModel, text: []const u8) void {
+    send(vm, .{ .editor_id = text });
+}
+fn submitId(vm: *m.ViewModel, text: []const u8) void {
+    send(vm, .{ .editor_id_submit = text });
+}
+fn setContext(vm: *m.ViewModel, text: []const u8) void {
+    send(vm, .{ .editor_context = text });
+}
+fn pick(vm: *m.ViewModel, value: ?[]const u8) void {
+    send(vm, .{ .editor_pick = value });
+}
+fn setReasoning(vm: *m.ViewModel, value: ?[]const u8) void {
+    send(vm, .{ .editor_capability = .{ .which = .reasoning, .value = value } });
+}
+fn setVision(vm: *m.ViewModel, value: ?[]const u8) void {
+    send(vm, .{ .editor_capability = .{ .which = .vision, .value = value } });
+}
+fn setEffort(vm: *m.ViewModel, index: u8, on: bool) void {
+    send(vm, .{ .editor_effort = .{ .index = index, .on = on } });
+}
+fn setDefault(vm: *m.ViewModel, on: bool) void {
+    send(vm, .{ .editor_default = on });
+}
+fn act(vm: *m.ViewModel, which: A.Command) void {
+    send(vm, which);
+}
+fn sourceIcon(source: A.Source) ui.SvgAsset {
+    return switch (source) {
+        .api => ui.icons.circle_check,
+        .manual => ui.icons.pencil,
+        .missing => ui.icons.circle_alert,
+    };
+}
+fn sourceText(source: A.Source) []const u8 {
+    return A.sourceText(source);
+}
+
+// 清单下拉的选项：view-model 给出数据（`A.catalogChoices`），这里换成原生 `W.SelectOption`（两份交替，同一设置窗口只有一个编辑器）。
+var catalog_options: [2][A.choice_limit]W.SelectOption = undefined;
+var catalog_flip: u1 = 0;
+fn catalogOptions(vm: *m.ViewModel) []const W.SelectOption {
+    const choices = A.catalogChoices(vm);
+    catalog_flip +%= 1;
+    const list = &catalog_options[catalog_flip];
+    for (choices, 0..) |choice, i| list[i] = .{ .value = choice.value, .label = choice.label, .disabled = choice.disabled, .test_id = choice.test_id };
+    return list[0..choices.len];
+}
+const reasoning_options = [_]W.SelectOption{ .{ .value = "unknown", .label = "未返回，请选择", .disabled = true }, .{ .value = "yes", .label = "支持", .test_id = "settings.ai.model.reasoning.yes" }, .{ .value = "no", .label = "不支持", .test_id = "settings.ai.model.reasoning.no" } };
+const vision_options = [_]W.SelectOption{ .{ .value = "unknown", .label = "未返回，请选择", .disabled = true }, .{ .value = "yes", .label = "支持", .test_id = "settings.ai.model.vision.yes" }, .{ .value = "no", .label = "不支持", .test_id = "settings.ai.model.vision.no" } };
+
+/// 能力 / 上下文的来源（接口已返回 / 手动设置 / 未返回）：图标形状 + 原生 Tooltip。
+fn SourceMark(source: A.Source, id: []const u8, tip: []const u8) View {
+    return (
+        <W.Tooltip text={sourceText(source)} position={.top} parts={.{ .content = tip }}>
+            <box testId={id} style={P.ai_source_slot} focusable={true} a11y={.{ .label = sourceText(source) }}>
+                <icon src={sourceIcon(source)} style={P.AiSource.of(.{ .tone = source })} />
+            </box>
+        </W.Tooltip>
+    );
+}
+
+fn Effort(vm: *m.ViewModel, index: u8) View {
+    return <W.Checkbox testId={A.effortId(index)} label={A.effort_labels[index]} checked={A.effortChecked(vm, index)} onChange={|v| setEffort(vm, index, v)} />;
+}
+
+/// 模型编辑器（旧 `ai_model_editor`）：模型 ID（清单下拉或手动输入）、上下文窗口、推理 / 识图能力与推理等级、测试模型、默认模型。
+/// 改动只在“添加模型 / 保存模型”时进草稿；校验不过时留在对话框里给出原因。
+pub fn ModelEditor(vm: *m.ViewModel) View {
+    return (
+        <box style={P.ai_dialog_anchor}>
+        {if (A.editorOpen(vm))
+        <W.Modal open={A.editorOpen(vm)} onOpenChange={|o| editorClosed(vm, o)} title={A.editorTitle(vm)} width={480} animateInitialOpen={true}>
+            <box testId="settings.ai.model.dialog" style={P.ai_dialog}>
+                <text style={P.ai_dialog_sub}>{A.editorProvider(vm)}</text>
+                <W.ScrollArea direction={.vertical} testId="settings.ai.model.viewport" style={P.ai_dialog_scroll} parts={.{ .content = .{ .style = P.ai_dialog_scroll_body } }}>
+                    <box style={P.ai_catalog_row}>
+                        <text testId="settings.ai.model.catalog_status" style={P.ai_catalog_status} box={P.ai_catalog_status_box}>{A.editorCatalogStatus(vm)}</text>
+                        <W.Button testId="settings.ai.model.fetch_models" label={A.editorFetchLabel(vm)} variant={.secondary} size={.sm} onClick={act(vm, .editor_fetch)} />
+                    </box>
+                    <box style={P.ai_field}>
+                        <text style={P.ai_field_label}>模型 ID *</text>
+                        <W.Select searchable={true} panelWidth={.trigger} options={catalogOptions(vm)} value={A.editorPicked(vm)} placeholder={A.catalogPlaceholder(vm)} disabled={A.catalogEmpty(vm)} onChange={|v| pick(vm, v)} parts={.{ .trigger = "settings.ai.model.catalog" }} />
+                        <W.Input value={A.editorId(vm)} placeholder="或手动输入模型 ID" autoFocus={true} onChange={|t| setId(vm, t)} onSubmit={|t| submitId(vm, t)} parts={.{ .input_container = "settings.ai.model.id" }} />
+                    </box>
+                    <box style={P.ai_field}>
+                        <box style={P.ai_field_heading}>
+                            <text style={P.ai_field_label}>上下文窗口 *</text>
+                            <SourceMark source={A.contextSource(vm)} id="settings.ai.model.context.source" tip="settings.ai.model.context.source.tooltip" />
+                        </box>
+                        <W.Input value={A.editorContext(vm)} placeholder="例如 128000" appendText="tokens" onChange={|t| setContext(vm, t)} onSubmit={|t| setContext(vm, t)} parts={.{ .input_container = "settings.ai.model.context" }} />
+                    </box>
+                    <box style={P.ai_field}>
+                        <box testId="settings.ai.model.capabilities.heading" style={P.ai_field_heading}>
+                            <text style={P.ai_field_label}>模型能力</text>
+                        </box>
+                        <box style={P.ai_capability}>
+                            <box style={P.ai_capability_label}>
+                                <text style={P.ai_label}>推理能力</text>
+                                <SourceMark source={A.capabilitySource(vm, .reasoning)} id="settings.ai.model.reasoning.source" tip="settings.ai.model.reasoning.source.tooltip" />
+                            </box>
+                            <W.Select panelWidth={.trigger} options={&reasoning_options} value={A.capabilityValue(vm, .reasoning)} width={180} onChange={|v| setReasoning(vm, v)} parts={.{ .trigger = "settings.ai.model.reasoning" }} />
+                        </box>
+                        <box testId="settings.ai.model.efforts" style={P.ai_efforts} visible={A.effortsShown(vm)}>
+                            <box style={P.ai_capability}>
+                                <text style={P.ai_hint} box={P.ai_catalog_status_box}>推理等级</text>
+                                <text style={P.ai_hint}>可多选</text>
+                            </box>
+                            <box style={P.ai_efforts_grid}>
+                                <Effort vm={vm} index={5} />
+                                <Effort vm={vm} index={0} />
+                                <Effort vm={vm} index={1} />
+                                <Effort vm={vm} index={2} />
+                                <Effort vm={vm} index={3} />
+                                <Effort vm={vm} index={4} />
+                                <Effort vm={vm} index={6} />
+                            </box>
+                        </box>
+                        <box style={P.ai_capability}>
+                            <box style={P.ai_capability_label}>
+                                <text style={P.ai_label}>识图能力</text>
+                                <SourceMark source={A.capabilitySource(vm, .vision)} id="settings.ai.model.vision.source" tip="settings.ai.model.vision.source.tooltip" />
+                            </box>
+                            <W.Select panelWidth={.trigger} options={&vision_options} value={A.capabilityValue(vm, .vision)} width={180} onChange={|v| setVision(vm, v)} parts={.{ .trigger = "settings.ai.model.vision" }} />
+                        </box>
+                    </box>
+                    <box style={P.ai_test_row}>
+                        <text testId="settings.ai.model.test_status" style={P.ai_test_status} box={P.ai_test_status_box}>{A.testStatus(vm)}</text>
+                        <W.Button testId="settings.ai.model.test" label={A.testLabel(vm)} variant={.secondary} size={.sm} onClick={act(vm, .editor_test)} />
+                    </box>
+                    <W.Checkbox testId="settings.ai.model.default" label="设为此服务提供方的默认模型" checked={A.editorDefault(vm)} onChange={|v| setDefault(vm, v)} />
+                    <text testId="settings.ai.model.error" style={P.ai_dialog_error} box={P.ai_dialog_text_box} visible={A.editorErrorShown(vm)}>{A.editorError(vm)}</text>
+                </W.ScrollArea>
+                <box testId="settings.ai.model.footer" style={P.ai_dialog_actions}>
+                    <W.Button testId="settings.ai.model.cancel" label="取消" variant={.secondary} onClick={act(vm, .editor_cancel)} />
+                    <W.Button testId="settings.ai.model.save" label={A.editorSaveLabel(vm)} variant={.primary} onClick={act(vm, .editor_save)} />
+                </box>
+            </box>
+        </W.Modal>
+        }
+        </box>
+    );
+}
+
+/// 删除确认：共享的原生确认框 `W.ConfirmDialog`（`shared/ui/confirm`）——焦点在“取消”，Esc / × / 点遮罩 = 取消，
+/// 危险按钮“删除服务提供方 / 删除模型”。确认期间配置变了就拒绝并在插槽里说明（框保持打开）。
+pub fn DeleteConfirm(vm: *m.ViewModel) View {
+    return (
+        <box style={P.ai_dialog_anchor}>
+        {if (A.deleteOpen(vm))
+        <W.ConfirmDialog open={A.deleteOpen(vm)} onCancel={act(vm, .cancel_delete)} onConfirm={act(vm, .confirm_delete)} closeOnConfirm={false} closeOnOverlay={Confirm.close_on_overlay} title={A.deleteTitle(vm)} message={A.deleteMessage(vm)} confirmLabel={A.deleteLabel(vm)} cancelLabel={Confirm.cancel_label} width={390} animateInitialOpen={true} testIds={.{ .dialog = "settings.ai.delete.dialog", .actions = "settings.ai.delete.footer", .cancel = "settings.ai.delete.cancel", .confirm = "settings.ai.delete.confirm" }}>
+            <text style={P.ai_dialog_error} box={P.ai_dialog_text_box} visible={A.deleteProblemShown(vm)}>{A.deleteProblem(vm)}</text>
+        </W.ConfirmDialog>
+        }
+        </box>
+    );
+}

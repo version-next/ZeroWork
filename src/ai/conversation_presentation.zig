@@ -252,7 +252,7 @@ test "conversation presentation roundtrip keeps questions steps reasoning attach
     try turn.applyEvent(a, .{ .kind = .step, .call_id = "read-1", .name = "host.read_terminal", .detail = "真实终端输出", .phase = .succeeded, .at_ms = 30 });
     try turn.applyEvent(a, .{ .kind = .text, .detail = "检查完毕 ✅", .phase = .assembling, .at_ms = 40 });
     turn.finishSegment(50);
-    var draft = try text.Draft.init(a, .{ .session = 1 });
+    var draft = try text.Draft.init(a, .{ .tab = 1 });
     defer draft.deinit();
     const ticket = try draft.begin();
     var ref = try text.ContentRef.create(a, "说明.txt", "原始附件 🧑‍💻", 100);
@@ -319,7 +319,7 @@ test "conversation presentation retained image pixels survive original bundle re
     var ref = try images.ContentRef.create(a, "original.png", png, 100, .{});
     defer ref.release();
     var items = [_]images.SentItem{.{ .id = 4, .reference = ref }};
-    const bundle: images.Bundle = .{ .allocator = a, .owner = .{ .session = 1 }, .draft_epoch = 1, .items = &items };
+    const bundle: images.Bundle = .{ .allocator = a, .owner = .{ .tab = 1 }, .draft_epoch = 1, .items = &items };
     var turn: turns.Turn = .{ .id = 1 };
     defer turn.deinit(a);
     turn.before = try wire.History.copy(a, &.{.{ .content = "pixels", .images = &.{ref} }}, "");

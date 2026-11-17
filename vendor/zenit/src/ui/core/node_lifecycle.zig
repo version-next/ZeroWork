@@ -174,8 +174,22 @@ pub var legacy_node_create_hits: u64 = 0;
 
 /// Unified write entry for component layer 'changing own child rects'.
 /// Writes to World.LayoutTable and maintains standalone fallback storage.
+/// Web DOM host (layout domains): rects written outside a layout-engine pass are
+/// component placements (input caret/selection, scrollbars, overlays) that CSS
+/// cannot derive from Style; the host pins those nodes at their zenit box.
+/// Null on native builds.
+pub var component_rect_hook: ?*const fn (node: *Node) void = null;
+/// >0 while layout_engine.layoutNode runs (engine-owned rect writes).
+pub var engine_layout_depth: u32 = 0;
+
 pub fn setLayoutRect(self: *Node, r: ComputedRect) void {
     assertOwnedByActiveWorld(self, "setLayoutRect");
+    if (component_rect_hook) |hook| if (engine_layout_depth == 0) hook(self);
+    // Every rect change reaches the hit index from here, the one write entry (layout engine and
+    // component placements alike); see node_dirty.markLayoutPlacementDirty.
+    const old = rectFromWorldOrFallback(self);
+    if (old.x != r.x or old.y != r.y or old.w != r.w or old.h != r.h)
+        @import("node_dirty.zig").markLayoutPlacementDirty(self);
     // P0-3 phase 3: write directly to owner World (semantic equivalent of original
     // core.zig:onRectWrite).
     if (self.world_ref) |w| {
@@ -250,6 +264,9 @@ pub fn create(allocator: Allocator, id: u32, tag: ElementTag, style: Style) !*No
         .style = style,
         .children = .empty,
     };
+    // The standalone rect store is keyed by address. A mock freed without
+    // releaseStandaloneState must not hand its rect to a node reusing it.
+    if (g_standalone_rects_init) _ = g_standalone_rects.remove(@intFromPtr(node));
     // If the current active cx registered the hook, auto linkNodeToWorld (setLayoutRect truly
     // writes the World table, so the fallback field never becomes source-of-truth).
     //
@@ -261,6 +278,8 @@ pub fn create(allocator: Allocator, id: u32, tag: ElementTag, style: Style) !*No
         legacy_node_create_hits += 1;
         hook(node);
     }
+    @import("node_tree.zig").hostCreated(node);
+    @import("trace").work_counters.bump(.nodes_created);
     return node;
 }
 
@@ -310,6 +329,8 @@ pub fn createIn(
     node.element_id_raw = eid.raw();
     node.world_id = world_id;
     node.world_ref = world;
+    @import("node_tree.zig").hostCreated(node);
+    @import("trace").work_counters.bump(.nodes_created);
     return node;
 }
 
@@ -328,6 +349,7 @@ pub fn destroy(self: *Node, allocator: Allocator) void {
     }
     if (self.freeing) return;
     self.freeing = true;
+    @import("node_tree.zig").g_retire_gen +%= 1;
     self.deferred_disposal.cancel();
     self.pending_free_cx = null;
     for (self.children.items) |child| {
@@ -348,10 +370,15 @@ pub fn destroy(self: *Node, allocator: Allocator) void {
         self.meta.per_frame.hooks.style_host = null;
         h.destroy(h.ptr);
     }
+    if (self.meta.per_frame.hooks.theme_inline) |rec| {
+        self.meta.per_frame.hooks.theme_inline = null;
+        rec.destroy();
+    }
 
     self.invalidateRenderCache();
     self.invalidatePromotedRenderCache();
     self.invalidateSubtreePayloadCache();
+    @import("render_engine/raw_shadow.zig").dropShadow(self);
 
     // Free dynamically allocated test_id.
     if (self.frame_state.state_bits.flags.test_id_owned) {
@@ -396,6 +423,7 @@ pub fn destroy(self: *Node, allocator: Allocator) void {
 
     releasePathGeometry(self, allocator);
     releaseStrokeGeometry(self, allocator);
+    releaseShapeGeometry(self, allocator);
     releaseCustomClipGeometry(self, allocator);
 
     if (self.world_ref) |w| {
@@ -414,10 +442,39 @@ pub fn destroy(self: *Node, allocator: Allocator) void {
     // than relying on 0xaa to make `freeing` read true for silent early-return.
     self.alive_sentinel = node_mod.DEAD_SENTINEL;
     allocator.destroy(self);
+    @import("trace").work_counters.bump(.nodes_destroyed);
 }
 
 /// Called by both standalone destroy and Cx reclamation, after owned payloads.
+// Both Node.destroy and Cx.freeNodeNow pass this release boundary. Layout's
+// callback publication compares the epoch without dereferencing freed nodes.
+pub const ReleaseWatch = struct {
+    node: *const Node,
+    alive: bool = true,
+    previous: ?*ReleaseWatch = null,
+    pub fn begin(self: *ReleaseWatch) void {
+        self.previous = release_watch_head;
+        release_watch_head = self;
+    }
+    pub fn end(self: *ReleaseWatch) void {
+        std.debug.assert(release_watch_head == self);
+        release_watch_head = self.previous;
+    }
+};
+var release_watch_head: ?*ReleaseWatch = null;
+
+var node_release_revision: u64 = 0;
+pub fn releaseRevision() u64 {
+    return node_release_revision;
+}
+
 pub fn releaseStandaloneState(node: *Node) void {
+    @import("node_tree.zig").hostDestroyed(node);
+    node_release_revision +%= 1;
+    var watch = release_watch_head;
+    while (watch) |w| : (watch = w.previous) {
+        if (w.node == node) w.alive = false;
+    }
     const ptr = @intFromPtr(node);
     @import("paint_content_accessor.zig").releaseStandaloneNode(ptr);
     if (g_standalone_rects_init) _ = g_standalone_rects.remove(ptr);
@@ -431,6 +488,15 @@ pub fn releasePathGeometry(self: *Node, allocator: Allocator) void {
         }
         lo.vector.fill.path = null;
     }
+}
+
+pub fn releaseShapeGeometry(self: *Node, allocator: Allocator) void {
+    const lo = self.layoutOutputPtr() orelse return;
+    const shape = lo.vector.shape orelse return;
+    lo.vector.shape = null;
+    if (shape.fill.owned and shape.fill.commands.len > 0) allocator.free(shape.fill.commands);
+    if (shape.border) |b| if (b.owned and b.commands.len > 0) allocator.free(b.commands);
+    allocator.destroy(shape);
 }
 
 pub fn releaseStrokeGeometry(self: *Node, allocator: Allocator) void {
@@ -463,6 +529,7 @@ pub fn releaseCustomClipGeometry(self: *Node, allocator: Allocator) void {
 pub fn releaseAllGeometry(self: *Node, allocator: Allocator) void {
     releasePathGeometry(self, allocator);
     releaseStrokeGeometry(self, allocator);
+    releaseShapeGeometry(self, allocator);
     releaseCustomClipGeometry(self, allocator);
 }
 
@@ -499,6 +566,15 @@ pub fn fireCleanupCallbacks(node: *Node) void {
     }
     if (node.frame_state.state_bits.flags.is_mounted) {
         node.frame_state.state_bits.flags.is_mounted = false;
+        // Cleanup may be followed by a same-geometry remount, even without a
+        // tree mutation. Restore the conservative publication path before user
+        // code can reenter layout. Stop at an already-pending ancestor.
+        var pending: ?*Node = node;
+        while (pending) |current| {
+            if (current.frame_state.frame_local.runtime.layout_mount_pending) break;
+            current.frame_state.frame_local.runtime.layout_mount_pending = true;
+            pending = current.parent;
+        }
         if (node.meta.ownership.hooks.on_cleanup) |cleanup_handler| {
             node.meta.ownership.hooks.on_cleanup = null;
             cleanup_handler.invoke();
@@ -510,13 +586,13 @@ pub fn fireCleanupCallbacks(node: *Node) void {
 /// For scenarios freeing root_scope before node memory, avoids accessing freed Scope.
 pub fn clearNodeScopes(node: *Node) void {
     if (node.meta.ownership.scope.node_slot) |slot| {
+        @import("cx_node_lifetime.zig").NodeScopeBinding.slotCleared(slot);
         slot.* = null;
         node.meta.ownership.scope.node_slot = null;
     }
     node.meta.ownership.scope.scope = null;
     // Mark hook/component state pointers invalid to avoid dangling references after
     // scope freed first.
-    node.meta.per_frame.hooks.slots.animated_bg_state = null;
     node.meta.per_frame.hooks.slots.hover_highlight_state = null;
     node.meta.per_frame.hooks.slots.anim_state = null;
     node.meta.per_frame.hooks.slots.focus_ring_anim = null;

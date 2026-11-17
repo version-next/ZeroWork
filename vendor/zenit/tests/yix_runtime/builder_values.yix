@@ -1,0 +1,93 @@
+//! Runtime fixture for parameters forwarded to builder widget props (ZeroWork G25): a row
+//! component passes its parameters to `W.Input` / `W.Select` / `W.Tooltip` as written. Props
+//! typed `ui.Source(T)` (placeholder, disabled, options, text) follow the parameter; plain-value
+//! props (appendText, width, size) take the parameter's value once, when the widget is built
+//! (at mount). Also the Yix components (`W.Button`, `W.Switch`, …), whose parameters are all
+//! sources, and the G24 forms (`parts` test id, whole `a11y` value) over a struct parameter.
+//! Lives outside tests/yix so it is not an LP3 equivalence input (those need reviewed goldens).
+const ui = @import("ui");
+const W = ui.widgets;
+
+pub const Row = struct {
+    unit: []const u8 = "MB",
+    id: []const u8 = "row.field",
+    name: []const u8 = "row",
+};
+
+fn unitOf(row: Row) []const u8 {
+    return row.unit;
+}
+
+fn fieldId(row: Row) []const u8 {
+    return row.id;
+}
+
+fn switchA11y(row: Row, on: bool) ?ui.A11yProps {
+    return .{ .role = .switch_role, .checked = on, .label = row.name };
+}
+
+/// Parameters forwarded as written: `unit` / `width` into plain props, `hint` / `off` into sources.
+pub fn InputRow(unit: []const u8 = "秒", hint: []const u8 = "", off: bool = false, width: ?f32 = 180) View {
+    return <W.Input appendText={unit} placeholder={hint} disabled={off} width={width} />;
+}
+
+/// Expressions over a struct parameter: a plain prop and a part's test id.
+pub fn ExprRow(row: Row) View {
+    return <W.Input appendText={unitOf(row)} parts={.{ .input_container = fieldId(row) }} />;
+}
+
+pub fn SelectRow(options: []const W.SelectOption = &.{}, hint: []const u8 = "", width: f32 = 180, off: bool = false) View {
+    return <W.Select options={options} placeholder={hint} width={width} disabled={off} />;
+}
+
+pub fn TipRow(help: []const u8 = "", width: ?f32 = null) View {
+    return (
+        <W.Tooltip text={help} width={width}>
+            <text>?</text>
+        </W.Tooltip>
+    );
+}
+
+/// Yix components: every parameter is a source, so these follow the parameters.
+pub fn Controls(title: []const u8 = "", off: bool = false, loading: bool = false, size: W.ButtonSize = .md, on: bool = false) View {
+    return (
+        <col>
+            <W.Button label={title} disabled={off} loading={loading} size={size} />
+            <W.Checkbox checked={on} label={title} disabled={off} />
+            <W.Switch checked={on} label={title} disabled={off} />
+            <W.Radio checked={on} label={title} disabled={off} />
+            <W.Tag label={title} />
+            <W.Badge label={title} />
+        </col>
+    );
+}
+
+/// G24 forms over a struct parameter: the whole `a11y` value and a part's test id.
+pub fn SwitchRow(row: Row, on: bool = false) View {
+    return <W.Switch checked={on} a11y={switchA11y(row, on)} testId={fieldId(row)} />;
+}
+
+/// A builder component's mount result through a handle the caller owns (ZeroWork AI-1: the host
+/// keeps the composer's `W.input.TextareaResult` for IME, paste, drop and history): `ref={handle}` binds
+/// the builder's own result type, also when the element carries attributes and named slots.
+pub fn NoteField(note: *ui.view.Ref(W.input.TextareaResult), hint: []const u8 = "") View {
+    return (
+        <W.Textarea ref={note} testId="row.note" placeholder={hint} visible={true} header={<text>chips</text>} footer={<text>tools</text>} />
+    );
+}
+
+/// The same handle on a plain builder element with no attributes.
+pub fn BareNote(note: *ui.view.Ref(W.input.TextareaResult)) View {
+    return <W.Textarea ref={note} />;
+}
+
+fn keepNote(slot: *?W.input.TextareaResult, note: *ui.view.Ref(W.input.TextareaResult)) void {
+    slot.* = note.get();
+}
+
+/// A template-local result handle (`ref(W.input.TextareaResult)`), copied out at mount.
+pub fn LocalNote(slot: *?W.input.TextareaResult) View {
+    const note = ref(W.input.TextareaResult);
+    onMount(keepNote(slot, note));
+    return <W.Textarea ref={note} testId="row.local" style={.{ .width = .{ .px = 160 } }} />;
+}

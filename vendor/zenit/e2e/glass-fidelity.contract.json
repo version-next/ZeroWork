@@ -1,0 +1,121 @@
+{
+  "schema_version": 3,
+  "reference": "Live SwiftUI glassEffect on macOS 26, captured from its real window",
+  "claim": "Regional visual similarity on the recorded OS and GPU; never exact pixel equivalence",
+  "viewport": {
+    "width": 640,
+    "height": 480,
+    "scale": 2
+  },
+  "preconditions": {
+    "reduce_transparency": false,
+    "increase_contrast": false,
+    "reduce_motion": false,
+    "active_key_window": true
+  },
+  "static_reference": {
+    "fixture_isolation": "fresh NSHostingView per scene",
+    "native_idle_rmse_max": 0.5
+  },
+  "thresholds": {
+    "background_rmse": 1.5,
+    "body_rmse": 8,
+    "body_p95_rgb_error": 18,
+    "body_ssim": 0.96,
+    "rim_rmse": 14,
+    "shadow_rmse": 6,
+    "idle_frame_rmse": 0.5
+  },
+  "playwright": {
+    "version": "1.63.0",
+    "comparator": "pixelmatch",
+    "threshold": 0.2,
+    "maxDiffPixels": 0,
+    "roi_padding_logical_pixels": 16,
+    "policy": "Public toMatchSnapshot with the Playwright default perceptual threshold and zero differing pixels; compare identical geometry-defined material crops. Never update SwiftUI references from Zenit."
+  },
+  "regions": {
+    "body": "Inside the exact rounded rectangle, excluding its outermost 6 logical pixels",
+    "rim": "The outermost 6 logical pixels inside the exact rounded rectangle",
+    "shadow": "Outside the rounded rectangle, within 16 logical pixels of its silhouette",
+    "background": "Outside a 40 logical pixel expansion of the glass; exclude native window controls"
+  },
+  "required_cases": [
+    "light-regular-capsule",
+    "light-clear-capsule",
+    "light-regular-panel",
+    "light-clear-panel",
+    "dark-regular-capsule",
+    "dark-clear-capsule",
+    "dark-regular-panel",
+    "dark-clear-panel",
+    "mixed-regular-capsule",
+    "mixed-clear-capsule",
+    "mixed-regular-panel",
+    "mixed-clear-panel",
+    "mixed-regular-circle",
+    "mixed-clear-circle",
+    "light-regular-tint",
+    "dark-regular-tint",
+    "light-regular-edge",
+    "dark-clear-edge",
+    "text-regular-left-edge",
+    "text-regular-right-edge",
+    "text-regular-toolbar",
+    "text-regular-panel",
+    "text-clear-panel",
+    "content-regular-panel",
+    "content-clear-panel",
+    "content-regular-toolbar"
+  ],
+  "required_window_regressions": [
+    "GlassMotion morph geometry and scroll edge",
+    "GlassMotion real wheel blur persistence",
+    "GlassChrome scroll and clamp",
+    "GlassEdge no black fringe",
+    "GlassIslands retained content",
+    "GlassLab idle and sidebar scroll flicker",
+    "GlassLab drag and hover/press"
+  ],
+  "required_native_motion_actions": [
+    "scroll",
+    "drag",
+    "morph",
+    "hover_press_release"
+  ],
+  "motion": {
+    "geometry_endpoint_error_logical_pixels": 2,
+    "trajectory_edge_error_logical_pixels": 4,
+    "trajectory_presentation_window_ms": 33.4,
+    "input_response_deadline_ms": 100,
+    "morph_completion_deadline_ms": 450,
+    "settled_checkpoint_delay_ms": 400,
+    "scroll_offset_error_logical_pixels": 0.5,
+    "moving_body_inset_logical_pixels": 12,
+    "moving_body_rmse": 10,
+    "moving_body_p95_rgb_error": 24,
+    "moving_body_ssim": 0.94,
+    "scope": "All presented morph geometry and drag/scroll input steps; full material at settled checkpoints; Playwright pixelmatch and body metrics on the fixed native deep-body mask during morph, with original moving-rim RGB and fine/broad curved-rim structure checked independently. No image translation, scaling or timestamp warping. Pair presentation timestamps only within two 60 Hz display frames. Native idle frames remain on screen until replaced, and input callbacks must prove hover and click delivery.",
+    "moving_rim_policy": "Compare original unregistered inside-rim RGB and fine/broad structure on moving morph frames; the interior mask does not establish edge fidelity"
+  },
+  "completion_policy": "All required cases and window regressions must pass. Missing captures, mismatched dimensions, accessibility fallback, process crash, or any threshold failure fails the gate. Thresholds must not be relaxed to fit the implementation. Dynamic native equivalence requires a separate timestamped native interaction comparison and cannot be inferred from static cases.",
+  "structure": {
+    "method": "Masked difference of Gaussian luminance bands at fine (1,4 px) and broad (4,12 px) scales; compare transmitted fine detail, blurred text and edge structure independently of mean RGB and identical outside background",
+    "sigma_physical_pixels": [
+      1,
+      4
+    ],
+    "native_rms_floor": 0.15,
+    "contrast_ratio_min": 0.8,
+    "contrast_ratio_max": 1.25,
+    "error_ratio_max": 0.5,
+    "correlation_min": 0.9,
+    "foreground_policy": "Exclude the shared foreground and its 12 physical pixel filter footprint; foreground contrast has separate window checks",
+    "completion_policy": "Require body and rim structure when native band RMS is at least 0.15; insufficient reference signal is recorded explicitly. These checks supplement the original unchanged thresholds.",
+    "broad_sigma_physical_pixels": [
+      4,
+      12
+    ],
+    "curved_rim_policy": "Measure rounded-corner inside-rim pixels independently of the whole rim at both scales; matching straight edges cannot hide absent curved backdrop mapping"
+  }
+}

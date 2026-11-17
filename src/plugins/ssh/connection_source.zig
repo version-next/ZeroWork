@@ -4,7 +4,7 @@ const std = @import("std");
 const hosts = @import("../../config/hosts.zig");
 const config = @import("../../config/config.zig");
 const session = @import("../../host/session_host.zig");
-const Snapshot = @import("../../ui/session_lifecycle.zig").Snapshot;
+const Snapshot = @import("../../host/session_lifecycle.zig").Snapshot;
 const credentials = @import("../../config/credential_store.zig");
 
 /// Envelopes deliberately contain references rather than plaintext. Resolve

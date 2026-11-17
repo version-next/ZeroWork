@@ -1,5 +1,6 @@
 /** Own native application + loopback HTTP model. Exercises actual host wiring;
  * generated fixture summaries establish transport/state semantics, not LLM quality. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -8,6 +9,9 @@ import { copyFile, mkdir, mkdtemp, open, readFile, writeFile } from 'node:fs/pro
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { query, clickTestId, key, type_, inputState, screenshot, sleep, waitFor, waitForServerReady, resizeWindow } from '../zig-out/share/zenit/harness/client.ts';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleBody,skipTitle} from './ai_title_fixture.ts';
+import {readRequestText} from './provider_fixture.ts';
 const options: Record<string,string> = {};
 for (let i=2; i<process.argv.length; i+=2) options[process.argv[i]] = process.argv[i+1];
 assert(options['--binary'] && options['--out']);
@@ -21,7 +25,7 @@ let mode='success', summaryCount=0, ordinaryCount=0;
 const requests:any[]=[];
 const server=createServer(async(req,res)=>{
   if(req.method==='GET') {res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:[{id:'compaction-native',context_window:contextWindow,reasoning:false,vision:false}]}));return;}
-  let raw='';for await(const chunk of req)raw+=chunk;
+  const raw=await readRequestText(req);if(isTitleBody(raw))return skipTitle(res);
   const body=JSON.parse(raw), summary=body.messages.some((m:any)=>m.role==='system' && m.content.includes('Create concise conversation memory'));
   const record:any={summary,mode,body};requests.push(record);
   let text:string;
@@ -51,12 +55,11 @@ function text(n:any):string{return (n.text??'')+(n.children??[]).map(text).join(
 async function visible(id:string){return waitFor(async()=>(await query(id)).find(shown)??null,20000);}
 async function click(id:string){await visible(id);assert((await clickTestId(id)).ok,id);}
 async function cap(name:string){const path=join(output,name+'.png');assert((await screenshot(path)).ok);const usage=await query('ai.usage.menu');await writeFile(join(output,name+'.usage.json'),JSON.stringify(usage,null,2));assert(!JSON.stringify(usage).includes('清空上下文'));assert(!JSON.stringify(usage).includes('clear_context'));report.stages.push({name,screenshot:path,usage_rect:usage.find(shown)?.rect});}
-async function status(fragment:string){return waitFor(async()=>{const n=(await query('ai.usage.compaction.status')).find(shown);return n&&text(n).includes(fragment)?n:null;},20000);}
 async function send(prompt:string,answer:number){await click('ai.prompt');assert((await key('a',{cmd:true})).ok);assert((await type_(prompt)).ok);await click('ai.send');await waitFor(async()=>{const responses=await query('ai.response');return responses.some(n=>text(n).includes('VISIBLE_NATIVE_ANSWER_'+answer))&&!(await query('ai.stop')).some(shown)||null;},20000);}
 async function history(){return (await query('ai.message.user.bubble')).map(text);}
 try{
   await waitForServerReady();assert.equal(Number(JSON.parse(await readFile(join(rpc,'owner.json'),'utf8')).pid),app.pid);
-  await resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await visible('ai.prompt');
+  await resizeWindow(1440,900);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await visible('ai.prompt');
   if(options['--failure']==='true') {
     mode='failure';
     const original=('ORIGINAL_FAILED_INPUT '+ 'PREFLIGHT_DATA '.repeat(90)).trim();
@@ -68,14 +71,20 @@ try{
     assert((await history()).some(x=>x.includes('ORIGINAL_FAILED_INPUT')), 'original visible prompt preserved');
     const count=summaryCount;await sleep(2200);assert.equal(summaryCount,count,'failure must not restart automatic compaction');
     await click('ai.composer.usage');await visible('ai.usage.compaction.start');await cap('01-failed-input-restored');
-    await key('Escape');mode='success';await click('ai.send');
+    assert((await key('escape')).ok);await waitFor(async()=>!(await query('ai.usage.menu')).some(shown)||null,5000);mode='success';await click('ai.send');
     await waitFor(async()=>summaryCount>count||null,20000);
     await waitFor(async()=>requests.filter(r=>r.summary).every(r=>r.completed)||null,20000);
     await sleep(800);
     await waitFor(async()=>(await query('ai.response')).some(n=>text(n).includes('VISIBLE_NATIVE_ANSWER_1'))||null,20000);
     report.status='passed';report.original_input_preserved=true;report.concurrent_draft_preserved=true;report.no_automatic_retry=true;report.manual_retry_available=true;
   } else {
-  await send('OLD_NATIVE_MARKER inspect the terminal '+ 'PREFLIGHT_DATA '.repeat(1800),1);
+  // The fixed reserve (system prompt + tool catalog + terminal context) shrank since this fixture was sized: 1800
+  // repeats (~6.8K draft tokens, local_text_request.textTokens = bytes/4) now lands at ~81% of the 20K window
+  // (~9.4K fixed), below the 90% trigger in context_compaction.reachesThreshold. 2530 repeats (~9.5K draft tokens,
+  // ~18.9K total, ~95%) keeps the original precondition: over the trigger yet still inside the window. The usage
+  // menu cannot measure the fixed part beforehand (it reads 0 for an empty conversation).
+  const repeats=2530;report.threshold_fixture={repeats,draft_tokens:Math.ceil((repeats*15+40)/4)};
+  await send('OLD_NATIVE_MARKER inspect the terminal '+ 'PREFLIGHT_DATA '.repeat(repeats),1);
   assert(requests[0].summary, 'over-budget captured draft must compact before the first ordinary request');
   await waitFor(async()=>summaryCount>0||null,20000);
   await waitFor(async()=>{const r=requests.filter(r=>r.summary);return r.length>0&&r.every(r=>r.completed)||null;},20000);
@@ -83,7 +92,7 @@ try{
   await click('ai.composer.usage');await cap('01-automatic-compaction');
   const summaryText=text((await query('ai.usage.summary')).find(shown));
   assert(!summaryText.includes('105%'));
-  await key('Escape');await send('NEXT_NATIVE_REQUEST',2);
+  assert((await key('escape')).ok);await waitFor(async()=>!(await query('ai.usage.menu')).some(shown)||null,5000);await send('NEXT_NATIVE_REQUEST',2);
   const next=requests.filter(r=>!r.summary).at(-1).body;
   const wire=JSON.stringify(next.messages);
   assert(wire.includes('MEMORY_NATIVE_BACKUP_TESTS_PASSED'));

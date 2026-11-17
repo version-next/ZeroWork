@@ -499,6 +499,17 @@ int zw_libssh2_session_handshake(LIBSSH2_SESSION *session, int socket_fd) {
     zw_last_connect_errno = result == 0 ? 0 : errno;
     return result;
 }
+int zw_libssh2_session_server_banner(LIBSSH2_SESSION *session, char *output, size_t output_len) {
+    if (!session || !output || output_len == 0) return -1;
+    const char *banner = libssh2_session_banner_get(session);
+    if (!banner) return -1;
+    size_t length = strnlen(banner, output_len);
+    if (length >= output_len) length = output_len - 1;
+    memcpy(output, banner, length);
+    output[length] = 0;
+    return (int)length;
+}
+
 int zw_libssh2_session_hostkey_fingerprint(LIBSSH2_SESSION *session,
                                             char *algorithm, size_t algorithm_len,
                                             char *fingerprint, size_t fingerprint_len) {

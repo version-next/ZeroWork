@@ -1,0 +1,15 @@
+//! AI 卡片里的“尚未配置 AI 服务”就地提示（panel-heads，主会话已判定）：没有可用模型时在输入区上方显示原生
+//! `W.Alert`（warning，带动作“配置 AI 服务”），不再弹全局提醒（全局提醒会盖住停靠 AI 的窗格头部）。
+//! 显隐与文案是宿主经 `ai_unconfigured_view.zig` 写的信号；动作交回宿主打开 AI 设置。
+const ui = @import("ui");
+const W = ui.widgets;
+const IdSpace = @import("../../shared/view/ai_id_space.zig").IdSpace;
+const S = @import("ai_unconfigured.yss");
+
+pub fn Unconfigured(space: IdSpace, title: []const u8, message: []const u8, shown: bool, onConfigure: ?Handler(void) = null) View {
+    return (
+        <box testId={space.id("ai.unconfigured")} style={S.holder} visible={shown}>
+            <W.Alert variant={.warning} title={title} message={message} actionLabel="配置 AI 服务" actionIconAsset={ui.icons.settings} onAction={onConfigure} actionTestId={space.id("ai.unconfigured.configure")} />
+        </box>
+    );
+}

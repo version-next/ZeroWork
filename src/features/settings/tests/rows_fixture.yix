@@ -1,0 +1,19 @@
+//! 测试夹具：把四个已改写分类的面板正文挂在一列里（settings_rows_tests.zig / settings_panes_tests.zig 使用）。
+//! 不经内容页外壳：夹具的 Controller 不开 drill-down，每个分类的面板全部显示。
+const ui = @import("ui");
+const m = @import("../model/view_model.zig");
+const Ssh = @import("../view/panes/ssh.yix");
+const Transfer = @import("../view/panes/transfer.yix");
+const Notify = @import("../view/panes/notify.yix");
+const Data = @import("../view/panes/data.yix");
+
+pub fn RowsFixture(vm: *m.ViewModel) View {
+    return (
+        <col>
+            <Ssh.SshPanes vm={vm} />
+            <Transfer.TransferPanes vm={vm} />
+            <Notify.NotifyPanes vm={vm} />
+            <Data.DataPanes vm={vm} />
+        </col>
+    );
+}

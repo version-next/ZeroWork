@@ -183,25 +183,24 @@ pub const TextInputState = struct {
     placeholder_text: ?[]const u8 = null,
     /// Placeholder color override
     placeholder_color: ?core.Color = null,
-    /// Focus ring parent node (unclipped container)
-    focus_ring_host: ?*core.Node = null,
-    /// Whether in Group attached composite scenario
-    grouped_attached: bool = false,
-    /// Input container node reference (on_focus/on_blur update border style)
+    /// The field node (ControlShell root: focus target, a11y, text input client)
     input_container_node: ?*core.Node = null,
-    /// Hover signal reference (blur checks to preserve hover border)
-    hover_signal: ?*core.Signal(bool) = null,
-    /// Whether error state (skip border update on focus/blur)
+    /// Invalid (invalid prop or error message): a11y and editing state; the frame color is the
+    /// shell's :invalid
     has_error: bool = false,
     /// Dynamic disable: when true, event handlers ignore all input (static disable doesn't install
     /// handler)
     disabled: bool = false,
-    /// Composite control embed mode: parent controls border/hover/focus chrome.
-    embedded_chrome: bool = false,
     /// Allocator for StyleExt writes (Group corner radius pass-through, etc.)
     /// Owns single-line undo/redo snapshots. Component mounts replace this fallback with Scope/Cx
     /// allocator and register deinit.
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    /// The text the field had when it last gained focus (`Cx.input_escape`), owned; null while
+    /// unfocused.
+    focus_value: ?[]u8 = null,
+    focus_value_pending: bool = false,
+    /// A compound control can own Escape and discard its own filter draft.
+    restore_focus_value_on_escape: bool = true,
     // Border animation unified into Transition system (enableImplicitAnimation + setBorderColor)
     /// input_container global x (updated in on_before_render)
     container_x: f32 = 0,
@@ -211,6 +210,7 @@ pub const TextInputState = struct {
     char_width: f32 = 7.8,
     /// Text font weight (400=regular, 500=medium, 700=bold)
     font_weight: u16 = 400,
+    /// Family / monospace / italic of the display text the metrics above were synced from.
     measured_font: text_utils.Font = .{},
     /// Text font size cache
     font_size: f32 = 13.0,
@@ -234,6 +234,10 @@ pub const TextInputState = struct {
 
     /// Input type
     input_type: InputType = .text,
+    /// A `.password` field shows its characters instead of the mask. Only the display follows it:
+    /// the field stays secure for text services (no IME, no surrounding text), copy / cut stay
+    /// blocked and accessibility keeps the value hidden. Ignored for other types.
+    revealed: bool = false,
     /// User interaction may select/copy, but cannot mutate this document.
     readonly: bool = false,
     /// Whether multiline input
@@ -491,6 +495,8 @@ pub const TextInputState = struct {
     }
 
     pub fn deinit(self: *TextInputState) void {
+        self.clearFocusValue();
+        if (self.cx_ref) |cx| cx.sprites.unregister(self);
         if (self.input_overflow) |bytes| self.allocator.free(bytes);
         self.input_overflow = null;
         self.ime_preedit.deinit();
@@ -518,8 +524,8 @@ pub const TextInputState = struct {
             else => false,
         };
         if (unchanged) return;
-        node.style.height = .{ .px = desired };
-        node.markLayoutDirty();
+        // Component-inline: a layered field keeps it across its own style replays.
+        node.setStyleInline(self.allocator, .{ .height = .{ .px = desired } });
     }
 
     // ========== Blink ==========
@@ -667,6 +673,9 @@ pub const TextInputState = struct {
                 .font_family = "system",
                 .font_size = self.font_size,
                 .font_weight = self.font_weight,
+                .font_family_id = self.textFont().family_id,
+                .use_monospace = self.textFont().monospace,
+                .use_italic = self.textFont().italic,
             }) catch null) |line| {
                 if (line.positionToCaret(.{
                     .byte = .{ .value = local_cursor },
@@ -979,8 +988,13 @@ pub const TextInputState = struct {
             text_utils.utf8GraphemeLen(self.preeditText());
     }
 
+    /// The display shows the mask ('*' per grapheme): a `.password` field not `revealed`.
+    pub fn masked(self: *const TextInputState) bool {
+        return self.input_type == .password and !self.revealed;
+    }
+
     pub fn visualCursorPos(self: *const TextInputState) usize {
-        if (self.input_type == .password) return self.maskedCpForBufferPrefix(self.cursor_pos) + self.maskedCpForPreeditPrefix(self.effectiveImeCursorOffset());
+        if (self.masked()) return self.maskedCpForBufferPrefix(self.cursor_pos) + self.maskedCpForPreeditPrefix(self.effectiveImeCursorOffset());
         const base_units = text_utils.utf8DisplayUnitsPrefix(self.singleLineBuffer()[0..self.buffer_len], self.cursor_pos);
         const preedit_units = text_utils.utf8DisplayUnitsPrefix(
             self.preeditText(),
@@ -1026,7 +1040,7 @@ pub const TextInputState = struct {
     }
 
     pub fn visualCursorAdvance(self: *const TextInputState) f32 {
-        if (self.input_type == .password) {
+        if (self.masked()) {
             const star = @constCast(self).singleStarAdvance();
             const base_cp = self.maskedCpForBufferPrefix(self.cursor_pos);
             const preedit_cp = self.maskedCpForPreeditPrefix(self.effectiveImeCursorOffset());
@@ -1052,7 +1066,7 @@ pub const TextInputState = struct {
     }
 
     pub fn displayedTextAdvance(self: *const TextInputState) f32 {
-        if (self.input_type == .password) {
+        if (self.masked()) {
             const star = @constCast(self).singleStarAdvance();
             return star * @as(f32, @floatFromInt(self.displayedTextLen()));
         }
@@ -1065,7 +1079,7 @@ pub const TextInputState = struct {
     }
 
     pub fn imePreeditStartAdvance(self: *const TextInputState) f32 {
-        if (self.input_type == .password) {
+        if (self.masked()) {
             const star = @constCast(self).singleStarAdvance();
             const base_cp = self.maskedCpForBufferPrefix(self.cursor_pos);
             return star * @as(f32, @floatFromInt(base_cp));
@@ -1081,7 +1095,7 @@ pub const TextInputState = struct {
     }
 
     pub fn imePreeditAdvance(self: *const TextInputState) f32 {
-        if (self.input_type == .password) {
+        if (self.masked()) {
             const star = @constCast(self).singleStarAdvance();
             const preedit_cp = self.maskedCpForPreeditPrefix(self.ime_preedit_len);
             return star * @as(f32, @floatFromInt(preedit_cp));
@@ -1092,10 +1106,6 @@ pub const TextInputState = struct {
     pub fn hasVisualValue(self: *const TextInputState) bool {
         if (self.textarea_doc) |doc| return doc.totalLength() > 0 or self.hasImePreedit();
         return self.buffer_len > 0 or self.hasImePreedit();
-    }
-
-    pub fn restingBorderColor(self: *const TextInputState) core.Color {
-        return @import("styles.zig").restingBorderColor(self.tokens, self.has_error, self.hasVisualValue());
     }
 
     // ========== Soft-wrap ==========
@@ -1169,6 +1179,9 @@ pub const TextInputState = struct {
             .font_family = "system",
             .font_size = self.font_size,
             .font_weight = self.font_weight,
+            .font_family_id = self.textFont().family_id,
+            .use_monospace = self.textFont().monospace,
+            .use_italic = self.textFont().italic,
         }) catch return null;
         return .{ .start = start, .end = end, .display_line = display_line, .line = line };
     }
@@ -1363,7 +1376,7 @@ pub const TextInputState = struct {
     pub fn buildDisplayTextChecked(self: *TextInputState, placeholder: ?[]const u8) ![]const u8 {
         const text = self.getText();
         if (text.len == 0 and self.ime_preedit_len == 0) return placeholder orelse "";
-        if (self.input_type == .password) {
+        if (self.masked()) {
             const out = try self.scratch(&self.display_buffer, &self.display_overflow, self.displayedTextLen());
             @memset(out, '*');
             return out;
@@ -1767,7 +1780,7 @@ pub const TextInputState = struct {
         }
         const local_x = global_x - self.container_x + self.scroll_x - self.padding_h;
         const target_x = if (local_x <= 0) 0 else local_x;
-        if (self.input_type == .password) {
+        if (self.masked()) {
             // Password screen displays mask '*' but buffer holds real UTF-8.
             // Click x must measure by mask to find char N, translate back to buffer byte offset.
             const buffer_text = self.getText();
@@ -1857,7 +1870,7 @@ pub const TextInputState = struct {
         props.content = snapshot;
         props.owned = true;
         props.inline_len = 0;
-        self.display_text_hash = std.hash.Wyhash.hash(0, display);
+        self.display_text_hash = @import("trace").work_counters.hashText(0, display);
         text_node.setText(props);
         return true;
     }
@@ -1895,7 +1908,7 @@ pub const TextInputState = struct {
         const pointer = if (self.drag_pointer) |*p| p else return false;
         const elapsed = std.math.clamp(time_ms - pointer.time_ms, 0, 100);
         pointer.time_ms = time_ms;
-        if (!self.focused or !self.is_dragging or self.suspend_drag_until_mouse_up or self.multiline) return false;
+        if (!self.focused or !self.is_dragging or self.suspend_drag_until_mouse_up or self.multiline or core.host_native_text_fields) return false;
         const left = self.container_x + self.padding_h;
         const right = left + self.input_inner_w;
         const distance = if (pointer.x < left) pointer.x - left else if (pointer.x > right) pointer.x - right else return false;
@@ -1918,6 +1931,18 @@ pub const TextInputState = struct {
     /// unified dirty here.
     pub fn updateScrollX(self: *TextInputState) void {
         if (self.multiline) {
+            self.scroll_x = 0;
+            self.markVisualDirty();
+            return;
+        }
+        if (core.host_native_text_fields) {
+            // The native control scrolls itself and reports its offset (set_scroll).
+            self.markVisualDirty();
+            return;
+        }
+        if (!self.focused) {
+            // An unfocused field shows the start of its value (platform text fields; a
+            // browser <input> rewinds on blur). Focus scrolls to the caret.
             self.scroll_x = 0;
             self.markVisualDirty();
             return;
@@ -1952,6 +1977,36 @@ pub const TextInputState = struct {
     }
 
     // ========== Text operations ==========
+
+    /// A focus began: the focus-time text is taken right before the first user edit of this focus
+    /// (`takeFocusValue`), so a value the app writes while focusing (a cleared query bound through
+    /// a signal) counts as the focus-time value. Out of memory: no snapshot, Escape does not revert.
+    pub fn noteFocusValue(self: *TextInputState) void {
+        self.clearFocusValue();
+        self.focus_value_pending = self.restore_focus_value_on_escape;
+    }
+
+    /// The user is about to edit (text, IME, a key): fix the focus-time text if not done yet.
+    pub fn takeFocusValue(self: *TextInputState) void {
+        if (!self.focus_value_pending) return;
+        self.focus_value_pending = false;
+        self.focus_value = self.allocator.dupe(u8, self.getText()) catch null;
+    }
+
+    pub fn clearFocusValue(self: *TextInputState) void {
+        if (self.focus_value) |bytes| self.allocator.free(bytes);
+        self.focus_value = null;
+        self.focus_value_pending = false;
+    }
+
+    /// Put back the text the field had when it gained focus (one undoable edit). False when there
+    /// is no snapshot or the text is unchanged. The caller fires `on_change`.
+    pub fn revertToFocusValue(self: *TextInputState) bool {
+        const saved = self.focus_value orelse return false;
+        if (std.mem.eql(u8, saved, self.getText())) return false;
+        _ = self.setTextChecked(saved) catch return false;
+        return true;
+    }
 
     /// Get current text
     pub fn getText(self: *const TextInputState) []const u8 {
@@ -2388,7 +2443,7 @@ pub const TextInputState = struct {
             return;
         }
 
-        if (self.input_type != .password) {
+        if (!self.masked()) {
             if (self.cx_ref) |cx| {
                 const text = self.singleLineBuffer()[0..self.buffer_len];
                 if (cx.text.visualLine(.{
@@ -2396,6 +2451,9 @@ pub const TextInputState = struct {
                     .font_family = "system",
                     .font_size = self.font_size,
                     .font_weight = self.font_weight,
+                    .font_family_id = self.textFont().family_id,
+                    .use_monospace = self.textFont().monospace,
+                    .use_italic = self.textFont().italic,
                 }) catch null) |line| {
                     var current_index: ?usize = null;
                     for (line.caret_stops, 0..) |stop, i| {

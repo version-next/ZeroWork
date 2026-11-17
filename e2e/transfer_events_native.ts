@@ -1,4 +1,5 @@
 /** Production Manager projection and event popover; deterministic engine, no network or file IO. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,mkdir,open,writeFile,readFile,chmod,rm} from 'node:fs/promises';
@@ -67,5 +68,5 @@ try{
  assert(compact.rect.x>=0&&compact.rect.y>=0&&compact.rect.x+compact.rect.w<=860&&compact.rect.y+compact.rect.h<=480);
  await visible('transfer.events.dismiss');assert((await screenshot(join(out,'events-compact.png'))).ok);
  report.checks=['520px width with content-driven height capped at 242px','Real Manager enqueue and running receipts visible','Escape and outside click close','Close returns to unchanged task list','Open popover follows trigger at 620x360, 860x480 and 1100x720 with 8px gap and viewport inset','860x480 popover and header dismiss stay inside viewport'];report.status='passed';
-}catch(e){report.status='failed';report.error=String(e);report.nodes=Object.fromEntries(await Promise.all(['transfer.events.dialog','transfer.events.entries','transfer.task.events','transfer.failure'].map(async id=>[id,await query(id)])));await screenshot(join(out,'failure.png')).catch(()=>{});throw e;}
+}catch(e){report.status='failed';report.error=String(e);report.nodes=Object.fromEntries(await Promise.all(['transfer.events.dialog','transfer.events.entries','transfer.task.events'].map(async id=>[id,await query(id)])));await screenshot(join(out,'failure.png')).catch(()=>{});throw e;}
 finally{child.kill('SIGTERM');await ended;await log.close();await rm(rpc,{recursive:true,force:true});report.cleanup={owned_process_exited:true,rpc_removed:true,signal:child.signalCode,note:'SIGTERM is owned preview cleanup, not normal window-close evidence'};await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));}

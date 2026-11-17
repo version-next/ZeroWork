@@ -1,0 +1,19 @@
+old_path	new_path	layer	mixed	note
+src/notification_coordinator_tests.zig	src/features/notifications/tests/notification_coordinator_tests.zig	tests	no	仅 import config/config、host/notification_coordinator（core）
+src/notification_platform_tests.zig	src/features/notifications/tests/notification_platform_tests.zig	tests	no	import host/notification_*、platform/notifications、host/tab_presentation（均 core）
+src/notification_presenter_controls_tests.zig	src/features/notifications/tests/notification_presenter_controls_tests.zig	tests	no	import ui、notification_history、notification_presenter、ai_assistant_styles、layer_materials、app_theme
+src/notification_preview_runner.zig	src/features/notifications/preview/notification_preview_runner.zig	preview	no	import zenit_app、ui、notification_history/presenter、command_error_hint_view；build.zig:610 硬编码路径（step test-notification-preview）
+src/ui/notification_card.zig	src/features/notifications/model/notification_card.zig	model	no	无 ui import；仅 host/notification_coordinator（core）
+src/ui/notification_countdown.zig	src/features/notifications/view/notification_countdown.zig	view	no	import ui；被 command_error_hint_view 引用（跨 feature）
+src/ui/notification_history.zig	src/features/notifications/view/notification_history.zig	view	no	import ui、host/notification_host、layer_materials、quick_connect_styles（connections）；被 main.zig 引用
+src/ui/notification_history_styles.zig	src/features/notifications/view/notification_history_styles.zig	view	no	import ui；被 app_theme、ai_recovery_view、button_policy_*、material_popup_tests 引用（跨 feature）
+src/ui/notification_placement.zig	src/features/notifications/model/notification_placement.zig	model	no	无 ui import；含 1 个就地 test
+src/ui/notification_presenter.zig	src/features/notifications/view/notification_presenter.zig	view	no	import ui、host/notification_host、floating_input、layer_materials；被 file_actions_view、file_workspace_view、plugin_window_host、transfer_manager_view、main.zig 引用（跨 feature）；Presenter 含挂载与窗口交互，无线程/IO，故归 view
+src/ui/notification_styles.zig	src/features/notifications/view/notification_styles.zig	view	no	import ui；被 app_theme、history_styles、command_error_hint_* 引用（跨 feature）
+# CONTESTED src/ui/feedback_message.zig shared/ui 无 ui import 的错误码到用户文案表，注释称 "shared by existing notification and field surfaces"；被 file_actions_view、file_workspace_*、status_theme_view、workspace、main 引用，多 feature 共用
+# CONTESTED src/notification_read_view_tests.zig terminal 仅 import ui/terminal_view、terminal_surface、vt/ghostty_adapter，测 TerminalView.notificationReadSequence，实际测 terminal 视图
+# CONTESTED src/settings_notification_permission_view_tests.zig settings import config/settings_content_view、settings_controller、settings_values，测设置页通知权限视图
+# CONTESTED src/ui/icon_button_feedback.zig shared/ui §5.2 已点名 shared/ui，仅提示不认领
+# E2E build.zig 引用了 src/notification_preview_runner.zig（build.zig:610）
+# E2E 其他 e2e/、scripts/、docs/（ARCHITECTURE_PLAN 与 move-map 除外）未引用 notification_* 或 feedback_message 旧路径
+# TESTID notifications

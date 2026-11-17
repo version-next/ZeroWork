@@ -4,7 +4,8 @@
 const std = @import("std");
 const testing = std.testing;
 const nlo = @import("node_layout_output.zig");
-const TextLayout = @import("text_layout.zig").TextLayout;
+const text_layout_mod = @import("text_layout.zig");
+const TextLayout = text_layout_mod.TextLayout;
 pub const ElementId = @import("element_id.zig").ElementId;
 pub const NodeLayoutOutput = nlo.NodeLayoutOutput;
 comptime {
@@ -47,11 +48,18 @@ pub const LayoutOutputTable = struct {
     /// aborts that layout/paint frame rather than displaying partially wrapped
     /// text. Existing complete outputs remain owned and valid for retry.
     layout_oom: bool = false,
+    /// Where text layouts longer than the inline line capacity are computed before
+    /// storeTextLayout copies them into their slot; capacity is kept across frames.
+    line_scratch: text_layout_mod.LineScratch,
     pub fn init(allocator: std.mem.Allocator) LayoutOutputTable {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .line_scratch = text_layout_mod.LineScratch.init(allocator) };
     }
     pub fn deinit(self: *LayoutOutputTable) void {
-        for (self.texts.items) |chunk| if (chunk.block) |p| self.allocator.destroy(p);
+        self.line_scratch.deinit();
+        for (self.texts.items) |chunk| if (chunk.block) |p| {
+            for (0..TEXT_CHUNK) |i| if (chunk.used & (@as(u8, 1) << @intCast(i)) != 0) p[i].deinitStorage(self.allocator);
+            self.allocator.destroy(p);
+        };
         self.texts.deinit(self.allocator);
         for (self.headers.items) |p| self.allocator.destroy(p);
         self.headers.deinit(self.allocator);
@@ -93,31 +101,44 @@ pub const LayoutOutputTable = struct {
             slot.* = .{ .live = true, .generation = id.generation, .revision = revision };
         }
     }
+    /// A fresh payload slot: no lines and no spill storage (block memory is not initialized).
     fn allocText(self: *LayoutOutputTable) !TextHandle {
-        if (self.free_text_head) |index| {
-            const chunk = &self.texts.items[index];
-            if (chunk.block == null) chunk.block = try self.allocator.create(TextBlock);
-            const slot: u3 = @intCast(@ctz(~chunk.used));
-            chunk.used |= @as(u8, 1) << slot;
-            if (self.spare_text_chunk == index) self.spare_text_chunk = null;
-            if (chunk.used == 255) {
-                self.free_text_head = chunk.next_free;
-                chunk.next_free = null;
+        const handle: TextHandle = blk: {
+            if (self.free_text_head) |index| {
+                const chunk = &self.texts.items[index];
+                if (chunk.block == null) chunk.block = try self.allocator.create(TextBlock);
+                const slot: u3 = @intCast(@ctz(~chunk.used));
+                chunk.used |= @as(u8, 1) << slot;
+                if (self.spare_text_chunk == index) self.spare_text_chunk = null;
+                if (chunk.used == 255) {
+                    self.free_text_head = chunk.next_free;
+                    chunk.next_free = null;
+                }
+                break :blk .{ .chunk = index, .slot = slot };
             }
-            return .{ .chunk = index, .slot = slot };
-        }
-        try self.texts.ensureUnusedCapacity(self.allocator, 1);
-        const block = try self.allocator.create(TextBlock);
-        const index = self.texts.items.len;
-        self.texts.appendAssumeCapacity(.{ .block = block, .used = 1 });
-        self.free_text_head = index;
-        return .{ .chunk = index, .slot = 0 };
+            try self.texts.ensureUnusedCapacity(self.allocator, 1);
+            const block = try self.allocator.create(TextBlock);
+            const index = self.texts.items.len;
+            self.texts.appendAssumeCapacity(.{ .block = block, .used = 1 });
+            self.free_text_head = index;
+            break :blk .{ .chunk = index, .slot = 0 };
+        };
+        const text = self.textPtr(handle);
+        text.spill_lines = &.{};
+        text.line_count = 0;
+        return handle;
     }
     fn textPtr(self: *const LayoutOutputTable, handle: TextHandle) *TextLayout {
         return &self.texts.items[handle.chunk].block.?[handle.slot];
     }
     fn releaseText(self: *LayoutOutputTable, slot: *Slot) void {
-        if (slot.text) |handle| {
+        if (slot.text) |handle| self.freeText(handle);
+        slot.text = null;
+        slot.output.artifacts.text_layout = null;
+    }
+    fn freeText(self: *LayoutOutputTable, handle: TextHandle) void {
+        self.textPtr(handle).deinitStorage(self.allocator);
+        {
             const chunk = &self.texts.items[handle.chunk];
             if (chunk.used == 255) {
                 chunk.next_free = self.free_text_head;
@@ -133,29 +154,37 @@ pub const LayoutOutputTable = struct {
                 }
             }
         }
-        slot.text = null;
-        slot.output.artifacts.text_layout = null;
     }
-    /// Allocate before commit; failure leaves the complete old output intact.
-    /// Existing caches update without allocating. Success expires TextBorrow.
+    /// Allocate before commit; failure leaves the complete old output intact and sets
+    /// `layout_oom`. Only the used lines are copied; a layout longer than the inline capacity
+    /// copies into the slot's own spill table, which grows geometrically, so an existing cache
+    /// usually updates without allocating. `value` may be the slot's own layout or a copy of
+    /// it (TextLayout.assign). Success expires TextBorrow.
     pub fn storeTextLayout(self: *LayoutOutputTable, id: ElementId, value: *const TextLayout) !void {
         const slot = self.validSlot(id) orelse return error.InvalidElement;
+        const fresh = slot.text == null;
         const handle = slot.text orelse self.allocText() catch |err| {
             self.layout_oom = true;
             return err;
         };
-        const target = self.textPtr(handle);
-        // Header/vector setters commonly pass their own borrowed cache back.
-        // Preserve ownership without copying 12KB through a temporary.
-        if (target != value) target.* = value.*;
+        self.textPtr(handle).assign(self.allocator, value) catch |err| {
+            if (fresh) self.freeText(handle);
+            self.layout_oom = true;
+            return err;
+        };
         slot.text = handle;
-        slot.output.artifacts.text_layout = target;
+        slot.output.artifacts.text_layout = self.textPtr(handle);
         slot.revision +%= 1;
     }
     pub fn clearTextLayout(self: *LayoutOutputTable, id: ElementId) void {
         const slot = self.validSlot(id) orelse return;
         self.releaseText(slot);
         slot.revision +%= 1;
+    }
+    /// Bumped by every text-layout store / clear (storeTextLayout overwrites the slot's TextLayout
+    /// in place, so its pointer does not show the change).
+    pub fn revisionOf(self: *const LayoutOutputTable, id: ElementId) ?u64 {
+        return (self.validSlot(id) orelse return null).revision;
     }
     pub fn getConstPtr(self: *const LayoutOutputTable, id: ElementId) ?*const NodeLayoutOutput {
         return &(self.validSlot(id) orelse return null).output;
@@ -199,6 +228,15 @@ pub const LayoutOutputTable = struct {
         if (slot.text == null) return null;
         return .{ .id = id, .revision = slot.revision };
     }
+    /// Note an allocation failure on the way to a store (e.g. growing `line_scratch`): the frame
+    /// is abandoned like a failed storeTextLayout.
+    pub fn noteAllocationFailure(self: *LayoutOutputTable) void {
+        self.layout_oom = true;
+    }
+    /// Idle trim of `line_scratch` above `keep_bytes`; returns the bytes released.
+    pub fn trimLineScratch(self: *LayoutOutputTable, keep_bytes: usize) usize {
+        return self.line_scratch.trim(keep_bytes);
+    }
     pub const MemoryStats = struct {
         slot_bytes: usize,
         len_bytes: usize,
@@ -206,16 +244,29 @@ pub const LayoutOutputTable = struct {
         text_layout_live_slots: usize,
         text_payload_bytes: usize,
         text_capacity_bytes: usize,
+        /// Spill tables of layouts longer than the inline capacity, and the scratch table.
+        text_spill_bytes: usize,
         metadata_bytes: usize,
     };
+    fn liveTexts(self: *const LayoutOutputTable, comptime f: anytype, ctx: anytype) !void {
+        for (self.texts.items) |chunk| if (chunk.block) |p| {
+            for (0..TEXT_CHUNK) |i| if (chunk.used & (@as(u8, 1) << @intCast(i)) != 0) try f(ctx, &p[i]);
+        };
+    }
     pub fn memoryStats(self: *const LayoutOutputTable) MemoryStats {
         var live: usize = 0;
         var blocks: usize = 0;
+        var spill: usize = self.line_scratch.lines.capacity * @sizeOf(text_layout_mod.LineInfo);
         for (self.texts.items) |chunk| {
             live += @popCount(chunk.used);
             if (chunk.block != null) blocks += 1;
         }
-        return .{ .slot_bytes = @sizeOf(Slot), .len_bytes = self.len * @sizeOf(Slot), .capacity_bytes = self.headers.items.len * @sizeOf(HeaderBlock), .text_layout_live_slots = live, .text_payload_bytes = live * @sizeOf(TextLayout), .text_capacity_bytes = blocks * @sizeOf(TextBlock), .metadata_bytes = self.headers.capacity * @sizeOf(*HeaderBlock) + self.texts.capacity * @sizeOf(TextChunk) };
+        self.liveTexts(struct {
+            fn add(total: *usize, text: *const TextLayout) !void {
+                total.* += text.spill_lines.len * @sizeOf(text_layout_mod.LineInfo);
+            }
+        }.add, &spill) catch unreachable;
+        return .{ .slot_bytes = @sizeOf(Slot), .len_bytes = self.len * @sizeOf(Slot), .capacity_bytes = self.headers.items.len * @sizeOf(HeaderBlock), .text_layout_live_slots = live, .text_payload_bytes = live * @sizeOf(TextLayout), .text_capacity_bytes = blocks * @sizeOf(TextBlock), .text_spill_bytes = spill, .metadata_bytes = self.headers.capacity * @sizeOf(*HeaderBlock) + self.texts.capacity * @sizeOf(TextChunk) };
     }
     pub const MemoryRange = struct { address: usize, bytes: usize };
     pub fn appendMemoryRanges(self: *const LayoutOutputTable, ranges: *std.ArrayListUnmanaged(MemoryRange), allocator: std.mem.Allocator) !void {
@@ -223,9 +274,17 @@ pub const LayoutOutputTable = struct {
         if (self.texts.capacity != 0) try ranges.append(allocator, .{ .address = @intFromPtr(self.texts.items.ptr), .bytes = self.texts.capacity * @sizeOf(TextChunk) });
         for (self.headers.items) |p| try ranges.append(allocator, .{ .address = @intFromPtr(p), .bytes = @sizeOf(HeaderBlock) });
         for (self.texts.items) |chunk| if (chunk.block) |p| try ranges.append(allocator, .{ .address = @intFromPtr(p), .bytes = @sizeOf(TextBlock) });
+        if (self.line_scratch.lines.capacity != 0) try ranges.append(allocator, .{ .address = @intFromPtr(self.line_scratch.lines.items.ptr), .bytes = self.line_scratch.lines.capacity * @sizeOf(text_layout_mod.LineInfo) });
+        const Ctx = struct { ranges: *std.ArrayListUnmanaged(MemoryRange), allocator: std.mem.Allocator };
+        try self.liveTexts(struct {
+            fn add(c: Ctx, text: *const TextLayout) !void {
+                if (text.spill_lines.len != 0) try c.ranges.append(c.allocator, .{ .address = @intFromPtr(text.spill_lines.ptr), .bytes = text.spill_lines.len * @sizeOf(text_layout_mod.LineInfo) });
+            }
+        }.add, Ctx{ .ranges = ranges, .allocator = allocator });
     }
 };
 
+// Fabricated layouts stay within 4 lines: valid inline for any `-Dtext-inline-lines` >= 4.
 test "LayoutOutputTable stable headers text borrows generation and reclamation" {
     var t = LayoutOutputTable.init(testing.allocator);
     defer t.deinit();
@@ -233,7 +292,7 @@ test "LayoutOutputTable stable headers text borrows generation and reclamation" 
     try t.ensureSlot(id);
     const header = t.getConstPtr(id).?;
     try testing.expectEqual(@as(usize, 0), t.memoryStats().text_capacity_bytes);
-    const text = TextLayout{ .line_count = 7, .total_height = 91 };
+    const text = TextLayout{ .line_count = 3, .total_height = 91 };
     try t.storeTextLayout(id, &text);
     const borrow = t.borrowText(id).?;
     const ptr = borrow.resolve(&t).?;
@@ -256,13 +315,13 @@ fn sparseFailureContract(allocator: std.mem.Allocator) !void {
     defer t.deinit();
     const id = ElementId{ .index = 0, .generation = 1 };
     try t.ensureSlot(id);
-    const text = TextLayout{ .line_count = 7 };
+    const text = TextLayout{ .line_count = 3 };
     try t.storeTextLayout(id, &text);
     const ptr = t.getConstPtr(id).?;
     const borrow = t.borrowText(id).?;
     t.ensureSlot(.{ .index = 200, .generation = 1 }) catch |err| {
         try testing.expect(ptr == t.getConstPtr(id).?);
-        try testing.expectEqual(@as(u16, 7), borrow.resolve(&t).?.line_count);
+        try testing.expectEqual(@as(u32, 3), borrow.resolve(&t).?.line_count);
         return err;
     };
     for (1..10) |i| {
@@ -271,7 +330,7 @@ fn sparseFailureContract(allocator: std.mem.Allocator) !void {
         t.storeTextLayout(other, &text) catch |err| {
             try testing.expectEqual(@as(f32, 1), t.get(other).?.vector.stroke.width);
             try testing.expect(t.get(other).?.artifacts.text_layout == null);
-            try testing.expectEqual(@as(u16, 7), borrow.resolve(&t).?.line_count);
+            try testing.expectEqual(@as(u32, 3), borrow.resolve(&t).?.line_count);
             return err;
         };
         var header = t.get(other).?;
@@ -301,7 +360,7 @@ test "LayoutOutputTable header set rejects foreign text and accepts self borrows
     const b = ElementId{ .index = 1, .generation = 1 };
     try t.ensureSlot(a);
     try t.ensureSlot(b);
-    const text = TextLayout{ .line_count = 19 };
+    const text = TextLayout{ .line_count = 4 };
     try t.storeTextLayout(a, &text);
     const ptr = t.getConstPtr(a).?.artifacts.text_layout.?;
     try t.set(a, t.get(a).?);
@@ -312,7 +371,7 @@ test "LayoutOutputTable header set rejects foreign text and accepts self borrows
     try testing.expect(ptr != t.getConstPtr(b).?.artifacts.text_layout.?);
     const borrow_b = t.borrowText(b).?;
     t.clear(a);
-    try testing.expectEqual(@as(u16, 19), borrow_b.resolve(&t).?.line_count);
+    try testing.expectEqual(@as(u32, 4), borrow_b.resolve(&t).?.line_count);
     try testing.expectEqual(@as(usize, 1), t.memoryStats().text_layout_live_slots);
 }
 

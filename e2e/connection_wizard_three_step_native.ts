@@ -2,6 +2,7 @@
  * Isolated config, synthetic Harness input, offline save only; no remote connection.
  * node e2e/connection_wizard_three_step_native.ts [prefix] [output] [theme]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,open,readFile,writeFile,rm,realpath} from 'node:fs/promises';
@@ -33,23 +34,32 @@ async function ensure(id:string){
 async function click(id:string){await ensure(id);assert((await h.clickTestId(id)).ok,id);await h.sleep(120);}
 async function edit(id:string,value:string){await click(id);await h.key('a',{cmd:true});await h.type_(value);}
 async function openKvm(){await h.key('t',{cmd:true});await visible('session.menu.new_kvm');await click('session.menu.new_kvm');await visible('bmc.editor.name');}
+// Island B v3 (e1372d88): the editor is its own native 720×640 window (wizard.zig window_spec); the in-window
+// `wizard.close` button is hidden there (wizard.zig: "The native window closes through its traffic light (= cancel)").
+// Harness cannot press the traffic light; Escape is the same cancel (wizard.zig windowKey). "Closed" = wizard.window gone.
+const closed=()=>absent('wizard.window');
+async function cancelWindow(){assert(!(await h.query('wizard.close')).some(shown),'native editor window has no in-window close button');await h.key('escape');await closed();}
 async function capture(name:string){await h.screenshot(join(out,name+'.png'));}
 const checks:string[]=[];
 try{
  await h.waitForServerReady();
  for(const [width,height] of [[1440,900],[860,480]]){
   await h.resizeWindow(width,height);await openKvm();
-  const picker=await visible('wizard.protocol'),steps=await visible('wizard.steps');
-  assert.equal(picker.rect.w,152);assert.equal(picker.rect.h,30);assert.equal(steps.rect.h,60);
+  const frame=await visible('wizard.window'),picker=await visible('wizard.protocol'),steps=await visible('wizard.steps');
+  assert.equal(frame.rect.w,720);assert.equal(frame.rect.h,640); // wizard.zig window_spec, independent of the main window size
+  assert.equal(picker.rect.w,152);assert.equal(picker.rect.h,32); // native md Select (zenit default height 32)
+  assert.equal(steps.rect.h,40); // Island B v3 quiet step row: wizard_styles.zig stepper_height = 40 (e1372d88)
   for(let i=0;i<2;i++){
    const line=await visible('wizard.steps.connector.'+i),left=await visible(['wizard.step.identity','wizard.step.route'][i]),right=await visible(['wizard.step.route','wizard.step.review'][i]);
-   assert(Math.abs(line.rect.x-left.rect.x-left.rect.w-20)<.2,'left connector gap');
-   assert(Math.abs(right.rect.x-line.rect.x-line.rect.w-20)<.2,'right connector gap');
+   assert(Math.abs(line.rect.x-left.rect.x-left.rect.w-16)<.2,'left connector gap'); // connection_stepper.zig connector margin 16 (e1372d88)
+   assert(Math.abs(right.rect.x-line.rect.x-line.rect.w-16)<.2,'right connector gap');
    assert(Math.abs(line.rect.y+line.rect.h/2-left.rect.y-left.rect.h/2)<.2,'connector vertical alignment');
   }
 
   await absent('bmc.editor.probe');await absent('bmc.editor.save');
   await click('bmc.editor.next');await visible('bmc.editor.host');
+  // usage-b2 (0879906e / ccd5a423): native Select fills its column, so both columns of a field row are equally wide.
+  for(const [l,r] of [['bmc.editor.name','bmc.editor.group'],['bmc.editor.host','bmc.editor.port']]){const a=await visible(l),b=await visible(r);assert(Math.abs(a.rect.w-b.rect.w)<.5,`${l} ${a.rect.w} vs ${r} ${b.rect.w}`);assert(Math.abs(a.rect.h-b.rect.h)<.5,`${l}/${r} height ${a.rect.h} vs ${b.rect.h}`);}
   if(width===1440)await edit('bmc.editor.name','compute-bmc-01');
   await edit('bmc.editor.host','bmc.example.internal');
   await edit('bmc.editor.username','operator');
@@ -68,11 +78,11 @@ try{
   await click('bmc.editor.next');await visible('bmc.editor.scale');
   await click('bmc.editor.next');assert.match(text(await visible('bmc.editor.review')),/只读：开启/);
   if(width===1440){
-   await click('bmc.editor.save');await absent('wizard.close');
+   await click('bmc.editor.save');await closed();
    const saved=await readFile(join(data,'hosts.toml'),'utf8');
    assert.match(saved,/bmc_ikvm/);assert.match(saved,/original/);assert.match(saved,/read_only_requested[^\n]*true/);
-  }else{await click('wizard.close');await absent('wizard.close');}
-  checks.push(`${width}×${height}: validation, retained steps/advanced options, route validation, review, fixed footer`);
+  }else await cancelWindow();
+  checks.push(`main ${width}×${height}, editor window 720×640: validation, retained steps/advanced options, route validation, review, fixed footer`);
  }
  // Each registered protocol shares one header Select; SSH advanced items remain intact.
  await h.resizeWindow(1440,900);await openKvm();
@@ -83,7 +93,7 @@ try{
  await capture('ssh-advanced');
  await click('wizard.protocol');await click('wizard.protocol.sftp');await visible('wizard.name');
  await capture('sftp-identity');
- await click('wizard.close');await absent('wizard.close');
+ await cancelWindow();
  checks.push('Shared protocol Select switches KVM → SSH → SFTP; SSH advanced settings remain available');
  await writeFile(join(out,'report.json'),JSON.stringify({status:'passed',theme,checks},null,2));
  console.log(JSON.stringify({status:'passed',theme,checks}));

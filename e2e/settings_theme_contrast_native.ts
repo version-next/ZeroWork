@@ -1,12 +1,18 @@
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import {nativeThemeData} from './native_theme_data.mjs';
 /** Settings card and selection feedback in isolated native windows.
  * node e2e/settings_theme_contrast_native.ts BINARY OUTPUT_DIR
  */
 import assert from 'node:assert/strict';
-import {execFileSync, spawn} from 'node:child_process';
+import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {decodePng, writeRgbPng, type DecodedPng} from '../vendor/zenit/e2e/png.ts';
+// Two-level Settings window: AI › 行为与权限 subpage, Appearance › 主题 subpage; the Settings window is its own
+// 960 pt wide native window, so screenshots (of the bound Settings window) scale by 960, not the 1440 main window.
+import {settingsNav} from './settings_nav.ts';
+const SETTINGS_WIDTH = 960;
 
 const binary = resolve(process.argv[2]), out = resolve(process.argv[3]);
 await mkdir(out, {recursive: true});
@@ -20,6 +26,49 @@ const palettes = nativeThemeData.themes;
 const shown = (node: any) => node && node.visible !== false && !node.hidden && node.rect?.w > 0 && node.rect?.h > 0;
 const descendants = (node: any): any[] => [node, ...(node.children ?? []).flatMap(descendants)];
 
+type Rgb = [number, number, number];
+type Rect = {x: number; y: number; w: number; h: number};
+
+function writeBackground(path: string) {
+  const width = 360, height = 240;
+  const pixels = new Uint8Array(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const inEllipse = ((x - 180) / 120) ** 2 + ((y - 120) / 90) ** 2 <= 1;
+      const color = inEllipse ? [102, 138, 143] : x < 180 ? [29, 48, 73] : [210, 180, 125];
+      pixels.set(color, (y * width + x) * 3);
+    }
+  }
+  writeRgbPng(path, width, height, pixels);
+}
+
+function pixel(image: DecodedPng, x: number, y: number): Rgb {
+  const scale = image.width / SETTINGS_WIDTH;
+  const offset = (Math.round(y * scale) * image.width + Math.round(x * scale)) * image.channels;
+  return [image.pixels[offset], image.pixels[offset + 1], image.pixels[offset + 2]];
+}
+
+function sample(image: DecodedPng, rect: Rect, x: number, y: number): Rgb {
+  return pixel(image, rect.x + rect.w * x, rect.y + rect.h * y);
+}
+
+function distance(a: Rgb, b: Rgb): number {
+  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+}
+
+function luminance(color: Rgb): number {
+  const weights = [.2126, .7152, .0722];
+  return color.reduce((sum, channel, index) => {
+    const value = channel / 255;
+    const linear = value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+    return sum + linear * weights[index];
+  }, 0);
+}
+
+function round2(number: number): number {
+  return Math.round(number * 100) / 100;
+}
+
 try {
   for (const [theme, transparency] of cases) {
     const name = `${theme}-t${transparency}`;
@@ -27,11 +76,7 @@ try {
     const iso = await mkdtemp('/private/tmp/zw-settings-colors-');
     const data = join(iso, 'data'), rpc = join(iso, 'rpc'), image = join(iso, 'background.png');
     await Promise.all([mkdir(data), mkdir(rpc)]);
-    execFileSync('python3', ['-c', `from PIL import Image, ImageDraw
-import sys
-im=Image.new('RGB',(360,240),(29,48,73));d=ImageDraw.Draw(im)
-d.rectangle((180,0,359,239),fill=(210,180,125));d.ellipse((60,30,300,210),fill=(102,138,143))
-im.save(sys.argv[1])`, image]);
+    writeBackground(image);
     await writeFile(join(data, 'config.toml'), `[ui]\ntheme="${theme}"\n[ui.materials]\nblur_px=0\n[ui.materials.background]\nenabled=true\npath=${JSON.stringify(image)}\nfit="fill"\ntransparency=${transparency}\n[ai]\ndefault_provider="Fixture"\n[[ai.providers]]\nid="Fixture"\nkind="openai_compat"\nendpoint="http://127.0.0.1:9/v1/chat/completions"\nenabled=true\n[[ai.providers.models]]\nname="model"\ndefault=true\ncontext_window=128000\n`);
     process.env.ZENIT_E2E_FILE_RPC_DIR = rpc;
     const log = await open(join(out, `${name}.log`), 'w');
@@ -44,59 +89,111 @@ im.save(sys.argv[1])`, image]);
       await h.waitForServerReady();
       assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
       await h.resizeWindow(1440, 900);
-      await click('toolbar.settings'); await click('settings.nav.ai');
+      const settings = settingsNav();
+      // Pane headers no longer fold, so they have no hover state. The clickable cards of the two-level Settings
+      // window are the category overview rows (Pencil sxDUF: transparent row inside the zw-window-rest list,
+      // hover recolours the row content, no fill). Card hover = largest change inside the hovered row away from
+      // the drawn pointer; card edge = the list surface against the page 5 pt above the list.
+      await settings.toCategory('ai');
+      const card = await visible('settings.overview.ai.behavior'), listTop = await visible('settings.overview.ai.providers');
+      await h.mouseMove(5, 5); await h.sleep(350);
+      assert((await h.screenshot(join(out, `${name}-overview-rest.png`))).ok);
+      await h.mouseMove(card.rect.x + card.rect.w * .75, card.rect.y + card.rect.h * .5);
+      await h.sleep(250); assert((await h.screenshot(join(out, `${name}-card-hover.png`))).ok);
+      await settings.toSub('ai', 'behavior');
       if ((await h.query('settings.ai.provider.0.endpoint')).some(shown)) await click('settings.ai.provider.0.header');
       const headerId = 'settings.ai.permissions.header', summaryId = 'settings.ai.permissions.summary';
       await visible(headerId);
       if (!(await h.query(summaryId)).some(shown)) await click(headerId);
       const summary = await visible(summaryId);
       await h.mouseMove(5, 5); await h.sleep(350);
-      const card = await visible(headerId), nav = await visible('settings.nav.ai');
-      const geometry = Object.fromEntries(await Promise.all(['settings.viewport', 'settings.footer', 'settings.ai.attachments', 'appearance.material.compensation'].map(async id => [id, await h.query(id)])));
+      // The selected nav row deliberately keeps its fill on hover (styles.yss NavRow selected :hover), so
+      // selection-hover feedback is measured on an unselected row.
+      const nav = await visible('settings.nav.ai'), hoverRow = await visible('settings.nav.keys');
+      const geometry = Object.fromEntries(await Promise.all(['settings.viewport', 'settings.footer', 'settings.ai.attachments'].map(async id => [id, await h.query(id)])));
       const attachments = geometry['settings.ai.attachments'].find(shown);
-      assert(attachments && !descendants(attachments).some(node => node.test_id === 'appearance.material.compensation'), 'collapsed provider contents must not mask the visible attachment card');
+      assert(attachments, 'the attachment card stays visible below the collapsed provider');
       if (process.env.ZW_SETTINGS_CONTRAST_DEBUG) await writeFile(join(out, `${name}-tree.json`), JSON.stringify(await h.tree()));
       assert((await h.screenshot(join(out, `${name}-rest.png`))).ok);
-      await h.mouseMove(card.rect.x + card.rect.w * .75, card.rect.y + card.rect.h * .5);
-      await h.sleep(250); assert((await h.screenshot(join(out, `${name}-card-hover.png`))).ok);
-      await h.mouseMove(nav.rect.x + nav.rect.w * .8, nav.rect.y + nav.rect.h * .5);
+      await h.mouseMove(hoverRow.rect.x + hoverRow.rect.w * .8, hoverRow.rect.y + hoverRow.rect.h * .5);
       await h.sleep(250); assert((await h.screenshot(join(out, `${name}-selection-hover.png`))).ok);
       await click('settings.nav.keys'); await h.mouseMove(5, 5); await h.sleep(200);
       assert((await h.screenshot(join(out, `${name}-unselected.png`))).ok);
       await writeFile(join(out, `${name}.json`), JSON.stringify({card: card.rect, nav: nav.rect, geometry}, null, 2));
-      const pixels = `from PIL import Image
-import json,sys,math,collections
-base,name,rects=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]);a=Image.open(f'{base}/{name}-rest.png').convert('RGB');b=Image.open(f'{base}/{name}-card-hover.png').convert('RGB');c=Image.open(f'{base}/{name}-selection-hover.png').convert('RGB');u=Image.open(f'{base}/{name}-unselected.png').convert('RGB');scale=a.width/1440
-def p(im,r,x,y):return im.getpixel((round((r['x']+r['w']*x)*scale),round((r['y']+r['h']*y)*scale)))
-def d(x,y):return math.sqrt(sum((u-v)**2 for u,v in zip(x,y)))
-card=d(p(a,rects['card'],.65,.5),p(b,rects['card'],.65,.5));edge=d(p(b,rects['card'],.65,.5),p(b,rects['card'],.65,-5/rects['card']['h']));selection=d(p(a,rects['nav'],.65,.7),p(c,rects['nav'],.65,.7));chosen=d(p(a,rects['nav'],.65,.7),p(u,rects['nav'],.65,.7));result={'card_hover_rgb_distance':round(card,2),'hover_edge_rgb_distance':round(edge,2),'selected_hover_rgb_distance':round(selection,2),'selection_rgb_distance':round(chosen,2)};assert card>=5 and edge>=5 and selection>=3 and chosen>=5
-if name=='light-t50':
- r=rects['summary'];ink=tuple(int(rects['ink'][i:i+2],16) for i in (1,3,5));box=tuple(round(v*scale) for v in (r['x'],r['y'],r['x']+min(r['w'],200),r['y']+r['h']));counts=collections.Counter(a.crop(box).getdata());bg=a.getpixel((round((r['x']+min(r['w'],190))*scale),round((r['y']+r['h']/2)*scale)))
- def lum(col):return sum((v/255/12.92 if v/255<=.04045 else ((v/255+.055)/1.055)**2.4)*w for v,w in zip(col,(.2126,.7152,.0722)))
- x,y=sorted((lum(ink),lum(bg)));ratio=(y+.05)/(x+.05);result['summary_contrast']=round(ratio,2);assert counts[ink]>=3 and ratio>=4.5
-print(json.dumps(result))`;
-      item.pixels = JSON.parse(execFileSync('python3', ['-c', pixels, out, name, JSON.stringify({card: card.rect, nav: nav.rect, summary: summary.rect, ink: palettes[theme]['--fg-1']})], {encoding: 'utf8'}));
-      await click('settings.nav.ai'); await visible(summaryId);
-      await click(headerId); await h.waitFor(async () => !(await h.query(summaryId)).some(shown) || null, 10000);
-      await click(headerId); await visible(summaryId);
+      const screenshot = (state: string) => decodePng(join(out, `${name}-${state}.png`));
+      const rest = screenshot('rest'), overview = screenshot('overview-rest');
+      const hoveredCard = screenshot('card-hover'), hoveredSelection = screenshot('selection-hover');
+      const unselected = screenshot('unselected');
+      const rect = card.rect;
+      const pointerX = rect.x + rect.w * .75, pointerY = rect.y + rect.h * .5;
+      let cardHover = 0;
+      for (let x = Math.trunc(rect.x); x < Math.trunc(rect.x + rect.w); x++) {
+        for (let y = Math.trunc(rect.y); y < Math.trunc(rect.y + rect.h); y++) {
+          if (Math.abs(x - pointerX) <= 32 && Math.abs(y - pointerY) <= 32) continue;
+          cardHover = Math.max(cardHover, distance(pixel(overview, x, y), pixel(hoveredCard, x, y)));
+        }
+      }
+      const list = listTop.rect;
+      const edge = distance(sample(hoveredCard, list, .65, .5), sample(hoveredCard, list, .65, -5 / list.h));
+      const selection = distance(sample(rest, hoverRow.rect, .65, .7), sample(hoveredSelection, hoverRow.rect, .65, .7));
+      const chosen = distance(sample(rest, nav.rect, .65, .7), sample(unselected, nav.rect, .65, .7));
+      item.pixels = {
+        card_hover_rgb_distance: round2(cardHover),
+        hover_edge_rgb_distance: round2(edge),
+        selected_hover_rgb_distance: round2(selection),
+        selection_rgb_distance: round2(chosen),
+      };
+      assert(cardHover >= 5 && edge >= 5 && selection >= 3 && chosen >= 5, JSON.stringify(item.pixels));
+      if (name === 'light-t50') {
+        const {x, y, w, h: height} = summary.rect;
+        const inkHex = palettes[theme]['--fg-1'];
+        const ink: Rgb = [1, 3, 5].map(index => parseInt(inkHex.slice(index, index + 2), 16)) as Rgb;
+        const scale = rest.width / SETTINGS_WIDTH;
+        const left = Math.round(x * scale), right = Math.round((x + Math.min(w, 200)) * scale);
+        const top = Math.round(y * scale), bottom = Math.round((y + height) * scale);
+        let inkCount = 0;
+        for (let row = top; row < bottom; row++) {
+          for (let col = left; col < right; col++) {
+            const offset = (row * rest.width + col) * rest.channels;
+            if (rest.pixels[offset] === ink[0] && rest.pixels[offset + 1] === ink[1] && rest.pixels[offset + 2] === ink[2]) {
+              inkCount++;
+            }
+          }
+        }
+        const bg = pixel(rest, x + Math.min(w, 190), y + height / 2);
+        const dark = Math.min(luminance(ink), luminance(bg));
+        const light = Math.max(luminance(ink), luminance(bg));
+        const contrast = (light + .05) / (dark + .05);
+        item.pixels.summary_contrast = round2(contrast);
+        assert(inkCount >= 3 && contrast >= 4.5, JSON.stringify({inkCount, contrast}));
+      }
+      // Panes no longer fold (two-level Settings): instead of collapse / expand, coming back to the subpage
+      // shows the same header summary again.
+      await settings.toSub('ai', 'behavior'); await visible(headerId); await visible(summaryId);
       if (theme === 'dark' && transparency === 0) {
-        await click('settings.nav.appearance');
-        const tile = await visible('settings.theme.dark');
+        await settings.toSub('appearance', 'theme');
+        // Theme tiles are now a preview card (56 pt) above a label/radio row; hover recolours the tile frame,
+        // so the samples sit on the right frame edge of the preview card.
+        const tile = await settings.reveal('settings.theme.dark');
         await h.mouseMove(5, 5); await h.sleep(200);
         assert((await h.screenshot(join(out, `${name}-theme-selected.png`))).ok);
         await h.mouseMove(tile.rect.x + tile.rect.w * .5, tile.rect.y + tile.rect.h * .5);
         await h.sleep(250); assert((await h.screenshot(join(out, `${name}-theme-selected-hover.png`))).ok);
-        const tilePixels = `from PIL import Image
-import json,sys,math
-base,name,r=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]);a=Image.open(f'{base}/{name}-theme-selected.png').convert('RGB');b=Image.open(f'{base}/{name}-theme-selected-hover.png').convert('RGB');s=a.width/1440;x=round((r['x']+r['w']*.98)*s);y=round((r['y']+r['h']*.5)*s);d=math.sqrt(sum((u-v)**2 for u,v in zip(a.getpixel((x,y)),b.getpixel((x,y)))));print(round(d,2));assert d>=3`;
-        item.theme_selected_hover_rgb_distance = Number(execFileSync('python3', ['-c', tilePixels, out, name, JSON.stringify(tile.rect)], {encoding: 'utf8'}));
+        const selected = screenshot('theme-selected');
+        const tileX = tile.rect.x + tile.rect.w - 1.5, tileY = tile.rect.y + 28;
+        const tileChange = distance(pixel(selected, tileX, tileY), pixel(screenshot('theme-selected-hover'), tileX, tileY));
+        item.theme_selected_hover_rgb_distance = round2(tileChange);
+        assert(tileChange >= 3, JSON.stringify({tileChange}));
         const otherTile = await visible('settings.theme.light');
         await h.mouseMove(otherTile.rect.x + otherTile.rect.w * .5, otherTile.rect.y + otherTile.rect.h * .5);
         await h.sleep(250); assert((await h.screenshot(join(out, `${name}-theme-unselected-hover.png`))).ok);
-        const otherTilePixels = `from PIL import Image
-import json,sys,math
-base,name,r=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]);a=Image.open(f'{base}/{name}-theme-selected.png').convert('RGB');b=Image.open(f'{base}/{name}-theme-unselected-hover.png').convert('RGB');s=a.width/1440;x=round((r['x']+r['w']*.98)*s);y=round((r['y']+r['h']*.5)*s);edge=round((r['x']+r['w']+2)*s);d=lambda p,q:math.sqrt(sum((u-v)**2 for u,v in zip(p,q)));change=d(a.getpixel((x,y)),b.getpixel((x,y)));boundary=d(b.getpixel((x,y)),b.getpixel((edge,y)));print(json.dumps({'change':round(change,2),'boundary':round(boundary,2)}));assert change>=5 and boundary>=5`;
-        item.theme_unselected_hover = JSON.parse(execFileSync('python3', ['-c', otherTilePixels, out, name, JSON.stringify(otherTile.rect)], {encoding: 'utf8'}));
+        const otherHovered = screenshot('theme-unselected-hover');
+        const otherX = otherTile.rect.x + otherTile.rect.w - 1.5, otherY = otherTile.rect.y + 28;
+        const otherEdge = otherTile.rect.x + otherTile.rect.w + 2;
+        const change = distance(pixel(selected, otherX, otherY), pixel(otherHovered, otherX, otherY));
+        const boundary = distance(pixel(otherHovered, otherX, otherY), pixel(otherHovered, otherEdge, otherY));
+        item.theme_unselected_hover = {change: round2(change), boundary: round2(boundary)};
+        assert(change >= 5 && boundary >= 5, JSON.stringify(item.theme_unselected_hover));
       }
       item.status = 'passed'; console.log(`${name} passed`);
     } catch (error) {

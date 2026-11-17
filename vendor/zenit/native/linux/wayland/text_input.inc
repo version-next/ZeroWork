@@ -1,6 +1,6 @@
 /* text-input-v3 v1. Raw keys remain independent; SDK integration must consume
  * kinds 6 (preedit), 7 (commit), 8 (surrounding deletion) in this same FIFO. */
-#define IME_TRACE(...) do { if (getenv("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, __VA_ARGS__); } while (0)
+#define IME_TRACE(...) do { if (zenitAutomationEnvironment("ZENIT_WAYLAND_IME_TRACE")) fprintf(stderr, __VA_ARGS__); } while (0)
 struct TextInputState {
     struct zwp_text_input_manager_v3 *manager;
     struct zwp_text_input_v3 *proxy;

@@ -1,0 +1,109 @@
+//! 浮动卡片的统一窗口外观（PLUGIN_ARCH_PLAN 2.5.7：浮动是卡片共用的一种放置状态，外观由通用浮动层
+//! 提供；Pencil「浮动卡片统一窗口外观」规范稿）。卡片只声明，外框统一生成：
+//!
+//! - 外框：原生 `W.Card` floating（圆角 dialog、1px border、shadow lg、bg-primary，子内容按圆角裁剪）。
+//! - 顶部拖动把手：整条 14 高的 `float.drag`（各卡片的 test id），中间是原生 `W.Grabber`。按住把手时
+//!   （下滑收起稿 AveHg）整条铺 hover 底色、Grabber 进入原生 active 态（强调色、加宽到 48）。
+//! - 头部：图标、标题、可选副标题（如“本地终端”“0 条记录”）、弹性空白、卡片插槽按钮（AI 的子智能体 /
+//!   会话列表 / 新建）、统一动作按钮。顺序固定：作为标签页打开 · 放入分屏 · 收起 · 放大 / 还原 · 关闭，每个都
+//!   是原生 ghost sm 图标按钮配原生 `W.Tooltip`；插槽按钮同尺寸、在动作区左侧。两个放置动作（作为标签页打开、
+//!   放入分屏）每张卡片都有：卡片类型不允许或当前状态不允许时用原生 Button 的 disabled 状态，Tooltip 写原因；
+//!   收起 / 放大 / 关闭按 Descriptor 声明出现。
+//! - 内容区：空的插槽，卡片把自己的内容挂进去。
+//! 状态（副标题、是否最大化）与点击都在 `float_chrome.zig` 的 `Vm`；这里只读它、把交互交给它。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("float_chrome.zig");
+const S = @import("float_chrome.yss");
+
+fn keep(slots: *m.Slots, root: *ui.view.Ref(*ui.Node), grip: *ui.view.Ref(*ui.Node), header: *ui.view.Ref(*ui.Node), title_text: *ui.view.Ref(*ui.Node), icon: *ui.view.Ref(*ui.Node), subtitle: *ui.view.Ref(*ui.Node), subtitle_text: *ui.view.Ref(*ui.Node), spacer: *ui.view.Ref(*ui.Node), body: *ui.view.Ref(*ui.Node)) void {
+    slots.root = root.get();
+    slots.title_text = title_text.get();
+    slots.icon = icon.get();
+    slots.grip = grip.get();
+    slots.header = header.get();
+    slots.subtitle = subtitle.get();
+    slots.subtitle_text = subtitle_text.get();
+    slots.spacer = spacer.get();
+    slots.body = body.get();
+}
+
+pub fn FloatChrome(vm: *m.Vm, slots: *m.Slots) View {
+    const root = ref();
+    const grip = ref();
+    const header = ref();
+    const title_text = ref();
+    const icon = ref();
+    const subtitle = ref();
+    const subtitle_text = ref();
+    const spacer = ref();
+    const body = ref();
+    onMount(keep(slots, root, grip, header, title_text, icon, subtitle, subtitle_text, spacer, body));
+    return (
+        <col ref={root} testId={vm.ids.root} style={S.root}>
+            <W.Card variant={.floating} padded={false} fill={true}>
+                <row ref={grip} testId={vm.ids.grip} style={S.Grip.of(.{ .held = vm.gripHeld() })}>
+                    <W.Grabber testId={vm.ids.grabber} active={vm.gripHeld()} />
+                </row>
+                <row ref={header} testId={vm.ids.header} style={S.header}>
+                    <box ref={icon} style={S.icon_box}><icon style={S.Icon.of(.{ .accent = vm.accent_icon })} src={vm.icon} /></box>
+                    <box style={S.title_box}>
+                        <text ref={title_text} style={S.title} box={S.text_box}>{vm.title}</text>
+                    </box>
+                    <box ref={subtitle} style={S.subtitle_box}>
+                        <text ref={subtitle_text} testId={vm.ids.subtitle} style={S.subtitle} box={S.text_box}>{vm.subtitleText()}</text>
+                    </box>
+                    <box ref={spacer} style={S.spacer} />
+                    {for (vm.slot_buttons) |button| <SlotAction key={button.test_id} vm={vm} button={button} />}
+                    {for (vm.action_entries) |entry| <HeaderAction key={entry.id} vm={vm} action={entry.action} />}
+                </row>
+                <box ref={body} style={S.body} />
+            </W.Card>
+        </col>
+    );
+}
+
+fn keepSlot(vm: *m.Vm, index: usize, anchor: *ui.view.Ref(*ui.Node)) void {
+    vm.slot_nodes[index] = anchor.get();
+}
+
+/// A card's own header button: native ghost sm icon button + Tooltip, the same size as the actions.
+/// Its wrapper is the anchor of the card's popovers (`Chrome.slotNode`).
+fn SlotAction(vm: *m.Vm, button: m.SlotEntry) View {
+    const anchor = ref();
+    onMount(keepSlot(vm, button.index, anchor));
+    return (
+        <box ref={anchor} style={S.action}>
+            <W.Tooltip text={button.label} position={.bottom} parts={.{ .content = button.tooltip_id }}>
+                <W.Button testId={button.test_id} variant={.ghost} size={.sm} iconOnly={true} iconAsset={button.icon} iconSize={14} a11yLabel={vm.slotLabel(button.index)} onClick={vm.press(button.index)} />
+            </W.Tooltip>
+        </box>
+    );
+}
+
+fn keepAction(vm: *m.Vm, action: m.Action, anchor: *ui.view.Ref(*ui.Node), button: *ui.view.Ref(*ui.Node)) void {
+    vm.action_nodes[@intFromEnum(action)] = anchor.get();
+    // A placement action only changes where the card's content is shown (minimize: not at all, the
+    // content stays its owner's): a pointer press on it leaves keyboard focus in the content
+    // (`surface_migration.placementButton`), so the owner still finds the reader's keyboard and
+    // selection there when it acts. Close can ask for a confirmation, which takes the keyboard.
+    switch (action) {
+        .open_as_tab, .dock_to_split, .maximize, .minimize => if (button.get()) |node| @import("../surface/surface_migration.zig").placementButton(node),
+        .close => {},
+    }
+}
+
+/// A header action (fixed order and icon for every card); a refused placement action is disabled and
+/// its Tooltip gives the reason.
+fn HeaderAction(vm: *m.Vm, action: m.Action) View {
+    const anchor = ref();
+    const button = ref();
+    onMount(keepAction(vm, action, anchor, button));
+    return (
+        <box ref={anchor} style={S.action}>
+            <W.Tooltip text={vm.actionTooltip(action)} position={.bottom} parts={.{ .content = vm.tooltipId(action) }}>
+                <W.Button ref={button} testId={vm.actionId(action)} variant={.ghost} size={.sm} iconOnly={true} iconAsset={vm.actionIcon(action)} iconSize={14} disabled={vm.actionDisabled(action)} a11yLabel={vm.actionLabel(action)} onClick={vm.act(action)} />
+            </W.Tooltip>
+        </box>
+    );
+}

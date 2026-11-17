@@ -1,0 +1,39 @@
+//! 文件传输（第 3 类）面板正文（P3 3e）：连接隔离、SFTP 引擎、默认行为。
+//! 前两个面板的页头说明是草稿摘要（`PaneSpec.summary`，跟随草稿）；窗口内存预算的校验问题落在三个引擎字段上。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("../../model/view_model.zig");
+const R = @import("../components/rows.yix");
+const S = @import("../styles.yss");
+const F = m.fields.transfer;
+
+const connection = &F.connection;
+const engine = &F.engine;
+const defaults = &F.defaults;
+
+const conflicts = [_]W.SelectOption{.{ .value = "ask", .label = "每次询问" }};
+fn conflictOptions() []const W.SelectOption {
+    return &conflicts;
+}
+
+pub fn TransferPanes(vm: *m.ViewModel) View {
+    return (
+        <box testId="settings.transfer" style={S.category_panes}>
+            <R.Pane vm={vm} pane={connection}>
+                <R.ToggleRow vm={vm} pane={connection} row={F.dedicated_connection} />
+                <R.InputRow vm={vm} pane={connection} row={F.shared_pacing_kbps} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={engine}>
+                <R.InputRow vm={vm} pane={engine} row={F.window_chunks} />
+                <R.InputRow vm={vm} pane={engine} row={F.chunk_kb} />
+                <R.InputRow vm={vm} pane={engine} row={F.max_tasks} />
+                <R.ToggleRow vm={vm} pane={engine} row={F.@"resume"} />
+                <R.ToggleRow vm={vm} pane={engine} row={F.verify_md5} />
+            </R.Pane>
+            <R.Pane vm={vm} pane={defaults}>
+                <R.DirectoryRow vm={vm} pane={defaults} row={F.download_dir} />
+                <R.SelectRow vm={vm} pane={defaults} row={F.conflict_policy} options={conflictOptions()} />
+            </R.Pane>
+        </box>
+    );
+}

@@ -1,0 +1,113 @@
+old_path	new_path	layer	mixed	note
+src/ai_provider_settings_tests.zig	src/features/settings/tests/ai_provider_settings_tests.zig	tests	no	21 个测试; import ui 与 config/ai_provider_settings
+src/appearance_apply_tests.zig	src/features/settings/tests/appearance_apply_tests.zig	tests	no	8 个测试; 测 config/appearance_apply（core）与 settings_controller 的外观提交
+src/appearance_font_tests.zig	src/tests_font.zig	root	no	test-font 构建根（build.zig:668），改名 src/tests_font.zig; 含 5 个测试用例; 测 config/appearance_font + platform/ui_fonts，无 ui import
+src/appearance_tests.zig	src/tests_appearance.zig	root	no	test-appearance 构建根（build.zig:679），改名 src/tests_appearance.zig; 自身 1 个 test 块，聚合 startup_transition/theme_registry/background_asset/background_geometry/background_asset_tests(17)/theme_installation_tests(3)/appearance_apply_tests(8)/appearance_ui_worker_tests(6)/settings_controller，聚合内相对路径需随搬迁更新
+src/appearance_ui_worker_tests.zig	src/features/settings/tests/appearance_ui_worker_tests.zig	tests	no	6 个测试; 测 appearance_ui_worker
+src/application_data_cleanup_ui_tests.zig	src/features/settings/tests/application_data_cleanup_ui_tests.zig	tests	no	3 个测试; 另被 settings_content_tests import
+src/config/ai_extensions_settings.zig	src/features/settings/view/ai_extensions_settings.zig	view	yes	import ui; AI 扩展(MCP/Skills)设置面板; 内含 std.Thread.spawn 导入 job 与 mcp/local_skills 调用，混合; 仅 main.zig 引用
+src/config/ai_model_editor.zig	src/features/settings/view/ai_model_editor.zig	view	no	import ui; 模型编辑弹窗; 仅被 ai_provider_settings 引用
+src/config/ai_provider_settings.zig	src/features/settings/view/ai_provider_settings.zig	view	yes	import ui; Provider 设置面板，含 model_discovery / provider_config 调用; 被 main.zig 与 ai_provider_settings_tests 引用
+src/config/appearance_ui_context.zig	src/features/settings/view/appearance_ui_context.zig	view	no	import ui（只用 ui.Cx/Node 作为 hook 类型）; 被 settings_content_view/appearance_view/main/settings_content_tests 引用，必须留在 host 之下
+src/config/appearance_ui_picker.zig	src/features/settings/host/appearance_ui_picker.zig	host	no	import ui; 系统文件面板 + 驱动 appearance_ui_worker，非节点构建; 仅 main.zig 引用
+src/config/appearance_ui_worker.zig	src/features/settings/host/appearance_ui_worker.zig	host	no	无 ui import; std.Thread.spawn 且读写主题/背景文件，按规则归 host; 被 appearance_ui_picker/main/appearance_ui_worker_tests 引用
+src/config/keybinding_picker.zig	src/features/settings/view/keybinding_picker.zig	view	no	import ui; 快捷键录入弹层; 被 main.zig 及 keybinding_tests/keybinding_recorder_tests/settings_picker_tests/material_popup_tests(非本包) 引用
+src/config/provider_delete_dialog.zig	src/features/settings/view/provider_delete_dialog.zig	view	no	import ui; 仅被 ai_provider_settings 引用
+src/config/settings_accordion.zig	src/features/settings/view/settings_accordion.zig	view	no	import ui
+src/config/settings_ai_draft.zig	src/features/settings/model/settings_ai_draft.zig	model	no	无 ui; 注意被 ai feature 的 src/ui/ai_composer_controls_view.zig 跨 feature import（需在 ai 包的迁移里更新路径）
+src/config/settings_content_view.zig	src/features/settings/view/settings_content_view.zig	view	yes	import ui; 838 行，Hooks/Action/Navigation 与控件混合; 计划 P3 拆
+src/config/settings_controller.zig	src/features/settings/model/settings_controller.zig	model	no	无 ui; 含 save/completeSave 的 io+dir 参数式 I/O 但无线程，按计划 §4.5 进 model/controller; 被 root.zig 与大量测试 import
+src/config/settings_history.zig	src/features/settings/model/settings_history.zig	model	no	无 ui; 仅 std
+src/config/settings_mcp_styles.zig	src/features/settings/view/settings_mcp_styles.zig	view	no	import ui
+src/config/settings_model.zig	src/features/settings/model/settings_model.zig	model	no	无 ui; root.zig 引用
+src/config/settings_parts/INTEGRATION.md	src/features/settings/view/panes/INTEGRATION.md	view	no	非 zig 文档，随 settings_parts 目录走
+src/config/settings_parts/appearance_styles.zig	src/features/settings/view/panes/appearance_styles.zig	view	no	import ui
+src/config/settings_parts/appearance_view.zig	src/features/settings/view/panes/appearance_view.zig	view	yes	import ui; 1532 行外观页
+src/config/settings_parts/settings.zig	src/features/settings/view/panes/settings.zig	view	no	无 ui 但仅重导出 appearance_view.mountContent，放 model 会造成 model→view 反向依赖，故归 view
+src/config/settings_parts/settings_ai.zig	src/features/settings/view/panes/settings_ai.zig	view	no	import ui
+src/config/settings_parts/settings_controls.zig	src/features/settings/view/panes/settings_controls.zig	view	yes	import ui; 699 行公共控件（被 provider_delete_dialog/ai_* 等 import，计划里归 view/components）
+src/config/settings_parts/settings_data.zig	src/features/settings/view/panes/settings_data.zig	view	no	import ui
+src/config/settings_parts/settings_keys.zig	src/features/settings/view/panes/settings_keys.zig	view	no	import ui
+src/config/settings_parts/settings_notify.zig	src/features/settings/view/panes/settings_notify.zig	view	no	import ui
+src/config/settings_parts/settings_plugins.zig	src/features/settings/view/panes/settings_plugins.zig	view	no	import ui
+src/config/settings_parts/settings_ssh.zig	src/features/settings/view/panes/settings_ssh.zig	view	no	import ui
+src/config/settings_parts/settings_transfer.zig	src/features/settings/view/panes/settings_transfer.zig	view	no	import ui
+src/config/settings_parts/settings_updates.zig	src/features/settings/view/panes/settings_updates.zig	view	no	import ui
+src/config/settings_parts/settings_updates_styles.zig	src/features/settings/view/panes/settings_updates_styles.zig	view	no	import ui
+src/config/settings_picker.zig	src/features/settings/view/settings_picker.zig	view	no	import ui; 锚定 chip 编辑器
+src/config/settings_search.zig	src/features/settings/model/settings_search.zig	model	no	无 ui; 当前没有任何文件 import 它（疑似死代码或仅文档引用），P1 照搬
+src/config/settings_shell.zig	src/features/settings/view/settings_shell.zig	view	yes	import ui; 偏好窗口外壳，含 aux_window Spec 与内联测试宿主; main.zig 引用 window_spec
+src/config/settings_styles.zig	src/features/settings/view/settings_styles.zig	view	no	import ui; 另被 connections 的 src/ui/socks_config_view.zig 跨 feature import
+src/config/settings_subpages.zig	src/features/settings/view/settings_subpages.zig	view	no	import ui（仅为图标）; 本质是数据表，计划 P3 拆成 model/catalog + view 图标映射; 仅 main.zig 引用
+src/config/settings_values.zig	src/features/settings/model/settings_values.zig	model	no	无 ui; 被 root.zig 与多个测试 import
+src/config/settings_view.zig	src/features/settings/model/settings_view.zig	model	no	无 ui; 被 root.zig 与 config_transaction_tests import
+src/config_transaction_tests.zig	src/features/settings/tests/config_transaction_tests.zig	tests	no	1 个测试; 只 import settings_controller/settings_schema/settings_view/plugin_page 等，测设置事务，不只是 core config
+src/keybinding_recorder_tests.zig	src/features/settings/tests/keybinding_recorder_tests.zig	tests	no	3 个测试; 只 import keybinding_picker/keybindings，picker 归 settings
+src/keybinding_tests.zig	src/features/settings/tests/keybinding_tests.zig	tests	no	4 个测试; 同上
+src/plugin_settings_v3_tests.zig	src/features/settings/tests/plugin_settings_v3_tests.zig	tests	no	1 个测试; 测 settings_parts/settings_plugins
+src/settings_content_tests.zig	src/features/settings/tests/settings_content_tests.zig	tests	no	45 个测试; 聚合 application_data_cleanup_ui_tests
+src/settings_field_lifecycle_tests.zig	src/features/settings/tests/settings_field_lifecycle_tests.zig	tests	no	1 个测试; 无 ui，测 settings_controller/values
+src/settings_notification_permission_view_tests.zig	src/features/settings/tests/settings_notification_permission_view_tests.zig	tests	no	3 个测试
+src/settings_picker_tests.zig	src/features/settings/tests/settings_picker_tests.zig	tests	no	6 个测试
+src/settings_preview_runner.zig	src/features/settings/preview/settings_preview_runner.zig	preview	no	settings-preview 构建根（build.zig:345），e2e/settings_previews.ts 引用; import ui/zenit_app
+src/settings_quiet_hours_tests.zig	src/features/settings/tests/settings_quiet_hours_tests.zig	tests	no	1 个测试
+src/settings_search_alias_tests.zig	src/features/settings/tests/settings_search_alias_tests.zig	tests	no	3 个测试; 被 transfer_panel_tests.zig:58 聚合
+src/settings_transfer_budget_tests.zig	src/features/settings/tests/settings_transfer_budget_tests.zig	tests	no	5 个测试
+src/ui/application_data_cleanup_styles.zig	src/features/settings/view/application_data_cleanup_styles.zig	view	no	import ui; 引用 history 的 record_cleanup_styles.zig（跨 feature 依赖，P1 先保留）
+src/ui/application_data_cleanup_view.zig	src/features/settings/view/application_data_cleanup_view.zig	view	no	import ui; 偏好设置「数据」页的清理确认弹层; main.zig 与 application_data_cleanup_ui_tests 引用
+src/ui/settings/_styles.yss.zig	src/features/settings/view/_styles.yss.zig	view	no	yss 孪生，跟 styles.yss 同目录; 内含 previewCss("src/ui/settings/styles.yss") 路径字面量，搬迁后需重新生成; 被 config/settings_shell.zig 与 settings_styles.zig import
+src/ui/settings/styles.yss	src/features/settings/view/styles.yss	view	no	设置窗口样式源文件; 计划 §5.1 目标 view/styles.yss
+# CONTESTED src/ai_extensions_tests.zig ai 25 个测试，绝大多数测 ai/ 的 MCP/extension gateway（无 ui import），仅 import settings_controller/settings_schema 做保存合并用例
+# CONTESTED src/model_catalog_tests.zig ai 只 import ai/model_catalog.zig，与设置界面无关
+# CONTESTED src/service_model_catalog_tests.zig ai 只 import ai/model_catalog.zig，与设置界面无关
+# CONTESTED src/provider_protocol_tools_tests.zig ai 只 import ai/provider_*，与设置界面无关
+# CONTESTED src/ui/auxiliary_appearance.zig shared-ui 窗口级全局外观投影（background_layers/background_texture/shell_styles/zenit_app），没有任何设置界面文件 import 它
+# CONTESTED src/auxiliary_appearance_tests.zig shared-ui 仅测 ui/auxiliary_appearance.zig（theme_layer_tests 与 transfer_panel_tests 聚合）
+# CONTESTED src/ui/color_palette.zig shared-ui 预设色按钮，被 connections(asset_group_host) 与 shell(tab_color_picker) 共用，不是设置界面
+# CONTESTED src/ui/color_palette_styles.zig shared-ui 同 color_palette.zig（还被 asset_group_host 直接 import）
+# CONTESTED src/settings_runtime_consumer_tests.zig terminal 8 个测试，名为 settings runtime 但 import terminal_view/session_runtime/vt/host/ai 等，测运行时消费配置
+# CONTESTED src/settings_transfer_defaults_tests.zig transfer 4 个测试，import transfer_panel/transfer/manager，测传输面板消费设置默认值
+# CONTESTED src/background_asset_tests.zig shared-ui 17 个测试，测 config/background_asset 等 core；仅被 appearance_tests(tests_appearance) 聚合，名字不属 appearance_* 前缀
+# CONTESTED src/theme_installation_tests.zig shared-ui 3 个测试，测 config/imported_theme/theme_registry；仅被 appearance_tests(tests_appearance) 聚合
+# STAY src/config/settings_schema.zig src/ai/session_lifecycle.zig（core import 它，另有 root.zig、main.zig、update_tests 与多个测试引用）；计划 §4.5 原定去 model/，但被 core import 须留在 config/
+# STAY src/config/settings_pages.zig src/config/settings_schema.zig（留在原地的文件 import 它；另有 root.zig、main.zig、update_tests、settings_search_alias_tests 引用）
+# NOTE 跨 feature 引用需在对应包迁移时改路径: src/ui/ai_composer_controls_view.zig -> config/settings_ai_draft.zig; src/ui/socks_config_view.zig -> config/settings_styles.zig; src/material_popup_tests.zig -> config/keybinding_picker.zig; src/ui_constraint_tests.zig -> settings_content_view/settings_controller/settings_styles
+# NOTE root.zig 直接 import config/settings_controller|settings_model|settings_values|settings_view（以及留原地的 schema/pages），搬迁后需改 root.zig 路径
+# E2E build.zig 引用了 src/appearance_font_tests.zig
+# E2E docs/ui-revamp/baselines/tests.md 引用了 src/appearance_font_tests.zig
+# E2E build.zig 引用了 src/appearance_tests.zig
+# E2E docs/ui-revamp/baselines/tests.md 引用了 src/appearance_tests.zig
+# E2E docs/UI_V4/mcp-services.md 引用了 src/config/ai_extensions_settings.zig
+# E2E docs/UI_V4/skills.md 引用了 src/config/ai_extensions_settings.zig
+# E2E tools/arch/rules.zon 引用了 src/config/ai_extensions_settings.zig
+# E2E tools/arch/rules.zon 引用了 src/config/ai_model_editor.zig
+# E2E tools/arch/rules.zon 引用了 src/config/ai_provider_settings.zig
+# E2E tools/arch/rules.zig 引用了 src/config/keybinding_picker.zig
+# E2E tools/arch/rules.zon 引用了 src/config/keybinding_picker.zig
+# E2E tools/arch/rules.zon 引用了 src/config/provider_delete_dialog.zig
+# E2E docs/ui-revamp/YIX_SPIKE.md 引用了 src/config/settings_content_view.zig
+# E2E tools/arch/rules.zig 引用了 src/config/settings_content_view.zig
+# E2E tools/arch/baseline.txt 引用了 src/config/settings_controller.zig
+# E2E docs/UI_V4/mcp-services.md 引用了 src/config/settings_mcp_styles.zig
+# E2E docs/UI_V4/skills.md 引用了 src/config/settings_mcp_styles.zig
+# E2E tools/arch/rules.zig 引用了 src/config/settings_model.zig
+# E2E tools/arch/rules.zig 引用了 src/config/settings_parts/appearance_view.zig
+# E2E docs/DESIGN/V0.4_AI_AGENT_CLUSTER.md 引用了 src/config/settings_parts/settings_ai.zig
+# E2E tools/mockups/yix_spike/legacy.zig 引用了 src/config/settings_parts/settings_updates.zig
+# E2E docs/ui-revamp/PENCIL_MAP.md 引用了 src/config/settings_subpages.zig
+# E2E e2e/settings_revamp_native.ts 引用了 src/config/settings_subpages.zig
+# E2E tools/arch/baseline.txt 引用了 src/config/settings_values.zig
+# E2E build.zig 引用了 src/settings_preview_runner.zig
+# E2E e2e/settings_previews.ts 引用了 src/settings_preview_runner.zig
+# E2E tools/arch/rules.zig 引用了 src/settings_preview_runner.zig
+# E2E tools/arch/rules.zig 引用了 src/ui/settings/_styles.yss.zig
+# E2E tools/arch/rules.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/arch/scan.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/_styles.yss.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/_views.yix.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/parts/_count_row.yix.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/parts/count_row.yix 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/selfcheck.zig 引用了 src/ui/settings/styles.yss
+# E2E tools/mockups/yix_spike/views.yix 引用了 src/ui/settings/styles.yss
+# TESTID settings (settings.*，约 103 处字面量 test_id)
+# TESTID data (data.cleanup.*，来自 application_data_cleanup_view)

@@ -1,15 +1,51 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "../automation_environment.h"
 #include <ole2.h>
 #include <uiautomation.h>
 #include <stdio.h>
 #include <string.h>
 #include <float.h>
+#include <limits.h>
 #include "a11y_snapshot.h"
 
 namespace zenit_uia {
 using namespace zenit_a11y;
+// Explicit diagnostic runs only: do not add per-call I/O to normal UIA work.
+static bool demand_trace_enabled() {
+    static const bool enabled = [] { wchar_t flag[2] = {}; return
+        zenitAutomationEnvironmentW(L"ZENIT_UIA_TRACE", flag, 2) == 1 && flag[0] == L'1'; }();
+    return enabled;
+}
+// Keep diagnostics outside reentrant UIA method calls. Provider entries carry
+// a timestamped listening sample taken at an owner request/frame boundary.
+alignas(8) static volatile LONG64 trace_listening_sample = 0;
+static void demand_trace_poll() {
+    if (demand_trace_enabled()) {
+        const bool listening = UiaClientsAreListening() != FALSE;
+        InterlockedExchange64(&trace_listening_sample, (LONG64)((GetTickCount64() << 1) | listening));
+    }
+}
+static void demand_trace(const char *entry, intptr_t detail = 0) {
+    if (!demand_trace_enabled()) return;
+    const auto sample = (ULONGLONG)InterlockedCompareExchange64(&trace_listening_sample, 0, 0);
+    DWORD foreground_pid = 0;
+    wchar_t path[MAX_PATH] = {};
+    if (!strcmp(entry, "WM_GETOBJECT")) {
+        GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+        DWORD length = MAX_PATH;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, foreground_pid);
+        if (process) { QueryFullProcessImageNameW(process, 0, path, &length); CloseHandle(process); }
+    }
+    const wchar_t *name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
+    fprintf(stderr, "[uia-demand] tick_ms=%llu thread=%lu entry=%s detail=%lld listening=%d listening_sample_tick_ms=%llu foreground_pid=%lu foreground=%ls\n",
+        (unsigned long long)GetTickCount64(), GetCurrentThreadId(), entry, (long long)detail,
+        (int)(sample & 1), (unsigned long long)(sample >> 1), foreground_pid, name);
+}
 static volatile LONG next_identity = 0;
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+static thread_local int subscription_allocation_fail_after = -1;
+#endif
 static bool supports_expand(const Node *node) {
     return node && (node->state & (1u << 18)) && (node->setters & 8);
 }
@@ -113,7 +149,7 @@ struct Request {
 };
 static bool background_e2e() {
     wchar_t flag[2] = {};
-    return GetEnvironmentVariableW(L"ZENIT_E2E_BACKGROUND", flag, 2) == 1 && flag[0] == L'1';
+    return zenitAutomationEnvironmentW(L"ZENIT_E2E_BACKGROUND", flag, 2) == 1 && flag[0] == L'1';
 }
 struct Binding {
     volatile LONG refs = 1;
@@ -125,6 +161,147 @@ struct Binding {
     SRWLOCK action_lock = SRWLOCK_INIT;
     ZenitA11yActionCallback action_callback = nullptr;
     void *action_context = nullptr;
+    // Owner thread only: installed, cleared and invoked there.
+    ZenitA11yDemandCallback demand_callback = nullptr;
+    void *demand_context = nullptr;
+    void *demand_window = nullptr;
+    // COM clients may call from worker threads. Only the timestamp, stale flag,
+    // connection state and subscriptions cross threads; callbacks stay on owner.
+    alignas(8) volatile LONG64 last_activity = 0;
+    volatile LONG snapshot_stale = 1, connected = 1;
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool refreshing = false; // owner only
+    struct Subscription { EVENTID event; PROPERTYID property; unsigned count; Subscription *next; };
+    static constexpr unsigned max_subscription_keys = 512;
+    static Subscription *new_subscription() {
+#ifdef ZENIT_UIA_CONTRACT_CONTENT
+        if (subscription_allocation_fail_after == 0) return nullptr;
+        if (subscription_allocation_fail_after > 0) --subscription_allocation_fail_after;
+#endif
+        return (Subscription *)calloc(1, sizeof(Subscription));
+    }
+    SRWLOCK subscription_lock = SRWLOCK_INIT;
+    Subscription *subscriptions = nullptr;
+    volatile LONG subscription_count = 0;
+    unsigned subscription_slots = 0; // under subscription_lock; bounded client input
+    static constexpr ULONGLONG activity_timeout_ms = 5000;
+    void activity() {
+        InterlockedExchange64(&last_activity, (LONG64)GetTickCount64());
+    }
+    bool should_publish(ULONGLONG now) {
+        if (!InterlockedCompareExchange(&connected, 0, 0)) return false;
+        if (InterlockedCompareExchange(&subscription_count, 0, 0)) return true;
+        LONG64 last = InterlockedCompareExchange64(&last_activity, 0, 0);
+        if (last && now - (ULONGLONG)last <= activity_timeout_ms) return true;
+        if (last && InterlockedCompareExchange64(&last_activity, 0, last) != last) return true;
+        if (!InterlockedExchange(&snapshot_stale, 1)) ResetEvent(ready);
+        return false;
+    }
+    bool refresh_on_owner() {
+        if (GetCurrentThreadId() != owner || !InterlockedCompareExchange(&connected, 0, 0)) return false;
+        if (!InterlockedCompareExchange(&snapshot_stale, 0, 0)) return true;
+        if (refreshing || !demand_callback) return false;
+        refreshing = true;
+        const bool published = demand_callback(demand_context, demand_window) != 0;
+        refreshing = false;
+        if (!published && InterlockedCompareExchange(&connected, 0, 0)) InvalidateRect(hwnd, nullptr, FALSE);
+        return published && !InterlockedCompareExchange(&snapshot_stale, 0, 0);
+    }
+    Snapshot *acquire_current() {
+        activity();
+        if (!InterlockedCompareExchange(&connected, 0, 0)) return nullptr;
+        if (InterlockedCompareExchange(&snapshot_stale, 0, 0)) {
+            if (GetCurrentThreadId() == owner) {
+                if (!refresh_on_owner()) return nullptr;
+            } else {
+                DWORD_PTR result = 0;
+                // No lock or borrowed Zig pointer crosses this synchronous send.
+                // An old provider cannot refresh a reused HWND: identity is checked.
+                if (!SendMessageTimeoutW(hwnd, ZENIT_UIA_REFRESH_MESSAGE, (WPARAM)identity, 0,
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &result)) return nullptr;
+                // A nested WM_GETOBJECT/COM call during a frame must wait until
+                // frame-end publication, never read the previous snapshot.
+                if (InterlockedCompareExchange(&snapshot_stale, 0, 0) &&
+                        WaitForSingleObject(ready, 1000) != WAIT_OBJECT_0) return nullptr;
+                if (InterlockedCompareExchange(&snapshot_stale, 0, 0)) return nullptr;
+            }
+        }
+        return context->acquire();
+    }
+    HRESULT advise(EVENTID event, SAFEARRAY *properties, bool added) {
+        if (!InterlockedCompareExchange(&connected, 0, 0)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (event <= 0) return E_INVALIDARG;
+        PROPERTYID keys[max_subscription_keys] = {};
+        unsigned key_count = 1; // Zero is the generic/all-properties subscription.
+        if (event == UIA_AutomationPropertyChangedEventId && properties) {
+            VARTYPE type = VT_EMPTY; LONG lower = 0, upper = -1;
+            if (SafeArrayGetDim(properties) != 1 || FAILED(SafeArrayGetVartype(properties, &type)) || type != VT_I4 ||
+                    FAILED(SafeArrayGetLBound(properties, 1, &lower)) || FAILED(SafeArrayGetUBound(properties, 1, &upper))) return E_INVALIDARG;
+            const int64_t count = (int64_t)upper - lower + 1;
+            if (count < 0) return E_INVALIDARG;
+            if (count > max_subscription_keys) return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_QUOTA);
+            if (!count) return S_OK;
+            LONG *data = nullptr;
+            HRESULT result = SafeArrayAccessData(properties, (void **)&data);
+            if (FAILED(result)) return result;
+            if (!data) { SafeArrayUnaccessData(properties); return E_INVALIDARG; }
+            key_count = (unsigned)count;
+            for (unsigned i = 0; i < key_count; ++i) keys[i] = data[i];
+            result = SafeArrayUnaccessData(properties);
+            if (FAILED(result)) return result;
+            for (unsigned i = 0; i < key_count; ++i) if (keys[i] <= 0) return E_INVALIDARG;
+            // Property arrays describe sets; duplicates must not pin the lease.
+            for (unsigned i = 1; i < key_count; ++i) {
+                const PROPERTYID key = keys[i]; unsigned j = i;
+                while (j && keys[j-1] > key) { keys[j] = keys[j-1]; --j; }
+                keys[j] = key;
+            }
+            unsigned unique = 0;
+            for (unsigned i = 0; i < key_count; ++i) if (!unique || keys[i] != keys[unique-1]) keys[unique++] = keys[i];
+            key_count = unique;
+        }
+        AcquireSRWLockExclusive(&subscription_lock);
+        HRESULT result = S_OK;
+        if (added) {
+            Subscription *entries[max_subscription_keys] = {}, *pending = nullptr;
+            unsigned pending_count = 0;
+            if (subscription_count > LONG_MAX - (LONG)key_count) result = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_QUOTA);
+            for (unsigned i = 0; SUCCEEDED(result) && i < key_count; ++i) {
+                Subscription *entry = subscriptions;
+                while (entry && (entry->event != event || entry->property != keys[i])) entry = entry->next;
+                if (entry && entry->count == UINT_MAX) result = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_QUOTA);
+                if (!entry && SUCCEEDED(result)) {
+                    if (subscription_slots + pending_count == max_subscription_keys) result = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_QUOTA);
+                    else if (!(entry = new_subscription())) result = E_OUTOFMEMORY;
+                    else { entry->event = event; entry->property = keys[i]; entry->next = pending; pending = entry; ++pending_count; }
+                }
+                entries[i] = entry;
+            }
+            if (SUCCEEDED(result)) {
+                // Commit all properties together. OOM/quota cannot leave a
+                // partially registered subscriber that the client never got.
+                while (pending) { Subscription *entry = pending; pending = entry->next; entry->next = subscriptions; subscriptions = entry; }
+                subscription_slots += pending_count;
+                for (unsigned i = 0; i < key_count; ++i) ++entries[i]->count;
+                InterlockedExchangeAdd(&subscription_count, (LONG)key_count);
+            } else while (pending) { Subscription *entry = pending; pending = entry->next; free(entry); }
+        } else {
+            for (unsigned i = 0; i < key_count; ++i) {
+                Subscription **slot = &subscriptions;
+                while (*slot && ((*slot)->event != event || (*slot)->property != keys[i])) slot = &(*slot)->next;
+                if (*slot && (*slot)->count) {
+                    --(*slot)->count; InterlockedDecrement(&subscription_count);
+                    if (!(*slot)->count) { Subscription *old = *slot; *slot = old->next; --subscription_slots; free(old); }
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&subscription_lock);
+        if (SUCCEEDED(result)) {
+            activity();
+            if (added) PostMessageW(hwnd, ZENIT_UIA_REFRESH_MESSAGE, (WPARAM)identity, 0);
+        }
+        return result;
+    }
     Request pending[64] = {};
     unsigned pending_count = 0;
     size_t pending_bytes = 0;
@@ -134,15 +311,15 @@ struct Binding {
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     void retain() { InterlockedIncrement(&refs); }
-    void release() { if (!InterlockedDecrement(&refs)) { clear_pending(); if (context) context->release(); delete this; } }
+    void release() { if (!InterlockedDecrement(&refs)) { clear_pending(); if (context) context->release(); if (ready) CloseHandle(ready); while (subscriptions) { auto *old = subscriptions; subscriptions = old->next; free(old); } delete this; } }
     bool has_action_handler() {
         AcquireSRWLockShared(&action_lock);
         bool result = action_callback != nullptr;
         ReleaseSRWLockShared(&action_lock); return result;
     }
     HRESULT enqueue_action(uint32_t id, uint8_t action, char *text = nullptr, size_t length = 0, double number = 0) {
+        Snapshot *snapshot = acquire_current();
         AcquireSRWLockExclusive(&action_lock);
-        Snapshot *snapshot = context->acquire();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = S_OK;
         if (!node) result = UIA_E_ELEMENTNOTAVAILABLE;
@@ -165,7 +342,7 @@ struct Binding {
         return result;
     }
     HRESULT enqueue_text_range(uint32_t id, uint32_t start, uint32_t end, const wchar_t *expected, uint8_t action = 11, double alignment = 0) {
-        Snapshot *snapshot = context->acquire();
+        Snapshot *snapshot = acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = S_OK;
         char *payload = nullptr;
@@ -232,13 +409,17 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown && iid != IID_IInvokeProvider) return E_NOINTERFACE;
         *out = static_cast<IInvokeProvider *>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE Invoke() override { return binding->enqueue_action(id, 0); }
+    HRESULT STDMETHODCALLTYPE Invoke() override {
+        binding->activity();
+        demand_trace("Invoke"); return binding->enqueue_action(id, 0); }
 };
 class TogglePattern final: public IToggleProvider {
     volatile LONG refs = 1;
@@ -250,16 +431,22 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown && iid != IID_IToggleProvider) return E_NOINTERFACE;
         *out = static_cast<IToggleProvider *>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE Toggle() override { return binding->enqueue_action(id, 1); }
+    HRESULT STDMETHODCALLTYPE Toggle() override {
+        binding->activity();
+        demand_trace("Toggle"); return binding->enqueue_action(id, 1); }
     HRESULT STDMETHODCALLTYPE get_ToggleState(ToggleState *out) override {
+        binding->activity();
+        demand_trace("get_ToggleState");
         if (!out) return E_POINTER; *out = ToggleState_Off;
-        Snapshot *snapshot = binding->context->acquire();
+        Snapshot *snapshot = binding->acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = !node ? UIA_E_ELEMENTNOTAVAILABLE : !supports_toggle(node) ? UIA_E_NOTSUPPORTED : S_OK;
         if (SUCCEEDED(result)) *out = toggle_state(node);
@@ -276,16 +463,22 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown && iid != IID_IValueProvider) return E_NOINTERFACE;
         *out = static_cast<IValueProvider *>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR value) override { return binding->enqueue_text(id, value); }
+    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR value) override {
+        binding->activity();
+        demand_trace("SetValue"); return binding->enqueue_text(id, value); }
     HRESULT STDMETHODCALLTYPE get_Value(BSTR *out) override {
+        binding->activity();
+        demand_trace("get_Value");
         if (!out) return E_POINTER; *out = nullptr;
-        Snapshot *snapshot = binding->context->acquire();
+        Snapshot *snapshot = binding->acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = !node ? UIA_E_ELEMENTNOTAVAILABLE : !supports_value(node) ? UIA_E_NOTSUPPORTED :
             node->state & secure_state ? E_ACCESSDENIED : S_OK;
@@ -293,8 +486,10 @@ public:
         if (snapshot) snapshot->release(); return result;
     }
     HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL *out) override {
+        binding->activity();
+        demand_trace("get_IsReadOnly");
         if (!out) return E_POINTER; *out = TRUE;
-        Snapshot *snapshot = binding->context->acquire();
+        Snapshot *snapshot = binding->acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = !node ? UIA_E_ELEMENTNOTAVAILABLE : !supports_value(node) ? UIA_E_NOTSUPPORTED : S_OK;
         if (SUCCEEDED(result)) *out = value_readonly(node);
@@ -308,7 +503,7 @@ class RangePattern final: public IRangeValueProvider {
     ~RangePattern() { binding->release(); }
     HRESULT read(double *out, unsigned field) {
         if (!out) return E_POINTER; *out = 0;
-        Snapshot *snapshot = binding->context->acquire();
+        Snapshot *snapshot = binding->acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = !node ? UIA_E_ELEMENTNOTAVAILABLE : !supports_range(node) ? UIA_E_NOTSUPPORTED : S_OK;
         if (SUCCEEDED(result)) *out = field == 0 ? node->value_now : field == 1 ? node->value_min :
@@ -320,21 +515,37 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown && iid != IID_IRangeValueProvider) return E_NOINTERFACE;
         *out = static_cast<IRangeValueProvider *>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE SetValue(double number) override { return binding->enqueue_action(id, 5, nullptr, 0, number); }
-    HRESULT STDMETHODCALLTYPE get_Value(double *out) override { return read(out, 0); }
-    HRESULT STDMETHODCALLTYPE get_Minimum(double *out) override { return read(out, 1); }
-    HRESULT STDMETHODCALLTYPE get_Maximum(double *out) override { return read(out, 2); }
-    HRESULT STDMETHODCALLTYPE get_SmallChange(double *out) override { return read(out, 3); }
-    HRESULT STDMETHODCALLTYPE get_LargeChange(double *out) override { return read(out, 4); }
+    HRESULT STDMETHODCALLTYPE SetValue(double number) override {
+        binding->activity();
+        demand_trace("SetValue"); return binding->enqueue_action(id, 5, nullptr, 0, number); }
+    HRESULT STDMETHODCALLTYPE get_Value(double *out) override {
+        binding->activity();
+        demand_trace("get_Value"); return read(out, 0); }
+    HRESULT STDMETHODCALLTYPE get_Minimum(double *out) override {
+        binding->activity();
+        demand_trace("get_Minimum"); return read(out, 1); }
+    HRESULT STDMETHODCALLTYPE get_Maximum(double *out) override {
+        binding->activity();
+        demand_trace("get_Maximum"); return read(out, 2); }
+    HRESULT STDMETHODCALLTYPE get_SmallChange(double *out) override {
+        binding->activity();
+        demand_trace("get_SmallChange"); return read(out, 3); }
+    HRESULT STDMETHODCALLTYPE get_LargeChange(double *out) override {
+        binding->activity();
+        demand_trace("get_LargeChange"); return read(out, 4); }
     HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL *out) override {
+        binding->activity();
+        demand_trace("get_IsReadOnly");
         if (!out) return E_POINTER; *out = TRUE;
-        Snapshot *snapshot = binding->context->acquire();
+        Snapshot *snapshot = binding->acquire_current();
         const Node *node = snapshot ? snapshot->find(id) : nullptr;
         HRESULT result = !node ? UIA_E_ELEMENTNOTAVAILABLE : !supports_range(node) ? UIA_E_NOTSUPPORTED : S_OK;
         if (SUCCEEDED(result)) *out = range_readonly(node);
@@ -343,7 +554,7 @@ public:
 };
 struct View {
     Snapshot *snapshot;
-    explicit View(Binding *binding): snapshot(binding->context->acquire()) {}
+    explicit View(Binding *binding, bool fresh = true): snapshot(fresh ? binding->acquire_current() : binding->context->acquire()) {}
     ~View() { if (snapshot) snapshot->release(); }
 };
 static CONTROLTYPEID control_type(uint16_t role) {
@@ -382,7 +593,7 @@ static CONTROLTYPEID control_type(uint16_t role) {
 }
 static HRESULT create_text_pattern(Binding *, uint32_t, IUnknown **);
 class Provider final: public IRawElementProviderSimple, public IRawElementProviderFragment, public IRawElementProviderFragmentRoot,
-    public ISelectionProvider, public ISelectionItemProvider, public IExpandCollapseProvider {
+    public ISelectionProvider, public ISelectionItemProvider, public IExpandCollapseProvider, public IRawElementProviderAdviseEvents {
     volatile LONG refs = 1;
     Binding *binding;
     uint32_t const id;
@@ -410,10 +621,13 @@ public:
     static void *operator new(size_t size) noexcept { return malloc(size); }
     static void operator delete(void *memory) noexcept { free(memory); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        binding->activity();
+        demand_trace("QueryInterface");
         if (!out) return E_POINTER; *out = nullptr;
         if (iid == IID_IUnknown || iid == IID_IRawElementProviderSimple) *out = static_cast<IRawElementProviderSimple *>(this);
         else if (iid == IID_IRawElementProviderFragment) *out = static_cast<IRawElementProviderFragment *>(this);
         else if (iid == IID_IRawElementProviderFragmentRoot && root()) *out = static_cast<IRawElementProviderFragmentRoot *>(this);
+        else if (iid == IID_IRawElementProviderAdviseEvents && root()) *out = static_cast<IRawElementProviderAdviseEvents *>(this);
         else if (iid == IID_IExpandCollapseProvider) *out = static_cast<IExpandCollapseProvider *>(this);
         else if (iid == IID_ISelectionProvider) *out = static_cast<ISelectionProvider *>(this);
         else if (iid == IID_ISelectionItemProvider) *out = static_cast<ISelectionItemProvider *>(this);
@@ -422,9 +636,25 @@ public:
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE Expand() override { return binding->enqueue_action(id, 9); }
-    HRESULT STDMETHODCALLTYPE Collapse() override { return binding->enqueue_action(id, 10); }
+    HRESULT STDMETHODCALLTYPE AdviseEventAdded(EVENTID event, SAFEARRAY *properties) override {
+        binding->activity();
+        demand_trace("AdviseEventAdded", event);
+        return binding->advise(event, properties, true);
+    }
+    HRESULT STDMETHODCALLTYPE AdviseEventRemoved(EVENTID event, SAFEARRAY *properties) override {
+        binding->activity();
+        demand_trace("AdviseEventRemoved", event);
+        return binding->advise(event, properties, false);
+    }
+    HRESULT STDMETHODCALLTYPE Expand() override {
+        binding->activity();
+        demand_trace("Expand"); return binding->enqueue_action(id, 9); }
+    HRESULT STDMETHODCALLTYPE Collapse() override {
+        binding->activity();
+        demand_trace("Collapse"); return binding->enqueue_action(id, 10); }
     HRESULT STDMETHODCALLTYPE get_ExpandCollapseState(ExpandCollapseState *out) override {
+        binding->activity();
+        demand_trace("get_ExpandCollapseState");
         if (!out) return E_POINTER; *out = ExpandCollapseState_LeafNode;
         View view(binding); const Node *n = node(view);
         if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -432,6 +662,8 @@ public:
         *out = expand_state(n); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetSelection");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); const Node *n = node(view);
         if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
@@ -457,18 +689,24 @@ public:
         *out = array; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_CanSelectMultiple(BOOL *out) override {
+        binding->activity();
+        demand_trace("get_CanSelectMultiple");
         if (!out) return E_POINTER; *out = FALSE;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (!selection_group(node(view))) return UIA_E_NOTSUPPORTED;
         *out = selection_multiple(node(view)); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsSelectionRequired(BOOL *out) override {
+        binding->activity();
+        demand_trace("get_IsSelectionRequired");
         if (!out) return E_POINTER; *out = FALSE;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (!selection_group(node(view))) return UIA_E_NOTSUPPORTED;
         *out = selection_required(node(view)); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsSelected(BOOL *out) override {
+        binding->activity();
+        demand_trace("get_IsSelected");
         if (!out) return E_POINTER; *out = FALSE;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const Node *n = node(view);
@@ -476,6 +714,8 @@ public:
         *out = selection_selected(n); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_SelectionContainer(IRawElementProviderSimple **out) override {
+        binding->activity();
+        demand_trace("get_SelectionContainer");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const Node *parent = selection_container(view.snapshot, node(view));
@@ -496,10 +736,18 @@ public:
         if (selection_selected(n) && (action == 7 || (action == 6 && selection_count(view.snapshot, parent) == 1))) return S_OK;
         return binding->enqueue_action(id, action);
     }
-    HRESULT STDMETHODCALLTYPE Select() override { return select_action(6); }
-    HRESULT STDMETHODCALLTYPE AddToSelection() override { return select_action(7); }
-    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override { return select_action(8); }
+    HRESULT STDMETHODCALLTYPE Select() override {
+        binding->activity();
+        demand_trace("Select"); return select_action(6); }
+    HRESULT STDMETHODCALLTYPE AddToSelection() override {
+        binding->activity();
+        demand_trace("AddToSelection"); return select_action(7); }
+    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override {
+        binding->activity();
+        demand_trace("RemoveFromSelection"); return select_action(8); }
     HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions *out) override {
+        binding->activity();
+        demand_trace("get_ProviderOptions");
         if (!out) return E_POINTER;
         // In unattended mode UIA focus requests only change internal Cx focus.
         // UIA can request focus implicitly while setting an editable value.
@@ -514,6 +762,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown **out) override {
+        binding->activity();
+        demand_trace("GetPatternProvider");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (pattern == UIA_TextPatternId && supports_text(node(view)))
@@ -543,6 +793,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT *out) override {
+        binding->activity();
+        demand_trace("GetPropertyValue");
         if (!out) return E_POINTER; VariantInit(out);
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const Node *n = node(view); uint32_t state = n ? n->state : 0;
@@ -627,11 +879,15 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple **out) override {
+        binding->activity();
+        demand_trace("get_HostRawElementProvider");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         return root() ? UiaHostProviderFromHwnd(binding->hwnd, out) : S_OK;
     }
     HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection direction, IRawElementProviderFragment **out) override {
+        binding->activity();
+        demand_trace("Navigate");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const Node *self = node(view);
@@ -655,6 +911,8 @@ public:
         return match ? fragment(match->id, out) : S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetRuntimeId");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (root()) return S_OK;
@@ -667,15 +925,21 @@ public:
         *out = array; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect *out) override {
+        binding->activity();
+        demand_trace("get_BoundingRectangle");
         if (!out) return E_POINTER; *out = {};
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         *out = bounds(view); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY **out) override {
+        binding->activity();
+        demand_trace("GetEmbeddedFragmentRoots");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); return available(view) ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
     }
     HRESULT STDMETHODCALLTYPE SetFocus() override {
+        binding->activity();
+        demand_trace("SetFocus");
         View view(binding);
         if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (!IsWindowEnabled(binding->hwnd)) return UIA_E_ELEMENTNOTENABLED;
@@ -683,12 +947,16 @@ public:
         return binding->enqueue_action(id, 2);
     }
     HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot **out) override {
+        binding->activity();
+        demand_trace("get_FragmentRoot");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         auto *provider = new Provider(binding, no_parent); if (!provider) return E_OUTOFMEMORY;
         *out = provider; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y, IRawElementProviderFragment **out) override {
+        binding->activity();
+        demand_trace("ElementProviderFromPoint");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         const auto &vp = view.snapshot->viewport;
@@ -706,6 +974,8 @@ public:
         return fragment(best, out);
     }
     HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment **out) override {
+        binding->activity();
+        demand_trace("GetFocus");
         if (!out) return E_POINTER; *out = nullptr;
         View view(binding); if (!available(view)) return UIA_E_ELEMENTNOTAVAILABLE;
         if (!owns_keyboard_focus()) return S_OK;
@@ -932,6 +1202,20 @@ extern "C" int32_t zenit_uia_contract_focus(void *opaque, uint32_t id) {
 #endif
 
 extern "C" size_t zenit_uia_node_size(void) { return sizeof(ZenitA11yNode); }
+extern "C" int zenit_uia_set_demand_handler(void *opaque, void *context, void *window, ZenitA11yDemandCallback callback) {
+    auto *binding = (zenit_uia::Binding *)opaque;
+    if (!binding || binding->owner != GetCurrentThreadId()) return 0;
+    binding->demand_callback = callback; binding->demand_context = context; binding->demand_window = window;
+    if (callback) { InterlockedExchange(&binding->snapshot_stale, 1); ResetEvent(binding->ready); }
+    return 1;
+}
+extern "C" int zenit_uia_should_publish(void *opaque) {
+    auto *binding = (zenit_uia::Binding *)opaque;
+    const bool publish = binding && binding->owner == GetCurrentThreadId() && binding->should_publish(GetTickCount64());
+    zenit_uia::demand_trace_poll();
+    zenit_uia::demand_trace("publish-gate", publish);
+    return publish;
+}
 extern "C" int zenit_uia_publish(void *opaque, const ZenitA11yNode *nodes, size_t count) {
     auto *binding = (zenit_uia::Binding *)opaque;
     if (!binding || binding->owner != GetCurrentThreadId()) return 0;
@@ -939,7 +1223,7 @@ extern "C" int zenit_uia_publish(void *opaque, const ZenitA11yNode *nodes, size_
     if (!GetClientRect(binding->hwnd, &rect) || !ClientToScreen(binding->hwnd, &origin)) return 0;
     zenit_a11y::Viewport vp{(double)origin.x, (double)origin.y,
         (double)(rect.right-rect.left), (double)(rect.bottom-rect.top), (double)GetDpiForWindow(binding->hwnd)/96};
-    zenit_uia::View before(binding);
+    zenit_uia::View before(binding, false);
     if (!binding->context->publish(nodes, count, vp)) {
         // Log each distinct rejection (site and reason) once; publication runs every frame.
         static thread_local int logged_line = -1;
@@ -956,10 +1240,12 @@ extern "C" int zenit_uia_publish(void *opaque, const ZenitA11yNode *nodes, size_
         }
         return 0;
     }
+    InterlockedExchange(&binding->snapshot_stale, 0);
+    SetEvent(binding->ready);
     // Notify only after publication, so clients reading in the event callback
     // observe the same committed state. All input paths share this notification.
-    if (before.snapshot && UiaClientsAreListening()) {
-        zenit_uia::View after(binding);
+    if (before.snapshot && InterlockedCompareExchange(&binding->subscription_count, 0, 0) && UiaClientsAreListening()) {
+        zenit_uia::View after(binding, false);
         if (!after.snapshot) return 1;
         zenit_uia::SelectionCounts old_counts(before.snapshot), new_counts(after.snapshot);
         for (size_t i = 0; after.snapshot && i < after.snapshot->count(); ++i) {
@@ -1033,11 +1319,14 @@ extern "C" void *zenit_uia_create(void *hwnd) {
     if (!hwnd || GetWindowThreadProcessId((HWND)hwnd, nullptr) != GetCurrentThreadId()) return nullptr;
     auto *binding = new zenit_uia::Binding((HWND)hwnd);
     if (!binding) return nullptr;
-    if (!binding->context || !zenit_uia_publish(binding, nullptr, 0)) { binding->release(); return nullptr; }
+    if (!binding->context || !binding->ready || !zenit_uia_publish(binding, nullptr, 0)) { binding->release(); return nullptr; }
     return binding;
 }
 extern "C" void zenit_uia_destroy(void *opaque) {
     auto *binding = (zenit_uia::Binding *)opaque; if (!binding) return;
+    InterlockedExchange(&binding->connected, 0);
+    binding->demand_callback = nullptr; binding->demand_context = nullptr; binding->demand_window = nullptr;
+    SetEvent(binding->ready);
     zenit_uia_set_action_handler(binding, nullptr, nullptr);
     binding->context->disconnect();
     UiaReturnRawElementProvider(binding->hwnd, 0, 0, nullptr);
@@ -1075,7 +1364,7 @@ extern "C" int zenit_uia_drain(void *opaque) {
         // tree on this thread; no Zig pointer is touched by COM/RPC threads.
         if (callback(context, id, request.action, request.text, request.length, request.number)) {
             ++dispatched;
-            if (request.action == 0 && UiaClientsAreListening()) {
+            if (request.action == 0 && InterlockedCompareExchange(&binding->subscription_count, 0, 0) && UiaClientsAreListening()) {
                 auto *provider = new Provider(binding, id);
                 if (provider) { UiaRaiseAutomationEvent(provider, UIA_Invoke_InvokedEventId); provider->Release(); }
             }
@@ -1085,9 +1374,27 @@ extern "C" int zenit_uia_drain(void *opaque) {
     binding->release(); return (int)dispatched;
 }
 extern "C" intptr_t zenit_uia_get_object(void *opaque, uintptr_t wparam, intptr_t lparam) {
+    zenit_uia::demand_trace_poll();
+    zenit_uia::demand_trace("WM_GETOBJECT", lparam);
     auto *binding = (zenit_uia::Binding *)opaque;
     if (!binding || (LONG)lparam != UiaRootObjectId) return 0;
-    auto *root = new zenit_uia::Provider(binding, zenit_a11y::no_parent); if (!root) return 0;
+    if (GetCurrentThreadId() != binding->owner) return 0;
+    binding->retain();
+    binding->activity();
+    // Refresh even when a previously returned proxy remains cached by UIA.
+    if (!binding->refresh_on_owner() && InterlockedCompareExchange(&binding->connected, 0, 0))
+        InvalidateRect(binding->hwnd, nullptr, FALSE);
+    if (!InterlockedCompareExchange(&binding->connected, 0, 0)) { binding->release(); return 0; }
+    auto *root = new zenit_uia::Provider(binding, zenit_a11y::no_parent); if (!root) { binding->release(); return 0; }
     LRESULT result = UiaReturnRawElementProvider(binding->hwnd, wparam, lparam, root);
-    root->Release(); return result;
+    root->Release(); binding->release(); return result;
+}
+
+extern "C" int zenit_uia_refresh(void *opaque, uintptr_t identity) {
+    auto *binding = (zenit_uia::Binding *)opaque;
+    if (!binding || binding->owner != GetCurrentThreadId() || identity != (uintptr_t)binding->identity) return 0;
+    binding->retain();
+    const bool result = binding->refresh_on_owner();
+    binding->release();
+    return result;
 }

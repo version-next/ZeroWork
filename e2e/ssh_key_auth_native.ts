@@ -2,6 +2,7 @@
  * node e2e/ssh_key_auth_native.ts BINARY PEER_READY_JSON OUTPUT [OPTIONAL_USER_KEY] [CASE]
  * Start ssh_key_native_peer.py separately; no external host is contacted.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,realpath,readFile,writeFile,open,rm} from 'node:fs/promises';

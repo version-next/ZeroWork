@@ -4,10 +4,10 @@
 const std = @import("std");
 const core = @import("../../core.zig");
 const Node = core.Node;
-const Color = core.Color;
 const Event = core.Event;
 const EventResult = core.EventResult;
 
+const styles = @import("styles.zig");
 const state_mod = @import("state.zig");
 const ScrollState = state_mod.ScrollState;
 const ScrollbarVisual = state_mod.ScrollbarVisual;
@@ -18,6 +18,7 @@ const scroll_event = @import("event.zig");
 const scrollEventHandler = scroll_event.scrollEventHandler;
 
 const debug = @import("debug.zig");
+const offset_binding = @import("offset_binding.zig");
 const logScroll = debug.logScroll;
 const render_engine = @import("../../core/render_engine/mod.zig");
 
@@ -25,20 +26,32 @@ fn syncScrollbarFrame(node: *Node, x: f32, y: f32, w: f32, h: f32) bool {
     const cur = node.rectFromWorldOrFallback();
     const rect_changed =
         cur.x != x or cur.y != y or cur.w != w or cur.h != h;
-    const margin_changed = @abs(node.style.margin.left - x) > 0.01 or
-        @abs(node.style.margin.top - y) > 0.01 or
-        node.style.marginLeftIsAuto() or
-        node.style.marginTopIsAuto();
-
-    if (margin_changed) {
-        node.style.margin.left = x;
-        node.style.margin.top = y;
-        if (node.style.marginLeftIsAuto()) node.style.setMarginLeftAutoFallback(false);
-        if (node.style.marginTopIsAuto()) node.style.setMarginTopAutoFallback(false);
+    // Thumbs and tracks are absolute boxes placed by left/top insets (padding-box origin of
+    // the container, CSS semantics), never by margin: a margin on top of the static position
+    // would add the container's padding (static positions start at the content edge).
+    // The insets exist from mount (mod.zig), so the ext is always there.
+    if (node.style.ext) |ext| {
+        ext.inset.left = .{ .px = x };
+        ext.inset.top = .{ .px = y };
     }
 
     node.setLayoutRect(.{ .x = x, .y = y, .w = w, .h = h });
     return rect_changed;
+}
+
+/// Thumb / track paint written by the per-frame hook: raw write (no transition), marked
+/// render-dirty only when it changed, so an unchanged bar stays clean and cacheable while a fading
+/// or resizing one is re-recorded (the container's descendants_cache_safe contract).
+fn syncBarBackground(node: *Node, color: core.Color) void {
+    if (std.meta.eql(node.getBackground(), color)) return;
+    node.setBackgroundRaw(color);
+    node.markRenderDirty();
+}
+
+fn syncBarBorder(node: *Node, border: core.Border) void {
+    if (std.meta.eql(node.style.border, border)) return;
+    node.style.border = border;
+    node.markRenderDirty();
 }
 
 /// Before each frame render: bonus decay + update scrollbar.
@@ -49,37 +62,20 @@ pub fn scrollbarBeforeRender(container: *Node) void {
     const content = ctx.content orelse return;
     const scrollbar = ctx.scrollbar orelse return;
 
-    // Global hook reads rect.
+    ctx.hook_frame = ctx.cx.frame_count;
+    // Extents and the clamp to them belong to the layout phase (the container's layout observer,
+    // mod.zig); refreshing here again is idempotent and covers rects written outside a layout pass.
     const cont_r = container.rectFromWorldOrFallback();
-    const content_r = content.rectFromWorldOrFallback();
-    // Update viewport/content size (only when rect valid, avoid first-frame rect=0 overwriting
-    // mount init).
-    if (cont_r.h > 0) {
-        state.viewport_height = cont_r.h - container.style.padding.vertical();
-    }
-    if (cont_r.w > 0) {
-        state.viewport_width = cont_r.w - container.style.padding.horizontal();
-    }
-    if (!state.external_content_height) {
-        if (content_r.h > 0) state.content_height = content_r.h;
-    }
-    if (!state.external_content_width) {
-        if (content_r.w > 0) state.content_width = content_r.w;
-    }
+    const viewport = content.parent orelse return;
+    state_mod.refreshExtents(state, container, content);
+
+    // Bound offset (scroll_y / scroll_x): apply a source write against this frame's extents,
+    // then report the settled offset once the hook is done with it (offset_binding.zig).
+    offset_binding.applyPending(ctx, cont_r);
+    defer offset_binding.publish(ctx);
 
     // After window resize, maxScroll may shrink or zero -> re-clamp prevent stuck.
-    const max_y = state.maxScrollY();
-    if (state.scroll_y > max_y) {
-        state.scroll_y = max_y;
-        content.style.translate_y = state.contentTranslateY();
-        content.markCompositePropDirty();
-    }
-    const max_x = state.maxScrollX();
-    if (state.scroll_x > max_x) {
-        state.scroll_x = max_x;
-        content.style.translate_x = state.contentTranslateX();
-        content.markCompositePropDirty();
-    }
+    _ = state.clampOffsets(content);
 
     const now_ms = render_engine.current_frame_time_ms;
 
@@ -92,7 +88,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         const old_ty = content.style.translate_y;
         state.tickBonus(now_ms);
         content.style.translate_y = state.contentTranslateY();
-        if (content.style.translate_y != old_ty) content.markInteractionDirty();
+        if (content.style.translate_y != old_ty) content.markHitLayerMotion();
         needs_redraw = true;
     }
 
@@ -100,7 +96,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         const old_tx = content.style.translate_x;
         state.tickBonusX(now_ms);
         content.style.translate_x = state.contentTranslateX();
-        if (content.style.translate_x != old_tx) content.markInteractionDirty();
+        if (content.style.translate_x != old_tx) content.markHitLayerMotion();
         needs_redraw = true;
     }
 
@@ -138,6 +134,33 @@ pub fn scrollbarBeforeRender(container: *Node) void {
     }
     const scrollbar_h = ctx.scrollbar_h orelse return;
 
+    // Track is a non-interactive sibling behind the thumb. Keep fade and theme
+    // resolution on the same frame as the thumb, including during drag. A hidden
+    // track keeps its mount paint (transparent) like a hidden thumb, so a theme
+    // replay that runs this hook on an idle or unlaid-out area leaves the same
+    // paint as a fresh mount.
+    const track_size = ScrollbarVisual.track_thickness;
+    if (ctx.track_v) |track| {
+        const visible = v_visible and (state.scrollbar_hovered or state.scrollbar_dragging);
+        const w: f32 = if (visible) track_size else 0;
+        const h: f32 = if (visible) cont_r.h else 0;
+        // Size lives in the style too (like the thumb): a layout pass in between (drag
+        // scrolls -> relayout) must not reset the track to its mount size every other frame.
+        track.style.width = .{ .px = w };
+        track.style.height = .{ .px = h };
+        if (syncScrollbarFrame(track, cont_r.w - track_size, 0, w, h)) track.markRenderDirty();
+        syncBarBackground(track, if (visible) styles.track(ctx.cx.tokens) else core.Color.TRANSPARENT);
+    }
+    if (ctx.track_h) |track| {
+        const visible = h_visible and (state.scrollbar_hovered_h or state.scrollbar_dragging_h);
+        const h: f32 = if (visible) track_size else 0;
+        const w: f32 = if (visible) cont_r.w else 0;
+        track.style.width = .{ .px = w };
+        track.style.height = .{ .px = h };
+        if (syncScrollbarFrame(track, 0, cont_r.h - track_size, w, h)) track.markRenderDirty();
+        syncBarBackground(track, if (visible) styles.track(ctx.cx.tokens) else core.Color.TRANSPARENT);
+    }
+
     // ---- Vertical scrollbar update ----
     if (!v_visible) {
         const cur = scrollbar.rectFromWorldOrFallback();
@@ -159,21 +182,13 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         // Scrollbar sticky to container edge, minimize content obstruction. Write both rect
         // (immediate this frame) and margin (maintain on layout rerun).
         const bar_x_local = cont_r.w - bar_width - ScrollbarVisual.edge_inset;
-        const bar_y_local = container.style.padding.top + bar_y;
+        const bar_y_local = container.style.contentInsets().top + bar_y;
         const rect_changed = syncScrollbarFrame(scrollbar, bar_x_local, bar_y_local, bar_width, bar_h);
         if (rect_changed) scrollbar.markInteractionDirty();
-        scrollbar.style.border = .{ .radius = bar_width / 2 };
+        syncBarBorder(scrollbar, .{ .radius = bar_width / 2 });
 
-        const base_alpha: f32 = if (state.scrollbar_dragging)
-            ScrollbarVisual.dragging_alpha
-        else if (state.scrollbar_hovered)
-            ScrollbarVisual.hover_alpha
-        else
-            ScrollbarVisual.idle_alpha;
         const fade = std.math.clamp(opacity / @max(state.scrollbar_fade.active_opacity, 0.001), 0.0, 1.0);
-        const alpha: u8 = @intFromFloat(@min(255, base_alpha * fade * 255));
-        const thumb = ctx.scrollbar_thumb;
-        scrollbar.setBackgroundRaw(Color.rgba(thumb.r, thumb.g, thumb.b, alpha));
+        syncBarBackground(scrollbar, styles.thumb(ctx.cx.tokens, active, fade));
     }
 
     // ---- Horizontal scrollbar update ----
@@ -188,7 +203,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         const opacity_h = state.scrollbar_fade_h.opacity;
         const active_h = state.scrollbar_dragging_h or state.scrollbar_hovered_h;
         const bar_height: f32 = if (active_h) ScrollbarVisual.active_thickness else ScrollbarVisual.idle_thickness;
-        const v_clearance: f32 = if (v_visible) ScrollbarVisual.cross_axis_clearance else 0;
+        const v_clearance: f32 = if (v_visible and viewport == container) ScrollbarVisual.cross_axis_clearance else 0;
         const metrics_h = computeHorizontalScrollbarMetrics(state, v_clearance);
         const bar_w = metrics_h.length;
         const bar_x = metrics_h.pos;
@@ -196,22 +211,14 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         scrollbar_h.style.width = .{ .px = bar_w };
         scrollbar_h.style.height = .{ .px = bar_height };
         // Horizontal sticky to bottom edge, reduce obstruction.
-        const bar_x_local = container.style.padding.left + bar_x;
+        const bar_x_local = container.style.contentInsets().left + bar_x;
         const bar_y_local = cont_r.h - bar_height - ScrollbarVisual.edge_inset;
         const rect_changed = syncScrollbarFrame(scrollbar_h, bar_x_local, bar_y_local, bar_w, bar_height);
         if (rect_changed) scrollbar_h.markInteractionDirty();
-        scrollbar_h.style.border = .{ .radius = bar_height / 2 };
+        syncBarBorder(scrollbar_h, .{ .radius = bar_height / 2 });
 
-        const base_alpha_h: f32 = if (state.scrollbar_dragging_h)
-            ScrollbarVisual.dragging_alpha
-        else if (state.scrollbar_hovered_h)
-            ScrollbarVisual.hover_alpha
-        else
-            ScrollbarVisual.idle_alpha;
         const fade_h = std.math.clamp(opacity_h / @max(state.scrollbar_fade_h.active_opacity, 0.001), 0.0, 1.0);
-        const alpha_h: u8 = @intFromFloat(@min(255, base_alpha_h * fade_h * 255));
-        const thumb_h = ctx.scrollbar_thumb;
-        scrollbar_h.setBackgroundRaw(Color.rgba(thumb_h.r, thumb_h.g, thumb_h.b, alpha_h));
+        syncBarBackground(scrollbar_h, styles.thumb(ctx.cx.tokens, active_h, fade_h));
     }
 }
 
@@ -228,13 +235,15 @@ pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
             // Begin drag immediately, don't distinguish thumb/track.
             state.scrollbar_dragging = true;
             state.scrollbar_last_mouse_y = down.y;
+            state.scrollbar_grab_scroll_y = state.scroll_y;
             state.scrollbar_hovered = true;
             state.bonus_y = 0;
             state.bonus_velocity = 0;
             state.onScrollActivity();
             ctx.cx.setPointerCapture(sb);
-            // The capture-scoped lease also keeps the hand outside the thumb.
-            _ = ctx.cx.acquireCursor(sb, .grabbing) catch return .stop;
+            // Capture-scoped lease: keeps the grabbing hand while the pointer leaves the thumb;
+            // released with the capture, which restores the cursor of the target underneath.
+            _ = ctx.cx.acquireCursor(sb, .grabbing) catch {};
             return .stop;
         },
         .mouse_up => {
@@ -247,9 +256,7 @@ pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
         },
         .mouse_move => |move| {
             if (state.scrollbar_dragging) {
-                const dy = move.y - state.scrollbar_last_mouse_y;
-                state.scrollbar_last_mouse_y = move.y;
-                applyScrollbarDrag(state, content, dy);
+                applyScrollbarDrag(state, content, move.y - state.scrollbar_last_mouse_y);
                 return .stop;
             }
             state.scrollbar_hovered = true;
@@ -271,12 +278,13 @@ pub fn scrollbarHEventHandler(event: Event, context: ?*anyopaque) EventResult {
         .mouse_down => |down| {
             state.scrollbar_dragging_h = true;
             state.scrollbar_last_mouse_x = down.x;
+            state.scrollbar_grab_scroll_x = state.scroll_x;
             state.scrollbar_hovered_h = true;
             state.bonus_x = 0;
             state.bonus_velocity_x = 0;
             state.onScrollActivity();
             ctx.cx.setPointerCapture(scrollbar_h);
-            _ = ctx.cx.acquireCursor(scrollbar_h, .grabbing) catch return .stop;
+            _ = ctx.cx.acquireCursor(scrollbar_h, .grabbing) catch {};
             return .stop;
         },
         .mouse_up => {
@@ -289,9 +297,7 @@ pub fn scrollbarHEventHandler(event: Event, context: ?*anyopaque) EventResult {
         },
         .mouse_move => |move| {
             if (state.scrollbar_dragging_h) {
-                const dx = move.x - state.scrollbar_last_mouse_x;
-                state.scrollbar_last_mouse_x = move.x;
-                applyHScrollbarDrag(state, content, dx);
+                applyHScrollbarDrag(state, content, move.x - state.scrollbar_last_mouse_x);
                 return .stop;
             }
             state.scrollbar_hovered_h = true;
@@ -369,27 +375,31 @@ pub fn computeHorizontalScrollbarMetrics(state: *const ScrollState, v_clearance:
 // ========== Drag ==========
 
 /// Mouse pixel delta -> scroll_y delta (track pixels : content pixels ratio conversion).
+/// The thumb stays under the pointer: scroll_y is mapped from the pointer's offset since
+/// the press (absolute, not accumulated per move), so dragging past an end and back
+/// re-engages only when the pointer returns to the grab point, like a native scrollbar.
 fn applyScrollbarDrag(state: *ScrollState, content: *Node, mouse_dy: f32) void {
     const bar_h = state.scrollbarHeight();
     const track_h = state.viewport_height - bar_h - 4;
     if (track_h <= 0) return;
     const max = state.maxScrollY();
-    state.scroll_y = std.math.clamp(state.scroll_y + mouse_dy / track_h * max, 0, max);
+    state.scroll_y = std.math.clamp(state.scrollbar_grab_scroll_y + mouse_dy / track_h * max, 0, max);
     state.input_serial +%= 1;
     state.onScrollActivity();
     content.style.translate_y = state.contentTranslateY();
-    content.markCompositeAnimFrameDirty();
+    content.markHitLayerMotionAnimFrameDirty();
 }
 
 /// Mouse pixel delta -> scroll_x delta (track pixels : content pixels ratio conversion).
+/// Horizontal counterpart of applyScrollbarDrag (grab-anchored).
 fn applyHScrollbarDrag(state: *ScrollState, content: *Node, mouse_dx: f32) void {
     const bar_w = state.hScrollbarWidth();
     const track_w = state.viewport_width - bar_w - 4;
     if (track_w <= 0) return;
     const max = state.maxScrollX();
-    state.scroll_x = std.math.clamp(state.scroll_x + mouse_dx / track_w * max, 0, max);
+    state.scroll_x = std.math.clamp(state.scrollbar_grab_scroll_x + mouse_dx / track_w * max, 0, max);
     state.input_serial +%= 1;
     state.onScrollActivity();
     content.style.translate_x = state.contentTranslateX();
-    content.markCompositeAnimFrameDirty();
+    content.markHitLayerMotionAnimFrameDirty();
 }

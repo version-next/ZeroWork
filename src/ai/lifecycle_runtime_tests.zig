@@ -7,7 +7,7 @@ const journal = @import("lifecycle_journal.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 fn context() host.Context {
-    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 };
+    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 101 }, .content = .{ .session = 101 }, .binding_revision = 1, .grant_revision = 1 };
 }
 fn synchronous(_: *anyopaque, raw: *anyopaque, invoke: *const fn (*anyopaque) anyerror!void, _: ?*@import("provider.zig").CancelToken) !void {
     try invoke(raw);
@@ -53,7 +53,7 @@ const Fixture = struct {
                 }
                 self.last_operation = request.operation;
                 if (self.fail_before_dispatch) try self.owner.dir.?.writeFile(io, .{ .sub_path = self.owner.path, .data = "disk changed before dispatch" });
-                call.result = .{ .group_plan = .{ .id = 77, .token = self, .binding_revision = 2, .notice_revision = 2 } };
+                call.result = .{ .group_plan = .{ .id = 77, .tab = 770, .token = self, .binding_revision = 2, .notice_revision = 2 } };
             },
             .commit_group => {
                 self.publish_count += 1;
@@ -220,7 +220,8 @@ test "lifecycle runtime publishes group only after durable intent and never repu
     try std.testing.expectEqual(@as(usize, 1), fixture.publish_count);
     try std.testing.expectEqual(journal.Stage.committed, owner.store.?.records.items[0].stage);
     // Scope refresh changes binding but cannot create another resource for key.
-    fixture.ctx.binding = .{ .group = 77 };
+    fixture.ctx.binding = .{ .tab = 77 };
+    fixture.ctx.content = .{ .group = 77 };
     fixture.ctx.binding_revision = 2;
     var repeated = try execute(&fixture, "host.create_group", args);
     defer repeated.deinit(a);
@@ -260,7 +261,8 @@ test "lifecycle runtime owned-session dispatch is fenced by the durable exact ha
     const owner = try backend.ProcessJournal.acquire(.{ .data_root = "/test/open-lifecycle", .dir = tmp.dir, .io = io });
     defer owner.release();
     var ctx = context();
-    ctx.binding = .{ .group = 77 };
+    ctx.binding = .{ .tab = 77 };
+    ctx.content = .{ .group = 77 };
     var fixture: Fixture = .{ .owner = owner, .ctx = ctx };
     const args = try std.fmt.allocPrint(a, "{{\"group_ref\":\"g1:{s}:77\",\"source_ref\":\"s1:{s}:101:1\",\"connection_policy\":\"new_only\",\"request_key\":\"open-1\"}}", .{ std.fmt.bytesToHex(ctx.conversation_id.bytes, .lower), std.fmt.bytesToHex(ctx.conversation_id.bytes, .lower) });
     defer a.free(args);
@@ -403,7 +405,8 @@ test "lifecycle runtime accepts saved connection sources without inventing a ses
     const owner = try backend.ProcessJournal.acquire(.{ .data_root = "/test/saved-source-lifecycle", .dir = tmp.dir, .io = io });
     defer owner.release();
     var ctx = context();
-    ctx.binding = .{ .group = 77 };
+    ctx.binding = .{ .tab = 77 };
+    ctx.content = .{ .group = 77 };
     var fixture: Fixture = .{ .owner = owner, .ctx = ctx };
     const args = try std.fmt.allocPrint(a, "{{\"group_ref\":\"g1:{s}:77\",\"source_ref\":\"c1:{s}:9:4\",\"connection_policy\":\"new_only\",\"request_key\":\"saved-1\"}}", .{ std.fmt.bytesToHex(ctx.conversation_id.bytes, .lower), std.fmt.bytesToHex(ctx.conversation_id.bytes, .lower) });
     defer a.free(args);
@@ -438,7 +441,8 @@ fn bootstrapApprovalCase(approve_deployment: bool) !void {
     const owner = try backend.ProcessJournal.acquire(.{ .data_root = if (approve_deployment) "/test/bootstrap-product-allow" else "/test/bootstrap-product-deny", .dir = tmp.dir, .io = io });
     defer owner.release();
     var ctx = context();
-    ctx.binding = .{ .group = 77 };
+    ctx.binding = .{ .tab = 77 };
+    ctx.content = .{ .group = 77 };
     var fixture: Fixture = .{ .owner = owner, .ctx = ctx, .approval_required = true, .bootstrap_required = true };
     defer if (fixture.bootstrap_installed) |prepared| prepared.release();
     var broker: @import("host_approval.zig").Broker = .{};

@@ -1,0 +1,75 @@
+//! 连接失败 / 重试视图（`connection_failure.yix`）的布局与文字。告警、徽标、进度条、按钮都是 zenit 原生默认外观，
+//! 这里只排盒子、文字层级与状态色（颜色只用 token）。尺寸照 Pencil RDiob › Hwswl：内容列宽 560 居中，行距 16。
+const ui = @import("ui");
+
+/// 会话 tab 的内容区：铺满宿主给的窗格，内容列在中间。
+style surface { width: fill; height: fill; direction: column; align-items: center; justify: center; padding: 24 16 24 16; }
+style column { width: fill; max-width: 560; direction: column; gap: 16; }
+style header { width: fill; height: 24; direction: row; align-items: center; gap: 8; }
+recipe HeadIcon {
+  base { width: 18; height: 18; flex-shrink: 0; }
+  variant tone = danger {
+    ok { icon-color: success; }
+    danger { icon-color: danger; }
+    warning { icon-color: warning; }
+    muted { icon-color: fg-secondary; }
+  }
+}
+pub const Tone = HeadIcon.Dim(.tone);
+style name { font-size: 14; font-weight: 600; color: fg-primary; }
+style name_box { flex-shrink: 0; max-width: 220; }
+style endpoint { font-size: 12; color: fg-secondary; use-monospace-font: true; }
+style endpoint_box { flex-shrink: 1; min-width: 0; }
+style title { font-size: 20; font-weight: 700; line-height: 1.3; color: fg-primary; wrap: word; }
+style fill_box { width: fill; }
+style grow_box { width: grow; min-width: 0; }
+style fixed_box { flex-shrink: 0; }
+style retry { width: fill; direction: column; gap: 8; }
+style note_row { width: fill; direction: row; align-items: center; gap: 8; }
+style note_icon { width: 14; height: 14; flex-shrink: 0; icon-color: fg-secondary; }
+style note { font-size: 12; color: fg-secondary; wrap: word; }
+style bar { width: fill; }
+style keys { width: fill; direction: column; gap: 8; }
+style key_block { width: fill; direction: column; gap: 4; padding: 10 12 10 12; background: bg-secondary; corner-radius: 8; }
+style key_title { font-size: 12; font-weight: 500; color: fg-secondary; }
+style key_value { font-size: 12; color: fg-primary; use-monospace-font: true; selectable: true; wrap: word; }
+style key_value_changed { font-size: 12; color: danger; use-monospace-font: true; selectable: true; wrap: word; }
+style route { width: fill; direction: column; gap: 10; }
+style route_label { font-size: 12; font-weight: 600; color: fg-secondary; }
+style hop_row { width: fill; direction: row; align-items: center; gap: 10; }
+recipe Marker {
+  base { width: 22; height: 22; corner-radius: 11; align-items: center; justify: center; flex-shrink: 0; }
+  variant tone = muted {
+    ok { background: success-subtle; }
+    danger { background: danger-subtle; }
+    warning { background: warning-subtle; }
+    muted { background: bg-secondary; }
+  }
+}
+pub const MarkerTone = Marker.Dim(.tone);
+recipe MarkerIcon {
+  base { width: 12; height: 12; }
+  variant tone = muted {
+    ok { icon-color: success; }
+    danger { icon-color: danger; }
+    warning { icon-color: warning; }
+    muted { icon-color: fg-secondary; }
+  }
+}
+pub const MarkerIconTone = MarkerIcon.Dim(.tone);
+style hop_text { width: grow; min-width: 0; direction: column; gap: 2; }
+style hop_name { font-size: 13; color: fg-primary; }
+style hop_address { font-size: 11; color: fg-secondary; use-monospace-font: true; }
+recipe HopStatus {
+  base { font-size: 12; text-align: end; }
+  variant tone = muted {
+    ok { color: success; }
+    danger { color: danger; }
+    warning { color: warning; }
+    muted { color: fg-secondary; }
+  }
+}
+pub const HopStatusTone = HopStatus.Dim(.tone);
+style logs { width: fill; direction: column; gap: 2; padding: 10 12 10 12; background: bg-secondary; corner-radius: 8; }
+style log_line { font-size: 11; line-height: 1.5; color: fg-secondary; use-monospace-font: true; selectable: true; wrap: word; }
+style actions { width: fill; direction: row; align-items: center; gap: 8; padding: 4 0 0 0; }

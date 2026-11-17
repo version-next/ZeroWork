@@ -1,0 +1,248 @@
+//! 会话记录卡片 `history`（PLUGIN_ARCH_PLAN 2.5.4、5.2 PL4b；设计稿 Pencil「ZW · 会话记录卡片补稿
+//! 2026-11-13（PL4b）」稿 A / B / C）：一张完整卡片，左列表、右详情。全部是 zenit 原生组件，默认外观。
+//!
+//! - 卡片框与头部按放置不同：**浮动**时由通用浮动层的统一窗口外观提供（`shared/ui/float_card/float_chrome`：
+//!   原生 `W.Card` floating、`history.float.drag` 把手、头部图标 / “会话记录” / 条数副标题，以及按卡片类型声明生成的
+//!   “作为标签页打开 · 放大 · 关闭”），这里只出内容（`HistoryCard`）；**作为 tab** 时是 `TabFrame`：原生 `W.Card`
+//!   （`default`，`fill` 铺满）+ 共享 `PanelHeader`（图标、“会话记录”、“N 条”，不带关闭——关闭归页签）+ 原生 `W.Divider`，内容挂进它的插槽。
+//!   同一个内容节点在两种放置之间搬动（宿主负责），筛选、滚动、选中与回放都保留。
+//! - 列表栏（宽 320）：原生 `W.Input` 搜索；来源筛选“全部 / SSH / 本地”三颗原生 `W.Button`（选中用
+//!   `secondary`，其余 `ghost`）与清空；原生 `W.ScrollArea` 里逐条记录：标题与日期、用户@地址 · 时长、
+//!   状态（原生 `W.Tag`）、查看 / 导出 / 删除（原生 ghost 图标按钮，删除与清空直接执行并弹带“撤销”的原生 Toast，`shared/ui/confirm` 的 `undoable`）；
+//!   翻页；消息与“重新读取”。
+//! - 列表栏与详情区之间是竖向原生 `W.Divider`。
+//! - 详情区：选中记录的标题、元信息与状态，下面是只读回放表面（终端视图的归档模式，带回放条
+//!   `terminal.history.*`）——它是终端表面，由宿主放进插槽（YIX_EXCEPTIONS 的终端表面类例外）；
+//!   未选中时是空态，加载时是原生 `W.Spinner`。
+//! - Esc：卡片根的捕获阶段（输入框自己会吃掉 Esc）——先关删除确认，再取消加载，浮动卡片最后关闭；
+//!   焦点在回放表面里时 Esc 归终端（关搜索等），不关卡片（与原归档 tab 相同）。
+//! - 宽度不足 600 时列表与详情二选一，详情头左侧“返回”（`history.back`）。
+//! 状态全在 `model/card_vm.zig`（列表 `list_vm.zig`、详情 `detail_vm.zig`）；这里只读它、把交互交给它。
+const ui = @import("ui");
+/// 浮层规则的唯一来源（OverlayHost `panel`）：确认弹层的焦点进入、Tab 圈住、Esc / 点外部、焦点归还。
+const O = @import("../../../shared/ui/overlay/overlay_host.zig");
+const W = ui.widgets;
+const m = @import("../model/view_model.zig");
+const list = @import("../list/model/view_model.zig");
+const detail = @import("../detail/model/view_model.zig");
+const ids = @import("../model/ids.zig");
+const S = @import("history_card.yss");
+const P = @import("../../../shared/ui/components/panel_header/panel_header.yix");
+
+/// 宿主拿节点：内容根、回放表面插槽。
+pub const Slots = struct {
+    root: ?*ui.Node = null,
+    surface: ?*ui.Node = null,
+    /// 列表视口（宿主读它的高度，键盘移动时把焦点行滚进视口）。
+    viewport: ?*ui.Node = null,
+};
+fn keep(slots: *Slots, root: *ui.view.Ref(*ui.Node), surface: *ui.view.Ref(*ui.Node)) void {
+    slots.root = root.get();
+    slots.surface = surface.get();
+}
+
+/// 作为 tab 时的卡片框：卡片根（`history.panel`）与内容插槽。
+pub const TabSlots = struct {
+    root: ?*ui.Node = null,
+    content: ?*ui.Node = null,
+};
+fn keepTab(slots: *TabSlots, root: *ui.view.Ref(*ui.Node), content: *ui.view.Ref(*ui.Node)) void {
+    slots.root = root.get();
+    slots.content = content.get();
+}
+fn filterVariant(on: bool) W.ButtonVariant {
+    return if (on) .secondary else .ghost;
+}
+fn tagColor(tone: list.Tone) W.TagColor {
+    return switch (tone) {
+        .neutral => .neutral,
+        .warning => .warning,
+        .danger => .danger,
+    };
+}
+fn viewDisabled(vm: *m.CardVm, row: list.Row) bool {
+    return !row.can_open or vm.list.actionsDisabled();
+}
+/// 打开确认的按钮在自己的确认打开期间保持可用：确认关闭时焦点要回到它（OverlayHost `panel`）。
+fn deleteDisabled(vm: *m.CardVm, _: list.Row) bool {
+    return vm.list.actionsDisabled();
+}
+fn clearDisabled(vm: *m.CardVm) bool {
+    return vm.list.clearDisabled();
+}
+fn exportDisabled(vm: *m.CardVm, row: list.Row) bool {
+    return !row.can_export or vm.list.actionsDisabled();
+}
+fn submitQuery(vm: *m.CardVm, _: []const u8) void {
+    vm.list.submit();
+}
+/// 卡片根的捕获阶段按键（输入框自己会吃掉 Esc 与方向键）：焦点在回放表面里时一律交给终端。
+/// Esc：先关删除确认，再取消加载，浮动卡片最后关闭；↑ / ↓：在本页的“查看”之间移动焦点。
+fn onCardKey(vm: *m.CardVm, e: anytype) void {
+    if (vm.replayFocused()) return;
+    if (e.key == .escape and vm.escape()) return e.stop();
+    if ((e.key == .down or e.key == .up) and vm.listShown() and vm.list.moveCursor(e.key == .down)) e.stop();
+}
+fn cardFocus(vm: *m.CardVm) ui.view.FocusRequest {
+    const seq = vm.focusSeq();
+    return if (seq == 0) .{} else .{ .id = vm.focusTarget(), .seq = seq };
+}
+fn listFocus(vm: *m.CardVm) ui.view.FocusRequest {
+    const seq = vm.list.focusSeq();
+    return if (seq == 0) .{} else .{ .id = vm.list.focusTarget(), .seq = seq };
+}
+fn phaseIs(vm: *m.CardVm, phase: detail.Phase) bool {
+    return vm.detail.currentPhase() == phase;
+}
+
+/// 作为 tab 打开时的卡片框（浮动时的框与头部由统一窗口外观提供，不用这个）。
+pub fn TabFrame(vm: *m.CardVm, slots: *TabSlots) View {
+    const root = ref();
+    const content = ref();
+    onMount(keepTab(slots, root, content));
+    return (
+        <col ref={root} testId={ids.panel} style={S.root}>
+            <W.Card variant={.default} padded={false} fill={true}>
+                <P.PanelHeader icon={ui.icons.history} title="会话记录" subtitle={vm.list.countText()} headerTestId="history.header" subtitleTestId={ids.count} closable={false} />
+                <W.Divider spacing={.none} />
+                <box ref={content} style={S.root} />
+            </W.Card>
+        </col>
+    );
+}
+
+/// 卡片内容（列表 + 详情）：浮动时挂进统一窗口外观的内容区，作为 tab 时挂进 `TabFrame`。
+pub fn HistoryCard(vm: *m.CardVm, slots: *Slots) View {
+    const root = ref();
+    const surface = ref();
+    onMount(keep(slots, root, surface));
+    return (
+        <col ref={root} style={S.root} focusRequest={cardFocus(vm)} focusable={true} focusRing={false} onKeyDownCapture={|e| onCardKey(vm, e)}>
+            <row style={S.body}>
+                <col testId={ids.list} style={S.List.of(.{ .alone = !vm.detailShown() })} visible={vm.listShown()} focusRequest={listFocus(vm)}>
+                    <ListColumn vm={vm} slots={slots} />
+                </col>
+                <box style={S.vertical_divider} visible={vm.dividerShown()}>
+                    <W.Divider orientation={.vertical} spacing={.none} />
+                </box>
+                <col testId={ids.detail} style={S.detail} visible={vm.detailShown()}>
+                    <row style={S.detail_header} visible={phaseIs(vm, .ready)}>
+                        <box style={S.header_action} visible={vm.backShown()}>
+                            <W.Button testId={ids.back} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.chevron_left} iconSize={14} a11yLabel="返回记录列表" onClick={vm.back()} />
+                        </box>
+                        <text style={S.detail_title}>{vm.detail.recordTitle()}</text>
+                        <text style={S.detail_meta}>{vm.detail.recordMeta()}</text>
+                        <W.Tag label={vm.detail.stateLabel()} color={tagColor(vm.detail.stateTone())} size={.sm} />
+                    </row>
+                    <box style={S.horizontal_divider} visible={phaseIs(vm, .ready)}>
+                        <W.Divider spacing={.none} />
+                    </box>
+                    <box ref={surface} style={S.surface} visible={phaseIs(vm, .ready)} />
+                    <col testId={ids.detail_loading} style={S.placeholder} visible={phaseIs(vm, .loading)}>
+                        <W.Spinner size={20} />
+                        <text style={S.placeholder_hint}>正在加载记录… 按 Esc 可取消</text>
+                    </col>
+                    <col testId={ids.detail_empty} style={S.placeholder} visible={phaseIs(vm, .empty)}>
+                        <W.Empty icon={ui.icons.history} title={emptyTitle(vm)} description={emptyHint(vm)} />
+                    </col>
+                </col>
+            </row>
+        </col>
+    );
+}
+
+fn emptyTitle(vm: *m.CardVm) []const u8 {
+    return if (vm.list.records().len == 0) "没有可回看的记录" else "选择一条记录查看回放";
+}
+fn emptyHint(vm: *m.CardVm) []const u8 {
+    return if (vm.list.records().len == 0) "会话结束后，记录会出现在左侧列表。" else "点左侧记录的“查看”，回放显示在这里。";
+}
+
+fn keepViewport(slots: *Slots, viewport: *ui.view.Ref(*ui.Node)) void {
+    slots.viewport = viewport.get();
+}
+
+fn ListColumn(vm: *m.CardVm, slots: *Slots) View {
+    const viewport = ref();
+    onMount(keepViewport(slots, viewport));
+    return (
+        <col style={S.list_body}>
+            <W.Input testId={ids.query} value={vm.list.query()} placeholder="搜索主机、用户或地址" leadingIconAsset={ui.icons.search} size={.sm} focusId={ids.focus_search} onChange={|q| vm.list.setQuery(q)} onSubmit={|q| submitQuery(vm, q)} parts={.{ .input_container = ids.search }} />
+            <row style={S.filters}>
+                <W.Button testId={ids.filter_all} label="全部" variant={filterVariant(vm.list.typeFilter() == .all)} size={.sm} onClick={vm.list.setFilter(.all)} />
+                <W.Button testId={ids.filter_ssh} label="SSH" variant={filterVariant(vm.list.typeFilter() == .ssh)} size={.sm} onClick={vm.list.setFilter(.ssh)} />
+                <W.Button testId={ids.filter_local} label="本地" variant={filterVariant(vm.list.typeFilter() == .local)} size={.sm} onClick={vm.list.setFilter(.local)} />
+                <spacer />
+                <box style={S.anchor}>
+                    <W.Tooltip text="清空历史列表（可撤销）" position={.bottom} parts={.{ .content = ids.clear_tooltip }}>
+                        <W.Button testId={ids.clear} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.list_x} iconSize={16} a11yLabel="清空历史列表" disabled={clearDisabled(vm)} onClick={vm.list.requestClear()} />
+                    </W.Tooltip>
+                </box>
+            </row>
+            <box ref={viewport} style={S.viewport}>
+            <W.ScrollArea direction={.vertical} testId={ids.viewport} style={S.scroll} scrollY={vm.list.scrollOffset()} onScrollYChange={|y| vm.list.scrolled(y)} parts={.{ .content = .{ .style = S.rows } }}>
+                {for (vm.list.records()) |row| <Record vm={vm} row={row} /> else <Empty vm={vm} />}
+            </W.ScrollArea>
+            </box>
+            <row style={S.paging} visible={vm.list.pagingShown()}>
+                <W.Tooltip text="上一批历史记录" position={.top} parts={.{ .content = ids.previous_tooltip }}>
+                    <W.Button testId={ids.previous} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.chevron_left} iconSize={16} a11yLabel="上一批历史记录" disabled={vm.list.previousDisabled()} onClick={vm.list.previousPage()} />
+                </W.Tooltip>
+                <W.Tooltip text="下一批历史记录" position={.top} parts={.{ .content = ids.next_tooltip }}>
+                    <W.Button testId={ids.next} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.chevron_right} iconSize={16} a11yLabel="下一批历史记录" disabled={vm.list.nextDisabled()} onClick={vm.list.nextPage()} />
+                </W.Tooltip>
+            </row>
+            <box style={S.message_row} visible={vm.list.messageShown()}>
+                <text testId={ids.message} style={S.Message.of(.{ .warning = vm.list.warning() })}>{vm.list.message()}</text>
+            </box>
+            <box style={S.retry} visible={vm.list.retryShown()}>
+                <W.Button testId={ids.retry} label="重新读取" variant={.secondary} size={.sm} onClick={vm.list.retry()} />
+            </box>
+        </col>
+    );
+}
+
+fn Empty(vm: *m.CardVm) View {
+    return (
+        <col testId={ids.empty} style={S.empty}>
+            <W.Empty icon={ui.icons.history} title={vm.list.emptyTitle()} description={vm.list.emptyHint()} descriptionTestId={ids.empty_detail} />
+        </col>
+    );
+}
+
+fn Record(vm: *m.CardVm, row: list.Row) View {
+    return (
+        <row testId={ids.record} style={S.Record.of(.{ .selected = row.selected })}>
+            <icon style={S.record_icon} src={ui.icons.history} />
+            <col style={S.record_main}>
+                <row style={S.record_meta}>
+                    <box style={S.grow}>
+                        <W.Tooltip text={row.title} position={.bottom} wrap={.char} width={360} fill={true} parts={.{ .content = ids.record_title_tooltip }}>
+                            <text testId={ids.record_title} style={S.record_title} box={S.text_box}>{row.title}</text>
+                        </W.Tooltip>
+                    </box>
+                    <text style={S.record_date}>{row.date}</text>
+                </row>
+                <row style={S.record_tail}>
+                    <box style={S.grow}>
+                        <W.Tooltip text={row.detail} position={.bottom} wrap={.char} width={360} fill={true} parts={.{ .content = ids.record_detail_tooltip }}>
+                            <text testId={ids.record_detail} style={S.record_detail} box={S.text_box}>{row.detail}</text>
+                        </W.Tooltip>
+                    </box>
+                    <W.Tag testId={ids.record_state} label={row.state} color={tagColor(row.tone)} size={.sm} />
+                    <W.Tooltip text={row.view_hint} position={.bottom} parts={.{ .content = ids.record_view_tooltip }}>
+                        <W.Button testId={ids.record_view} focusId={ids.rowFocus(row.position)} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.eye} iconSize={14} a11yLabel="查看历史会话" disabled={viewDisabled(vm, row)} onClick={vm.list.view(row.id)} />
+                    </W.Tooltip>
+                    <W.Tooltip text={row.export_hint} position={.bottom} parts={.{ .content = ids.record_export_tooltip }}>
+                        <W.Button testId={ids.record_export} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.download} iconSize={14} a11yLabel={row.export_label} disabled={exportDisabled(vm, row)} onClick={vm.list.exportRecord(row.id)} />
+                    </W.Tooltip>
+                    <box style={S.anchor}>
+                        <W.Tooltip text="删除会话记录" position={.bottom} parts={.{ .content = ids.record_delete_tooltip }}>
+                            <W.Button testId={ids.record_delete} variant={.ghost} size={.sm} iconOnly={true} iconAsset={ui.icons.trash_2} iconSize={14} a11yLabel="删除会话记录" disabled={deleteDisabled(vm, row)} onClick={vm.list.requestRowDelete(row.id)} />
+                        </W.Tooltip>
+                    </box>
+                </row>
+            </col>
+        </row>
+    );
+}

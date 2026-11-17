@@ -14,8 +14,8 @@ pub const FontStyle = @import("types.zig").FontStyle;
 pub const font_catalog = @import("font_catalog.zig");
 pub const FontCatalog = font_catalog.FontCatalog;
 
-// Backend selection: CoreText on macOS, FreeType elsewhere
-pub const Backend = switch (builtin.target.os.tag) {
+// Native font backends, plus an injected-measurement-only freestanding closure.
+pub const Backend = if (builtin.target.cpu.arch.isWasm()) @import("freestanding/font_system.zig") else switch (builtin.target.os.tag) {
     .macos => @import("coretext/font_system.zig"),
     .windows => @import("windows/font_system.zig"),
     else => @import("freetype/font_system.zig"),

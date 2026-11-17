@@ -14,6 +14,11 @@ import time
 import traceback
 import paramiko
 import shared_forward as shared
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 
 class Files(paramiko.SFTPServerInterface):
@@ -149,6 +154,7 @@ def main():
     parser.add_argument('--runner', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     peer = shared.Peer()

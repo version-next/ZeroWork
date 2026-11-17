@@ -1,9 +1,13 @@
 /** Real native transcript: preserve channel switches, tool slots and history. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdir,mkdtemp,open,readFile,writeFile,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/private/tmp/zw-ordered-timeline-build');
 const out=resolve(process.argv[2]??'/private/tmp/zw-ordered-timeline-evidence');await mkdir(out,{recursive:true});
 const iso=await mkdtemp('/private/tmp/zw-ordered-timeline-'),data=join(iso,'data'),rpc=join(iso,'rpc');for(const p of[data,rpc])await mkdir(p);
@@ -13,7 +17,7 @@ let held:any=null,failed:string|null=null;
 const payload=(s:string)=>{const envelope=JSON.parse(s);for(const block of envelope.content??[])try{return JSON.parse(block.text)}catch{}return envelope;};
 const server=createServer(async(req,res)=>{try{
  if(req.method!=='POST')return res.end('{"data":[{"id":"timeline-fixture"}]}');
- let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
  res.writeHead(200,{'content-type':'text/event-stream'});
  if(body.messages.findLast((m:any)=>m.role==='user')?.content==='SECOND_TURN')return res.end(frame({content:'SECOND_MESSAGE'})+'data: [DONE]\n\n');
  const results=new Map(body.messages.filter((m:any)=>m.role==='tool').map((m:any)=>[m.tool_call_id,payload(m.content)]));
@@ -24,32 +28,37 @@ const server=createServer(async(req,res)=>{try{
  if(!results.has('timeline-session')){thinking(3);message(3);return tool('timeline-session','host.get_session',{session_ref:(results.get('timeline-context')as any).binding_ref});}
  thinking(4);message(4);thinking(5);message(5);held=res;
 }catch(error){failed=String(error);res.end(frame({content:'FIXTURE_ERROR'})+'data: [DONE]\n\n');}});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
-await writeFile(join(data,'config.toml'),`[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_size=14\n[ai]\ndefault_provider="timeline-fixture"\npermission_mode="confirm"\n[[ai.providers]]\nid="timeline-fixture"\nkind="openai_compat"\nendpoint="http://127.0.0.1:${(server.address()as any).port}/v1/chat/completions"\nenabled=true\n[[ai.providers.models]]\nname="timeline-fixture"\ncontext_window=200000\ndefault=true\nreasoning=true\n`);
+await writeFile(join(data,'config.toml'),`[meta]\nconfig_revision=1\n[ui]\ntheme="dark"\nfont_size=14\n[ai]\ndefault_provider="timeline-fixture"\npermission_mode="confirm"\nstep_display="expanded"\n[[ai.providers]]\nid="timeline-fixture"\nkind="openai_compat"\nendpoint="http://127.0.0.1:${(server.address()as any).port}/v1/chat/completions"\nenabled=true\n[[ai.providers.models]]\nname="timeline-fixture"\ncontext_window=200000\ndefault=true\nreasoning=true\n`);
 process.env.ZENIT_E2E_FILE_RPC_DIR=rpc;const h=await import(join(prefix,'share/zenit/harness/client.ts'));
 const log=await open(join(out,'app.log'),'w');const app=spawn(join(prefix,'bin/zerowork'),[],{env:{...process.env,ZENIT_E2E_FILE_RPC_DIR:rpc,ZEROWORK_DATA_DIR:data,ZEROWORK_AUTOCONNECT:'0',ZENIT_E2E_BACKGROUND:'1',ZENIT_E2E_ISOLATE_POINTER:'1'},stdio:['ignore',log.fd,log.fd]});
 const flat=(n:any):any[]=>Array.isArray(n)?n.flatMap(flat):n?[n,...(n.children??[]).flatMap(flat)]:[];
 const text=(n:any)=>flat(n).map(n=>n.text??'').join(' ');
 const shown=(n:any)=>n&&n.visible!==false&&!n.hidden&&n.rect?.w>0&&n.rect?.h>0;
 const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??null,15000);
-const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)).ok)};
-const timeline=async()=>{const root=(await h.query('ai.conversation'))[0];assert(root,'conversation root');return(root.children??[]).flatMap((n:any)=>{
+// The floating launcher fades in after the tab mounts; retry until it is hit-testable (same as ai_v3_native).
+const click=async(id:string)=>{await visible(id);await h.waitFor(async()=>(await h.clickTestId(id)).ok||null,12000)};
+// Steps now live in ai.timeline > ai.step_group > ai.step_group.content (step_groups.zig); walk the tree in
+// document order and stop at the first recognised item (expanded step display keeps every step visible).
+const timeline=async()=>{const root=(await h.query('ai.conversation'))[0];assert(root,'conversation root');const walk=(n:any):any[]=>{
+ if(n.hidden||n.visible===false)return[];
  if(n.test_id==='ai.thinking')return[{kind:'thinking',label:text(n).match(/THOUGHT\d+/)?.[0],rect:n.rect}];
  if(n.test_id==='ai.message.assistant')return[{kind:'message',label:text(n).match(/MESSAGE\d+|SECOND_MESSAGE/)?.[0],rect:n.rect}];
- if(n.test_id==='ai.step.tool'||flat(n).some((c:any)=>c.test_id==='ai.tool.result.title'))return[{kind:'tool',label:'TOOL',rect:n.rect}];
- return[];
-});};
+ if(n.test_id==='ai.step.tool'||n.test_id==='ai.step'||flat(n.children??[]).some((c:any)=>c.test_id==='ai.tool.result.title')&&!flat(n.children??[]).some((c:any)=>['ai.thinking','ai.message.assistant','ai.step_group'].includes(c.test_id)))return[{kind:'tool',label:'TOOL',rect:n.rect}];
+ return(n.children??[]).flatMap(walk);
+};return(root.children??[]).flatMap(walk);};
 const labels=(items:any[])=>items.map(n=>n.label);
 const send=async(value:string)=>{await click('ai.prompt');await h.type_(value);await click('ai.send')};
 const report:any={status:'running',checks:[]};
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1440,1000);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');await click('ai.maximize');await send('按实际时间顺序输出每个步骤。');
+ await h.waitForServerReady(60000);await h.resizeWindow(1440,1000);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());await click('ai.maximize');await send('按实际时间顺序输出每个步骤。');
  const expected=['THOUGHT1','MESSAGE1','THOUGHT2','MESSAGE2','TOOL','THOUGHT3','MESSAGE3','TOOL','THOUGHT4','MESSAGE4','THOUGHT5','MESSAGE5'];
  await h.waitFor(async()=>held&&labels(await timeline()).includes('MESSAGE5')||null,20000);assert.equal(failed,null);
  let items=await timeline();assert.deepEqual(labels(items),expected);
  const firstThinking=items[0].rect;await h.clickAt(firstThinking.x+80,firstThinking.y+16);
- await h.waitFor(async()=>(await timeline())[0].rect.h>32||null,5000);
- let independent=await timeline();assert.equal(independent[2].rect.h,32,'another thinking segment stays collapsed');
- await h.clickAt(firstThinking.x+80,firstThinking.y+16);await h.waitFor(async()=>(await timeline())[0].rect.h===32||null,5000);items=await timeline();
+ const collapsedStep=24; // a collapsed step inside a step group is its 24px ai.step.header row (was a 32px standalone card)
+ await h.waitFor(async()=>(await timeline())[0].rect.h>collapsedStep||null,5000);
+ let independent=await timeline();assert.equal(independent[2].rect.h,collapsedStep,'another thinking segment stays collapsed');
+ await h.clickAt(firstThinking.x+80,firstThinking.y+16);await h.waitFor(async()=>(await timeline())[0].rect.h===collapsedStep||null,5000);items=await timeline();
 
  for(let i=1;i<items.length;i++)assert(items[i].rect.y>=items[i-1].rect.y+items[i-1].rect.h-.5,'native layout follows event order');
  const before=JSON.stringify(items.slice(0,-1));held.write(frame({content:' · tail stays in MESSAGE5'}));await h.waitFor(async()=>text(await h.query('ai.conversation')).includes('tail stays')||null,5000);items=await timeline();assert.deepEqual(labels(items),expected);assert.equal(JSON.stringify(items.slice(0,-1)),before,'earlier cards keep content and layout');

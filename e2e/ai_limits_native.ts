@@ -1,10 +1,14 @@
 /** Production assistant: 568 successful calls, over 512 history messages, no output cap, and durable completion. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdir, mkdtemp, writeFile, readFile, open, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? '/private/tmp/zw-ai-limits-build');
 const out = resolve(process.argv[2] ?? '/private/tmp/zw-ai-limits-evidence');
 await mkdir(out, { recursive: true });
@@ -20,8 +24,7 @@ const requests: any[] = [];
 const server = createServer(async (req, res) => {
   try {
     if (req.method !== 'POST') return res.end('{"data":[{"id":"steer-fixture"}]}');
-    let raw = ''; for await (const part of req) raw += part;
-    const body = JSON.parse(raw); requests.push(body);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res); requests.push(body);
     res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
     const call = (id: string, index: number) => ({ index, id, type: 'function', function: { name: wire('host.get_current_context'), arguments: '{}' } });
     if (requests.length === 1) {
@@ -58,7 +61,7 @@ const capture = async (name: string) => { assert((await h.screenshot(join(out, n
 const report: any = { status: 'running', checks: [] };
 try {
   await h.waitForServerReady(60000); await h.resizeWindow(1440, 1000);
-  await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+  await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
   await send('FIRST_TASK 检查当前会话');
   await h.waitFor(async () => held || null, 20000);
   await h.waitFor(async () => (await h.query('ai.step_group.header')).length === 1 || null, 10000);
@@ -72,7 +75,11 @@ try {
   assert.equal((await h.query('ai.followup.pending')).length, 0);
   assert(groups[0].rect.y + groups[0].rect.h <= bubble.rect.y, 'old group precedes the input');
   assert(bubble.rect.y + bubble.rect.h <= groups[1].rect.y, 'new group follows the input');
-  assert.equal(groups[0].rect.h, 32); assert.equal(groups[1].rect.h, 32);
+  // 步骤分组头是原生 W.Disclosure 的触发行（ai_step_group_view.zig trigger_test_id = ai.step_group.header），
+  // 高度取 zenit 默认：vendor/zenit/src/ui/components/disclosure/styles.yss `Trigger { height: 28 }`（旧手搓分组头 32 已随 143c4c7b 换成原生组件）。
+  const triggerHeight = 28;
+  assert.equal(groups[0].rect.h, triggerHeight); assert.equal(groups[1].rect.h, triggerHeight);
+  assert.equal(groups[0].rect.x, groups[1].rect.x, 'both step groups share one left edge'); assert.equal(groups[0].rect.w, groups[1].rect.w, 'both step groups share one width');
   assert(!text(await h.query('ai.step_group.summary')).includes('失败'), 'skipped old plan does not fail its group');
   assert.equal((await h.query('ai.recovery')).length, 0);
   assert.equal(requests.length, 20, 'production runtime passes the former 16-round limit');
@@ -97,7 +104,7 @@ try {
   await h.waitFor(async () => !(await h.query('ai.stop')).some(shown) || null, 10000);
   assert.equal((await h.query('ai.followup.consumed')).length, 1);
   assert.equal((await h.query('ai.recovery')).length, 0);
-  const journal = (await readFile(join(data, 'ai-sessions.jsonl'), 'utf8')).trim().split('\n').map(s => JSON.parse(s));
+  const journal = (await readFile(join(data, 'ai-sessions.v4.jsonl'), 'utf8')).trim().split('\n').map(s => JSON.parse(s));
   const consumed = journal.filter((e: any) => e.receipt?.delivery === 'consumed').map((e: any) => e.receipt);
   assert.equal(consumed.length, 2); assert.equal(consumed[0].turn, consumed[1].turn);
   await capture('03-completed'); report.status = 'passed';

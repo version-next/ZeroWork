@@ -35,6 +35,10 @@ const FaceKey = struct {
     size_q: u32,
     weight: u16,
     italic: bool,
+    /// face was created with an exact numeric weight (see setExactWeight). Part of the key so a
+    /// toggle never hands out a face built under the other mode, and old faces stay valid for
+    /// borrowers (no eviction).
+    exact: bool = false,
 };
 
 const FaceCtx = struct {
@@ -44,17 +48,21 @@ const FaceCtx = struct {
         h.update(std.mem.asBytes(&k.size_q));
         h.update(std.mem.asBytes(&k.weight));
         h.update(std.mem.asBytes(&k.italic));
+        h.update(std.mem.asBytes(&k.exact));
         return h.final();
     }
     pub fn eql(_: FaceCtx, a: FaceKey, b: FaceKey) bool {
         return a.family == b.family and a.size_q == b.size_q and
-            a.weight == b.weight and a.italic == b.italic;
+            a.weight == b.weight and a.italic == b.italic and a.exact == b.exact;
     }
 };
 
 const Entry = struct {
     name: [NAME_CAP]u8 = @as([NAME_CAP]u8, @splat(0)),
     len: u8 = 0,
+    /// opt-in per family (setExactWeight): resolve passes the numeric weight through as
+    /// FontDescriptor.numeric_weight instead of only the 9-tier mapping.
+    exact_weight: bool = false,
     pub fn slice(self: *const Entry) []const u8 {
         return self.name[0..self.len];
     }
@@ -103,6 +111,23 @@ pub const FontRegistry = struct {
         return @fromBackingInt(@intCast(self.entries.items.len));
     }
 
+    /// Opt a family into exact numeric weights (default off). When enabled, `resolve` asks the
+    /// font system for the exact weight (e.g. 450 pins a variable font's 'wght' axis to 450;
+    /// non-variable families fall back to the nearest tier face). Faces already handed out stay
+    /// valid; the next resolve under the new mode creates/reuses a separate cache entry.
+    /// No-op for `.default` and unknown ids.
+    pub fn setExactWeight(self: *FontRegistry, family: FamilyId, enabled: bool) void {
+        const raw = @backingInt(family);
+        if (raw == 0 or raw > self.entries.items.len) return;
+        self.entries.items[raw - 1].exact_weight = enabled;
+    }
+
+    pub fn exactWeight(self: *const FontRegistry, family: FamilyId) bool {
+        const raw = @backingInt(family);
+        if (raw == 0 or raw > self.entries.items.len) return false;
+        return self.entries.items[raw - 1].exact_weight;
+    }
+
     pub fn nameOf(self: *const FontRegistry, id: FamilyId) ?[]const u8 {
         const raw = @backingInt(id);
         if (raw == 0 or raw > self.entries.items.len) return null;
@@ -122,12 +147,14 @@ pub const FontRegistry = struct {
         if (family == .default) return null;
         const fs = self.font_system orelse return null;
         const name = self.nameOf(family) orelse return null;
+        const exact = self.exactWeight(family);
 
         const key = FaceKey{
             .family = @backingInt(family),
             .size_q = @intFromFloat(@round(@max(1.0, size) * 4.0)),
             .weight = weight,
             .italic = italic,
+            .exact = exact,
         };
         if (self.faces.get(key)) |f| return f;
 
@@ -135,7 +162,7 @@ pub const FontRegistry = struct {
             .family = name,
             .size = size,
             .weight = mapWeight(weight),
-            .numeric_weight = weight,
+            .numeric_weight = if (exact) weight else null,
             .style = if (italic) .italic else .normal,
         };
         const font = fs.findFont(desc) catch return null;
@@ -188,4 +215,100 @@ test "没装 FontSystem 时 resolve 安全返回 null" {
     const id = try r.intern("Zapfino");
     try std.testing.expect(r.resolve(id, 16, 400, false) == null);
     try std.testing.expect(r.resolve(.default, 16, 400, false) == null);
+}
+
+test "setExactWeight: 默认关闭，按族开关，default/越界 id 为 no-op" {
+    var r = FontRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const a = try r.intern("Menlo");
+    const b = try r.intern("Courier");
+    try std.testing.expect(!r.exactWeight(a));
+    r.setExactWeight(a, true);
+    try std.testing.expect(r.exactWeight(a));
+    try std.testing.expect(!r.exactWeight(b));
+    r.setExactWeight(.default, true);
+    r.setExactWeight(@fromBackingInt(@intCast(999)), true);
+    try std.testing.expect(!r.exactWeight(.default));
+    r.setExactWeight(a, false);
+    try std.testing.expect(!r.exactWeight(a));
+}
+
+// The tests below need real CoreText faces (the render test root links the CoreText bridge on
+// macOS); elsewhere they skip.
+const has_native_weight = @import("builtin").os.tag == .macos and @hasDecl(Font, "variableWeight");
+
+fn identityOf(font: *Font) u64 {
+    return text_module.fallbackFontRefIdentityHash(font.ct_font);
+}
+
+test "exact weight 关闭时 resolve 走 9 档映射：同描述符同字体同 hash" {
+    if (!has_native_weight) return error.SkipZigTest;
+    var fs = try text_module.FontSystem.init(std.testing.allocator, std.testing.io);
+    defer fs.deinit();
+    var r = FontRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    r.setFontSystem(&fs);
+    const id = try r.intern("system-ui");
+
+    const f = r.resolve(id, 16, 450, false) orelse return error.SkipZigTest;
+    try std.testing.expect(r.resolve(id, 16, 450, false).? == f);
+    // Font.weight is the tier number, exactly as before the opt-in existed.
+    try std.testing.expectEqual(@as(u16, 500), f.weight);
+    // A direct tier lookup with the same descriptor yields the same native face identity.
+    const direct = try fs.findFont(.{ .family = "system-ui", .size = 16, .weight = .medium });
+    defer direct.deinit();
+    try std.testing.expectEqual(identityOf(direct), identityOf(f));
+    if (f.variableWeight()) |w| try std.testing.expect(@abs(w - 450) >= 0.5); // tier instance, not 450
+}
+
+test "exact weight 开启后可变字体 450 精确生效并读回 450；FaceKey 复用、与档位 face 不共用 hash" {
+    if (!has_native_weight) return error.SkipZigTest;
+    var fs = try text_module.FontSystem.init(std.testing.allocator, std.testing.io);
+    defer fs.deinit();
+    var r = FontRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    r.setFontSystem(&fs);
+
+    // system-ui (SF Pro) ships with every supported macOS; STIX Two Text / Skia are system
+    // fonts too. A candidate that is missing or not variable on this machine is skipped, and the
+    // test skips (not passes) when none can be exercised.
+    var exercised: usize = 0;
+    for ([_][]const u8{ "system-ui", "STIX Two Text", "Skia" }) |family| {
+        const id = try r.intern(family);
+        const tier = r.resolve(id, 16, 450, false) orelse continue;
+        if (tier.variableWeight() == null) continue;
+
+        r.setExactWeight(id, true);
+        defer r.setExactWeight(id, false);
+        const exact = r.resolve(id, 16, 450, false) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(exact != tier);
+        try std.testing.expectEqual(@as(u16, 450), exact.weight);
+        const actual = exact.variableWeight() orelse return error.TestUnexpectedResult;
+        try std.testing.expectApproxEqAbs(@as(f64, 450), actual, 0.5);
+        try std.testing.expect(identityOf(exact) != identityOf(tier));
+        // same key reuses the cached face; toggling back returns the original tier face.
+        try std.testing.expect(r.resolve(id, 16, 450, false).? == exact);
+        r.setExactWeight(id, false);
+        try std.testing.expect(r.resolve(id, 16, 450, false).? == tier);
+        exercised += 1;
+    }
+    if (exercised == 0) return error.SkipZigTest;
+}
+
+test "exact weight 开启后非可变字体回退最近档，读回如实（非 450）" {
+    if (!has_native_weight) return error.SkipZigTest;
+    var fs = try text_module.FontSystem.init(std.testing.allocator, std.testing.io);
+    defer fs.deinit();
+    var r = FontRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    r.setFontSystem(&fs);
+    const id = try r.intern("Menlo");
+    const tier = r.resolve(id, 16, 450, false) orelse return error.SkipZigTest;
+    if (tier.variableWeight() != null) return error.SkipZigTest; // Menlo became variable: not this case
+
+    r.setExactWeight(id, true);
+    const exact = r.resolve(id, 16, 450, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(exact.variableWeight() == null);
+    // the same nearest-tier native face as the default path
+    try std.testing.expectEqual(identityOf(tier), identityOf(exact));
 }

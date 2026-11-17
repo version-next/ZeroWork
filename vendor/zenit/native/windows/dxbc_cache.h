@@ -2,6 +2,7 @@
 // translation unit: each backend keeps its own in-flight table).
 #pragma once
 #include <windows.h>
+#include "../automation_environment.h"
 #include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,9 +50,9 @@ static void cache_hash(const char *tag, UINT compile_flags, const void *source, 
 }
 static bool cache_path(const char hash[33], wchar_t out[MAX_PATH]) {
     wchar_t dir[MAX_PATH];
-    DWORD n = GetEnvironmentVariableW(L"ZENIT_SHADER_CACHE", dir, MAX_PATH);
+    DWORD n = zenitAutomationEnvironmentW(L"ZENIT_SHADER_CACHE", dir, MAX_PATH);
     if (n == 1 && dir[0] == L'0') return false;
-    n = GetEnvironmentVariableW(L"ZENIT_SHADER_CACHE_DIR", dir, MAX_PATH);
+    n = zenitAutomationEnvironmentW(L"ZENIT_SHADER_CACHE_DIR", dir, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) {
         n = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
         if (n == 0 || n >= MAX_PATH - 20) return false;

@@ -1,0 +1,17 @@
+//! Empty state styling: centered column, tertiary icon, primary title, secondary description;
+//! all ink and type from tokens. View in empty.yix.
+const ui = @import("../../ui.zig");
+
+/// Fills the space it is given and centers the content vertically; each line centers itself.
+style root { width: fill; height: fill; min-width: 0; min-height: 0; direction: column; justify: center; gap: space200; padding: space400; }
+/// One centered line (icon / copy column / action).
+style line { width: fill; min-width: 0; height: fit; direction: row; justify: center; }
+/// 24 × 24 glyph in the tertiary ink (quiet, not a status color).
+style icon { width: 24; height: 24; flex-shrink: 0; icon-color: fg-tertiary; }
+/// Title and description share one column, at most 280 wide; lines are centered.
+style copy { width: fill; max-width: 280; min-width: 0; height: fit; direction: column; gap: space100; }
+style title { width: fill; min-width: 0; font-size: 13; font-weight: 500; line-height: 1.4; color: fg-primary; wrap: word; text-align: center; selectable: false; }
+/// The description is required by design: it says what will appear here, or what to do.
+style description { width: fill; min-width: 0; font-size: 12; line-height: 1.5; color: fg-secondary; wrap: word; text-align: center; selectable: false; }
+/// The action sits 4 below the description (gap + 4).
+style action { width: fill; height: fit; direction: row; justify: center; padding: space100 0 0 0; }

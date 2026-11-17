@@ -110,44 +110,8 @@ pub const OffloadedImage = struct {
     reference: @import("image_attachments.zig").ContentRef,
     owner: ?@import("../host/identity.zig").SessionHandle = null,
 };
-pub const CancelToken = struct {
-    cancelled: std.atomic.Value(bool) = .init(false),
-    /// Borrowed for this operation only. The source and its thread-safe poll
-    /// must outlive every consumer, including child work through its join.
-    source: ?struct {
-        context: *const anyopaque,
-        poll: *const fn (*const anyopaque) bool,
-        /// Human decisions suspend the active-run budget, not Stop or scope checks.
-        user_wait: ?*const fn (*const anyopaque, bool) void = null,
-        /// Capacity waits pause this branch without reporting a human decision.
-        resource_wait: ?*const fn (*const anyopaque, bool) void = null,
-    } = null,
-    pub const UserWait = struct {
-        token: ?*const CancelToken,
-        resource: bool = false,
-        pub fn end(self: UserWait) void {
-            if (self.token) |token| if (token.source) |source| {
-                const callback = if (self.resource) source.resource_wait else source.user_wait;
-                if (callback) |notify| notify(source.context, false);
-            };
-        }
-    };
-    /// Worker-owned guard. Always end it, including rejection and cancellation.
-    pub fn beginUserWait(self: ?*const CancelToken) UserWait {
-        if (self) |token| if (token.source) |source| if (source.user_wait) |notify| notify(source.context, true);
-        return .{ .token = self };
-    }
-    pub fn beginResourceWait(self: ?*const CancelToken) UserWait {
-        if (self) |token| if (token.source) |source| if (source.resource_wait) |notify| notify(source.context, true);
-        return .{ .token = self, .resource = true };
-    }
-    pub fn cancel(self: *CancelToken) void {
-        self.cancelled.store(true, .release);
-    }
-    pub fn isCancelled(self: *const CancelToken) bool {
-        return self.cancelled.load(.acquire) or if (self.source) |source| source.poll(source.context) else false;
-    }
-};
+/// 共享实现见 shared/base/cancel.zig（persist-async）。
+pub const CancelToken = @import("../shared/base/cancel.zig").CancelToken;
 pub const ReasoningWire = enum { none, thinking_type, openrouter, ollama, anthropic_adaptive };
 /// Internal only: the host rechecks a frozen plan after a human wait. This is
 /// never serialized into a model tool's schema or arguments.

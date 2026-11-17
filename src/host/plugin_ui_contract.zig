@@ -38,10 +38,14 @@ pub const EditorMount = struct {
     events: EditorEvents,
     editor_host: ?*@import("content_context.zig").EditorHost = null,
     editor_id: u64 = 0,
+    /// Set when this editor is a nested child opened for its parent. The
+    /// subject is borrowed for the mount call only.
+    child: ?ChildMount = null,
     credentials: ?@import("editor_credentials.zig").Facade = null,
     probes: ?@import("probe_contract.zig").EditorProbes = null,
     connection_configs: ?@import("connection_config_resolver.zig").Resolver = null,
 };
+pub const ChildMount = struct { intent: @import("content_context.zig").ChildIntent, subject: []const u8 = "" };
 pub const ModalPresentation = struct {
     width: f32,
     title: []const u8,
@@ -104,8 +108,29 @@ pub const RendererInstance = struct {
         /// Open the renderer's existing connection diagnostics for the shared
         /// status-bar connection/route entries.
         show_connection_details: ?*const fn (*anyopaque) void = null,
+        /// The content's side of the tab's floating AI launcher (Pencil j8WXoF D): its bounds,
+        /// where its fixed top chrome ends and whether the remote keyboard / mouse is captured.
+        launcher_context: ?*const fn (*anyopaque) LauncherContext = null,
+        /// Host -> content: where the launcher rests (its corner and window rect) when this
+        /// content occupies that corner; null otherwise. The launcher never moves for the
+        /// content's overlays — they give way to it.
+        place_launcher: ?*const fn (*anyopaque, ?LauncherPlacement) void = null,
     };
 };
+/// Window coordinates.
+pub const LauncherRect = struct { x: f32, y: f32, w: f32, h: f32 };
+pub const LauncherCorner = enum { bottom_right, bottom_left, top_right, top_left };
+pub const LauncherContext = struct {
+    /// The content's window rect; null = not on screen.
+    bounds: ?LauncherRect = null,
+    /// Bottom edge of fixed chrome at the content's top (KVM toolbar); the launcher's top
+    /// corners rest 12 below it. null = none.
+    top_chrome_bottom: ?f32 = null,
+    /// The remote picture while it holds the keyboard and mouse; a launcher over it yields
+    /// (fades out, lets the pointer through). null = not captured.
+    captured: ?LauncherRect = null,
+};
+pub const LauncherPlacement = struct { corner: LauncherCorner, rect: LauncherRect };
 pub const ConnectionStatus = struct {
     state: enum { connecting, online, degraded, ended },
     label: []const u8,

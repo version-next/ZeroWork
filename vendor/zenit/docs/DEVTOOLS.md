@@ -184,12 +184,21 @@ whether that optimization introduced it.
 | `ZENIT_DISABLE_SPANNED_TEXT_RETAINED` | The retained path for rich text |
 | `ZENIT_DISABLE_SCROLL_CLIP` | Scroll clipping tokens |
 | `ZENIT_NO_BLUR` / `ZENIT_NO_BLUR_HYSTERESIS` | Background blur / its hysteresis |
+| `ZENIT_GLASS_REUSE=0` | Cross-frame reuse of glass composites whose backdrop did not change |
+| `ZENIT_FRAME_DAMAGE=0` | Metal damage-rect redraw (frames with effects and glass redraw only their damage while the kept frame copy fits `ZENIT_FRAME_DAMAGE_MAX_MIB`, default 24) |
+| `ZENIT_VERIFY_PAINT_DIGEST=1` | Check every frame that no paint-item content digest (`paint_digest`, this frame or the last) stands for two different full item hashes; logs `[paint-digest]` errors, `=2` panics (for e2e) |
 | `ZENIT_FULL_RUNTIME_REBUILD` | Force a full rebuild of the runtime index every frame |
 
 ### Liquid Glass
 
 `ZENIT_DEBUG_GLASS`, `ZENIT_DEBUG_GLASSCAP`, `ZENIT_DEBUG_GLASSHOVER`,
-`ZENIT_DEBUG_GLASS_RT`, `ZENIT_GLASS_NOPAD`.
+`ZENIT_DEBUG_GLASS_RT`, `ZENIT_GLASS_NOPAD`, `ZENIT_DEBUG_GLASS_REUSE` (per glass:
+its backdrop key inputs, kept texture size and reuse hits), `ZENIT_DEBUG_FRAME_DAMAGE`
+(per frame: why it redraws in full, or the changed and grown damage rect and changed entries).
+
+> When changing glass-related code, note: **e2e pixel assertions cannot catch
+> problems like "the wrong shader was used"**: you must eyeball the
+> screenshots.
 
 ### Hit testing / interaction
 

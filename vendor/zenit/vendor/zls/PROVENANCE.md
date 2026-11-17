@@ -14,4 +14,4 @@ Transitive dependencies are pinned by hashes in build.zig.zon. See ZIG017.md for
 From the Zenit root, `zig build zls` installs `zig-out/bin/zenit-zls` (Windows: `.exe`).
 `zig build dev-tools` installs both it and yix-lsp. `zig build test-zls` runs the upstream
 suite and real build-protocol regressions. Use Zig 0.17.0.
-The build is isolated so ordinary framework consumers do not compile or link editor tools.
+The build is isolated so ordinary framework consumers do not build or fetch editor tools.

@@ -41,7 +41,7 @@ fn cacheFiles(io: std.Io, dir: std.Io.Dir) !usize {
 
 pub fn run(io: std.Io) !void {
     const allocator = std.heap.page_allocator;
-    const temp = try @import("zenit_environment").getOwned(allocator, "TEMP");
+    const temp = try @import("zenit_environment").getSystemOwned(allocator, "TEMP");
     defer allocator.free(temp);
     const path = try std.fmt.allocPrint(allocator, "{s}\\zenit-shader-cache-contract-{d}", .{ temp, std.os.windows.GetCurrentProcessId() });
     defer allocator.free(path);

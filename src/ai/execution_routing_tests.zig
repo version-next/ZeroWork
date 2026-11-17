@@ -3,7 +3,7 @@ const routing = @import("execution_routing.zig");
 const host = @import("host_tools.zig");
 const identity = @import("../host/identity.zig");
 fn context() host.Context {
-    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
+    return .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 1 }, .content = .{ .session = 1 }, .binding_revision = 1, .grant_revision = 1 };
 }
 const target: identity.SessionHandle = .{ .session_id = @fromBackingInt(1), .generation = 3 };
 
@@ -74,7 +74,8 @@ test "routing handoff preserves only committed same task source single to group 
     try state.configure(ctx);
     try state.select(ctx, .{ .route = .new_terminal, .source = .{ .session = target } }, "pwd", true);
     var next = ctx;
-    next.binding = .{ .group = 3 };
+    next.binding = .{ .tab = 3 };
+    next.content = .{ .group = 3 };
     next.binding_revision += 1;
     var wrong = next;
     wrong.task_id = identity.TaskId.generate();
@@ -84,6 +85,76 @@ test "routing handoff preserves only committed same task source single to group 
     try std.testing.expect(state.resolve(next, target, "pwd", .batch).trusted);
     state.clear();
     try std.testing.expect(!state.resolve(next, target, "pwd", .batch).trusted);
+}
+
+test "routing a held choice survives the handoff commit that supersedes approvals, and only it" {
+    // ai-redesign-e: committing the AI lifecycle session -> group handoff supersedes the worker's
+    // approvals (revoke); the commit holds the choice first and hands it on afterwards.
+    var state: routing.State = .{};
+    const ctx = context();
+    try state.configure(ctx);
+    try state.select(ctx, .{ .route = .new_terminal, .source = .{ .session = target } }, "pwd", true);
+    var next = ctx;
+    next.binding = .{ .tab = 3 };
+    next.content = .{ .group = 3 };
+    next.binding_revision += 1;
+    const held = state.hold(ctx).?;
+    state.revoke();
+    try std.testing.expectError(error.RouteGrantNotFound, state.handoff(ctx, next, target));
+    var wrong = next;
+    wrong.task_id = identity.TaskId.generate();
+    try std.testing.expectError(error.RouteGrantChanged, state.handoffHeld(held, ctx, wrong, target));
+    try std.testing.expect(!state.resolve(ctx, target, "pwd", .batch).trusted);
+    try state.handoffHeld(held, ctx, next, target);
+    try state.configure(next);
+    const resolved = state.resolve(next, target, "pwd", .batch);
+    try std.testing.expect(resolved.trusted and resolved.route == .new_terminal and resolved.needs_creation);
+    // A different choice made meanwhile is not overwritten by the held one.
+    try state.select(next, .{ .route = .current_terminal, .source = .{ .session = target } }, "ls", true);
+    try std.testing.expectError(error.RouteGrantChanged, state.handoffHeld(held, ctx, next, target));
+    try std.testing.expect(state.resolve(next, target, "ls", .batch).route == .current_terminal);
+    // Nothing held for another context.
+    try std.testing.expect(state.hold(ctx) == null);
+}
+
+test "routing an environment refresh puts back only the held choice of the same context" {
+    var state: routing.State = .{};
+    const ctx = context();
+    try state.configure(ctx);
+    try state.select(ctx, .{ .route = .new_terminal, .source = .{ .session = target } }, "pwd", true);
+    // An ordinary choice is not held unless a committed transition says so.
+    try std.testing.expect(state.holdLive(false) == null);
+    const held = state.holdLive(true).?;
+    state.revoke();
+    state.restore(held);
+    try std.testing.expect(state.resolve(ctx, target, "pwd", .batch).trusted);
+    // A newer choice is kept; a changed context takes nothing back.
+    try state.select(ctx, .{ .route = .current_terminal, .source = .{ .session = target } }, "ls", true);
+    state.restore(held);
+    try std.testing.expect(state.resolve(ctx, target, "ls", .batch).route == .current_terminal);
+    state.revoke();
+    var other = ctx;
+    other.binding_revision += 1;
+    try state.configure(other);
+    state.restore(held);
+    try std.testing.expect(!state.resolve(other, target, "pwd", .batch).trusted);
+}
+
+test "routing a choice waiting for its own bound create is held across the refresh that create causes" {
+    var state: routing.State = .{};
+    const ctx = context();
+    try state.configure(ctx);
+    try state.select(ctx, .{ .route = .new_terminal, .source = .{ .session = target }, .retention = .keep }, "echo ready", true);
+    const create: routing.Create = .{ .operation_id = identity.HostOperationId.generate(), .request_hash = routing.digest("open-one"), .source = .{ .session = target }, .retention = .keep, .policy = .new_only };
+    try state.bindCreate(ctx, create);
+    const held = state.holdLive(false).?;
+    state.revoke();
+    state.restore(held);
+    const fresh: identity.SessionHandle = .{ .session_id = @fromBackingInt(2), .generation = 9 };
+    try state.created(ctx, create, fresh);
+    try std.testing.expect(state.resolve(ctx, fresh, "echo ready", .current_terminal).approved);
+    // Created: no longer waiting, so an outside refresh is not carried.
+    try std.testing.expect(state.holdLive(false) == null);
 }
 
 test "routing new session then batch keeps creation separate from command path" {

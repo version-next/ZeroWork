@@ -1,6 +1,7 @@
 /** Actual SSH discovery and native colour artwork; all hosts are owned loopback fixtures.
  * node e2e/domestic_os_native.ts BUILD_PREFIX PYTHON [OUTPUT_DIRECTORY] [--international|--audit|--contrast|--graphical]
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, readdir, realpath, rm, writeFile} from 'node:fs/promises';
@@ -29,7 +30,7 @@ const kinds = graphical
   : ['kylin', 'neokylin', 'openkylin', 'ubuntukylin', 'uos', 'deepin', 'openeuler', 'euleros', 'anolis', 'opencloudos', 'tencentos', 'alinux', 'loongnix', 'aosc', 'bclinux', 'kylinsec', 'nfs', 'linx', 'isoft', 'redflag'];
 const releaseIds: Record<string, string> = {oraclelinux: 'ol', opensuse: 'opensuse-leap', amazonlinux: 'amzn'};
 const batchSize = graphical ? 3 : contrast ? 8 : audit ? 5 : international ? 7 : 10;
-const assetRegistry = await readFile('src/ui/host_os_assets.zig', 'utf8');
+const assetRegistry = await readFile('src/shared/ui/assets/host_os_assets.zig', 'utf8');
 const iconIds = Object.fromEntries([...assetRegistry.matchAll(/pub const (\w+) = source\("[^"]+", (\d+)\);/g)].map(match => [match[1], Number(match[2])]));
 const peerOut = join(base, 'peer');
 const peerLog = await open(join(out, 'peer.log'), 'w');
@@ -100,7 +101,7 @@ try {
       await writeFile(join(out, `batch-${batch}-nodes.json`), JSON.stringify({hosts: await h.query('sidebar.host'), tabs: await h.query('tabs.type_icon')}, null, 2));
     } catch (error) {
       await h.screenshot(join(out, `failure-${batch}.png`)).catch(() => {});
-      await writeFile(join(out, `failure-${batch}.json`), JSON.stringify(await h.tree().catch(() => ({})), null, 2));
+      await writeFile(join(out, `failure-${batch}.json`), JSON.stringify(await h.tree({ visibleOnly: true }).catch(() => ({})), null, 2));
       throw error;
     } finally {
       if (app.exitCode === null && app.signalCode === null) app.kill('SIGTERM');

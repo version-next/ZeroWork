@@ -1,4 +1,5 @@
 const std = @import("std");
+const shared_retry = @import("../shared/base/retry.zig");
 const Session = @import("../proto/ssh/session.zig").Session;
 const Library = @import("../proto/ssh/session.zig").Library;
 const Options = @import("../proto/ssh/session.zig").Options;
@@ -36,11 +37,11 @@ pub const RuntimeOptions = struct {
     scrollback: ?u32 = null,
     timeline_max_events: usize = 4096,
     timeline_max_bytes: usize = 64 * 1024 * 1024,
-    reconnect_max: u8 = 5,
+    reconnect_max: u8 = shared_retry.ssh_reconnect_max,
     auto_reconnect: bool = true,
     buffer_input: bool = true,
-    reconnect_backoff: [5]u8 = .{ 1, 2, 4, 8, 16 },
-    connect_timeout_ms: u32 = 15_000,
+    reconnect_backoff: [5]u8 = shared_retry.ssh_reconnect_seconds,
+    connect_timeout_ms: u32 = shared_retry.ssh_connect_timeout_ms,
     keepalive_sec: u16 = 30,
     compression: bool = false,
     /// Plain shell commands to inject once the interactive shell is opened.
@@ -463,7 +464,7 @@ pub const SshWorker = struct {
         worker.startup_command_ends = startup_command_ends;
         worker.startup_cursor = .{};
         worker.shell_initializer_chunks = initializer_chunks;
-        worker.startup_pending = .init(runtime.wait_for_attachment or startup_input.len != 0 or initializer_chunks.len != 0);
+        worker.startup_pending = .init(startup_input.len != 0 or initializer_chunks.len != 0);
         worker.presentation_attached = .init(!runtime.wait_for_attachment);
         worker.pending_scrollback_limit = .init(0);
         worker.resize_dims = .init(0);
@@ -502,8 +503,9 @@ pub const SshWorker = struct {
         // No relay can borrow facades until every fallible Worker allocation
         // succeeded. Failed initialization therefore cannot strand a facade.
         if (worker.jump_route) |value| value.bindForwards(worker.forward_services[0..worker.forward_count]);
-        // Opening the shell channel is not the same as prompt readiness.
-        // step waits for a 500ms quiet interval before injecting setup.
+        // A shell with startup input still needs a quiet interval before
+        // that input is injected. The worker activates a bare shell as soon
+        // as its presentation attaches.
         // A separate bounded exec request shares the existing IO owner.
         worker.os_probe = worker.exec_bridge.diagnostic(@import("../proto/ssh/remote_os.zig").command, .{ .timeout_ms = 3000, .capture_cap = 8192 }) catch null;
         if (worker.os_probe == null) worker.os_probe_finished.store(true, .release);
@@ -1955,8 +1957,8 @@ pub const SshWorker = struct {
             self.startup_pending.store(false, .release);
             return;
         }
-        if (self.shell_initializer_chunks.len == 0 and !startupReadyAt(now_ns, last_output_ns)) return;
         const startup_input = self.startup_input[0..if (self.initial_input_allowed) self.startup_input.len else self.startup_commands_input_len];
+        if (startup_input.len != 0 and self.shell_initializer_chunks.len == 0 and !startupReadyAt(now_ns, last_output_ns)) return;
         if (startup_input.len != 0) if (self.shell_execution) |*bridge| {
             // An initializer ACK is emitted before Readline/ZLE resumes. Only
             // a subsequent prompt in this shell is safe for automatic input.
@@ -2056,7 +2058,7 @@ pub const SshWorker = struct {
         self.initial_input_allowed = false;
         self.startup_cursor = .{};
         self.startup_end_index = null;
-        self.startup_pending.store(true, .release);
+        self.startup_pending.store(self.startup_commands_input_len != 0 or self.shell_initializer_chunks.len != 0, .release);
     }
 
     fn configureStartup(self: *SshWorker, configuration: @import("reconnect.zig").Configuration) !void {
@@ -2980,7 +2982,7 @@ test "history SSH applied resize is ordered with output and keeps original geome
     try worker.timeline.exportCast(&writer, worker.recording_initial_cols, worker.recording_initial_rows);
     try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "{\"version\":2,\"width\":80,\"height\":24}"));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"r\",\"120x30\"") != null);
-    var decoded = try @import("../ui/history_cast.zig").load(a, writer.buffered());
+    var decoded = try @import("../features/history/model/history_cast.zig").load(a, writer.buffered());
     defer decoded.deinit();
     const frame = @import("text_frame.zig");
     try std.testing.expectEqual(@as(u16, 80), frame.decode(decoded.frames.items[0].wire).?.cols);

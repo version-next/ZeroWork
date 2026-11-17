@@ -1,0 +1,13 @@
+//! Grabber view. Styles in styles.yss, tests in mod.zig.
+const ui = @import("../../ui.zig");
+const S = @import("styles.yss");
+
+/// Grabber: the drag indicator of a movable surface (the capsule at the top of a floating panel or
+/// a sheet, `UISheetPresentationController.prefersGrabberVisible`). Purely visual and hit-transparent:
+/// the host decides which region drags. `<W.Grabber />` / `W.Grabber(.{ .width = 48 })`.
+/// `active`: the host's drag region is held (pointer down / dragging) — the capsule takes the
+/// accent ink and widens to `activeWidth` (a bool or a signal; the host clears it on release).
+pub fn Grabber(width: f32 = 36, active: bool = false, activeWidth: f32 = 48) View {
+    const shown_width = computed(if (active) activeWidth else width);
+    return <box style={.{ S.capsule.of(.{ .width = shown_width }), S.Ink.of(.{ .active = active }) }} />;
+}

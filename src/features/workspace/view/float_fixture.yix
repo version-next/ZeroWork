@@ -1,0 +1,18 @@
+//! 测试卡片 `fixture.float` 的内容（float-split，只在 test-mode 构建里出现）：原生 Input、原生 ScrollArea
+//! 里的一列原生 Button（选中行是 secondary，其余 ghost）。卡片外框由通用浮动外框或分屏窗格提供，这里只有内容。
+const ui = @import("ui");
+const W = ui.widgets;
+const m = @import("float_fixture_view.zig");
+const S = @import("float_fixture.yss");
+
+pub fn FixtureCard(vm: *m.Vm) View {
+    return (
+        <col testId="fixture.float.content" style={S.root}>
+            <W.Input testId="fixture.float.input" value={vm.text()} placeholder="输入一些文字" size={.sm} onChange={|t| vm.edit(t)} />
+            <text testId="fixture.float.selection" style={S.status}>{vm.selectionText()}</text>
+            <W.ScrollArea direction={.vertical} testId="fixture.float.list" style={S.list}>
+                {for (vm.rows) |row| <W.Button key={row.test_id} testId={row.test_id} label={row.label} variant={vm.rowVariant(row.index)} size={.sm} block={true} onClick={vm.select(row.index)} />}
+            </W.ScrollArea>
+        </col>
+    );
+}

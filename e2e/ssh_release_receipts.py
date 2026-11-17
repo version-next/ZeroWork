@@ -14,6 +14,11 @@ import threading
 
 import paramiko
 from paramiko.common import MSG_CHANNEL_CLOSE
+# Refuse non-test-mode ZeroWork binaries before starting them (e2e/regression/build_mode_guard.py):
+# acceptance runners must be -Dtest-mode=true builds; exported Zig test binaries are accepted as well.
+import importlib.util as _bmg_util
+_bmg_spec = _bmg_util.spec_from_file_location('build_mode_guard', __import__('pathlib').Path(__file__).resolve().parent / 'regression/build_mode_guard.py')
+build_mode_guard = _bmg_util.module_from_spec(_bmg_spec); _bmg_spec.loader.exec_module(build_mode_guard)
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
@@ -107,6 +112,7 @@ def main():
     parser.add_argument("--runner", required=True, type=Path)
     parser.add_argument("--output", type=Path, default=Path("dist/ssh-acceptance/20261019/release-receipts/report.json"))
     args = parser.parse_args()
+    build_mode_guard.assert_runner_binary(args.runner)
     key = paramiko.RSAKey.generate(2048)
     cases = [run_case(args.runner, key, mode) for mode in ("child-isolation", "native-awaiting")]
     report = {"scope": "actual native allocation/free, EAGAIN owner retention, child close isolation and final owned FD release", "passed": sum(case["passed"] for case in cases), "total": len(cases), "cases": cases, "limits": ["Owned loopback peer only; no remote host or process, GUI or application build.", "Fixture pins the existing diffie-hellman-group14-sha256 KEX so every counted LIBSSH2_ALLOC allocation has an observable matching callback free. This is a release test, not an all-KEX crypto test.", "The mbedTLS ECDH backend allocates its private-key struct through LIBSSH2_ALLOC but frees it directly through mbedtls_free; allocator-observer-ecdh.json records why that first probe cannot use this callback counter as a total leak detector.", "Crypto library global allocations are outside this counter."]}

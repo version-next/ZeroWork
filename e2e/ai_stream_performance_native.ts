@@ -1,10 +1,14 @@
 /** ReleaseFast before/after benchmark. Private Local PTY, provider, data and RPC. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, writeFile, open, realpath} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
 
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.argv[2]);
 const out = resolve(process.argv[3]);
 const code = process.argv.includes('--code');
@@ -24,8 +28,7 @@ let rounds=0, reasoningChunks=0, streaming=false, finish=false, fixtureError:str
 const server = createServer(async(req,res)=>{
  try {
   if(req.method!=='POST') return res.end(JSON.stringify({data:[{id:'perf',context_window:200000,reasoning:true,thinking:{values:['low','medium','high']}}]}));
-  let raw=''; for await(const chunk of req) raw+=chunk;
-  const body=JSON.parse(raw);
+  const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
   res.writeHead(200,{'content-type':'text/event-stream'}); res.flushHeaders();
   if(!body.tools?.length) return res.end(frame({content:'性能验证'})+'data: [DONE]\n\n');
   rounds++;
@@ -59,7 +62,7 @@ const click=async(id:string)=>{await visible(id);assert((await h.clickTestId(id)
 const report:any={status:'running',prefix,isolated:iso,latency_ms:[]};
 try {
  await h.waitForServerReady(60000);await h.resizeWindow(1440,1000);
- await click('workspace.empty.local');await visible('terminal.surface');await click('ai.strip');
+ await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await click('ai.prompt');await h.type_('连续核对当前上下文，验证十八个步骤');
  await h.resetTiming();const started=performance.now();await click('ai.send');
  await h.waitFor(()=>{assert.equal(fixtureError,null);return streaming||null},90000);

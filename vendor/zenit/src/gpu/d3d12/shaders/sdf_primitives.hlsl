@@ -3,8 +3,10 @@
 // zenit-entry: vertex sdf_region_vertex_main
 // zenit-entry: vertex sdf_vertex_main
 // zenit-entry: vertex sdf_shadow_ring_vertex_main
+// zenit-entry: vertex sdf_shadow_gradient_vertex_main
 // zenit-entry: vertex sdf_dual_shadow_vertex_main
 // zenit-entry: fragment sdf_shadow_ring_fragment_main
+// zenit-entry: fragment sdf_shadow_gradient_fragment_main
 // zenit-entry: fragment sdf_dual_shadow_fragment_main
 // zenit-entry: fragment sdf_linear_x_fragment_main
 // zenit-entry: fragment sdf_linear_y_fragment_main
@@ -23,10 +25,11 @@ struct Uniforms {
     float scale_factor; // DPI scale factor (Retina=2.0).
     uint clip_shape_kind;
     float4 clip_rect;
-    float clip_radius;
+    float4 clip_radii; // TL, TR, BR, BL (logical px)
     uint clip_fill_rule;
     uint clip_point_count;
     uint clip_contour_count;
+    uint clip_pad; // keeps the polygon arrays 16-byte aligned (cbuffer register)
     uint4 clip_polygon_end_points[2];
     float4 clip_polygon_points[16];
     uint frame_seed; // Per-frame increment driving film_grain dynamic noise.
@@ -458,8 +461,9 @@ float shape_clip_alpha(float2 screen_pos, Uniforms uniforms) {
     const float2 clip_size = uniforms.clip_rect.zw * uniforms.scale_factor * 0.5;
     float clip_sdf = 1.0;
     if (uniforms.clip_shape_kind == 1u) {
-        const float clip_radius = uniforms.clip_radius * uniforms.scale_factor;
-        clip_sdf = sdf_rounded_rect(screen_pos - clip_center, clip_size, clip_radius);
+        // Per-corner radii (TL, TR, BR, BL); a uniform radius is the single-radius distance.
+        const float4 clip_radii = uniforms.clip_radii * uniforms.scale_factor;
+        clip_sdf = sdf_rounded_rect_4(screen_pos - clip_center, clip_size, clip_radii);
     } else if (uniforms.clip_shape_kind == 2u) {
         clip_sdf = sdf_ellipse_clip(screen_pos - clip_center, clip_size);
     } else if (uniforms.clip_shape_kind == 3u) {
@@ -654,6 +658,23 @@ VertexOutput sdf_shadow_ring_vertex_main(uint vertex_id : SV_VertexID, uint inst
     o.solid_fill = inst.shadow_color;
     o.solid_border = float4(inst.shadow_blur, inst.noise_scale, 0, 0);
     o.solid_shape = inst.packed_flags & (1u << 28u);
+    return o;
+}
+
+// One ordered instance stream for borderless linear gradients and shadow
+// rings. Keep the original four ring quads; a fill uses its original six
+// vertices and makes the remaining triangles degenerate.
+VertexOutput sdf_shadow_gradient_vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
+    InstanceData inst = instances[instance_id + first_instance];
+    bool ring = inst.fill_color.a == 0.0 && inst.shadow_color.a > 0.0;
+    VertexOutput o = sdf_vertex_impl(ring ? vertex_id : vertex_id % 6u, instance_id, ring);
+    if (ring) {
+        o.solid_fill = inst.shadow_color;
+        o.solid_border = float4(inst.shadow_blur, inst.noise_scale, 0, 0);
+        o.solid_shape = (1u << 31u) | (inst.packed_flags & (1u << 28u));
+    } else if (vertex_id >= 6u) {
+        o.position = float4(0, 0, 0, 1);
+    }
     return o;
 }
 
@@ -1082,6 +1103,25 @@ float4 sdf_shadow_ring_fragment_main(VertexOutput input) : SV_Target {
     inst.shadow_offset_x = input.solid_metrics.y;
     inst.shadow_offset_y = input.solid_metrics.z;
     inst.packed_flags = input.solid_shape & (1u << 28u);
+    return sdf_fragment_impl(input, inst, false, false, false);
+}
+
+float4 sdf_shadow_gradient_fragment_main(VertexOutput input) : SV_Target {
+    InstanceData inst = (InstanceData)0;
+    if ((input.solid_shape & (1u << 31u)) != 0u) {
+        inst.shadow_color = input.solid_fill;
+        inst.shadow_blur = input.solid_border.x;
+        inst.noise_scale = input.solid_border.y;
+        inst.corner_radii = input.solid_radii;
+        inst.shadow_offset_x = input.solid_metrics.y;
+        inst.shadow_offset_y = input.solid_metrics.z;
+        inst.packed_flags = input.solid_shape & (1u << 28u);
+    } else {
+        inst = instances[input.instance_id];
+        inst.shape_type = 0u;
+        inst.packed_flags &= 3u;
+        inst.shadow_color.a = 0.0;
+    }
     return sdf_fragment_impl(input, inst, false, false, false);
 }
 // CPU guarantees a rectangle with two outer shadows and no other material.

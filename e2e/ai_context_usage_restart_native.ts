@@ -1,9 +1,13 @@
 /** Durable context baseline across real process restarts and model changes. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp, mkdir, writeFile, readFile, open, realpath, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix = resolve(process.env.ZW_AI_TEST_PREFIX ?? 'zig-out');
 const h = await import(join(prefix, 'share/zenit/harness/client.ts'));
 const out = resolve(process.argv[2] ?? '/tmp/zw-context-restart-results');
@@ -14,8 +18,7 @@ let replies = 0, phase = 0, app: any = null;
 const frame = (content: string) => 'data: ' + JSON.stringify({choices: [{index: 0, delta: {content}}]}) + '\n\n';
 const server = createServer(async (req, res) => {
     if (req.method !== 'POST') { res.end(JSON.stringify({data: [{id: 'restart-fixture'}, {id: 'other-fixture'}]})); return; }
-    let raw = ''; for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw);
+    const body = await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (body.messages[0]?.content?.startsWith('将用户的问题概括')) { res.end(frame('上下文基准恢复') + 'data: [DONE]\n\n'); return; }
     replies++;
@@ -61,7 +64,7 @@ async function launch() {
     await h.waitForServerReady(30000);
     assert.equal(Number(JSON.parse(await readFile(join(rpc, 'owner.json'), 'utf8')).pid), app.pid);
     await h.resizeWindow(1280, 900);
-    await click('workspace.empty.local'); await visible('terminal.surface'); await click('toolbar.ai');
+    await click('workspace.empty.local'); await visible('terminal.surface'); await click(await aiToggleId());
 }
 async function stop() {
     if (app && app.exitCode === null && app.signalCode === null) {
@@ -70,14 +73,19 @@ async function stop() {
     app = null;
 }
 async function restore() {
-    await click('ai.sessions'); await click('ai.session.restore.1');
+    // The welcome page's recent list reuses the session row view (ai_empty_view.zig → ai_session_row.zig), so ai.session.* ids
+    // exist twice while the welcome page is shown; click the Restore inside ai.sessions.menu.
+    await click('ai.sessions'); await visible('ai.sessions.menu');
+    const flat = (n: any): any[] => [n, ...(n.children ?? []).flatMap(flat)];
+    const restoreButton = await h.waitFor(async () => (await h.query('ai.sessions.menu')).filter(shown).flatMap(flat).find((n: any) => n.test_id === 'ai.session.restore.1' && shown(n)) ?? null, 15000);
+    assert((await h.clickAt(restoreButton.rect.x + restoreButton.rect.w / 2, restoreButton.rect.y + restoreButton.rect.h / 2)).ok, 'ai.session.restore.1');
     await h.sleep(150);
     if ((await h.query('ai.session.close.accept')).some(shown)) await click('ai.session.close.accept');
     await h.waitFor(async () => (await h.query('ai.message.user.text')).filter(shown).some((n: any) => text(n).includes('重启恢复基准')) || null, 15000);
 }
 async function menu() { await click('ai.composer.usage'); return visible('ai.usage.menu'); }
 async function lastPresentation() {
-    const lines = (await readFile(join(data, 'ai-sessions.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const lines = (await readFile(join(data, 'ai-sessions.v4.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
     return lines.map(row => row.event).filter(event => event?.kind === 'presentation' && event.presentation.includes('重启恢复基准')).at(-1);
 }
 const report: any = {status: 'running', checks: []};
@@ -106,7 +114,7 @@ try {
 } catch (error) {
     report.status = 'failed'; report.error = String(error); process.exitCode = 1;
     await h.screenshot(join(out, 'failure.png')).catch(() => {});
-    await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree().catch(() => null), null, 2));
+    await writeFile(join(out, 'failure-tree.json'), JSON.stringify(await h.tree({ visibleOnly: true }).catch(() => null), null, 2));
 } finally {
     await stop(); server.closeAllConnections(); await new Promise<void>(done => server.close(() => done()));
     await log.close(); report.modelRequests = replies;

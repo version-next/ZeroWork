@@ -1,11 +1,15 @@
 /** Full display-history recovery and post-turn tool-catalog lifetime regression.
  * Owned Local terminals and loopback model only; no external credentials.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,open,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {isTitleRequest,skipTitle} from './ai_title_fixture.ts';
+import {readRequestJson} from './provider_fixture.ts';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-conversation-restore-test');
 const out=resolve(process.argv[2]??'/tmp/zw-conversation-restore-results');await mkdir(out,{recursive:true});
 const isolated=await realpath(await mkdtemp('/tmp/zw-restore-'));
@@ -15,7 +19,7 @@ const event=(delta:any)=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\
 let calls=0;const requests:any[]=[];
 const server=createServer(async(req,res)=>{
  if(req.method!=='POST'){res.end(JSON.stringify({data:[{id:'restore-fixture',context_window:200000,reasoning:false,vision:false}]}));return}
- let raw='';for await(const c of req)raw+=c;const body=JSON.parse(raw);requests.push(body);res.writeHead(200,{'content-type':'text/event-stream'});
+ const body=await readRequestJson(req);if(isTitleRequest(body))return skipTitle(res);requests.push(body);res.writeHead(200,{'content-type':'text/event-stream'});
  if(!body.tools?.length){res.end(event({content:'终端恢复检查'})+'data: [DONE]\n\n');return}
  const user=body.messages.findLastIndex((m:any)=>m.role==='user'),question=String(body.messages[user].content);
  const tail=body.messages.slice(user+1);
@@ -37,21 +41,24 @@ const visible=(id:string)=>h.waitFor(async()=>(await h.query(id)).find(shown)??n
 const report:any={status:'running',isolated,checks:[]};
 const tokenValues=async()=>(await h.query('ai.turn.tokens')).filter(shown).map((n:any)=>text(n));
 const click=async(id:string)=>{report.last_action=id;await visible(id);assert((await h.clickTestId(id)).ok,id)};
-async function stable(count:number){await h.waitFor(async()=>{const n=(await h.query('ai.turn.complete')).filter(shown);return n.length===count&&n||null},20000);await h.sleep(400);assert(!text(await h.tree()).includes('InvalidUtf8'),'no freed-catalog UTF8 error after completion');}
+// The welcome page's recent list reuses the session row view (src/features/ai/sessions/view/ai_empty_view.zig → ai_session_row.zig),
+// so ai.session.* ids exist twice while the welcome page is shown; popover actions must target the copy inside ai.sessions.menu.
+const clickInMenu=async(id:string)=>{report.last_action='ai.sessions.menu>'+id;const node=await h.waitFor(async()=>(await h.query('ai.sessions.menu')).filter(shown).flatMap(flat).find((n:any)=>n.test_id===id&&shown(n))??null,20000);assert((await h.clickAt(node.rect.x+node.rect.w/2,node.rect.y+node.rect.h/2)).ok,id)};
+async function stable(count:number){await h.waitFor(async()=>{const n=(await h.query('ai.turn.complete')).filter(shown);return n.length===count&&n||null},20000);await h.sleep(400);assert(!text([...await h.query('ai.content'),...await h.query('notifications.presenter')]).includes('InvalidUtf8'),'no freed-catalog UTF8 error after completion');}
 async function send(value:string,count:number){await click('ai.prompt');await h.type_(value);await click('ai.send');await stable(count)}
 async function confirmIfNeeded(){await h.sleep(150);if((await h.query('ai.session.close.accept')).some(shown))await click('ai.session.close.accept')}
 async function full(count:number,contains:string[]){await stable(count);const users=(await h.query('ai.message.user.text')).filter(shown);assert.equal(users.length,count);for(const s of contains)assert(text(users).includes(s));assert.equal((await h.query('ai.turn.tokens')).filter(shown).length,count);assert.equal((await h.query('ai.step_group')).filter(shown).length,count);}
 try{
- await h.waitForServerReady(60000);await h.resizeWindow(1280,960);await click('workspace.empty.local');await visible('terminal.surface');await click('toolbar.ai');
+ await h.waitForServerReady(60000);await h.resizeWindow(1280,960);await click('workspace.empty.local');await visible('terminal.surface');await click(await aiToggleId());
  await send('FIRST 检查当前终端 🧑‍💻',1);await full(1,['FIRST']);const originalTokens=(await tokenValues())[0];assert(!originalTokens.includes('未返回'));report.checks.push('A fresh conversation completes with user, reasoning/tool group and usage; idle updates do not read freed tools');
- await click('ai.collapse');await click('toolbar.new_session');await click('session.menu.local');await visible('terminal.surface');await click('toolbar.ai');await send('NEW_CONNECTION 新连接问答',1);report.checks.push('A second connection and new AI conversation also complete without InvalidUtf8');
- await click('ai.sessions');await click('ai.session.copy_use.1');await confirmIfNeeded();await full(1,['FIRST']);assert.equal((await tokenValues())[0],originalTokens);
+ await click('ai.collapse');await click('toolbar.new_session');await click('session.menu.local');await visible('terminal.surface');await click(await aiToggleId());await send('NEW_CONNECTION 新连接问答',1);report.checks.push('A second connection and new AI conversation also complete without InvalidUtf8');
+ await click('ai.sessions');await clickInMenu('ai.session.copy_use.1');await confirmIfNeeded();await full(1,['FIRST']);assert.equal((await tokenValues())[0],originalTokens);
  assert(!text(await h.query('ai.message.user.text')).includes('NEW_CONNECTION'));
  await send('COPY_FOLLOWUP 副本继续问答',2);await full(2,['FIRST','COPY_FOLLOWUP']);const copiedTokens=await tokenValues();assert((await h.screenshot(join(out,'01-copy-complete.png'))).ok);
  report.checks.push('Copy-and-use retains original question, reasoning/tool timeline, timing and tokens; next Chinese/emoji turn succeeds');
- await click('ai.session.new');await confirmIfNeeded();await click('ai.sessions');await click('ai.session.restore.3');await confirmIfNeeded();await full(2,['FIRST','COPY_FOLLOWUP']);assert.deepEqual(await tokenValues(),copiedTokens);
+ await click('ai.session.new');await confirmIfNeeded();await click('ai.sessions');await clickInMenu('ai.session.restore.3');await confirmIfNeeded();await full(2,['FIRST','COPY_FOLLOWUP']);assert.deepEqual(await tokenValues(),copiedTokens);
  await send('RESTORED_FOLLOWUP 恢复后继续 ✅',3);await full(3,['FIRST','COPY_FOLLOWUP','RESTORED_FOLLOWUP']);assert((await h.screenshot(join(out,'02-restored-complete.png'))).ok);
  report.checks.push('Restore retains both complete turns and the next turn succeeds without InvalidUtf8 or tool replay');
  assert.equal(calls,4,'exactly one read per submitted task; restoring/copying never replays tools');report.status='passed';
-}catch(e){report.status='failed';report.error=String(e);await h.screenshot(join(out,'failure.png')).catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree().catch(()=>null),null,2));process.exitCode=1;}
+}catch(e){report.status='failed';report.error=String(e);await h.screenshot(join(out,'failure.png')).catch(()=>{});await writeFile(join(out,'failure-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}).catch(()=>null),null,2));process.exitCode=1;}
 finally{app.kill('SIGTERM');if(app.exitCode===null&&app.signalCode===null)await new Promise(r=>app.once('close',r));server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));await log.close();report.toolCalls=calls;report.requests=requests.length;await writeFile(join(out,'report.json'),JSON.stringify(report,null,2));}

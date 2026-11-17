@@ -187,6 +187,7 @@ pub const Runtime = struct {
 pub const Plugin = struct {
     allocator: std.mem.Allocator,
     runtimes: std.ArrayList(*Runtime) = .empty,
+    card_defs: [1]registry.CardTypeDef = undefined,
     creates: usize = 0,
     releases: usize = 0,
     pub fn init(a: std.mem.Allocator) !*Plugin {
@@ -203,15 +204,22 @@ pub const Plugin = struct {
         const a = self.allocator;
         a.destroy(self);
     }
+    /// 不初始化插件就能读到的元数据（“已链接插件表”，Q5 的 e2e 用它验证禁用流程）。
+    pub const linked: @import("../../host/plugin_enablement.zig").Linked = .{
+        .id = model.protocol_id,
+        .display_name = "Fixture · 合成画面",
+        .plugin_version = "0.2.0-test",
+        .origin = .bundled,
+        .icons = .{ .settings = "server", .protocol = "server", .tab = "server" },
+    };
     pub fn manifest(self: *Plugin) registry.PluginManifest {
         return .{
-            .id = model.protocol_id,
-            .display_name = "Fixture · 合成画面",
-            .plugin_version = "0.2.0-test",
-            .origin = .bundled,
+            .id = linked.id,
+            .display_name = linked.display_name,
+            .plugin_version = linked.plugin_version,
+            .origin = linked.origin,
             .order = 100,
-            .icons = .{ .settings = "server", .protocol = "server", .tab = "server" },
-            .integration = .{ .ai = true },
+            .icons = linked.icons,
             .connection = .{ .create_kind = .saved_or_temporary, .validate_payload = model.validatePayload, .editor_factory = .{ .context = self, .mount = views.mountEditor }, .encode = codec, .decode = codec, .migrate = migrate },
             .workspace_kind = model.workspace_kind,
             .content_renderer = model.workspace_kind,
@@ -220,7 +228,8 @@ pub const Plugin = struct {
             .tool_definitions = &definitions,
             .tools = &tool_bindings,
             .notifications = &.{.{ .id = "fixture_probe.connection", .category = .connection_change }},
-            .ai_context = .{ .identity = "Synthetic non-terminal fixture", .context = self, .summarize = summarize },
+            .card_type = "fixture_probe",
+            .cards = self.cardTypes(),
             .settings_section = .{ .fields = &.{.{ .key = "show_grid", .label = "显示合成网格", .kind = .boolean, .default_value = "true", .apply_timing = .next_connection }} },
             .session_factory = .{ .context = self, .vtable = &factory_vtable, .poll = poll },
         };
@@ -236,6 +245,31 @@ pub const Plugin = struct {
         if (target_version != 1) return error.UnsupportedPayloadVersion;
         return codec(a, value);
     }
+    /// 非终端夹具的卡片类型：会话卡片，可独立成 tab、可进分屏；AI 上下文是本夹具的合成摘要，
+    /// 工具只列本夹具登记的工具。
+    fn cardTypes(self: *Plugin) []const registry.CardTypeDef {
+        self.card_defs = .{.{
+            .id = "fixture_probe",
+            // 窗口移交：卡片类型层面允许（插件渲染器呈现的会话卡片）；渲染器的 `supports_window_transfer` 另行判定。
+            .supports_window_transfer = true,
+            .title = "Fixture",
+            .binding = .session,
+            .placements = .{ .standalone_tab = true, .split = true, .float = true },
+            .default_placement = .standalone_tab,
+            // cards-float：注册表里所有会话类卡片都可以浮动（通用会话卡片的尺寸）。
+            .float = registry.card_types.sessionFloat("fixture_probe", registry.card_types.float_sizes.terminal),
+            .ai = .{
+                .summary = .{ .provider = .{ .identity = "Synthetic non-terminal fixture", .context = self, .summarize = summarize } },
+                .tools = .{ .own = &tool_ids },
+            },
+        }};
+        return &self.card_defs;
+    }
+    const tool_ids = blk: {
+        var result: [definitions.len][]const u8 = undefined;
+        for (definitions, &result) |definition, *id| id.* = definition.id;
+        break :blk result;
+    };
     fn summarize(ptr: ?*anyopaque, owner: identity.SessionHandle, a: std.mem.Allocator) ![]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ptr.?));
         const runtime = self.runtimeFor(owner) orelse return error.StaleBinding;

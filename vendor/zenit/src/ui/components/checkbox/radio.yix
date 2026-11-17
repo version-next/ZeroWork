@@ -21,25 +21,35 @@ pub fn Radio(checked: bool = false, label: Text = "", disabled: bool = false) Vi
 
 /// RadioGroup option: button semantic node, focusable, focus ring; unhovered
 /// highlights circle border on hover. Caller's `testId` lands on root node (this
-/// button semantic node).
-fn RadioChoice(label: []const u8, checked: bool, disabled: bool, onPick: ?Handler(void) = null, focusRing: ui.FocusRingConfig = .{}) View {
+/// button semantic node). `description` (RadioOption.description) is the option's a11y description;
+/// its line is the `about` slot, built at mount (the row is rebuilt when it changes: RadioGroup's
+/// key), so a row without one keeps the one-line tree [circle, label] with no anchors even when the
+/// options come from a signal. A described row stacks the label over the description, aligns to
+/// the top and drops the circle onto the label's first line; its one-line label is hidden.
+fn RadioChoice(label: []const u8, checked: bool, disabled: bool, description: ?[]const u8 = null, onPick: ?Handler(void) = null, focusRing: ui.FocusRingConfig = .{}, about: ?View) View {
     var hovered: bool = signal(false);
     const enabled = computed(!disabled);
+    const described = computed(description != null);
     return (
         <row
-            style={S.RadioParts.slot(.root, .{ .disabled = disabled })}
+            style={S.RadioParts.slot(.root, .{ .disabled = disabled, .described = described })}
             tag={.button}
             focusable={enabled}
             focusRing={focusRing}
-            a11y={.{ .role = .radio, .label = label, .checked = checked, .disabled = disabled }}
+            a11y={.{ .role = .radio, .label = label, .checked = checked, .disabled = disabled, .description = description }}
             onClick={onPick}
             onHover={hovered = true}
             onLeave={hovered = false}
         >
-            <box style={S.RadioParts.slot(.circle, .{ .checked = checked, .hovered = hovered, .disabled = disabled })}>
+            <box style={.{ S.RadioParts.slot(.circle, .{ .checked = checked, .hovered = hovered, .disabled = disabled, .described = described }), S.described_circle.of(.{ .on = described }) }}>
                 <box style={S.RadioParts.slot(.dot, .{ .checked = checked, .disabled = disabled })} />
             </box>
-            <text style={S.RadioParts.slot(.label, .{ .disabled = disabled })}>{label}</text>
+            <text style={S.RadioParts.slot(.label, .{ .disabled = disabled })} visible={!described}>{label}</text>
+            {if (about)
+                <col style={S.radio_text.of(.{ .disabled = disabled })}>
+                    <text style={S.RadioParts.slot(.label, .{ .disabled = disabled })}>{label}</text>
+                    {about}
+                </col>}
         </row>
     );
 }
@@ -66,9 +76,11 @@ pub fn RadioGroup(
         <box style={S.RadioGroupLayout.of(.{ .horizontal = horizontal })} a11y={.{ .role = .radiogroup, .required = true }}>
             {for (options) |opt|
                 <RadioChoice
-                    key={.{ opt.value, opt.label, opt.disabled }}
+                    key={.{ opt.value, opt.label, opt.disabled, opt.description }}
                     focusRing={focusRing}
                     label={opt.label}
+                    description={opt.description}
+                    about={if (opt.description != null) <text style={S.radio_description}>{opt.description orelse ""}</text>}
                     checked={isSelected(value, opt.value)}
                     disabled={disabled or opt.disabled}
                     testId={opt.test_id}

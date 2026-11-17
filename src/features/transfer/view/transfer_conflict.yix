@@ -1,0 +1,113 @@
+//! 同名文件处理对话框的视图。控件全部是 zenit 原生组件的默认外观：`W.Modal`（面板、遮罩、开合动效、焦点圈定、
+//! Esc）、`W.ScrollArea`、`W.RadioGroup`（四个处理方式；“覆盖”的后果写在原生的选项说明里）、`W.Input`、
+//! `W.Checkbox`、`W.Alert`（覆盖确认的危险提示）、`W.Tag`（“较新”）、`W.Button`，以及全应用统一的关闭按钮
+//! `PanelClose`。这里不写任何原生控件的样式，只排自己的盒子（`transfer_conflict_styles.yss`）。
+//!
+//! 状态与裁决都在 `transfer_conflict_view.zig` 的 `View`：视图只读它的信号，用户操作以提议值交回去。
+const ui = @import("ui");
+const W = ui.widgets;
+const S = @import("transfer_conflict_styles.yss");
+const C = @import("transfer_conflict_view.zig");
+const PanelClose = @import("../../../shared/ui/components/panel_header/panel_header.yix").PanelClose;
+
+/// 对比卡片（上传的文件 / 服务器上的文件）：类型图标、标题、“文件名 · 目录”、修改时间与大小；较新的一侧带原生 Tag。
+fn Card(view: *C.View, side: C.Side) View {
+    return (
+        <col testId={C.cardId(side)} style={S.compare_card}>
+            <row style={S.compare_head}>
+                <icon src={C.cardIcon(view, side)} style={S.compare_icon} />
+                <col style={S.compare_titles}>
+                    <text testId="transfer.conflict.compare.title" style={S.compare_title} box={S.text_box}>{C.cardTitle(view, side)}</text>
+                    <text testId="transfer.conflict.compare.place" style={S.compare_place} box={S.text_box}>{C.cardPlace(view, side)}</text>
+                </col>
+                <W.Tag testId="transfer.conflict.compare.newer" label="较新" color={.success} size={.sm} visible={C.cardNewer(view, side)} />
+            </row>
+            <col style={S.compare_meta}>
+                <row style={S.compare_row}>
+                    <text style={S.compare_key} box={S.compare_key_box}>修改时间</text>
+                    <text testId="transfer.conflict.compare.modified" style={S.compare_value} box={S.compare_value_box}>{C.cardModified(view, side)}</text>
+                </row>
+                <row style={S.compare_row}>
+                    <text style={S.compare_key} box={S.compare_key_box}>大小</text>
+                    <text testId="transfer.conflict.compare.size" style={S.compare_value} box={S.compare_value_box}>{C.cardSize(view, side)}</text>
+                </row>
+            </col>
+        </col>
+    );
+}
+
+pub fn ConflictDialog(view: *C.View) View {
+    const form = ref();
+    onMount(C.attach(view, form));
+    return (
+        <box style={S.anchor}>
+            <W.Modal
+                open={C.isOpen(view)}
+                onOpenChange={|o| C.openChanged(view, o)}
+                width={C.dialogWidth(view)}
+                maxHeight={C.dialogMaxHeight(view)}
+                closeOnOverlay={false}
+                bodyPadding={ui.Padding.all(0)}
+                bodyGap={0}
+                parts={.{ .overlay = "transfer.conflict.overlay", .dialog = "transfer.conflict" }}
+            >
+                <col ref={form} style={S.form} focusRequest={C.focusRequest(view)}>
+                    <row style={S.header}>
+                        <icon src={C.headerIcon(view)} style={S.header_icon} />
+                        <text style={S.title} box={S.title_box}>{C.title(view)}</text>
+                        <PanelClose label={C.closeLabel(view)} buttonTestId="transfer.conflict.close" focusName={C.focus_close} onClose={C.dismiss(view)} />
+                    </row>
+                    <W.ScrollArea
+                        direction={.vertical}
+                        rubberBandY={false}
+                        testId="transfer.conflict.viewport"
+                        scrollY={C.scrollY(view)}
+                        onScrollYChange={|y| C.scrolled(view, y)}
+                        style={S.viewport.of(.{ .max = C.bodyMaxHeight(view) })}
+                        parts={.{ .content = .{ .style = S.body } }}
+                    >
+                        <col style={S.stack} visible={C.choiceShown(view)}>
+                            <text testId="transfer.conflict.caption" style={S.caption} box={S.text_box}>{C.caption(view)}</text>
+                            <text testId="transfer.conflict.target" style={S.path} box={S.text_box} visible={C.summaryShown(view)}>{C.summaryTarget(view)}</text>
+                            <text testId="transfer.conflict.metadata" style={S.detail} box={S.text_box} visible={C.summaryShown(view)}>{C.summaryMetadata(view)}</text>
+                            <row testId="transfer.conflict.compare" style={S.compare} visible={C.compareShown(view)}>
+                                <Card view={view} side={.source} />
+                                <Card view={view} side={.existing} />
+                            </row>
+                            <box style={S.field} visible={C.decisionShown(view)}>
+                                <W.RadioGroup options={&C.options} value={C.selected(view)} disabled={C.locked(view)} onChange={|v| C.choose(view, v)} />
+                            </box>
+                            <box style={S.field} visible={C.renameShown(view)}>
+                                <W.Input
+                                    value={C.rename(view)}
+                                    labelText="另存文件名"
+                                    placeholder="新的文件名"
+                                    disabled={C.locked(view)}
+                                    focusId={C.focus_name}
+                                    onChange={|t| C.renamed(view, t)}
+                                    onSubmit={|t| C.submitted(view, t)}
+                                    parts={.{ .input_container = "transfer.conflict.name" }}
+                                />
+                            </box>
+                            <text testId="transfer.conflict.hint" style={S.detail} box={S.text_box} visible={C.hintShown(view)}>{C.hint(view)}</text>
+                            <box style={S.field} visible={C.decisionShown(view)}>
+                                <W.Checkbox testId="transfer.conflict.remaining" label="仅对本队列剩余同名文件应用此选择" checked={C.applyRemaining(view)} disabled={C.locked(view)} onChange={|v| C.setApplyRemaining(view, v)} />
+                            </box>
+                        </col>
+                        <col style={S.confirmation} visible={C.confirmationShown(view)}>
+                            <W.Alert variant={.@"error"} title={C.confirmHeading(view)} message={C.confirmMessage(view)} titleTestId="transfer.conflict.confirm.heading" messageTestId="transfer.conflict.confirm.detail" />
+                            <text testId="transfer.conflict.confirm.paths" style={S.path} box={S.text_box}>{C.confirmPaths(view)}</text>
+                            <text testId="transfer.conflict.confirm.metadata" style={S.metadata} box={S.text_box}>{C.confirmMetadata(view)}</text>
+                        </col>
+                        <text testId="transfer.conflict.error" style={S.issue} box={S.text_box} visible={C.issueShown(view)}>{C.issue(view)}</text>
+                    </W.ScrollArea>
+                    <row testId="transfer.conflict.footer" style={S.footer}>
+                        <W.Button testId="transfer.conflict.pause" variant={.ghost} iconOnly={true} iconAsset={ui.icons.pause} a11yLabel="暂不处理，暂停原任务" disabled={C.locked(view)} visible={C.pauseShown(view)} onClick={C.postpone(view)} />
+                        <W.Button testId="transfer.conflict.back" variant={.secondary} label="返回选择" disabled={C.locked(view)} visible={C.confirmationShown(view)} onClick={C.returnToChoice(view)} />
+                        <W.Button testId="transfer.conflict.apply" variant={C.primaryVariant(view)} label={C.primaryLabel(view)} disabled={C.primaryDisabled(view)} onClick={C.submit(view)} />
+                    </row>
+                </col>
+            </W.Modal>
+        </box>
+    );
+}

@@ -29,6 +29,7 @@ extern fn zenit_wayland_ime_set_cursor_rect(*Handle, i32, i32, i32, i32) c_int;
 extern fn zenit_wayland_ime_set_surrounding(*Handle, [*]const u8, usize, u32, u32) c_int;
 extern fn zenit_wayland_ime_set_secure(*Handle, c_int) c_int;
 extern fn zenit_wayland_poll(*Handle, c_int) c_int;
+extern fn zenit_wayland_poll_wake(*Handle, c_int, c_int) c_int;
 extern fn zenit_wayland_metrics(*Handle, *NativeSurface) c_int;
 extern fn zenit_wayland_request_frame(*Handle) c_int;
 extern fn zenit_wayland_request_frame_clock(*Handle) c_int;
@@ -190,8 +191,13 @@ pub const Window = struct {
         self.handle = null;
     }
     pub fn poll(self: *Window, timeout_ms: u31) !bool {
+        return self.pollWake(timeout_ms, -1);
+    }
+    /// `poll` that also returns when `wake_fd` (the process wake eventfd, -1 = none) becomes
+    /// readable, and drains it.
+    pub fn pollWake(self: *Window, timeout_ms: u31, wake_fd: i32) !bool {
         const handle = self.handle orelse return false;
-        return switch (zenit_wayland_poll(handle, @intCast(timeout_ms))) {
+        return switch (zenit_wayland_poll_wake(handle, @intCast(timeout_ms), wake_fd)) {
             0 => false,
             1 => true,
             else => error.WaylandDisconnected,

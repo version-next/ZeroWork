@@ -1,9 +1,12 @@
 /** Persist committed directory progress through real timed rotation and restarts. */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, open, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import * as h from '../vendor/zenit/e2e/client.ts';
+import {settingsNav} from './settings_nav.ts';
+const nav = settingsNav();
 
 const binary = resolve(process.argv[2] ?? 'zig-out/bin/zerowork');
 const out = resolve(process.argv[3] ?? '/tmp/zw-background-resume-native');
@@ -34,8 +37,8 @@ async function reveal(id:string) {
     throw Error('Cannot reveal '+id);
 }
 async function openSettings() {
-    await click('toolbar.settings'); await click('settings.nav.appearance');
-    await reveal('settings.materials.header'); await click('settings.materials.header');
+    // Two-level settings (settings_nav.ts): 外观与主题 › 主题 holds the materials pane (no folding header any more).
+    await nav.toPane('settings.appearance.materials');
     await reveal('settings.background.state');
 }
 async function expectImage(name:string) {
@@ -53,7 +56,7 @@ async function launch(round:number, run:()=>Promise<void>) {
         await run();
     } catch (error) {
         await h.screenshot(join(out,'failure-'+round+'.png')).catch(()=>{});
-        await writeFile(join(out,'failure-'+round+'-tree.json'),JSON.stringify(await h.tree().catch(()=>null),null,2));
+        await writeFile(join(out,'failure-'+round+'-tree.json'),JSON.stringify(await h.tree({visibleOnly:true}).catch(()=>null),null,2));
         throw error;
     }
     finally {
@@ -70,14 +73,15 @@ try {
     await launch(1, async () => {
         await openSettings(); await expectImage('1.png');
         const config = await readFile(join(data, 'config.toml'), 'utf8');
-        await click('settings.close');
+        await nav.close();
         console.log('Waiting for the real one-minute switch');
         await h.sleep(31000); await h.health(); await h.sleep(31000);
         await openSettings(); await expectImage('2.png');
         const state = await readProgress();
         assert.equal(state.paths[state.index], join(images,'2.png'));
         assert.equal(await readFile(join(data,'config.toml'),'utf8'), config);
-        assert.equal((await visible('settings.footer.state')).text, '已保存');
+        // Clean settings: the floating Save Bar is hidden (was the persistent footer state "已保存").
+        assert.equal(await nav.dirty(), false, 'rotation does not dirty settings (no Save Bar)');
         assert((await h.screenshot(join(out,'sequential-before-restart.png'))).ok);
         report.checks.push('real one-minute rotation persists current image without changing config or dirtying settings');
     });
@@ -88,7 +92,7 @@ try {
         report.checks.push('restart restores the displayed sequential image and starts a fresh interval');
         await reveal('settings.field.order'); await click('settings.field.order'); await click('settings.option.order.random');
         await click('settings.save');
-        await h.waitFor(async () => (await visible('settings.footer.state')).text==='已保存' || null, 15000);
+        await nav.saved(15000);
         await expectImage('2.png');
         randomProgress = await readProgress();
         assert.equal(randomProgress.random, true);

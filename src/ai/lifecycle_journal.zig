@@ -1,6 +1,7 @@
 //! One IO owner persists metadata before an effect. No command/credential/output
 //! text is accepted here. Controllers exchange handles and owned snapshots.
 const std = @import("std");
+const persist_io = @import("../shared/base/persist.zig");
 const identity = @import("../host/identity.zig");
 const host = @import("host_tools.zig");
 const scope = @import("tool_scope.zig");
@@ -75,6 +76,8 @@ pub const Update = struct {
     wire_notice_revision: ?u64 = null,
 };
 const Disk = struct { schema_version: u32, records: []const Record };
+/// 本版本能读 1–3（3 起含 tab 绑定，M10）；写出时按内容选最低够用的版本。
+const schema: persist_io.SchemaRange = .{ .min = 1, .max = 3 };
 pub const Journal = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -89,9 +92,7 @@ pub const Journal = struct {
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Journal {
         if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOf(u8, path, "..") != null) return error.InvalidJournalPath;
         if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
-        const lock_path = try std.fmt.allocPrint(a, "{s}.lock", .{path});
-        defer a.free(lock_path);
-        const lock_file = try dir.createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true, .permissions = @fromBackingInt(0o600) });
+        const lock_file = try persist_io.acquireLock(io, dir, path);
         errdefer lock_file.close(io);
         var journal: Journal = .{ .allocator = a, .io = io, .dir = dir, .path = try a.dupe(u8, path), .lock_file = lock_file };
         errdefer {
@@ -105,13 +106,35 @@ pub const Journal = struct {
         };
         defer a.free(source);
         journal.disk_hash = hash(source);
+        if (try journal.load(source)) try journal.persist(journal.records.items);
+        return journal;
+    }
+    /// Open `path`; when it does not exist yet, read the records of `legacy` (read only, never
+    /// written or locked), validate them as `open` does and write them to `path`. Later versions
+    /// write only `path`, so an older version keeps reading `legacy` as it understood it.
+    pub fn openMigrating(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, legacy: []const u8) !Journal {
+        var journal = try open(a, io, dir, path);
+        errdefer journal.deinit();
+        if (journal.disk_hash != null) return journal;
+        const source = try persist_io.readLegacy(a, io, dir, path, legacy, .unlimited) orelse return journal;
+        defer a.free(source);
+        _ = try journal.load(source);
+        try journal.persist(journal.records.items);
+        return journal;
+    }
+    /// Parse and validate a journal file into `records`; true when interrupted operations were
+    /// recovered (the caller persists).
+    fn load(journal: *Journal, source: []const u8) !bool {
+        const a = journal.allocator;
         const parsed = try std.json.parseFromSlice(Disk, a, source, .{});
         defer parsed.deinit();
-        if (parsed.value.schema_version != 1 and parsed.value.schema_version != 2) return error.UnsupportedJournalSchema;
+        if (!schema.accepts(parsed.value.schema_version)) return error.UnsupportedJournalSchema;
         try journal.records.ensureTotalCapacity(a, parsed.value.records.len);
         var recovered = false;
         for (parsed.value.records) |value| {
             if (parsed.value.schema_version == 1 and value.context.child_origin != null) return error.UnsupportedJournalSchema;
+            // tab 绑定与绑定内容（M10）只出现在 schema 3 起的文件里。
+            if (parsed.value.schema_version < 3 and (value.context.binding == .tab or value.context.content != null or (value.committed_binding != null and value.committed_binding.? == .tab))) return error.UnsupportedJournalSchema;
             try validateRecord(value);
             for (journal.records.items) |prior| if (prior.operation_ref.eql(value.operation_ref) or sameKey(prior, value.context, value.tool_id, value.request_key)) return error.InvalidJournal;
             var owned = try value.clone(a);
@@ -139,8 +162,7 @@ pub const Journal = struct {
             }
             journal.records.appendAssumeCapacity(owned);
         }
-        if (recovered) try journal.persist(journal.records.items);
-        return journal;
+        return recovered;
     }
     pub fn deinit(self: *Journal) void {
         for (self.records.items) |*record| record.deinit(self.allocator);
@@ -262,13 +284,12 @@ pub const Journal = struct {
         const extended = for (records) |record| {
             if (record.context.child_origin != null) break true;
         } else false;
-        const encoded = try std.json.Stringify.valueAlloc(self.allocator, Disk{ .schema_version = if (extended) 2 else 1, .records = records }, .{});
+        const tab_bound = for (records) |record| {
+            if (record.context.binding == .tab or record.context.content != null or (record.committed_binding != null and record.committed_binding.? == .tab)) break true;
+        } else false;
+        const encoded = try std.json.Stringify.valueAlloc(self.allocator, Disk{ .schema_version = if (tab_bound) 3 else if (extended) 2 else 1, .records = records }, .{});
         defer self.allocator.free(encoded);
-        var atomic = try self.dir.createFileAtomic(self.io, self.path, .{ .permissions = @fromBackingInt(0o600), .make_path = true, .replace = true });
-        defer atomic.deinit(self.io);
-        try atomic.file.writeStreamingAll(self.io, encoded);
-        try atomic.file.sync(self.io);
-        try atomic.replace(self.io);
+        try persist_io.writeAtomic(self.io, self.dir, self.path, encoded, .{ .make_path = true, .sync_dir = true });
         self.disk_hash = hash(encoded);
     }
 };

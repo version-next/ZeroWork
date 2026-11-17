@@ -139,7 +139,7 @@ fn testPrepared() !*Prepared {
     const bytes = [_][]const u8{ "launcher fixture", "module fixture", "zsh fixture" };
     var package: bootstrap.Package = .{ .arena = arena, .platform = "darwin-aarch64", .manifest_hash = @splat(7), .files = bytes, .hashes = undefined };
     for (bytes, &package.hashes) |value, *hash| std.crypto.hash.sha2.Sha256.hash(value, hash, .{});
-    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
+    const context: host.Context = .{ .conversation_id = identity.ConversationId.generate(), .task_id = identity.TaskId.generate(), .binding = .{ .tab = 7 }, .content = .{ .group = 7 }, .binding_revision = 2, .grant_revision = 3 };
     const source: identity.SessionHandle = .{ .session_id = @fromBackingInt(10), .generation = 4 };
     const owner: identity.SessionHandle = .{ .session_id = @fromBackingInt(11), .generation = 1 };
     return Prepared.createWithPackage(a, context, identity.HostOperationId.generate(), source, owner, try Probed.init(.{ .platform = .darwin_aarch64, .shell_path = .bin }, "fixture", "controlled.test", 2222), package);

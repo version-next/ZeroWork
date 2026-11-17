@@ -15,7 +15,7 @@ static int stamp_desktop_frame(ZenitD3D11Probe *probe) {
 
 static int capture_desktop_bmp(ZenitD3D11Probe *probe, unsigned index, LONGLONG present_not_before) {
     wchar_t directory[MAX_PATH], path[MAX_PATH];
-    DWORD n=GetEnvironmentVariableW(L"ZENIT_WINDOWS_FRAME_CAPTURE_DIR",directory,MAX_PATH);
+    DWORD n=zenitAutomationEnvironmentW(L"ZENIT_WINDOWS_FRAME_CAPTURE_DIR",directory,MAX_PATH);
     if (!n || n>=MAX_PATH-40) return 0;
     if (IsIconic(probe->hwnd) || GetForegroundWindow()!=probe->hwnd) {
         fprintf(stderr,"[windows-desktop-unavailable] minimized=%d foreground=%d\n",

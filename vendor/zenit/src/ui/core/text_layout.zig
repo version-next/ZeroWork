@@ -46,6 +46,7 @@ fn currentMeasureCtxId() u64 {
 
 pub fn setMeasureCtxFn(f: ?MeasureCtxFn, ctx: ?*anyopaque) void {
     if (external_measure_ctx_fn == f and external_measure_ctx == ctx) return;
+    if (external_measure_ctx == ctx) invalidateMeasureCache();
     external_measure_ctx_fn = f;
     external_measure_ctx = ctx;
     // Doesn't clear the table: ctx identity is already part of MeasureKey (see
@@ -101,7 +102,14 @@ pub fn hasShapeMeasure() bool {
 /// Clear measure cache. Must call when measure fn changes (different fns,
 /// same key should give different widths).
 pub fn invalidateMeasureCache() void {
-    for (&g_measure_cache) |*e| e.valid = false;
+    // A generation bump invalidates every entry without writing the table
+    // (zero-filled storage stays untouched, outside the process footprint).
+    g_measure_cache_generation +%= 1;
+    g_measure_cache_live = 0;
+    if (g_measure_cache_generation == 0) {
+        @memset(g_measure_cache, .{ .key = undefined, .width = 0, .last_used = 0, .generation = 0 });
+        g_measure_cache_generation = 1;
+    }
 }
 
 // Measure cache: text_hash + font params -> width. Target: shape cache > 95% hit. Hit skips
@@ -110,8 +118,12 @@ pub fn invalidateMeasureCache() void {
 // text each call measure_x N times). Capacity basis: a dense 40KB Chinese document cold-open
 // produces ~16.5k unique (segment, font) keys; 4096 capacity evicted twice in a single
 // open, so revert/reopen redid all shaping.
-// 16384 x ~48B = ~786KB, keeps whole document segments resident.
+// The table starts small and doubles at half load, capped at 16384 entries.
+// Its byte ceiling is tested below, including authoritative-query identities.
+// A window of labels does not keep the full table resident (hashed writes
+// would dirty most of its pages).
 const MEASURE_CACHE_CAP: usize = 16384;
+const MEASURE_CACHE_INITIAL: usize = 1024;
 const MeasureKey = packed struct {
     text_hash: u64,
     font_size_bits: u32, // f32 reinterpret used as integral key part.
@@ -129,14 +141,50 @@ const MeasureKey = packed struct {
     /// prevented by clearing the whole table on ctx change, which MultiWindowApp (each window's
     /// layout() run sequentially per frame) would do every frame: hit rate zero.
     measure_ctx_id: u64 = 0,
+    // Authoritative width queries share this bounded table, with a separate
+    // namespace and all additional drawing inputs. Retain fingerprints only:
+    // a provider may destroy its owner and source buffer during measurement.
+    width_owner: u64 = 0,
+    width_provider: u64 = 0,
+    width_provider_ctx: u64 = 0,
+    width_hash2: u64 = 0,
+    width_text_len: u32 = 0,
+    width_family: u16 = 0,
+    width_symbols: u8 = 0,
+    width_cell: u32 = 0,
 };
 const MeasureEntry = struct {
     key: MeasureKey,
     width: f32,
     last_used: u64,
-    valid: bool = false,
+    /// Valid when equal to g_measure_cache_generation (never 0).
+    generation: u32 = 0,
 };
-var g_measure_cache: [MEASURE_CACHE_CAP]MeasureEntry = @as([MEASURE_CACHE_CAP]MeasureEntry, @splat(.{ .key = undefined, .width = 0, .last_used = 0, .valid = false }));
+var g_measure_cache: []MeasureEntry = &.{};
+var g_measure_cache_live: usize = 0;
+var g_measure_cache_generation: u32 = 1;
+
+fn measureCacheResize(len: usize) bool {
+    const fresh = std.heap.page_allocator.alloc(MeasureEntry, len) catch return false;
+    @memset(fresh, .{ .key = undefined, .width = 0, .last_used = 0, .generation = 0 });
+    const old = g_measure_cache;
+    g_measure_cache = fresh;
+    g_measure_cache_live = 0;
+    for (old) |e| if (e.generation == g_measure_cache_generation) measureCacheInsert(e);
+    if (old.len > 0) std.heap.page_allocator.free(old);
+    return true;
+}
+
+fn measureCacheInsert(entry: MeasureEntry) void {
+    const base: usize = @intCast((entry.key.text_hash % g_measure_cache.len) & ~@as(u64, 1));
+    const e0 = &g_measure_cache[base];
+    const e1 = &g_measure_cache[base + 1];
+    const gen = g_measure_cache_generation;
+    const target = if (e0.generation != gen) e0 else if (e1.generation != gen) e1 else if (e0.last_used <= e1.last_used) e0 else e1;
+    if (target.generation != gen) g_measure_cache_live += 1;
+    target.* = entry;
+    target.generation = gen;
+}
 var g_measure_cache_clock: u64 = 0;
 var g_measure_cache_hits: u64 = 0;
 var g_measure_cache_misses: u64 = 0;
@@ -160,6 +208,12 @@ pub fn resetMeasureCacheStats() void {
     g_measure_cache_misses = 0;
 }
 
+test "managed width memo keeps the shared table within two MiB" {
+    const bytes = @sizeOf(MeasureEntry) * MEASURE_CACHE_CAP;
+    try std.testing.expect(bytes <= 2 * 1024 * 1024);
+    std.debug.print("[width-memo-budget] entry_bytes={d} max_table_bytes={d} source_text_bytes=0\n", .{ @sizeOf(MeasureEntry), bytes });
+}
+
 inline fn measureKeyEq(a: MeasureKey, b: MeasureKey) bool {
     return a.text_hash == b.text_hash and
         a.font_size_bits == b.font_size_bits and
@@ -170,17 +224,74 @@ inline fn measureKeyEq(a: MeasureKey, b: MeasureKey) bool {
         // Note: this function compares field-by-field not bitwise whole, adding
         // MeasureKey fields must also sync here, else that field (different values
         // hit each other).
-        a.measure_ctx_id == b.measure_ctx_id;
+        a.measure_ctx_id == b.measure_ctx_id and
+        a.width_owner == b.width_owner and
+        a.width_provider == b.width_provider and
+        a.width_provider_ctx == b.width_provider_ctx and
+        a.width_hash2 == b.width_hash2 and
+        a.width_text_len == b.width_text_len and
+        a.width_family == b.width_family and
+        a.width_symbols == b.width_symbols and
+        a.width_cell == b.width_cell;
 }
+
+/// A managed, authoritative query can reuse the same scalar width in later
+/// frames. The owner is its ShapingCache; that cache invalidates the generation
+/// before destruction/reuse. No owner pointer or source slice is read after
+/// invoking the provider. Unavailable answers never enter this memo.
+pub const AuthoritativeWidthMemo = struct {
+    key: ?MeasureKey = null,
+    generation: u32 = 0,
+
+    pub fn init(owner: usize, provider: usize, provider_ctx: usize, text: []const u8, size: f32, weight: u16, italic: bool, mono: bool, family: u16, symbols: bool, cell: f32) AuthoritativeWidthMemo {
+        // Prefix queries dominate wrapping. Long, changing line suffixes must
+        // not evict that working set on every streamed token.
+        if (owner == 0 or text.len > 512) return .{ .generation = g_measure_cache_generation };
+        return .{ .generation = g_measure_cache_generation, .key = .{
+            .text_hash = @import("trace").work_counters.hashText(0, text),
+            .font_size_bits = @bitCast(size),
+            .font_weight = weight,
+            .use_italic = @intFromBool(italic),
+            .text_len_low = @truncate(text.len),
+            .use_monospace = @intFromBool(mono),
+            .measure_ctx_id = currentMeasureCtxId(),
+            .width_owner = owner,
+            .width_provider = provider,
+            .width_provider_ctx = provider_ctx,
+            .width_hash2 = @import("trace").work_counters.hashText(0x9e3779b97f4a7c15, text),
+            .width_text_len = @intCast(text.len),
+            .width_family = family,
+            .width_symbols = @intFromBool(symbols),
+            .width_cell = @bitCast(cell),
+        } };
+    }
+
+    pub fn lookup(self: AuthoritativeWidthMemo) ?f32 {
+        return if (self.key) |key| measureCacheLookup(key) else null;
+    }
+
+    pub fn isCurrent(self: AuthoritativeWidthMemo) bool {
+        return self.generation == g_measure_cache_generation;
+    }
+
+    pub fn store(self: AuthoritativeWidthMemo, width: f32) void {
+        if (!self.isCurrent() or !std.math.isFinite(width)) return;
+        if (self.key) |key| measureCacheStore(key, width);
+    }
+};
 
 // 2-way set-associative: direct-mapped hot key conflicts kick each other
 // (repeated CoreText remeasure), two slots/group + group LRU eviction
 // significantly lowers thrash, same capacity.
 fn measureCacheLookup(key: MeasureKey) ?f32 {
-    const base: usize = @intCast((key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1));
+    if (g_measure_cache.len == 0) {
+        g_measure_cache_misses += 1;
+        return null;
+    }
+    const base: usize = @intCast((key.text_hash % g_measure_cache.len) & ~@as(u64, 1));
     inline for (0..2) |way| {
         const e = &g_measure_cache[base + way];
-        if (e.valid and measureKeyEq(e.key, key)) {
+        if (e.generation == g_measure_cache_generation and measureKeyEq(e.key, key)) {
             g_measure_cache_clock += 1;
             e.last_used = g_measure_cache_clock;
             g_measure_cache_hits += 1;
@@ -192,17 +303,11 @@ fn measureCacheLookup(key: MeasureKey) ?f32 {
 }
 
 fn measureCacheStore(key: MeasureKey, width: f32) void {
-    const base: usize = @intCast((key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1));
-    const e0 = &g_measure_cache[base];
-    const e1 = &g_measure_cache[base + 1];
-    const target = if (!e0.valid) e0 else if (!e1.valid) e1 else if (e0.last_used <= e1.last_used) e0 else e1;
+    if (g_measure_cache.len == 0 and !measureCacheResize(MEASURE_CACHE_INITIAL)) return;
+    if (g_measure_cache_live * 2 >= g_measure_cache.len and g_measure_cache.len < MEASURE_CACHE_CAP)
+        _ = measureCacheResize(g_measure_cache.len * 2);
     g_measure_cache_clock += 1;
-    target.* = .{
-        .key = key,
-        .width = width,
-        .last_used = g_measure_cache_clock,
-        .valid = true,
-    };
+    measureCacheInsert(.{ .key = key, .width = width, .last_used = g_measure_cache_clock });
 }
 
 /// Internal proportional measure + cache. Sole aggregation point for
@@ -219,7 +324,7 @@ fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_i
         if (!std.math.isNan(w)) return w;
     }
     // measure cache lookup
-    const text_hash = std.hash.Wyhash.hash(0, text);
+    const text_hash = @import("trace").work_counters.hashText(0, text);
     const key = MeasureKey{
         .text_hash = text_hash,
         .font_size_bits = @bitCast(font_size),
@@ -248,6 +353,7 @@ fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_i
             }
             break :blk native_text.coretext_measure_text_width_utf8(text.ptr, @intCast(text.len), font_size);
         }
+        if (builtin.cpu.arch.isWasm()) @panic("freestanding text measurement requires an injected hook");
         // Fallback: rough estimate by codepoint (ASCII 0.6em, non-ASCII full-width
         // 1.0em). Can't use byte count; CJK 3 bytes/char, byte count overestimates
         // ~3x (selection/cursor misaligned).
@@ -277,7 +383,7 @@ pub fn measureMonospaceTextWidth(text: []const u8, font_size: f32, font_weight: 
         // Walk cache (use_monospace=1 separate key): external mono measure same
         // FFI/shaping overhead, before uncached.
         const key = MeasureKey{
-            .text_hash = std.hash.Wyhash.hash(0, text),
+            .text_hash = @import("trace").work_counters.hashText(0, text),
             .font_size_bits = @bitCast(font_size),
             .font_weight = font_weight,
             .use_italic = if (use_italic) 1 else 0,
@@ -420,10 +526,14 @@ pub fn estimateItalicOverhangPadding(font_size: f32, use_italic: bool) f32 {
     return std.math.clamp(font_size * 0.12, 1.0, 4.0);
 }
 
-// Phase 5: cap 64 -> 1024. Full ArrayList conversion in Phase 6 text
-// pipeline rewrite (integrate with text_core PieceTree together); current
-// 1024 far exceeds any UI text scenario.
-pub const MAX_LINES = 1024;
+/// Lines a `TextLayout` holds inline; longer layouts keep all their lines in `spill_lines`.
+/// 1024 keeps the common case free of extra allocations (docs/design/streaming-content.md §5.9).
+/// `-Dtext-inline-lines=<n>` lowers it for a test run, so every text test also goes through the
+/// spilled table.
+pub const inline_line_capacity: usize = blk: {
+    const env = @import("zenit_environment");
+    break :blk if (@hasDecl(env, "text_inline_lines") and env.text_inline_lines != 0) env.text_inline_lines else 1024;
+};
 pub const INTERACTION_PREFIX_MAX_CHARS: usize = 1024;
 const INTERACTION_PREFIX_CACHE_SIZE: usize = 512;
 // Sidecar hash table (open addressing). >= 2x cache size for low collision rate.
@@ -431,6 +541,24 @@ const INTERACTION_PREFIX_INDEX_SIZE: usize = 2048;
 const INTERACTION_PREFIX_INDEX_MASK: usize = INTERACTION_PREFIX_INDEX_SIZE - 1;
 const INTERACTION_PREFIX_INDEX_PROBE_LIMIT: usize = 8;
 /// Sentinel: sidecar slot empty / evicted.
+/// A space a soft wrap leaves at the start of the next line, which the line never starts with
+/// (UAX #14 LB7 / LB21: no break before SP or a BA such as TAB, so a CSS `pre-wrap` line never
+/// begins with them; zenit's emergency breaks can, so the layout skips them). Other space
+/// separators (U+3000 …) and no-break spaces are content and may start a line.
+pub fn isLineStartWrapSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+/// A space that hangs at the end of a line instead of being content there (CSS Text 3 §4.1.3,
+/// `pre-wrap`): SPACE, TAB and the other Unicode space separators, but not the no-break spaces
+/// (U+00A0, U+2007, U+202F), which glue their neighbours. Trimmed before a line-end ellipsis.
+pub fn isLineEndHangingSpace(cp: u21) bool {
+    return switch (cp) {
+        ' ', '\t', 0x1680, 0x2000...0x2006, 0x2008...0x200A, 0x205F, 0x3000 => true,
+        else => false,
+    };
+}
+
 const INVALID_CACHE_IDX: u16 = std.math.maxInt(u16);
 
 pub const LineInfo = struct {
@@ -439,23 +567,119 @@ pub const LineInfo = struct {
     width: f32,
 };
 
+/// Line-break result of one text: its lines plus the inputs it was computed for (the cache key).
+///
+/// Read the lines through `lines()`. Up to `inline_line_capacity` lines live inline; a longer
+/// layout keeps all of them in `spill_lines`, memory owned by whoever owns this TextLayout (the
+/// layout output table for a node's layout, the `LineScratch` for a freshly computed one).
+/// A copy of the struct is therefore a borrow: its lines stay valid only until the owner stores
+/// the next layout over it. To keep a layout, `assign` it into a TextLayout you own and release
+/// that with `deinitStorage`.
 pub const TextLayout = struct {
-    lines: [MAX_LINES]LineInfo = undefined,
-    line_count: u16 = 0,
+    /// Internal storage, read through `lines()`.
+    inline_lines: [inline_line_capacity]LineInfo = undefined,
+    /// Internal storage, read through `lines()`: all lines when `line_count` exceeds the inline
+    /// capacity (its length is the capacity, possibly more than `line_count`), else empty.
+    spill_lines: []LineInfo = &.{},
+    line_count: u32 = 0,
     total_height: f32 = 0,
     max_line_width: f32 = 0,
-    // Cache key, triple-check ptr+len+hash.
+    /// `max_lines` ended the layout with content still to come (more than blank lines): the
+    /// text is truncated by its line limit.
+    lines_truncated: bool = false,
+    // Cache key. Borrowed text can be republished at the same address.
     cached_content_ptr: [*]const u8 = undefined,
     cached_content_len: usize = 0,
     cached_content_hash: u64 = 0,
     cached_available_width: f32 = 0,
     cached_font_weight: u16 = 400,
     cached_font_size: f32 = 0,
+    cached_line_height: f32 = 0,
+    cached_measure_generation: u32 = 0,
+    cached_measure_ctx: ?*anyopaque = null,
+    cached_measure_ctx_fn: ?MeasureCtxFn = null,
+    cached_shape_fn: ?ShapeMeasureFn = null,
     cached_use_italic: bool = false,
     cached_use_monospace: bool = false,
     cached_wrap: TextWrap = .none,
     cached_max_lines: u16 = 0,
     cached_spans_hash: u64 = 0,
+
+    /// The laid-out lines, in order.
+    pub fn lines(self: *const TextLayout) []const LineInfo {
+        const n: usize = self.line_count;
+        return if (n <= inline_line_capacity) self.inline_lines[0..n] else self.spill_lines[0..n];
+    }
+
+    /// Make `self` (whose spill storage belongs to `allocator`) a copy of `src`. Two phases: a
+    /// larger spill table is allocated before anything changes, so on failure `self` is left
+    /// exactly as it was. `src` may be `self`, or a copy of `self` whose lines are `self`'s own
+    /// spill table: lines are copied before any table is released. The spill table grows by
+    /// half again its size, so a layout growing line by line reallocates logarithmically often;
+    /// it is released when the layout fits inline again.
+    pub fn assign(self: *TextLayout, allocator: std.mem.Allocator, src: *const TextLayout) std.mem.Allocator.Error!void {
+        if (self == src) return;
+        const src_lines = src.lines();
+        const n = src_lines.len;
+        if (n <= inline_line_capacity) {
+            @memmove(self.inline_lines[0..n], src_lines);
+            self.copyKeyFrom(src);
+            const old_spill = self.spill_lines;
+            self.spill_lines = &.{};
+            if (old_spill.len != 0) allocator.free(old_spill);
+            return;
+        }
+        const old_spill = self.spill_lines;
+        const grown: ?[]LineInfo = if (old_spill.len >= n) null else try allocator.alloc(LineInfo, @max(n, old_spill.len + old_spill.len / 2));
+        const table = grown orelse old_spill;
+        @memmove(table[0..n], src_lines);
+        self.copyKeyFrom(src);
+        if (grown) |fresh| {
+            self.spill_lines = fresh;
+            if (old_spill.len != 0) allocator.free(old_spill);
+        }
+    }
+
+    /// Release the spill table (`allocator` is the one `assign` was given). The layout keeps its
+    /// header; it no longer has lines beyond the inline capacity, so it is emptied.
+    pub fn deinitStorage(self: *TextLayout, allocator: std.mem.Allocator) void {
+        if (self.spill_lines.len != 0) allocator.free(self.spill_lines);
+        self.spill_lines = &.{};
+        if (self.line_count > inline_line_capacity) self.line_count = 0;
+    }
+
+    /// Every field except the line storage.
+    fn copyKeyFrom(self: *TextLayout, src: *const TextLayout) void {
+        inline for (comptime @import("zenit_reflection").fields(TextLayout)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "inline_lines") or std.mem.eql(u8, field.name, "spill_lines")) continue;
+            @field(self, field.name) = @field(src, field.name);
+        }
+    }
+};
+
+/// Growable line table for computing layouts longer than the inline capacity. Reused across
+/// computations (its capacity is kept), so steady relayout of a long text allocates nothing.
+/// A computed layout's lines beyond the inline capacity borrow it until the next computation.
+pub const LineScratch = struct {
+    allocator: std.mem.Allocator,
+    lines: std.ArrayListUnmanaged(LineInfo) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) LineScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *LineScratch) void {
+        self.lines.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Drop retained capacity above `keep_bytes`; returns the bytes released.
+    pub fn trim(self: *LineScratch, keep_bytes: usize) usize {
+        const capacity_bytes = self.lines.capacity * @sizeOf(LineInfo);
+        if (capacity_bytes <= keep_bytes) return 0;
+        self.lines.clearAndFree(self.allocator);
+        return capacity_bytes;
+    }
 };
 
 // Hot header, accessed every lookup. ~64 bytes (one cache line). Header/payload split:
@@ -500,9 +724,23 @@ var interaction_prefix_cache_index: [INTERACTION_PREFIX_INDEX_SIZE]u16 =
     @as([INTERACTION_PREFIX_INDEX_SIZE]u16, @splat(INVALID_CACHE_IDX));
 var interaction_prefix_cache_gen: u32 = 1;
 
+/// The range's bytes are part of the key: content_version alone does not change for an in-place
+/// edit of a (borrowed or owned) text buffer that the raw-state verification marks without a
+/// version bump (render_engine/raw_shadow.zig), and a same-length edit keeps the range.
+/// `text` holds more than `limit` grapheme clusters (the boundary walk of buildPrefixWidthsForRange,
+/// stopped after `limit` clusters).
+fn graphemesExceed(text: []const u8, limit: usize) bool {
+    var cursor = grapheme.BoundaryCursor.init(text);
+    var off: usize = 0;
+    var n: usize = 0;
+    while (off < text.len and n < limit) : (n += 1) off = cursor.next(off);
+    return off < text.len;
+}
+
 inline fn computeInteractionPrefixKeyHash(
     node_id: u32,
     content_version: u32,
+    range_bytes: []const u8,
     range_start: u32,
     range_end: u32,
     spans_hash: u64,
@@ -514,6 +752,7 @@ inline fn computeInteractionPrefixKeyHash(
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&node_id));
     hasher.update(std.mem.asBytes(&content_version));
+    hasher.update(range_bytes);
     hasher.update(std.mem.asBytes(&range_start));
     hasher.update(std.mem.asBytes(&range_end));
     hasher.update(std.mem.asBytes(&spans_hash));
@@ -839,11 +1078,18 @@ fn getInteractionPrefixCacheIndex(
     spans: []const TextSpan,
 ) ?usize {
     if (range_end <= range_start or range_end > content.len) return null;
+    // Beyond the build limit (it would fail, buildPrefixWidthsForRange): return before hashing
+    // the key (the range bytes are part of it). Graphemes, not bytes: a range of up to
+    // INTERACTION_PREFIX_MAX_CHARS bytes always fits; a longer one is counted, at most
+    // INTERACTION_PREFIX_MAX_CHARS + 1 steps.
+    if (range_end - range_start > INTERACTION_PREFIX_MAX_CHARS and
+        graphemesExceed(content[range_start..range_end], INTERACTION_PREFIX_MAX_CHARS)) return null;
 
     const spans_hash = hashSpans(spans);
     const key_hash = computeInteractionPrefixKeyHash(
         node_id,
         content_version,
+        content[range_start..range_end],
         range_start,
         range_end,
         spans_hash,
@@ -1044,6 +1290,8 @@ pub fn decodeUtf8(bytes: []const u8) u21 {
 /// Compute text line-break layout.
 ///
 /// Parameters:
+/// - scratch: holds the lines beyond `inline_line_capacity`; the returned layout's `lines()`
+///   borrow it until its next use. Untouched for layouts that fit inline.
 /// - content: UTF-8 text
 /// - available_width: available width (pixels)
 /// - wrap: wrap mode
@@ -1052,7 +1300,10 @@ pub fn decodeUtf8(bytes: []const u8) u21 {
 /// - line_height: line height multiplier
 /// - use_italic: base italic toggle
 /// - spans: TextSpan array; span-covered segments are measured with span.font_weight/italic
+///
+/// All lines within the requested limit are kept. Fails only when `scratch` cannot grow.
 pub fn computeTextLayout(
+    scratch: *LineScratch,
     content: []const u8,
     available_width: f32,
     wrap: TextWrap,
@@ -1063,94 +1314,177 @@ pub fn computeTextLayout(
     use_italic: bool,
     use_monospace: bool,
     spans: []const TextSpan,
-) TextLayout {
-    var layout = TextLayout{};
+) std.mem.Allocator.Error!TextLayout {
+    @import("trace").work_counters.bump(.text_layouts);
+    @import("trace").work_counters.add(.text_layout_bytes, content.len);
+    var layout = TextLayout{
+        .cached_content_ptr = content.ptr,
+        .cached_content_len = content.len,
+        .cached_content_hash = @import("trace").work_counters.hashText(0, content),
+        .cached_available_width = available_width,
+        .cached_font_weight = font_weight,
+        .cached_font_size = font_size,
+        .cached_line_height = line_height,
+        .cached_measure_generation = g_measure_cache_generation,
+        .cached_measure_ctx = external_measure_ctx,
+        .cached_measure_ctx_fn = external_measure_ctx_fn,
+        .cached_shape_fn = g_shape_measure_fn,
+        .cached_use_italic = use_italic,
+        .cached_use_monospace = use_monospace,
+        .cached_wrap = wrap,
+        .cached_max_lines = max_lines,
+        .cached_spans_hash = hashSpans(spans),
+    };
+    var sink = LayoutLineSink{ .layout = &layout, .scratch = scratch };
+    const extent = try walkLines(&sink, content, available_width, wrap, max_lines, font_size, font_weight, use_italic, use_monospace, spans);
+    layout.line_count = extent.line_count;
+    if (extent.line_count > inline_line_capacity) layout.spill_lines = scratch.lines.items;
+    layout.max_line_width = extent.max_line_width;
+    layout.lines_truncated = extent.lines_truncated;
+    layout.total_height = @as(f32, @floatFromInt(extent.line_count)) * font_size * line_height;
+    return layout;
+}
 
+/// What `computeTextLayout` would report about the lines, without keeping them: no storage, no
+/// allocation (intrinsic sizing needs only the widest line and the line count).
+pub const TextExtent = struct {
+    line_count: u32,
+    max_line_width: f32,
+    total_height: f32,
+};
+
+pub fn measureTextExtent(
+    content: []const u8,
+    available_width: f32,
+    wrap: TextWrap,
+    max_lines: u16,
+    font_size: f32,
+    line_height: f32,
+    font_weight: u16,
+    use_italic: bool,
+    use_monospace: bool,
+    spans: []const TextSpan,
+) TextExtent {
+    @import("trace").work_counters.bump(.text_layouts);
+    @import("trace").work_counters.add(.text_layout_bytes, content.len);
+    var sink = CountingLineSink{};
+    const extent = walkLines(&sink, content, available_width, wrap, max_lines, font_size, font_weight, use_italic, use_monospace, spans) catch unreachable;
+    return .{
+        .line_count = extent.line_count,
+        .max_line_width = extent.max_line_width,
+        .total_height = @as(f32, @floatFromInt(extent.line_count)) * font_size * line_height,
+    };
+}
+
+/// Lines into a TextLayout: inline first; past the inline capacity the whole table moves to the
+/// scratch list and grows there.
+const LayoutLineSink = struct {
+    layout: *TextLayout,
+    scratch: *LineScratch,
+    count: u32 = 0,
+
+    fn push(self: *LayoutLineSink, line: LineInfo) std.mem.Allocator.Error!void {
+        const i: usize = self.count;
+        if (i < inline_line_capacity) {
+            self.layout.inline_lines[i] = line;
+        } else {
+            const list = &self.scratch.lines;
+            if (i == inline_line_capacity) {
+                list.clearRetainingCapacity();
+                try list.ensureTotalCapacity(self.scratch.allocator, inline_line_capacity * 2);
+                list.appendSliceAssumeCapacity(self.layout.inline_lines[0..inline_line_capacity]);
+            }
+            try list.append(self.scratch.allocator, line);
+        }
+        self.count += 1;
+    }
+};
+
+const CountingLineSink = struct {
+    count: u32 = 0,
+
+    fn push(self: *CountingLineSink, _: LineInfo) error{}!void {
+        self.count += 1;
+    }
+};
+
+const LineWalk = struct { line_count: u32, max_line_width: f32, lines_truncated: bool = false };
+
+/// The one line-breaking walk behind computeTextLayout and measureTextExtent: emits each line to
+/// `sink` in order (at least one line, possibly empty).
+fn walkLines(
+    sink: anytype,
+    content: []const u8,
+    available_width: f32,
+    wrap: TextWrap,
+    max_lines: u16,
+    font_size: f32,
+    font_weight: u16,
+    use_italic: bool,
+    use_monospace: bool,
+    spans: []const TextSpan,
+) !LineWalk {
     if (content.len == 0 or available_width <= 0) {
-        layout.line_count = 1;
-        layout.lines[0] = .{ .byte_start = 0, .byte_end = 0, .width = 0 };
-        layout.total_height = font_size * line_height;
-        return layout;
+        try sink.push(.{ .byte_start = 0, .byte_end = 0, .width = 0 });
+        return .{ .line_count = sink.count, .max_line_width = 0 };
     }
 
     if (wrap == .none) {
         // No wrap: single line.
-        layout.line_count = 1;
-        layout.lines[0] = .{
-            .byte_start = 0,
-            .byte_end = @intCast(content.len),
-            .width = measureSpanAware(content, 0, @intCast(content.len), font_size, font_weight, use_italic, use_monospace, spans),
-        };
-        layout.max_line_width = layout.lines[0].width;
-        layout.total_height = font_size * line_height;
-        return layout;
+        const width = measureSpanAware(content, 0, @intCast(content.len), font_size, font_weight, use_italic, use_monospace, spans);
+        try sink.push(.{ .byte_start = 0, .byte_end = @intCast(content.len), .width = width });
+        return .{ .line_count = sink.count, .max_line_width = width };
     }
 
+    const effective_max: u32 = if (max_lines == 0) std.math.maxInt(u32) else max_lines;
+
     if (wrap == .newline_only) {
-        // Break only on \n, no width wrapping (code fence scenarios).
+        // Break only on \n, no width wrapping (code fence scenarios). `max_lines` bounds the
+        // rows as in the width-wrapping modes.
         var line_start: u32 = 0;
-        var lc: u16 = 0;
         var mw: f32 = 0;
-        while (line_start <= content.len and lc < MAX_LINES) {
+        while (line_start <= content.len and sink.count < effective_max) {
             // Find line end (\n or EOF).
             var line_end: u32 = line_start;
             while (line_end < content.len and content[line_end] != '\n') line_end += 1;
 
             const w = measureSpanAware(content, line_start, line_end, font_size, font_weight, use_italic, use_monospace, spans);
-            layout.lines[lc] = .{ .byte_start = line_start, .byte_end = line_end, .width = w };
+            try sink.push(.{ .byte_start = line_start, .byte_end = line_end, .width = w });
             mw = @max(mw, w);
-            lc += 1;
 
+            line_start = line_end;
             if (line_end >= content.len) break;
-            line_start = line_end + 1; // Skip \n.
+            line_start += 1; // Skip \n.
         }
-        if (lc == 0) {
-            lc = 1;
-            layout.lines[0] = .{ .byte_start = 0, .byte_end = 0, .width = 0 };
-        }
-        layout.line_count = lc;
-        layout.max_line_width = mw;
-        layout.total_height = @as(f32, @floatFromInt(lc)) * font_size * line_height;
-
-        layout.cached_content_ptr = content.ptr;
-        layout.cached_content_len = content.len;
-        layout.cached_content_hash = std.hash.Wyhash.hash(0, content);
-        layout.cached_available_width = available_width;
-        layout.cached_font_weight = font_weight;
-        layout.cached_font_size = font_size;
-        layout.cached_use_italic = use_italic;
-        layout.cached_use_monospace = use_monospace;
-        layout.cached_wrap = wrap;
-        layout.cached_max_lines = max_lines;
-        layout.cached_spans_hash = hashSpans(spans);
-        return layout;
+        return .{
+            .line_count = sink.count,
+            .max_line_width = mw,
+            .lines_truncated = truncatedByLimit(content, max_lines, sink.count, line_start),
+        };
     }
 
-    const effective_max: u16 = if (max_lines == 0) MAX_LINES else @min(max_lines, MAX_LINES);
-
     var line_start: u32 = 0;
-    var line_count: u16 = 0;
     var max_width: f32 = 0;
 
-    while (line_start < content.len and line_count < effective_max) {
+    while (line_start < content.len and sink.count < effective_max) {
         // Find current line break point.
         const result = findLineBreak(content, line_start, available_width, wrap, font_size, font_weight, use_italic, use_monospace, spans);
         const line_end = line_start + result.byte_len;
         const line_width = result.width;
 
-        layout.lines[line_count] = .{
+        try sink.push(.{
             .byte_start = line_start,
             .byte_end = @intCast(line_end),
             .width = line_width,
-        };
+        });
         max_width = @max(max_width, line_width);
-        line_count += 1;
 
         line_start = @intCast(line_end);
 
-        // Skip space after break (word wrap mode).
-        if (wrap == .word) {
-            while (line_start < content.len and content[line_start] == ' ') {
+        // A soft wrap never leaves a space or tab at the start of the next line, in any
+        // width-wrapping mode (emergency breaks of break_all / char included).
+        if (wrap != .none and wrap != .newline_only and line_start > 0 and content[line_start - 1] != '\n') {
+            while (line_start < content.len and isLineStartWrapSpace(content[line_start])) {
                 line_start += 1;
             }
         }
@@ -1162,40 +1496,32 @@ pub fn computeTextLayout(
         // A trailing separator still creates the expected final empty line.
         if (line_start < content.len and content[line_start] == '\n') {
             line_start += 1;
-            if (line_start == content.len and line_count < effective_max) {
-                layout.lines[line_count] = .{
+            if (line_start == content.len and sink.count < effective_max) {
+                try sink.push(.{
                     .byte_start = line_start,
                     .byte_end = line_start,
                     .width = 0,
-                };
-                line_count += 1;
+                });
             }
         }
     }
 
-    if (line_count == 0) {
-        line_count = 1;
-        layout.lines[0] = .{ .byte_start = 0, .byte_end = 0, .width = 0 };
+    if (sink.count == 0) try sink.push(.{ .byte_start = 0, .byte_end = 0, .width = 0 });
+    return .{
+        .line_count = sink.count,
+        .max_line_width = max_width,
+        .lines_truncated = truncatedByLimit(content, max_lines, sink.count, line_start),
+    };
+}
+
+/// The layout stopped at the caller's `max_lines` with content after
+/// `rest`: anything but spaces, tabs and line breaks (hidden blank rows are not a truncation).
+fn truncatedByLimit(content: []const u8, max_lines: u16, line_count: u32, rest: u32) bool {
+    if (max_lines == 0 or line_count < max_lines) return false;
+    for (content[@min(rest, content.len)..]) |byte| {
+        if (byte != ' ' and byte != '\t' and byte != '\n' and byte != '\r') return true;
     }
-
-    layout.line_count = line_count;
-    layout.max_line_width = max_width;
-    layout.total_height = @as(f32, @floatFromInt(line_count)) * font_size * line_height;
-
-    // Cache key (ptr+len fast path + hash prevent pointer reuse false-hit).
-    layout.cached_content_ptr = content.ptr;
-    layout.cached_content_len = content.len;
-    layout.cached_content_hash = std.hash.Wyhash.hash(0, content);
-    layout.cached_available_width = available_width;
-    layout.cached_font_weight = font_weight;
-    layout.cached_font_size = font_size;
-    layout.cached_use_italic = use_italic;
-    layout.cached_use_monospace = use_monospace;
-    layout.cached_wrap = wrap;
-    layout.cached_max_lines = max_lines;
-    layout.cached_spans_hash = hashSpans(spans);
-
-    return layout;
+    return false;
 }
 
 /// Internal helper: span-aware measure (segment when spans, direct measure
@@ -1216,6 +1542,16 @@ const LineBreakResult = struct {
     width: f32,
 };
 
+/// Slack when deciding whether a measured width fits the width a line may take: a fraction of
+/// the font size (1/1024 em; 1/64 pt at 16 pt, the layout unit browsers compare lines with).
+/// Layout adds and subtracts sibling sizes, gaps and paddings in f32, so the width handed back to
+/// the very text it was measured from can come back a few ulps short; without slack that text
+/// wraps its own last cluster. Proportional to the font size so that the break points stay the
+/// same when the available width and the font size scale together (a view zoom).
+pub fn lineFitSlack(font_size: f32) f32 {
+    return @max(0, font_size) / 1024.0;
+}
+
 /// Find line break point within given width. content: full text, line_start:
 /// this line's start offset in content.
 fn findLineBreak(
@@ -1230,6 +1566,7 @@ fn findLineBreak(
     spans: []const TextSpan,
 ) LineBreakResult {
     const text = content[line_start..];
+    const slack = lineFitSlack(font_size);
 
     // Fast path: find this line's natural end (\n or EOF) first.
     var natural_end: u32 = 0;
@@ -1238,7 +1575,7 @@ fn findLineBreak(
     // directly, avoid per-character advance (drops O(N) CoreText calls to O(1)).
     if (natural_end > 0) {
         const full_width = measureSpanAware(content, line_start, line_start + natural_end, font_size, font_weight, use_italic, use_monospace, spans);
-        if (full_width <= available_width) {
+        if (full_width <= available_width + slack) {
             return .{ .byte_len = natural_end, .width = full_width };
         }
     }
@@ -1287,20 +1624,22 @@ fn findLineBreak(
             since_checkpoint = 0;
         }
 
-        if (width_so_far > available_width and pos > 0) {
+        if (width_so_far > available_width + slack and pos > 0) {
             // Exceed available width.
-            if (wrap == .word and has_break_point) {
+            if ((wrap == .word or wrap == .char or wrap == .word_break or wrap == .keep_all) and has_break_point) {
                 // Word mode: backtrack to last break point.
                 return .{ .byte_len = last_break_pos, .width = last_break_width };
             }
-            // Char mode or no break point: break before current character.
-            return .{ .byte_len = pos, .width = previous_width };
+            // Normal/keep-all preserve an unbreakable word even when it
+            // overflows the line. Emergency wrapping is an explicit option.
+            if (wrap != .word and wrap != .keep_all)
+                return .{ .byte_len = pos, .width = previous_width };
         }
 
         // Record possible break point.
-        if (wrap == .word) {
+        if (wrap == .word or wrap == .char or wrap == .word_break or wrap == .keep_all) {
             const cp = decodeUtf8(text[pos..@min(pos + 4, @as(u32, @intCast(text.len)))]);
-            if (isCJK(cp)) {
+            if (isCJK(cp) and wrap != .keep_all) {
                 // CJK character, breakable after.
                 last_break_pos = @intCast(next_pos);
                 last_break_width = width_so_far;
@@ -1309,7 +1648,7 @@ fn findLineBreak(
                 // UAX #14: is current cp and next cp breakable between.
                 const next_cp_bytes = text[@intCast(next_pos)..@min(@as(usize, @intCast(next_pos)) + 4, text.len)];
                 const next_cp = decodeUtf8(next_cp_bytes);
-                if (isBreakableCluster(cp, next_cp)) {
+                if (isBreakableCluster(cp, next_cp) and !(wrap == .keep_all and (isCJK(cp) or isCJK(next_cp)))) {
                     last_break_pos = @intCast(next_pos);
                     last_break_width = width_so_far;
                     has_break_point = true;
@@ -1317,6 +1656,8 @@ fn findLineBreak(
             }
         }
 
+        if (width_so_far > available_width + slack and has_break_point and (wrap == .word or wrap == .keep_all))
+            return .{ .byte_len = last_break_pos, .width = last_break_width };
         pos = @intCast(next_pos);
     }
 
@@ -1324,26 +1665,21 @@ fn findLineBreak(
     return .{ .byte_len = pos, .width = width_so_far };
 }
 
-/// Check cache validity. Use ptr+len fast path + hash verify prevent
-/// pointer reuse false-hit. Width uses 0.5px epsilon compare, avoid float
-/// precision invalid recomputation.
+/// Check both the wrapping inputs and the active measurement provider.
 pub fn isCacheValid(layout: *const TextLayout, content: []const u8, available_width: f32, font_weight: u16, font_size: f32, use_italic: bool, use_monospace: bool, wrap: TextWrap, max_lines: u16, spans: []const TextSpan) bool {
-    if (layout.line_count == 0) return false;
+    if (layout.line_count == 0 or !(layout.cached_available_width > 0) or !(available_width > 0)) return false;
+    if (layout.cached_measure_generation != g_measure_cache_generation or
+        layout.cached_measure_ctx != external_measure_ctx or
+        layout.cached_measure_ctx_fn != external_measure_ctx_fn or
+        layout.cached_shape_fn != g_shape_measure_fn) return false;
     if (layout.cached_content_len != content.len) return false;
-    if (@abs(layout.cached_available_width - available_width) > 0.5) return false;
-    if (layout.cached_font_weight != font_weight) return false;
-    if (layout.cached_font_size != font_size) return false;
-    if (layout.cached_use_italic != use_italic) return false;
-    if (layout.cached_use_monospace != use_monospace) return false;
-    if (layout.cached_wrap != wrap) return false;
-    if (layout.cached_max_lines != max_lines) return false;
+    // Code lines only break on newlines, regardless of the probe width.
+    if (layout.cached_available_width != available_width and wrap != .newline_only) return false;
+    if (layout.cached_font_weight != font_weight or layout.cached_font_size != font_size) return false;
+    if (layout.cached_use_italic != use_italic or layout.cached_use_monospace != use_monospace) return false;
+    if (layout.cached_wrap != wrap or layout.cached_max_lines != max_lines) return false;
     if (layout.cached_spans_hash != hashSpans(spans)) return false;
-
-    // Fast path: ptr same and hash match.
-    if (layout.cached_content_ptr == content.ptr) return true;
-
-    // Slow path: ptr different but content possibly same (memory reallocated).
-    return layout.cached_content_hash == std.hash.Wyhash.hash(0, content);
+    return layout.cached_content_hash == @import("trace").work_counters.hashText(0, content);
 }
 
 test "interaction prefix cache matches direct prefix measurement" {
@@ -1489,7 +1825,10 @@ test "interaction prefix cache can floor prefix boundary by width" {
 }
 
 test "word wrap consumes each hard newline exactly once" {
-    const layout = computeTextLayout(
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const layout = try computeTextLayout(
+        &scratch,
         "one\ntwo\nthree",
         1000,
         .word,
@@ -1502,24 +1841,92 @@ test "word wrap consumes each hard newline exactly once" {
         &.{},
     );
 
-    try std.testing.expectEqual(@as(u16, 3), layout.line_count);
-    try std.testing.expectEqual(@as(u32, 0), layout.lines[0].byte_start);
-    try std.testing.expectEqual(@as(u32, 3), layout.lines[0].byte_end);
-    try std.testing.expectEqual(@as(u32, 4), layout.lines[1].byte_start);
-    try std.testing.expectEqual(@as(u32, 7), layout.lines[1].byte_end);
-    try std.testing.expectEqual(@as(u32, 8), layout.lines[2].byte_start);
-    try std.testing.expectEqual(@as(u32, 13), layout.lines[2].byte_end);
+    try std.testing.expectEqual(@as(u32, 3), layout.line_count);
+    try std.testing.expectEqual(@as(u32, 0), layout.lines()[0].byte_start);
+    try std.testing.expectEqual(@as(u32, 3), layout.lines()[0].byte_end);
+    try std.testing.expectEqual(@as(u32, 4), layout.lines()[1].byte_start);
+    try std.testing.expectEqual(@as(u32, 7), layout.lines()[1].byte_end);
+    try std.testing.expectEqual(@as(u32, 8), layout.lines()[2].byte_start);
+    try std.testing.expectEqual(@as(u32, 13), layout.lines()[2].byte_end);
 }
 
 test "word wrap preserves intentional empty and trailing hard-newline rows" {
-    const middle_empty = computeTextLayout("a\n\nb", 1000, .word, 0, 14, 1.25, 400, false, false, &.{});
-    try std.testing.expectEqual(@as(u16, 3), middle_empty.line_count);
-    try std.testing.expectEqual(middle_empty.lines[1].byte_start, middle_empty.lines[1].byte_end);
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const middle_empty = try computeTextLayout(&scratch, "a\n\nb", 1000, .word, 0, 14, 1.25, 400, false, false, &.{});
+    try std.testing.expectEqual(@as(u32, 3), middle_empty.line_count);
+    try std.testing.expectEqual(middle_empty.lines()[1].byte_start, middle_empty.lines()[1].byte_end);
 
-    const trailing_empty = computeTextLayout("a\n", 1000, .word, 0, 14, 1.25, 400, false, false, &.{});
-    try std.testing.expectEqual(@as(u16, 2), trailing_empty.line_count);
-    try std.testing.expectEqual(@as(u32, 2), trailing_empty.lines[1].byte_start);
-    try std.testing.expectEqual(@as(u32, 2), trailing_empty.lines[1].byte_end);
+    const trailing_empty = try computeTextLayout(&scratch, "a\n", 1000, .word, 0, 14, 1.25, 400, false, false, &.{});
+    try std.testing.expectEqual(@as(u32, 2), trailing_empty.line_count);
+    try std.testing.expectEqual(@as(u32, 2), trailing_empty.lines()[1].byte_start);
+    try std.testing.expectEqual(@as(u32, 2), trailing_empty.lines()[1].byte_end);
+}
+
+test "no wrapping mode starts a line with the space or tab its soft break left behind" {
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    // Measure the break position first: the line ends somewhere inside "aaaa<sep>bbbb".
+    const one = measureTextWidthByFontKind("aaaa", 14, 400, false, false);
+    for ([_]TextWrap{ .break_all, .char, .word, .word_break }) |wrap| {
+        for ([_][]const u8{ "aaaa bbbb", "aaaa\tbbbb", "aaaa  \t bbbb" }) |content| {
+            const layout = try computeTextLayout(&scratch, content, one + 0.5, wrap, 0, 14, 1.25, 400, false, false, &.{});
+            try std.testing.expect(layout.line_count >= 2);
+            for (layout.lines()[1..]) |line| {
+                if (line.byte_start < line.byte_end) {
+                    try std.testing.expect(!isLineStartWrapSpace(content[line.byte_start]));
+                }
+            }
+        }
+    }
+}
+
+test "newline-only text keeps at most max_lines rows" {
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const clamped = try computeTextLayout(&scratch, "a\nb\nc\nd", 1000, .newline_only, 2, 14, 1.25, 400, false, false, &.{});
+    try std.testing.expectEqual(@as(u32, 2), clamped.line_count);
+    try std.testing.expectEqual(@as(u32, 2), clamped.lines()[1].byte_start);
+    try std.testing.expectEqual(@as(u32, 3), clamped.lines()[1].byte_end);
+    try std.testing.expectApproxEqAbs(2 * 14 * 1.25, clamped.total_height, 0.01);
+    const all = try computeTextLayout(&scratch, "a\nb\nc\nd", 1000, .newline_only, 0, 14, 1.25, 400, false, false, &.{});
+    try std.testing.expectEqual(@as(u32, 4), all.line_count);
+}
+
+test "lines_truncated: max_lines marks real omissions, including after the old row cap" {
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const Row = struct { content: []const u8, wrap: TextWrap, max: u16, truncated: bool };
+    const rows = [_]Row{
+        .{ .content = "a\nb\nc", .wrap = .word, .max = 0, .truncated = false },
+        .{ .content = "a\nb\nc", .wrap = .word, .max = 3, .truncated = false },
+        .{ .content = "a\nb\nc", .wrap = .word, .max = 2, .truncated = true },
+        .{ .content = "a\nb   ", .wrap = .word, .max = 2, .truncated = false },
+        .{ .content = "a\nb\n", .wrap = .word, .max = 2, .truncated = false },
+        .{ .content = "a\nb\n\n  \n", .wrap = .word, .max = 2, .truncated = false },
+        .{ .content = "a\n\nb", .wrap = .word, .max = 2, .truncated = true },
+        .{ .content = "a\nb\nc", .wrap = .newline_only, .max = 2, .truncated = true },
+        .{ .content = "a\nb\n", .wrap = .newline_only, .max = 2, .truncated = false },
+        .{ .content = "a\nb", .wrap = .newline_only, .max = 2, .truncated = false },
+    };
+    for (rows) |row| {
+        const layout = try computeTextLayout(&scratch, row.content, 1000, row.wrap, row.max, 14, 1.25, 400, false, false, &.{});
+        try std.testing.expectEqual(row.truncated, layout.lines_truncated);
+    }
+    const row_count = 1044;
+    var many: [2 * row_count]u8 = undefined;
+    for (0..row_count) |i| {
+        many[2 * i] = 'x';
+        many[2 * i + 1] = '\n';
+    }
+    for ([_]TextWrap{ .word, .newline_only }) |wrap| {
+        const complete = try computeTextLayout(&scratch, &many, 1000, wrap, row_count, 14, 1.25, 400, false, false, &.{});
+        try std.testing.expectEqual(@as(u32, row_count), complete.line_count);
+        try std.testing.expect(!complete.lines_truncated);
+        const limited = try computeTextLayout(&scratch, &many, 1000, wrap, row_count - 1, 14, 1.25, 400, false, false, &.{});
+        try std.testing.expectEqual(@as(u32, row_count - 1), limited.line_count);
+        try std.testing.expect(limited.lines_truncated);
+    }
 }
 
 test "findLineBreak preserves word wrap boundary with incremental width accumulation" {
@@ -1813,6 +2220,69 @@ test "monospace measure also routes through shape callback" {
     try std.testing.expectEqual(@as(u32, 1), TestShapeContext.call_count);
 }
 
+/// Fractional advances proportional to the font size (0.304... em per byte: 3.3447623 at 11 pt),
+/// the way a real shaper measures; the headless estimate's integer advances never show f32
+/// rounding.
+fn testLinearMeasureMock(text: []const u8, font_size: f32, font_weight: u16, use_italic: bool, use_monospace: bool) f32 {
+    _ = font_weight;
+    _ = use_italic;
+    _ = use_monospace;
+    return @as(f32, @floatFromInt(text.len)) * font_size * (3.3447623 / 11.0);
+}
+
+test "a text handed back its own measured width, a few ulps short, stays on one line" {
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    invalidateMeasureCache();
+    setShapeMeasureFn(&testLinearMeasureMock);
+    defer {
+        setShapeMeasureFn(null);
+        invalidateMeasureCache();
+    }
+    const samples = [_][]const u8{ "选择覆盖后查看目标文件，点击一次确认即可执行。", "Check the config before restarting: nginx -t" };
+    for (samples) |content| {
+        const natural = measureTextWidthWithSpans(content, 0, @intCast(content.len), 11, 400, false, false, &.{});
+        // What a fit-content parent (or a padded box) gives back after adding and subtracting.
+        const round_trip = (natural + 24) - 24;
+        const one_ulp_short = std.math.nextAfter(f32, natural, 0);
+        for ([_]f32{ natural, round_trip, one_ulp_short, natural - lineFitSlack(11) / 2 }) |available| {
+            for ([_]TextWrap{ .word, .char }) |wrap| {
+                const layout = try computeTextLayout(&scratch, content, available, wrap, 0, 11, 16.5, 400, false, false, &.{});
+                try std.testing.expectEqual(@as(u32, 1), layout.line_count);
+            }
+        }
+        // A width that really is too small still wraps.
+        const narrow = try computeTextLayout(&scratch, content, natural - 1, .word, 0, 11, 16.5, 400, false, false, &.{});
+        try std.testing.expect(narrow.line_count > 1);
+    }
+}
+
+test "line fitting slack scales with the font: the same overflow per em wraps (or not) at every view scale" {
+    var scratch = LineScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    invalidateMeasureCache();
+    setShapeMeasureFn(&testLinearMeasureMock);
+    defer {
+        setShapeMeasureFn(null);
+        invalidateMeasureCache();
+    }
+    const content = "Check the config before restarting: nginx -t";
+    const font: f32 = 16;
+    const natural = measureTextWidthWithSpans(content, 0, @intCast(content.len), font, 400, false, false, &.{});
+    const scales = [_]f32{ 1.0, 0.75, 0.5, 0.25, 0.1, 2.0, 4.0 };
+    // Short by twice the slack: wraps at every scale. (An absolute slack would let it fit once the
+    // scaled shortfall drops under that constant.)
+    for (scales) |s| {
+        const layout = try computeTextLayout(&scratch, content, (natural - 2 * lineFitSlack(font)) * s, .word, 0, font * s, 1.25, 400, false, false, &.{});
+        try std.testing.expect(layout.line_count > 1);
+    }
+    // Short by half the slack: one line at every scale.
+    for (scales) |s| {
+        const layout = try computeTextLayout(&scratch, content, (natural - lineFitSlack(font) / 2) * s, .word, 0, font * s, 1.25, 400, false, false, &.{});
+        try std.testing.expectEqual(@as(u32, 1), layout.line_count);
+    }
+}
+
 // -- Line break result must be scale-independent --
 //
 // Scale is pure geometry: a whole proportional shrink must not change which character
@@ -1849,7 +2319,10 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
 
     for (cases) |c| {
         // Baseline: scale = 1 (world coordinates true break points).
-        const base = computeTextLayout(
+        var base_scratch = LineScratch.init(std.testing.allocator);
+        defer base_scratch.deinit();
+        const base = try computeTextLayout(
+            &base_scratch,
             c.content,
             (c.world_w - c.inset_world * 2),
             .word,
@@ -1868,7 +2341,10 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
             const font_px = world_font * eff;
             const avail = (c.world_w - c.inset_world * 2) * eff;
 
-            const got = computeTextLayout(
+            var got_scratch = LineScratch.init(std.testing.allocator);
+            defer got_scratch.deinit();
+            const got = try computeTextLayout(
+                &got_scratch,
                 c.content,
                 avail,
                 .word,
@@ -1890,14 +2366,11 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
                 return error.LineCountChangedWithScale;
             }
             // 2) Break point (byte offset) independent of scale.
-            var i: u16 = 0;
-            while (i < base.line_count) : (i += 1) {
-                if (got.lines[i].byte_start != base.lines[i].byte_start or
-                    got.lines[i].byte_end != base.lines[i].byte_end)
-                {
+            for (got.lines(), base.lines(), 0..) |g, b, i| {
+                if (g.byte_start != b.byte_start or g.byte_end != b.byte_end) {
                     std.debug.print(
                         "[{s}] scale={d} line {d}: [{d}:{d}] != base [{d}:{d}]\n",
-                        .{ c.name, s, i, got.lines[i].byte_start, got.lines[i].byte_end, base.lines[i].byte_start, base.lines[i].byte_end },
+                        .{ c.name, s, i, g.byte_start, g.byte_end, b.byte_start, b.byte_end },
                     );
                     return error.WrapPositionChangedWithScale;
                 }
@@ -1965,4 +2438,20 @@ test "切换 measure ctx 不清空缓存，且两个 ctx 的条目互不串味" 
     const wb2 = measureProportional("abcd", 14.0, 400, false);
     try std.testing.expectEqual(@as(u32, 2), TestCtxMeasure.calls);
     try std.testing.expectEqual(@as(f32, 80), wb2);
+}
+
+test "interaction prefix cache key covers the range bytes (in-place same-length edit)" {
+    const a = computeInteractionPrefixKeyHash(7, 3, "abcd efgh", 0, 9, 0, 14, 400, false, false);
+    const b = computeInteractionPrefixKeyHash(7, 3, "abcd efgx", 0, 9, 0, 14, 400, false, false);
+    try std.testing.expect(a != b);
+}
+
+test "interaction prefix: the early limit check counts graphemes, not bytes" {
+    // 1000 CJK characters (3000 bytes) fit the limit; 1025 ASCII characters do not.
+    var cjk: [3000]u8 = undefined;
+    for (0..1000) |i| @memcpy(cjk[i * 3 ..][0..3], "\u{4e2d}");
+    try std.testing.expect(!graphemesExceed(&cjk, INTERACTION_PREFIX_MAX_CHARS));
+    const ascii: [INTERACTION_PREFIX_MAX_CHARS + 1]u8 = @splat('a');
+    try std.testing.expect(graphemesExceed(&ascii, INTERACTION_PREFIX_MAX_CHARS));
+    try std.testing.expect(!graphemesExceed(ascii[0..INTERACTION_PREFIX_MAX_CHARS], INTERACTION_PREFIX_MAX_CHARS));
 }

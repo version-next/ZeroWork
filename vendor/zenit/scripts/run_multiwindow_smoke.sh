@@ -4,7 +4,8 @@
 # Asserts: two native windows coexist in one process, window_id does not collide (a11y/system
 # API routing precondition), both render, closing A leaves B running, closing B exits
 # cleanly; covers both window creation methods, active window switch, and app-wide quit
-# resource cleanup.
+# resource cleanup; a background thread's Inbox.notify wakes an idle loop and renders only the
+# inbox's window.
 # Usage: bash scripts/run_multiwindow_smoke.sh [frames=120]
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -13,6 +14,18 @@ FRAMES="${1:-120}"
 
 echo "==> build multi_window"
 zig build multi-window || { echo "build failed"; exit 1; }
+
+echo "==> run inbox check"
+INBOX_LOG=$(ZENIT_SMOKE_INBOX=1 "./zig-out/Multi Window.app/Contents/MacOS/multi_window" 2>&1)
+INBOX_RC=$?
+if [ $INBOX_RC -ne 0 ]; then
+  echo "FAIL: inbox check exited rc=$INBOX_RC"
+  echo "$INBOX_LOG" | tail -20
+  exit 1
+fi
+echo "$INBOX_LOG" | grep -q "inbox ok" || { echo "FAIL: 后台线程 Inbox.notify 未唤醒空闲事件循环或唤醒了其他窗口"; exit 1; }
+echo "$INBOX_LOG" | grep -q "inbox closed ok" || { echo "FAIL: 窗口关闭后的 Inbox 句柄未失效"; exit 1; }
+echo "$INBOX_LOG" | grep -E "inbox ok|inbox closed ok"
 
 echo "==> run smoke (${FRAMES} frames)"
 LOG=$(ZENIT_SMOKE_FRAMES="$FRAMES" "./zig-out/Multi Window.app/Contents/MacOS/multi_window" 2>&1)

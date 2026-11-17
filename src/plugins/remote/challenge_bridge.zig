@@ -4,7 +4,7 @@
 const std = @import("std");
 const auth = @import("../../proto/ssh/auth_challenge.zig");
 const shared = @import("../../host/challenge_host.zig");
-const host_key = @import("../../ui/host_key_confirmation.zig");
+const host_key = @import("../../host/host_key_confirmation.zig");
 pub const Details = struct { allow_save_password: bool = false, display_name: []const u8 = "", private_key_path: []const u8 = "", host_key: ?host_key.Request = null };
 pub const Callbacks = struct {
     context: *anyopaque,
@@ -134,6 +134,6 @@ fn submitLabel(kind: auth.Kind) []const u8 {
         .private_key_passphrase => "解锁并继续",
         .keyboard_interactive => "验证并继续",
         .host_key_unknown => "保存并继续",
-        .host_key_changed => "替换密钥并继续",
+        .host_key_changed => "替换主机密钥",
     };
 }

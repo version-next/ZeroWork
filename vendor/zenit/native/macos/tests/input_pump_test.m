@@ -58,27 +58,6 @@ uint64_t zenit_text_input_utf8_for_utf16(uint32_t wid, uint64_t offset) { return
 }
 @end
 
-@interface CompositionCommandContext : NSTextInputContext
-@property NSUInteger calls;
-@end
-@implementation CompositionCommandContext
-- (BOOL)handleEvent:(NSEvent *)event {
-    if (event.type != NSEventTypeKeyDown) return NO;
-    self.calls++;
-    if (event.keyCode == 53) {
-        if (self.client.hasMarkedText) {
-            [self.client setMarkedText:@"" selectedRange:NSMakeRange(0, 0)
-                      replacementRange:NSMakeRange(NSNotFound, 0)];
-        } else [self.client doCommandBySelector:@selector(cancelOperation:)];
-    } else {
-        if (self.client.hasMarkedText) {
-            [self.client insertText:@"你" replacementRange:NSMakeRange(NSNotFound, 0)];
-        } else [self.client doCommandBySelector:@selector(insertNewline:)];
-    }
-    return YES;
-}
-@end
-
 static NSEvent *key(WindowWrapper *w, NSString *text, unsigned short code) {
     return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
         modifierFlags:0 timestamp:0 windowNumber:w.window.windowNumber context:nil
@@ -115,55 +94,6 @@ static void dispatchToClient(WindowWrapper *w) {
     w.hasImePreedit = w.hasImeCommit = NO;
 }
 
-static void verifyCompositionCommandOwnership(WindowWrapper *w) {
-    NSTextInputContext *previous = w.metalView.zenitInputContext;
-    CompositionCommandContext *context = [[CompositionCommandContext alloc] initWithClient:w.metalView];
-    w.metalView.zenitInputContext = context;
-    w.lastKeyboardInputSource = context.selectedKeyboardInputSource;
-    macos_set_text_input_enabled((__bridge void *)w, 1);
-    for (NSNumber *codeValue in @[@36, @76, @53]) {
-        unsigned short code = codeValue.unsignedShortValue;
-        NSString *text = code == 53 ? @"\x1b" : @"\r";
-        context.calls = 0;
-        [w.metalView setMarkedText:@"ni" selectedRange:NSMakeRange(2, 0)
-                 replacementRange:NSMakeRange(NSNotFound, 0)];
-        dispatchToClient(w);
-        enqueue(@[key(w, text, code)]);
-        for (int i = 0; i < 16 && context.calls == 0; i++) pumpAppEventsWithTimeout(0);
-        assert(context.calls == 1 && !w.metalView.hasMarkedText);
-        // The native callback has ended composition before the SDK drains
-        // the queues. No raw command may survive to submit/close the editor.
-        assert(w.keyEventQueue.count == 0);
-        if (code == 53) {
-            assert(w.imeCommitQueue.count == 0 && w.imePreeditQueue.count == 1);
-            assert(w.imePreeditQueue.firstObject.text.length == 0);
-        } else {
-            assert(w.imeCommitQueue.count == 1);
-            assert([w.imeCommitQueue.firstObject.text isEqualToString:@"你"]);
-        }
-        dispatchToClient(w);
-        // A later physical press without composition still reaches widgets,
-        // and Return is no longer duplicated by a post-IME re-bridge.
-        enqueue(@[key(w, text, code)]);
-        for (int i = 0; i < 16 && context.calls == 1; i++) pumpAppEventsWithTimeout(0);
-        assert(context.calls == 2 && w.keyEventQueue.count == 1);
-        dispatchToClient(w);
-        NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp location:NSZeroPoint
-            modifierFlags:0 timestamp:0 windowNumber:w.window.windowNumber context:nil
-            characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:code];
-        enqueue(@[up]);
-        for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
-        assert(w.keyEventQueue.count == 1);
-        KeyEventPacket packet;
-        [w.keyEventQueue.firstObject getValue:&packet];
-        assert(packet.keycode == code && !packet.pressed);
-        dispatchToClient(w);
-    }
-    w.metalView.zenitInputContext = previous;
-    w.lastKeyboardInputSource = previous.selectedKeyboardInputSource;
-    fprintf(stderr, "PASS: IME Return/Enter/Escape commands are consumed before composition ends; later presses and key-up remain\n");
-}
-
 // AppKit can publish the new source only after handling its first composing
 // key. The next key must not discard that already accepted first letter.
 @interface SourceTransitionInputContext : NSTextInputContext
@@ -194,6 +124,7 @@ static void verifySourceTransitionPreservesFirstLetter(WindowWrapper *w, BOOL pu
     // or only become observable after that key's setMarkedText callback.
     if (publishBeforeKey) context.reportedSource = @"com.apple.inputmethod.SCIM.ITABC";
     macos_set_text_input_enabled((__bridge void *)w, 1);
+    NSResponder *responder = w.window.firstResponder;
     enqueue(@[key(w, @"n", 45)]);
     for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
     assert(w.metalView.zenitInputContext == context);
@@ -202,6 +133,7 @@ static void verifySourceTransitionPreservesFirstLetter(WindowWrapper *w, BOOL pu
     enqueue(@[key(w, @"i", 34)]);
     for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
     assert(w.metalView.zenitInputContext == context);
+    assert(w.window.firstResponder == responder);
     assert(context.calls == 2 && [w.metalView.markedTextStorage.string isEqualToString:@"ni"]);
     assert([w.imePreeditQueue.lastObject.text isEqualToString:@"ni"]);
     assert([w.lastKeyboardInputSource isEqualToString:context.reportedSource]);
@@ -211,6 +143,266 @@ static void verifySourceTransitionPreservesFirstLetter(WindowWrapper *w, BOOL pu
     w.lastKeyboardInputSource = previous.selectedKeyboardInputSource;
     fprintf(stderr, "PASS: %s input-source publication preserves first composing letter and context\n",
             publishBeforeKey ? "early" : "delayed");
+}
+
+// Drag motion is drained in one bounded batch like hover motion; the key
+// that follows it is still interpreted by the same pump, after the motion.
+static void verifyDragMotionBatch(WindowWrapper *w) {
+    macos_set_text_input_enabled((__bridge void *)w, 0);
+    dispatchToClient(w);
+    NSMutableArray<NSEvent *> *events = [NSMutableArray array];
+    for (int i = 0; i < 6; i++) {
+        [events addObject:[NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+            location:NSMakePoint(100 + i * 5, 100) modifierFlags:0 timestamp:0
+            windowNumber:w.window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1]];
+    }
+    [events addObject:key(w, @"d", 2)];
+    w.leftButtonPressed = YES; // Model a press already delivered to Zig.
+    enqueue(events);
+    pumpAppEventsWithTimeout(0);
+    assert(w.mouseMoveQueue.count > 0);
+    assert(w.keyEventQueue.count == 1);
+    w.leftButtonPressed = NO;
+    dispatchToClient(w);
+    fprintf(stderr, "PASS: queued drag motion drains in one native batch before the next key\n");
+}
+
+static void verifyResizeCursors(WindowWrapper *w) {
+    NSCursor *nwse = diagonalResizeFallback(YES), *nesw = diagonalResizeFallback(NO);
+    assert(nwse == diagonalResizeFallback(YES) && nesw == diagonalResizeFallback(NO));
+    assert(![nwse.image.TIFFRepresentation isEqual:nesw.image.TIFFRepresentation]);
+    assert(![nwse.image.TIFFRepresentation isEqual:NSCursor.arrowCursor.image.TIFFRepresentation]);
+    assert(NSEqualPoints(nwse.hotSpot, NSMakePoint(nwse.image.size.width / 2, nwse.image.size.height / 2)));
+    assert(NSEqualPoints(nesw.hotSpot, nwse.hotSpot));
+    const int shapes[] = {7, 8, 9, 10, 11, 12, 1};
+    NSCursor *expected[] = {NSCursor.openHandCursor, NSCursor.closedHandCursor,
+        NSCursor.resizeLeftRightCursor, NSCursor.resizeUpDownCursor,
+        diagonalResizeCursor(YES), diagonalResizeCursor(NO), NSCursor.arrowCursor};
+    for (NSUInteger i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        macos_set_cursor_shape((__bridge void *)w, shapes[i]);
+        assert([w.metalView.zenitDesiredCursor.image.TIFFRepresentation isEqual:expected[i].image.TIFFRepresentation]);
+    }
+    assert(![diagonalResizeCursor(YES).image.TIFFRepresentation isEqual:diagonalResizeCursor(NO).image.TIFFRepresentation]);
+    fprintf(stderr, "PASS: grab, grabbing, four resize axes, reset and cached macOS 14 diagonal artwork\n");
+}
+
+// Keep titlebar probes non-blocking while exercising the real hit policy.
+@interface TitlebarProbeWindow : ZenitWindow
+@property NSUInteger zoomCalls;
+@property NSUInteger miniaturizeCalls;
+@property BOOL pretendFullscreen;
+@end
+@implementation TitlebarProbeWindow
+- (void)zoom:(id)sender { self.zoomCalls++; }
+- (void)miniaturize:(id)sender { self.miniaturizeCalls++; }
+- (NSWindowStyleMask)styleMask {
+    return [super styleMask] | (self.pretendFullscreen ? NSWindowStyleMaskFullScreen : 0);
+}
+@end
+static int titlebarControl(void *ctx, float x, float y) { return x >= 100 && x <= 220; }
+static int titlebarRegion(void *ctx, float x, float y) { return titlebarControl(ctx, x, y) ? 1 : 2; }
+static NSEvent *titlebarClick(WindowWrapper *w, CGFloat x, CGFloat y, NSInteger count) {
+    NSPoint p = [w.window.contentView convertPoint:NSMakePoint(x, w.window.contentView.bounds.size.height - y) toView:nil];
+    return [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:p
+        modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime
+        windowNumber:w.window.windowNumber context:nil eventNumber:0 clickCount:count pressure:1];
+}
+static BOOL armed(WindowWrapper *w, CGFloat x, CGFloat y) {
+    w.pendingWindowDragEvent = nil;
+    NSEvent *event = titlebarClick(w, x, y, 2);
+    const BOOL result = zenitArmTitlebarMouseDown(w, event);
+    assert(result == (w.pendingWindowDragEvent == event));
+    w.pendingWindowDragEvent = nil;
+    return result;
+}
+static void setDoubleClickAction(NSString *action) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSMutableDictionary *domain = [[defaults volatileDomainForName:NSArgumentDomain] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (action) domain[@"AppleActionOnDoubleClick"] = action;
+    else [domain removeObjectForKey:@"AppleActionOnDoubleClick"];
+    [defaults removeVolatileDomainForName:NSArgumentDomain];
+    [defaults setVolatileDomain:domain forName:NSArgumentDomain];
+}
+static void verifyTitlebarDoubleClick(WindowWrapper *live) {
+    WindowWrapper *w = [WindowWrapper new];
+    TitlebarProbeWindow *probe = [[TitlebarProbeWindow alloc] initWithContentRect:NSMakeRect(100, 100, 640, 400)
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
+                  NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
+        backing:NSBackingStoreBuffered defer:NO];
+    probe.releasedWhenClosed = NO;
+    w.window = probe;
+    w.titlebarDragHeight = 40;
+    w.titlebarDragRightInset = 150;
+    w.titlebarHitCallback = titlebarControl;
+    assert(armed(w, 300, 10));
+    assert(!armed(w, 150, 10));  // published control owns the click
+    assert(!armed(w, 300, 80));  // body
+    assert(!armed(w, 600, 10));  // right action inset
+    assert(!armed(w, 40, 10));   // traffic lights
+    w.chromeFullscreenTransition = YES;
+    assert(!armed(w, 300, 10));
+    w.chromeFullscreenTransition = NO;
+    probe.pretendFullscreen = YES;
+    assert(!armed(w, 300, 10));
+    probe.pretendFullscreen = NO;
+    w.titlebarHitCallback = NULL;
+    w.chromeHitCallback = titlebarRegion;
+    assert(!armed(w, 150, 10));
+    assert(armed(w, 300, 10));
+    NSButton *close = [probe standardWindowButton:NSWindowCloseButton];
+    NSPoint native = [probe.contentView convertPoint:NSMakePoint(NSMidX(close.bounds), NSMidY(close.bounds)) fromView:close];
+    assert(!armed(w, native.x, probe.contentView.bounds.size.height - native.y));
+
+    // The double-click action follows the user's titlebar preference.
+    setDoubleClickAction(@"Maximize");
+    zenitPerformTitlebarDoubleClick(probe);
+    assert(probe.zoomCalls == 1 && probe.miniaturizeCalls == 0);
+    setDoubleClickAction(@"Minimize");
+    zenitPerformTitlebarDoubleClick(probe);
+    assert(probe.zoomCalls == 1 && probe.miniaturizeCalls == 1);
+    setDoubleClickAction(@"None");
+    zenitPerformTitlebarDoubleClick(probe);
+    assert(probe.zoomCalls == 1 && probe.miniaturizeCalls == 1);
+    [probe close];
+
+    // Real NSEvents through both pump entries: AppKit routes the armed press
+    // to MetalView, which zooms and restores the exact frame.
+    setDoubleClickAction(@"Maximize");
+    void *siblingPtr = macos_create_window(420, 260, "titlebar sibling isolation");
+    WindowWrapper *sibling = (__bridge WindowWrapper *)siblingPtr;
+    NSRect siblingFrame = sibling.window.frame;
+    NSRect original = live.window.frame;
+    live.titlebarDragHeight = 40;
+    live.titlebarDragRightInset = 150;
+    live.titlebarHitCallback = titlebarControl;
+    for (int pass = 0; pass < 2; pass++) {
+        enqueue(@[titlebarClick(live, 90, 34, 2)]);
+        // Bounded by time rather than pump count: under a loaded test run the
+        // window server may deliver the posted click several pumps later.
+        for (int i = 0; i < 300; i++) {
+            if (pass == 0) pumpAppEventsWithTimeout(10);
+            else {
+                macos_poll_events((__bridge void *)live);
+                if (live.window.isZoomed != (pass == 0)) [NSThread sleepForTimeInterval:0.01];
+            }
+            if (live.window.isZoomed == (pass == 0)) break;
+        }
+        assert(live.window.isZoomed == (pass == 0));
+        assert(live.mouseButtonQueue.count == 0); // never delivered to Zig
+        assert(NSEqualRects(siblingFrame, sibling.window.frame));
+        // Let the zoom animation settle before addressing the next click in
+        // window coordinates.
+        NSRect settled = NSZeroRect;
+        for (int i = 0; i < 200 && !NSEqualRects(settled, live.window.frame); i++) {
+            settled = live.window.frame;
+            pumpAppEventsWithTimeout(20);
+        }
+        dispatchToClient(live);
+    }
+    assert(NSEqualRects(original, live.window.frame));
+    live.titlebarDragHeight = 0;
+    live.titlebarDragRightInset = 0;
+    live.titlebarHitCallback = NULL;
+
+    // Window chrome hit callback, driven through the test entry points a
+    // harness uses (macos_test_post_mouse): a press on a drag point is claimed
+    // by the title-bar policy and never reaches Zig; a press on a control is
+    // delivered; a double click on a drag point zooms, a second one restores.
+    live.chromeHitCallback = titlebarRegion;
+    void *livePtr = (__bridge void *)live;
+    float frame[4];
+    macos_test_window_frame(livePtr, frame);
+    assert(frame[2] == (float)original.size.width && frame[3] == (float)original.size.height);
+    uint64_t taken = macos_test_titlebar_presses(livePtr);
+    assert(macos_test_post_mouse(livePtr, 0, 300, 10, 1) == 1);
+    assert(macos_test_post_mouse(livePtr, 1, 300, 10, 1) == 1);
+    for (int i = 0; i < 300 && macos_test_titlebar_presses(livePtr) == taken; i++) pumpAppEventsWithTimeout(10);
+    assert(macos_test_titlebar_presses(livePtr) == taken + 1);
+    for (int i = 0; i < 10; i++) pumpAppEventsWithTimeout(10);
+    assert(live.mouseButtonQueue.count <= 1); // the press was claimed; at most its release is delivered
+    assert(NSEqualRects(original, live.window.frame)); // no physical pointer: the drag moves nothing
+    dispatchToClient(live);
+    assert(macos_test_post_mouse(livePtr, 0, 150, 10, 1) == 1); // titlebarRegion: 100..220 is a control
+    for (int i = 0; i < 300 && live.mouseButtonQueue.count == 0; i++) pumpAppEventsWithTimeout(10);
+    assert(live.mouseButtonQueue.count == 1);
+    assert(macos_test_titlebar_presses(livePtr) == taken + 1);
+    assert(macos_test_post_mouse(livePtr, 1, 150, 10, 1) == 1);
+    for (int i = 0; i < 20; i++) pumpAppEventsWithTimeout(10);
+    dispatchToClient(live);
+    for (int pass = 0; pass < 2; pass++) {
+        assert(macos_test_post_mouse(livePtr, 0, 300, 10, 2) == 1);
+        for (int i = 0; i < 300 && live.window.isZoomed != (pass == 0); i++) pumpAppEventsWithTimeout(10);
+        assert(live.window.isZoomed == (pass == 0));
+        assert(live.mouseButtonQueue.count == 0);
+        NSRect settled = NSZeroRect;
+        for (int i = 0; i < 200 && !NSEqualRects(settled, live.window.frame); i++) {
+            settled = live.window.frame;
+            pumpAppEventsWithTimeout(20);
+        }
+        dispatchToClient(live);
+    }
+    assert(NSEqualRects(original, live.window.frame));
+    assert(macos_test_titlebar_presses(livePtr) == taken + 3);
+    assert(macos_test_post_mouse(livePtr, 3, 300, 10, 1) == 0 && macos_test_post_mouse(livePtr, 0, 300, 10, 0) == 0);
+    live.chromeHitCallback = NULL;
+    setDoubleClickAction(nil);
+    macos_destroy_window(siblingPtr);
+    dispatchToClient(live);
+    fprintf(stderr, "PASS: titlebar hit policy, double-click preference, zoom/restore and window isolation\n");
+}
+
+static void verifyHideAndReopen(WindowWrapper *live) {
+    void *ptr = macos_create_window(300, 200, "hidden by application");
+    WindowWrapper *hidden = (__bridge WindowWrapper *)ptr;
+    void *otherPtr = macos_create_window(300, 200, "ordered out elsewhere");
+    WindowWrapper *other = (__bridge WindowWrapper *)otherPtr;
+    for (int i = 0; i < 8; i++) pumpAppEventsWithTimeout(0);
+    assert(hidden.window.isVisible);
+    macos_hide_window(ptr);
+    assert(!hidden.window.isVisible && hidden.hiddenByApplication);
+    // Only application-hidden windows are restored; the native window and
+    // its wrapper survive the hide unchanged.
+    [other.window orderOut:nil];
+    [live.window orderOut:nil];
+    ZenitAppDelegate *delegate = [ZenitAppDelegate new];
+    assert([delegate applicationShouldHandleReopen:NSApp hasVisibleWindows:YES]);
+    assert(!hidden.window.isVisible);
+    assert(![delegate applicationShouldHandleReopen:NSApp hasVisibleWindows:NO]);
+    assert(hidden.window.isVisible && !hidden.hiddenByApplication);
+    assert(!other.window.isVisible);
+    // Nothing hidden by the application leaves AppKit's default in place.
+    [hidden.window orderOut:nil];
+    assert([delegate applicationShouldHandleReopen:NSApp hasVisibleWindows:NO]);
+    // A presented window is no longer restored by a later reopen.
+    macos_hide_window(ptr);
+    macos_activate_window(ptr);
+    assert(!hidden.hiddenByApplication);
+    // A committed close cannot be revived by hide/reopen.
+    macos_hide_window(ptr);
+    macos_begin_window_close(ptr);
+    assert([delegate applicationShouldHandleReopen:NSApp hasVisibleWindows:NO]);
+    for (int i = 0; i < 64 && !macos_window_close_completed(ptr); i++) pumpAppEventsWithTimeout(10);
+    macos_destroy_window(ptr);
+    macos_destroy_window(otherPtr);
+    [live.window makeKeyAndOrderFront:nil];
+    for (int i = 0; i < 8; i++) { pumpAppEventsWithTimeout(0); dispatchToClient(live); }
+    fprintf(stderr, "PASS: hide preserves the window; Dock reopen restores only application-hidden windows\n");
+}
+
+static void verifyMinimumContentSize(void) {
+    void *ptr = macos_create_window(300, 200, "minimum size");
+    int width = 0, height = 0;
+    assert(macos_chrome_minimum(ptr, 360, 150));
+    macos_get_window_size(ptr, &width, &height);
+    assert(width == 360 && height == 200); // grows only the short axis
+    macos_set_window_size(ptr, 100, 100);
+    macos_get_window_size(ptr, &width, &height);
+    assert(width == 360 && height == 150); // programmatic resize honors the minimum
+    macos_set_window_size(ptr, 500, 400);
+    macos_get_window_size(ptr, &width, &height);
+    assert(width == 500 && height == 400);
+    macos_destroy_window(ptr);
+    fprintf(stderr, "PASS: content minimum grows the window and bounds programmatic resizes\n");
 }
 
 // Observe the native ordering boundary with two logical client documents.
@@ -658,6 +850,85 @@ static void verifyScrollLifecycle(WindowWrapper *w) {
     fprintf(stderr, "PASS: native scroll lifecycle preserves zero-delta boundaries, momentum and dequeue order\n");
 }
 
+static NSEvent *chordKey(WindowWrapper *w, NSString *text, unsigned short code, NSEventModifierFlags flags) {
+    return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+        modifierFlags:flags timestamp:0 windowNumber:w.window.windowNumber context:nil
+        characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:code];
+}
+
+// Pumps one queued key and returns whether the input context saw it, the
+// queued key packet count and the text the context inserted.
+static void pumpChord(WindowWrapper *w, PumpInputContext *probe, NSEvent *event,
+                      BOOL expectInterpreted, NSString *expectedText) {
+    [w.keyEventQueue removeAllObjects];
+    [document setString:@""];
+    const NSUInteger calls = probe.calls;
+    enqueue(@[event]);
+    for (int i = 0; i < 8 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
+    // The raw key always reaches Zig.
+    assert(w.keyEventQueue.count == 1);
+    KeyEventPacket packet;
+    [w.keyEventQueue.firstObject getValue:&packet];
+    assert(packet.keycode == event.keyCode && packet.pressed);
+    assert(probe.calls == calls + (expectInterpreted ? 1 : 0));
+    if (!expectInterpreted) assert(w.inputTextQueue.count == 0 && w.imeCommitQueue.count == 0);
+    dispatchToClient(w);
+    assert([document isEqualToString:expectedText]);
+}
+
+// Reserved chords (macos_set_reserved_key_chords): ⌥] reaches Zig as a key
+// without the input method typing ‘; anything not reserved exactly (other
+// modifiers, other keys, cleared table) is interpreted as before; Caps Lock
+// does not defeat a reservation; an active composition keeps every key.
+static void verifyReservedChords(WindowWrapper *w, PumpInputContext *probe) {
+    void *ptr = (__bridge void *)w;
+    dispatchToClient(w);
+    macos_set_text_input_enabled(ptr, 1);
+    probe.compose = NO;
+    const NSEventModifierFlags opt = NSEventModifierFlagOption;
+    // Unreserved: today's behaviour (the IME types the Option character).
+    pumpChord(w, probe, chordKey(w, @"‘", 30, opt), YES, @"‘");
+    const uint32_t chords[] = {
+        30u | (ZENIT_CHORD_OPTION << 16),
+        33u | (ZENIT_CHORD_OPTION << 16),
+        42u | (ZENIT_CHORD_OPTION << 16),
+        30u | (ZENIT_CHORD_CONTROL << 16),
+    };
+    macos_set_reserved_key_chords(ptr, chords, 4);
+    pumpChord(w, probe, chordKey(w, @"‘", 30, opt), NO, @"");
+    pumpChord(w, probe, chordKey(w, @"“", 33, opt), NO, @"");
+    pumpChord(w, probe, chordKey(w, @"«", 42, opt), NO, @"");
+    pumpChord(w, probe, chordKey(w, @"‘", 30, opt | NSEventModifierFlagCapsLock), NO, @"");
+    // Exact modifier match: ⌥⇧] and ⌘⌥] are not reserved; nor is ⌥p.
+    pumpChord(w, probe, chordKey(w, @"’", 30, opt | NSEventModifierFlagShift), YES, @"’");
+    pumpChord(w, probe, chordKey(w, @"π", 35, opt), YES, @"π");
+    // A composition in progress owns the key.
+    [w.metalView setMarkedText:@"n" selectedRange:NSMakeRange(1, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+    [w.imePreeditQueue removeAllObjects];
+    {
+        const NSUInteger calls = probe.calls;
+        enqueue(@[chordKey(w, @"‘", 30, opt)]);
+        for (int i = 0; i < 8 && probe.calls == calls; i++) pumpAppEventsWithTimeout(0);
+        assert(probe.calls == calls + 1);
+        [w.metalView unmarkText];
+        dispatchToClient(w);
+    }
+    // Replacing the table with an empty one restores interpretation.
+    macos_set_reserved_key_chords(ptr, NULL, 0);
+    pumpChord(w, probe, chordKey(w, @"‘", 30, opt), YES, @"‘");
+    // A table over the cap is truncated, never overflows.
+    uint32_t many[40];
+    for (int i = 0; i < 40; i++) many[i] = (uint32_t)(100 + i) | (ZENIT_CHORD_OPTION << 16);
+    many[39] = 30u | (ZENIT_CHORD_OPTION << 16);
+    macos_set_reserved_key_chords(ptr, many, 40);
+    assert(w.reservedKeyChords.length == 32 * sizeof(uint32_t));
+    pumpChord(w, probe, chordKey(w, @"‘", 30, opt), YES, @"‘");
+    macos_set_reserved_key_chords(ptr, NULL, 0);
+    [document setString:@""];
+    macos_set_text_input_enabled(ptr, 0);
+    fprintf(stderr, "PASS: reserved chords reach Zig without IME text; exact match, caps lock, composition and clear\n");
+}
+
 static void verifyKeyboardIsolation(WindowWrapper *w, PumpInputContext *probe) {
     void *ptr = (__bridge void *)w;
     dispatchToClient(w);
@@ -708,104 +979,194 @@ static void verifyKeyboardIsolation(WindowWrapper *w, PumpInputContext *probe) {
     fprintf(stderr, "PASS: per-window keyboard isolation blocks quit/close/IME, preserves other windows and restores normal input\n");
 }
 
-// Keep drag tests non-blocking while exercising the real native hit policy.
-@interface TitlebarProbeWindow : ZenitWindow
-@property NSUInteger dragCalls;
-@property NSUInteger zoomCalls;
-@property BOOL pretendFullscreen;
+// While composing, Return/Enter/Escape commit/cancel inside the input method
+// only; the same press must not also reach Zig as a submit/close key.
+@interface CompositionCommandContext : NSTextInputContext
+@property NSUInteger calls;
 @end
-@implementation TitlebarProbeWindow
-- (void)performWindowDragWithEvent:(NSEvent *)event { self.dragCalls++; }
-- (void)zoom:(id)sender { self.zoomCalls++; }
-- (NSWindowStyleMask)styleMask {
-    return [super styleMask] | (self.pretendFullscreen ? NSWindowStyleMaskFullScreen : 0);
+@implementation CompositionCommandContext
+- (BOOL)handleEvent:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown) return NO;
+    self.calls++;
+    if (event.keyCode == 53) {
+        if (self.client.hasMarkedText) {
+            [self.client setMarkedText:@"" selectedRange:NSMakeRange(0, 0)
+                      replacementRange:NSMakeRange(NSNotFound, 0)];
+        } else [self.client doCommandBySelector:@selector(cancelOperation:)];
+    } else {
+        if (self.client.hasMarkedText) {
+            [self.client insertText:@"你" replacementRange:NSMakeRange(NSNotFound, 0)];
+        } else [self.client doCommandBySelector:@selector(insertNewline:)];
+    }
+    return YES;
 }
 @end
-static int titlebarControl(void *ctx, float x, float y) { return x >= 100 && x <= 220; }
-static int titlebarRegion(void *ctx, float x, float y) { return titlebarControl(ctx,x,y) ? 1 : 2; }
-static NSEvent *titlebarClick(WindowWrapper *w, CGFloat x, CGFloat y, NSInteger count) {
-    NSPoint p = [w.window.contentView convertPoint:NSMakePoint(x, w.window.contentView.bounds.size.height-y) toView:nil];
-    return [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:p
-        modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime
-        windowNumber:w.window.windowNumber context:nil eventNumber:0 clickCount:count pressure:1];
-}
-static void verifyTitlebarDoubleClick(WindowWrapper *live) {
-    WindowWrapper *w = [WindowWrapper new];
-    TitlebarProbeWindow *probe = [[TitlebarProbeWindow alloc] initWithContentRect:NSMakeRect(100,100,640,400)
-        styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable
-        backing:NSBackingStoreBuffered defer:NO];
-    probe.releasedWhenClosed = NO;
-    w.window = probe;
-    w.titlebarDragHeight = 40;
-    w.titlebarDragRightInset = 150;
-    w.titlebarHitCallback = titlebarControl;
-    assert(handleTitlebarMouseDown(w,titlebarClick(w,300,10,1)) && probe.dragCalls == 1);
-    assert(handleTitlebarMouseDown(w,titlebarClick(w,300,10,2)) && probe.zoomCalls == 1);
-    assert(handleTitlebarMouseDown(w,titlebarClick(w,600,10,2)) && probe.zoomCalls == 2); // right action gap
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,150,10,2))); // Tab / button owns click
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,300,80,2))); // body
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,638,10,2))); // resize edge
-    w.chromeFullscreenTransition = YES;
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,300,10,2)));
-    w.chromeFullscreenTransition = NO;
-    probe.pretendFullscreen = YES;
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,300,10,2)));
-    probe.pretendFullscreen = NO;
-    NSButton *close = [probe standardWindowButton:NSWindowCloseButton];
-    NSPoint native = [probe.contentView convertPoint:NSMakePoint(NSMidX(close.bounds),NSMidY(close.bounds)) fromView:close];
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,native.x,probe.contentView.bounds.size.height-native.y,2)));
-    w.titlebarHitCallback = NULL;
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,600,10,2))); // rectangle fallback keeps exclusion
-    w.chromeHitCallback = titlebarRegion;
-    assert(!handleTitlebarMouseDown(w,titlebarClick(w,150,10,2)));
-    assert(handleTitlebarMouseDown(w,titlebarClick(w,300,10,2)) && probe.zoomCalls == 3);
-    assert(probe.dragCalls == 1);
-    [probe close];
 
-    // Deliver real NSEvents through the registered window pump, including the
-    // legacy single-window entry, and verify AppKit restores the precise frame.
-    void *siblingPtr = macos_create_window(420,260,"titlebar sibling isolation");
-    WindowWrapper *sibling = (__bridge WindowWrapper *)siblingPtr;
-    NSRect siblingFrame = sibling.window.frame;
-    NSRect original = live.window.frame;
-    live.titlebarDragHeight = 40;
-    live.titlebarDragRightInset = 150;
-    live.titlebarHitCallback = titlebarControl;
-    for (int pass=0;pass<2;pass++) {
-        enqueue(@[titlebarClick(live,300,10,2)]);
-        for (int i=0;i<32;i++) {
-            if (pass == 0) pumpAppEventsWithTimeout(0);
-            else macos_poll_events((__bridge void *)live);
-            if (live.window.isZoomed == (pass == 0)) break;
+static void verifyCompositionCommandOwnership(WindowWrapper *w) {
+    NSTextInputContext *previous = w.metalView.zenitInputContext;
+    CompositionCommandContext *context = [[CompositionCommandContext alloc] initWithClient:w.metalView];
+    w.metalView.zenitInputContext = context;
+    w.lastKeyboardInputSource = context.selectedKeyboardInputSource;
+    dispatchToClient(w);
+    macos_set_text_input_enabled((__bridge void *)w, 1);
+    for (NSNumber *codeValue in @[@36, @76, @53]) {
+        unsigned short code = codeValue.unsignedShortValue;
+        NSString *text = code == 53 ? @"\x1b" : @"\r";
+        context.calls = 0;
+        [w.metalView setMarkedText:@"ni" selectedRange:NSMakeRange(2, 0)
+                 replacementRange:NSMakeRange(NSNotFound, 0)];
+        dispatchToClient(w);
+        enqueue(@[key(w, text, code)]);
+        for (int i = 0; i < 16 && context.calls == 0; i++) pumpAppEventsWithTimeout(0);
+        assert(context.calls == 1 && !w.metalView.hasMarkedText);
+        // Composition ended inside the input method; no raw command packet.
+        assert(w.keyEventQueue.count == 0);
+        if (code == 53) {
+            assert(w.imeCommitQueue.count == 0);
+        } else {
+            assert(w.imeCommitQueue.count == 1);
+            assert([w.imeCommitQueue.firstObject.text isEqualToString:@"你"]);
         }
-        assert(live.window.isZoomed == (pass == 0));
-        assert(!(live.window.styleMask & NSWindowStyleMaskFullScreen));
-        assert(NSEqualRects(siblingFrame,sibling.window.frame));
+        dispatchToClient(w);
+        // A later press without composition still reaches widgets once.
+        enqueue(@[key(w, text, code)]);
+        for (int i = 0; i < 16 && context.calls == 1; i++) pumpAppEventsWithTimeout(0);
+        assert(context.calls == 2 && w.keyEventQueue.count == 1);
+        dispatchToClient(w);
+        // Key-up is never owned by the input method.
+        NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp location:NSZeroPoint
+            modifierFlags:0 timestamp:0 windowNumber:w.window.windowNumber context:nil
+            characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:code];
+        enqueue(@[up]);
+        for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
+        assert(w.keyEventQueue.count == 1);
+        KeyEventPacket packet;
+        [w.keyEventQueue.firstObject getValue:&packet];
+        assert(packet.keycode == code && !packet.pressed);
+        dispatchToClient(w);
     }
-    assert(NSEqualRects(original,live.window.frame));
-    live.titlebarDragHeight = 0;
-    live.titlebarDragRightInset = 0;
-    live.titlebarHitCallback = NULL;
-    macos_destroy_window(siblingPtr);
-    fprintf(stderr,"PASS: titlebar drag, double-click zoom/restore, controls, right gaps, resize edges, fullscreen guards and window isolation\n");
+    // Other keys while composing keep today's routing (key packet + IME).
+    [w.metalView setMarkedText:@"ni" selectedRange:NSMakeRange(2, 0)
+             replacementRange:NSMakeRange(NSNotFound, 0)];
+    dispatchToClient(w);
+    context.calls = 0;
+    enqueue(@[key(w, @"\t", 48)]);
+    for (int i = 0; i < 16 && context.calls == 0; i++) pumpAppEventsWithTimeout(0);
+    assert(context.calls == 1 && w.keyEventQueue.count == 1);
+    [w.metalView unmarkText];
+    dispatchToClient(w);
+    macos_set_text_input_enabled((__bridge void *)w, 0);
+    w.metalView.zenitInputContext = previous;
+    w.lastKeyboardInputSource = previous.selectedKeyboardInputSource;
+    fprintf(stderr, "PASS: IME Return/Enter/Escape are owned by composition; later presses, key-up and other keys remain\n");
 }
 
-static void verifyResizeCursors(WindowWrapper *w) {
-    NSCursor *nwse = diagonalResizeFallback(YES), *nesw = diagonalResizeFallback(NO);
-    assert(nwse == diagonalResizeFallback(YES) && nesw == diagonalResizeFallback(NO));
-    assert(![nwse.image.TIFFRepresentation isEqual:nesw.image.TIFFRepresentation]);
-    assert(![nwse.image.TIFFRepresentation isEqual:NSCursor.arrowCursor.image.TIFFRepresentation]);
-    assert(NSEqualPoints(nwse.hotSpot, NSMakePoint(nwse.image.size.width / 2, nwse.image.size.height / 2)));
-    assert(NSEqualPoints(nesw.hotSpot, nwse.hotSpot));
-    const int shapes[] = {7, 8, 9, 10, 11, 12, 1};
-    NSCursor *expected[] = {NSCursor.openHandCursor, NSCursor.closedHandCursor,
-        NSCursor.resizeLeftRightCursor, NSCursor.resizeUpDownCursor,
-        diagonalResizeCursor(YES), diagonalResizeCursor(NO), NSCursor.arrowCursor};
-    for (NSUInteger i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
-        macos_set_cursor_shape((__bridge void *)w, shapes[i]);
-        assert([w.metalView.zenitDesiredCursor.image.TIFFRepresentation isEqual:expected[i].image.TIFFRepresentation]);
-    }
-    fprintf(stderr, "PASS: native grab, grabbing, four resize axes, reset and cached macOS 14 diagonal artwork\n");
+// Application event filters (zenit_native_event_filter.h). AppKit may also
+// deliver its own events through the pump, so probes count key-downs only and
+// run their reentrant actions on a key-down.
+typedef struct {
+    int keyCalls;
+    BOOL consumeKeys;
+    BOOL removeSelf;
+    void *removeOther; // FilterProbe * whose filter to remove on first key
+    void *addOther;
+} FilterProbe;
+static int probeFilter(void *ctx, void *raw) {
+    FilterProbe *p = ctx;
+    NSEvent *event = (__bridge NSEvent *)raw;
+    assert(!zenitIsWakeEvent(event)); // wake events are never offered
+    if (event.type != NSEventTypeKeyDown) return 0;
+    p->keyCalls++;
+    if (p->removeSelf) macos_remove_native_event_filter(probeFilter, p);
+    if (p->removeOther) { macos_remove_native_event_filter(probeFilter, p->removeOther); p->removeOther = NULL; }
+    if (p->addOther) { assert(macos_add_native_event_filter(probeFilter, p->addOther)); p->addOther = NULL; }
+    return p->consumeKeys;
+}
+static void pumpKey(WindowWrapper *w, NSEvent *event, int *keyCalls, int expected) {
+    enqueue(@[event]);
+    for (int i = 0; i < 16 && *keyCalls < expected && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
+}
+static void verifyNativeEventFilters(WindowWrapper *w) {
+    macos_set_text_input_enabled((__bridge void *)w, 0);
+    for (int i = 0; i < 16; i++) { pumpAppEventsWithTimeout(0); dispatchToClient(w); }
+    assert(g_event_filter_count == 0);
+    // Unregistered: routing unchanged.
+    enqueue(@[key(w, @"a", 0)]);
+    for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
+    assert(w.keyEventQueue.count == 1);
+    dispatchToClient(w);
+
+    // Registered: a consumed key never reaches the window; unclaimed events do.
+    FilterProbe a = { .consumeKeys = YES };
+    assert(macos_add_native_event_filter(probeFilter, &a) == 1);
+    assert(macos_add_native_event_filter(probeFilter, &a) == 1); // set semantics
+    assert(g_event_filter_count == 1);
+    assert(macos_add_native_event_filter(NULL, &a) == 0);
+    pumpKey(w, key(w, @"b", 11), &a.keyCalls, 1);
+    pumpAppEventsWithTimeout(0);
+    assert(a.keyCalls == 1 && w.keyEventQueue.count == 0 && w.inputTextQueue.count == 0);
+    enqueue(@[click(w, NSEventTypeLeftMouseDown), click(w, NSEventTypeLeftMouseUp)]);
+    for (int i = 0; i < 16 && w.mouseButtonQueue.count < 2; i++) pumpAppEventsWithTimeout(0);
+    assert(w.mouseButtonQueue.count == 2);
+    dispatchToClient(w);
+    macos_set_text_input_enabled((__bridge void *)w, 0);
+    // The wake event ends the pump without reaching filters (callback assert).
+    macos_post_empty_event();
+    for (int i = 0; i < 4; i++) pumpAppEventsWithTimeout(0);
+    assert(a.keyCalls == 1);
+
+    // Chain order: the first consumer stops the chain.
+    FilterProbe b = { .consumeKeys = YES };
+    assert(macos_add_native_event_filter(probeFilter, &b));
+    pumpKey(w, key(w, @"c", 8), &a.keyCalls, 2);
+    pumpAppEventsWithTimeout(0);
+    assert(a.keyCalls == 2 && b.keyCalls == 0 && w.keyEventQueue.count == 0);
+
+    // Reentrancy: a removes itself and b (later in the snapshot) mid-dispatch,
+    // and adds c, which first sees the next event. b must not be called.
+    FilterProbe c = { 0 };
+    a.consumeKeys = NO; a.removeSelf = YES; a.removeOther = &b; a.addOther = &c;
+    pumpKey(w, key(w, @"d", 2), &a.keyCalls, 3);
+    assert(a.keyCalls == 3 && b.keyCalls == 0 && c.keyCalls == 0);
+    assert(w.keyEventQueue.count == 1); // nothing consumed: routed normally
+    assert(g_event_filter_count == 1 && g_event_filters[0].ctx == &c);
+    dispatchToClient(w);
+    pumpKey(w, key(w, @"e", 14), &c.keyCalls, 1);
+    assert(a.keyCalls == 3 && c.keyCalls == 1 && w.keyEventQueue.count == 1);
+    dispatchToClient(w);
+    // Self-removal while consuming: the event is still consumed, exactly once.
+    c.consumeKeys = YES; c.removeSelf = YES;
+    pumpKey(w, key(w, @"f", 3), &c.keyCalls, 2);
+    pumpAppEventsWithTimeout(0);
+    assert(c.keyCalls == 2 && w.keyEventQueue.count == 0 && g_event_filter_count == 0);
+
+    // Fixed capacity: no allocation, add fails when full, remove frees a slot.
+    FilterProbe many[ZENIT_MAC_EVENT_FILTER_CAPACITY + 1];
+    memset(many, 0, sizeof(many));
+    for (int i = 0; i < ZENIT_MAC_EVENT_FILTER_CAPACITY; i++)
+        assert(macos_add_native_event_filter(probeFilter, &many[i]) == 1);
+    assert(macos_add_native_event_filter(probeFilter, &many[ZENIT_MAC_EVENT_FILTER_CAPACITY]) == 0);
+    macos_remove_native_event_filter(probeFilter, &many[3]);
+    macos_remove_native_event_filter(probeFilter, &many[3]); // idempotent
+    assert(macos_add_native_event_filter(probeFilter, &many[ZENIT_MAC_EVENT_FILTER_CAPACITY]) == 1);
+    // Off the main thread registration is refused.
+    __block int offMain = -1;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    FilterProbe *freed = &many[3];
+    [NSThread detachNewThreadWithBlock:^{
+        offMain = macos_add_native_event_filter(probeFilter, freed);
+        dispatch_semaphore_signal(done);
+    }];
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    assert(offMain == 0);
+    for (int i = 0; i <= ZENIT_MAC_EVENT_FILTER_CAPACITY; i++) macos_remove_native_event_filter(probeFilter, &many[i]);
+    assert(g_event_filter_count == 0);
+    // Unregistered again: routing unchanged.
+    enqueue(@[key(w, @"g", 5)]);
+    for (int i = 0; i < 16 && w.keyEventQueue.count == 0; i++) pumpAppEventsWithTimeout(0);
+    assert(w.keyEventQueue.count == 1);
+    dispatchToClient(w);
+    fprintf(stderr, "PASS: native event filters: default routing, consumption, chain order, wake exclusion, reentrant add/remove, main thread and fixed capacity\n");
 }
 
 int main(int argc, const char **argv) {
@@ -875,6 +1236,8 @@ int main(int argc, const char **argv) {
             return 0;
         }
         verifyTitlebarDoubleClick(w);
+        verifyHideAndReopen(w);
+        verifyMinimumContentSize();
         verifyUnmarkAndDiscard(w);
         verifyExplicitReplacementCommit(w);
         verifyCompositionStartsNewInsertIdentity(w);
@@ -888,9 +1251,12 @@ int main(int argc, const char **argv) {
         w.metalView.zenitInputContext = probe;
         w.lastKeyboardInputSource = probe.selectedKeyboardInputSource;
         verifyKeyboardIsolation(w, probe);
+        verifyReservedChords(w, probe);
         verifyCompositionCommandOwnership(w);
+        verifyNativeEventFilters(w);
         verifySourceTransitionPreservesFirstLetter(w, YES);
         verifySourceTransitionPreservesFirstLetter(w, NO);
+        verifyDragMotionBatch(w);
         verifyQueuedTextBeforeFocusClick(w, probe);
 
         // First click and first key queued together: the old pump consumed

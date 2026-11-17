@@ -4,12 +4,15 @@
  * request: exactly one read_terminal, no preparatory discovery or side effects.
  * Requires a delivered candidate and the native-app slot; never retries a model run.
  */
+import './regression/build_mode_guard.mjs';  // refuses non-test-mode ZeroWork binaries before child_process starts them
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {mkdtemp,mkdir,writeFile,readFile,open,realpath,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {aiToggleId} from './ai_entry.ts';
+import {readRequestText} from './provider_fixture.ts';
 
 const minimalRead=process.env.ZW_AI_TEST_MINIMAL_READ==='1';
 const prefix=resolve(process.env.ZW_AI_TEST_PREFIX??'/tmp/zw-patch-discovery-native');
@@ -102,7 +105,7 @@ const server=createServer(async(req,res)=>{
    const response=await upstream.text();providerProbes.push({path:req.url,status:upstream.status});res.writeHead(upstream.status,{'content-type':upstream.headers.get('content-type')??'application/json'});res.end(response);return;
   }
   assert.equal(req.method,'POST');assert.equal(req.url,'/v1/chat/completions');
-  let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw),index=requests.length+1;
+  const raw=await readRequestText(req);const body=JSON.parse(raw),index=requests.length+1;
   await writeFile(join(out,`request-${index}.json`),raw);observeRequest(body);
   forwardedRequests++;
   const upstream=await fetch(gateway+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer local-gateway'},body:raw,signal:AbortSignal.timeout(120000)});
@@ -148,7 +151,7 @@ try{
  await h.type_(`discovery_marker="ZW_DISCOVERY_$(/usr/bin/uuidgen)"; printf '%s\\n' "$discovery_marker"; printf '%s' "$discovery_marker" > '${ready}'`);await h.key('return');
  await h.waitFor(async()=>{try{marker=await readFile(ready,'utf8');return /^ZW_DISCOVERY_[0-9A-F-]{36}$/i.test(marker)||null}catch{return null}},15000);
  await writeFile(join(out,'terminal-marker.txt'),marker);
- await click('toolbar.ai');await click('ai.maximize');await click('ai.prompt');
+ await click(await aiToggleId());await click('ai.maximize');await click('ai.prompt');
  const prompt=minimalRead?'请查看当前会话终端里可见的内容，只返回其中以 ZW_DISCOVERY_ 开头的完整随机标记。标记必须从实际终端内容读取，不得猜测，也不要执行命令。':'先调用对话状态和会话列表查询工具确认当前目标，再读取当前终端。只返回终端中以 ZW_DISCOVERY_ 开头的完整随机标记。不得猜测标记，不得执行命令。';
  await writeFile(join(out,'user-prompt.txt'),prompt);assert(!prompt.includes(marker));await h.type_(prompt);report.phase='model_turn';await click('ai.send');
  const turnStarted=performance.now();let turnComplete=false;
@@ -168,7 +171,7 @@ try{
  assert(!String(await readFile(join(out,'app.log'),'utf8')).includes('"event":"exec_started"'),'no execution may be dispatched');
  assert((await h.screenshot(join(out,'completed.png'))).ok);report.acceptance_passed=true;report.random_marker_echoed=true;
  report.checks.push(minimalRead?'Natural current-terminal request uses exactly one read_terminal from the unique authorized schema target, with zero preparatory discovery calls.':'Real model discovers the native conversation and session through registered host tools.','Production read_terminal returns actual Local output and the model echoes a shell-generated unpredictable marker.','No dynamic session facts are injected into system rules; no command or side-effect tool is dispatched.');
-}catch(e){report.status='failed';report.error=providerFailure??String(e);report.primary_failure={phase:report.phase??'startup',reason:report.error};process.exitCode=1;await h.screenshot(join(out,'failure.png')).catch(()=>{});await h.tree().then((tree:any)=>writeFile(join(out,'failure-tree.json'),JSON.stringify(tree,null,2))).catch(()=>{});}
+}catch(e){report.status='failed';report.error=providerFailure??String(e);report.primary_failure={phase:report.phase??'startup',reason:report.error};process.exitCode=1;await h.screenshot(join(out,'failure.png')).catch(()=>{});await h.tree({visibleOnly:true}).then((tree:any)=>writeFile(join(out,'failure-tree.json'),JSON.stringify(tree,null,2))).catch(()=>{});}
 finally{
  quitting=true;await normalQuit().catch(error=>{report.normal_quit_error=String(error)});
  let forced=false;if(alive()){forced=true;app.kill('SIGTERM');await Promise.race([ended,h.sleep(2000)])}if(alive()){app.kill('SIGKILL');await ended}

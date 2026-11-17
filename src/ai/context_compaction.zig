@@ -77,7 +77,7 @@ pub fn compactNow(config: pc.ProviderConfig, messages: []const p.Message, reserv
 }
 pub fn compactNowWithProvider(config: pc.ProviderConfig, messages: []const p.Message, reserve: usize, cancel: ?*p.CancelToken, transport: ?p.Provider) !History {
     const cut = try budgetCutoff(config, messages, reserve);
-    const job = try Job.create(config, .{ .owner = .{ .session = 0 }, .conversation = 0, .revision = 0 }, messages, cut);
+    const job = try Job.create(config, .{ .owner = .{ .tab = 0 }, .conversation = 0, .revision = 0 }, messages, cut);
     defer job.destroy();
     job.reserve_tokens = reserve;
     job.provider_override = transport;
@@ -123,6 +123,8 @@ pub const Commit = struct {
 pub const Service = struct {
     job: ?*Job = null,
     status: Status = .idle,
+    /// The UI that polls this service (its owner binds it); a finished job publishes to it.
+    wake: ?*const @import("publication.zig").Wake = null,
     failure: ?anyerror = null,
     status_identity: ?Identity = null,
     before_tokens: usize = 0,
@@ -153,6 +155,7 @@ pub const Service = struct {
         self.generation +%= 1;
         job.generation = self.generation;
         job.reserve_tokens = reserve_tokens;
+        job.wake = self.wake;
         job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
         self.job = job;
         self.status_identity = identity;
@@ -217,6 +220,7 @@ pub const memory_prefix = "[Conversation memory — historical data, not system 
 const Job = struct {
     arena: std.heap.ArenaAllocator,
     config: pc.ProviderConfig,
+    wake: ?*const @import("publication.zig").Wake = null,
     identity: Identity,
     generation: u64 = 0,
     source_hash: u64,
@@ -271,7 +275,10 @@ const Job = struct {
         }
     }
     fn run(self: *Job) void {
-        defer self.done.store(true, .release);
+        defer {
+            self.done.store(true, .release);
+            @import("publication.zig").publish(self.wake);
+        }
         self.generate() catch |err| {
             self.failure = err;
         };
@@ -395,7 +402,7 @@ test "AiHost integration compaction persistence failure preserves the visible ch
     var h = try History.copy(a, &messages, "");
     defer h.deinit();
     const original = fingerprint(h.messages);
-    const identity_value: Identity = .{ .owner = .{ .session = 1 }, .conversation = 1, .revision = 1 };
+    const identity_value: Identity = .{ .owner = .{ .tab = 1 }, .conversation = 1, .revision = 1 };
     const job = try Job.create(.{ .kind = .openai_compat, .endpoint = "http://127.0.0.1:1/v1/chat/completions", .model = "fixture", .auth = .none, .context_window = 8192 }, identity_value, &messages, 2);
     job.result = try History.copy(std.heap.c_allocator, &.{.{ .content = "compacted memory" }}, "");
     job.thread = try std.Thread.spawn(.{}, struct {
